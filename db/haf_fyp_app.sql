@@ -90,7 +90,8 @@ $$;
 
 -- ---------------------------------------------------------------------------
 -- Main block-processing loop
--- NOTE (T-0.3): verify hive.app_next_iteration INOUT signature on live node.
+-- hive.app_next_block(context_name) returns hive.blocks_range (first_block, last_block INT).
+-- NULL return means no blocks yet — loop continues. Negative range means wait for live block.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.main()
@@ -98,18 +99,16 @@ RETURNS void
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    _context      hive.contexts_name := 'haf_fyp';
-    _first_block  INT;
-    _last_block   INT;
+    _block_range hive.blocks_range;
 BEGIN
     PERFORM haf_fyp_app.allow_processing();
 
     LOOP
-        PERFORM hive.app_next_iteration(_context, _first_block, _last_block);
+        _block_range := hive.app_next_block('haf_fyp');
 
-        IF _last_block IS NOT NULL AND _last_block >= _first_block THEN
-            PERFORM haf_fyp_app.process_block_range(_first_block, _last_block);
-            UPDATE haf_fyp_app.app_status SET last_processed_block = _last_block;
+        IF _block_range IS NOT NULL AND _block_range.first_block > 0 THEN
+            PERFORM haf_fyp_app.process_block_range(_block_range.first_block, _block_range.last_block);
+            UPDATE haf_fyp_app.app_status SET last_processed_block = _block_range.last_block;
         END IF;
 
         EXIT WHEN NOT haf_fyp_app.continue_processing();
