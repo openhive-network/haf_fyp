@@ -1,0 +1,117 @@
+version: "3.8"
+
+# Full production stack:
+#   haf                — HAF PostgreSQL node (hived + sql_serializer)
+#   haf-fyp-setup      — One-time schema installation (runs as haf_admin)
+#   haf-fyp-sync       — Infinite block-processing loop (PL/pgSQL main())
+#   haf-fyp-ranker     — Python ranking daemon (5-minute cycles)
+#   haf-fyp-api        — FastAPI overlay (rate limiting, force-refresh, explainer)
+#   postgrest          — Auto-generated REST API over haf_fyp_endpoints schema
+#   redis              — Pub/sub for force-refresh signals
+
+services:
+  haf:
+    image: ${HAF_REGISTRY}/haf/instance:${HAF_VERSION}
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    volumes:
+      - haf_datadir:/home/hived/datadir
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -U haf_admin -d haf_block_log"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 72h   # replay can take days on first run
+
+  haf-fyp-setup:
+    build:
+      context: ..
+      dockerfile: Dockerfile.sql
+    command: ["/app/scripts/install_app.sh"]
+    environment:
+      POSTGRES_HOST: haf
+      POSTGRES_USER: haf_admin   # install requires DDL privileges
+      POSTGRES_DB:   haf_block_log
+    depends_on:
+      haf:
+        condition: service_healthy
+    restart: on-failure
+
+  haf-fyp-sync:
+    build:
+      context: ..
+      dockerfile: Dockerfile.sql
+    command: ["/app/scripts/process_blocks.sh"]
+    environment:
+      POSTGRES_HOST: haf
+      POSTGRES_USER: haf_fyp_owner
+      POSTGRES_DB:   haf_block_log
+    depends_on:
+      haf-fyp-setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "psql -h haf -U haf_fyp_user -d haf_block_log -c 'SELECT 1' -q"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 72h
+
+  haf-fyp-ranker:
+    build:
+      context: ..
+      dockerfile: Dockerfile.python
+    command: ["python", "-m", "haf_fyp.ranker_daemon"]
+    environment:
+      HAF_DB_URL: postgresql://haf_fyp_user@haf/haf_block_log
+      REDIS_URL:  redis://redis:6379
+    depends_on:
+      haf-fyp-setup:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+  haf-fyp-api:
+    build:
+      context: ..
+      dockerfile: Dockerfile.python
+    command: ["uvicorn", "haf_fyp.api:app", "--host", "0.0.0.0", "--port", "3002"]
+    ports:
+      - "${FYP_API_PORT:-3002}:3002"
+    environment:
+      HAF_DB_URL: postgresql://haf_fyp_user@haf/haf_block_log
+      REDIS_URL:  redis://redis:6379
+    depends_on:
+      haf-fyp-setup:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+  postgrest:
+    image: postgrest/postgrest:${POSTGREST_VERSION}
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-3001}:3000"
+    environment:
+      PGRST_DB_URI:                "postgres://haf_fyp_user@haf/haf_block_log"
+      PGRST_DB_SCHEMA:             "haf_fyp_endpoints"
+      PGRST_DB_ANON_ROLE:          "haf_fyp_user"
+      PGRST_DB_POOL:               "20"
+      PGRST_DB_POOL_TIMEOUT:       "10"
+      PGRST_SERVER_TIMING_ENABLED: "true"
+    depends_on:
+      haf-fyp-setup:
+        condition: service_completed_successfully
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+
+volumes:
+  haf_datadir:
+  redis_data:

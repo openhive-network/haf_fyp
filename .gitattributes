@@ -1,0 +1,6 @@
+# Force LF line endings for all text files so scripts run correctly inside Docker (Linux).
+* text=auto eol=lf
+
+# Explicitly mark binary files
+*.png binary
+*.jpg binary

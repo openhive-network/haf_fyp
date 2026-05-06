@@ -1,0 +1,57 @@
+---
+test_name: Health check — PostgREST
+
+includes:
+  - !include common.yaml
+
+stages:
+  - name: GET /rpc/get_health returns 200 with status ok
+    request:
+      url: "{api_url}/rpc/get_health"
+      method: GET
+    response:
+      status_code: 200
+
+---
+test_name: Algorithm version endpoint
+
+includes:
+  - !include common.yaml
+
+stages:
+  - name: GET /rpc/get_algorithm returns v1.0.0
+    request:
+      url: "{api_url}/rpc/get_algorithm"
+      method: GET
+    response:
+      status_code: 200
+
+---
+test_name: Personalized feed returns empty array before ranker runs
+
+includes:
+  - !include common.yaml
+
+stages:
+  - name: GET /rpc/get_personalized_feed returns 200
+    request:
+      url: "{api_url}/rpc/get_personalized_feed"
+      method: GET
+      params:
+        username: testuser
+    response:
+      status_code: 200
+
+---
+test_name: Global feed returns empty array before ranker runs
+
+includes:
+  - !include common.yaml
+
+stages:
+  - name: GET /rpc/get_global_feed returns 200
+    request:
+      url: "{api_url}/rpc/get_global_feed"
+      method: GET
+    response:
+      status_code: 200
