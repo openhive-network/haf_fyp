@@ -70,7 +70,7 @@ END;
 $$;
 
 -- ---------------------------------------------------------------------------
--- Block range dispatcher (stub — processors added in Phase 2)
+-- Block range dispatcher (stub — overridden by process_block_range.sql)
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_block_range(
@@ -81,9 +81,6 @@ RETURNS void
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    -- Phase 2: PERFORM haf_fyp_app.process_posts(_first_block, _last_block);
-    -- Phase 3: PERFORM haf_fyp_app.process_engagement(_first_block, _last_block);
-    -- Phase 4: PERFORM haf_fyp_app.process_communities(_first_block, _last_block);
     NULL;
 END;
 $$;
