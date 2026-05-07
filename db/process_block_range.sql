@@ -10,7 +10,7 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
     PERFORM haf_fyp_app.process_posts(_first_block, _last_block);
-    -- Phase 3: PERFORM haf_fyp_app.process_engagement(_first_block, _last_block);
+    PERFORM haf_fyp_app.process_engagement(_first_block, _last_block);
     -- Phase 4: PERFORM haf_fyp_app.process_communities(_first_block, _last_block);
 END;
 $$;

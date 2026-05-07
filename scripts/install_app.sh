@@ -22,20 +22,25 @@ run_sql_file "${SCRIPT_DIR}/../db/haf_fyp_app.sql"
 # 3. Application tables and composite type
 run_sql_file "${SCRIPT_DIR}/../db/create_tables.sql"
 
-# 4. Phase 2: post ingestion processors
+# 4. Phase 2: post ingestion
 run_sql_file "${SCRIPT_DIR}/../db/process_posts.sql"
+
+# 5. Phase 3: engagement tracking
+run_sql_file "${SCRIPT_DIR}/../db/process_engagement.sql"
+
+# 6. Block range dispatcher (loads after all processors are defined)
 run_sql_file "${SCRIPT_DIR}/../db/process_block_range.sql"
 
-# 5. Seed data (algorithm versions)
+# 7. Seed data (algorithm versions)
 run_sql_file "${SCRIPT_DIR}/../db/seed_data.sql"
 
-# 6. API endpoints
+# 8. API endpoints
 run_sql_file "${SCRIPT_DIR}/../endpoints/endpoint_schema.sql"
 
-# 7. Register HAF context (idempotent)
+# 9. Register HAF context (idempotent)
 psql_cmd -c "SELECT haf_fyp_app.create_context_if_not_exists();"
 
-# 8. Grant read access on current and future objects to haf_fyp_user
+# 10. Grant read access on current and future objects to haf_fyp_user
 psql_cmd -c "
     ALTER DEFAULT PRIVILEGES FOR ROLE haf_fyp_owner IN SCHEMA haf_fyp_app
         GRANT SELECT ON TABLES TO haf_fyp_user;
