@@ -28,7 +28,10 @@ run_sql_file "${SCRIPT_DIR}/../db/process_posts.sql"
 # 5. Phase 3: engagement tracking
 run_sql_file "${SCRIPT_DIR}/../db/process_engagement.sql"
 
-# 6. Block range dispatcher (loads after all processors are defined)
+# 6. Phase 4: community subscription sync
+run_sql_file "${SCRIPT_DIR}/../db/process_communities.sql"
+
+# 7. Block range dispatcher (loads after all processors are defined)
 run_sql_file "${SCRIPT_DIR}/../db/process_block_range.sql"
 
 # 7. Seed data (algorithm versions)
