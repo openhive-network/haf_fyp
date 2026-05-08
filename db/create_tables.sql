@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.engagement_metrics (
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.user_profile_vectors (
     username        VARCHAR(16) NOT NULL,
-    interest_vector VECTOR(768),
+    interest_vector VECTOR(384),
     posts_sampled   INT         NOT NULL DEFAULT 0,
     communities     INT[],
     updated_at      TIMESTAMP,

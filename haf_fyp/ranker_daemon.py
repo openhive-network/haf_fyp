@@ -16,11 +16,16 @@ import pandas as pd
 import psycopg2
 import psycopg2.extras
 
+from haf_fyp.embeddings import fetch_post_vectors, register_vector_type
 from haf_fyp.scoring import (
+    bootstrap_vector_from_communities,
+    build_user_profile_vector,
     compute_scores,
     fetch_user_communities,
+    read_user_vector,
     write_feed_cache,
     write_global_feed_cache,
+    write_user_vector,
 )
 
 log = logging.getLogger(__name__)
@@ -100,6 +105,8 @@ def _fetch_community_users(conn) -> list[str]:
 
 
 def run_cycle(conn) -> None:
+    register_vector_type(conn)
+
     algo_version, weights = _fetch_algorithm(conn)
     candidates = _fetch_candidates(conn)
 
@@ -108,6 +115,13 @@ def run_cycle(conn) -> None:
         return
 
     log.info("scoring %d candidates (algo %s)", len(candidates), algo_version)
+
+    # Pre-fetch all candidate embeddings in one round-trip
+    post_ids = candidates["post_id"].tolist()
+    post_vectors = fetch_post_vectors(conn, post_ids)
+    log.info(
+        "embeddings available for %d / %d candidates", len(post_vectors), len(post_ids)
+    )
 
     # Global feed: no user vector, no community boost
     global_scored = compute_scores(
@@ -125,10 +139,26 @@ def run_cycle(conn) -> None:
     users = _fetch_community_users(conn)
     for username in users:
         communities = fetch_user_communities(conn, username)
+
+        # Build fresh vector from interaction history; fall back to stored
+        # vector if no interactions have embeddings; fall back to community
+        # bootstrap for brand-new users with no interaction history at all.
+        user_vector, sampled = build_user_profile_vector(conn, username, post_vectors)
+        if user_vector is not None:
+            write_user_vector(conn, username, user_vector, sampled)
+        else:
+            user_vector, _ = read_user_vector(conn, username)
+            if user_vector is None and communities:
+                user_vector = bootstrap_vector_from_communities(
+                    conn, communities, post_vectors
+                )
+                if user_vector is not None:
+                    write_user_vector(conn, username, user_vector, 0)
+
         scored = compute_scores(
             candidates=candidates,
-            user_vector=None,
-            post_vectors={},
+            user_vector=user_vector,
+            post_vectors=post_vectors,
             author_credibility={},
             user_communities=communities,
             algorithm_weights=weights,
