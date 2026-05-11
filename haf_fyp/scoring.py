@@ -8,8 +8,8 @@ Signal weights (v1.0.0):
     credibility      0.10  author reputation from btracker + reputation_tracker
     community_boost  x1.20 post-sum multiplier for subscribed-community posts
 
-Phase 6: recency, engagement, community boost, and semantic relevance (HiveSense).
-Credibility returns 0.3 neutral until btracker is integrated (Phase 7).
+Phase 7: all four signals active — recency, engagement, semantic relevance (HiveSense),
+and credibility (btracker VESTS + reptracker reputation).
 """
 
 from __future__ import annotations
@@ -50,8 +50,8 @@ def compute_engagement_quality(df: pd.DataFrame, params: dict) -> pd.Series:
 
 def compute_credibility(authors: pd.Series, author_credibility: dict) -> pd.Series:
     """
-    Author credibility score in [0, 1].
-    Returns 0.3 default until btracker + reputation_tracker are integrated (Phase 7).
+    Author credibility score in [0, 1] from btracker VESTS + reptracker reputation.
+    Falls back to 0.3 for authors absent from the pre-fetched credibility dict.
     """
     return authors.map(lambda a: author_credibility.get(a, 0.3))
 

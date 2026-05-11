@@ -16,6 +16,7 @@ import pandas as pd
 import psycopg2
 import psycopg2.extras
 
+from haf_fyp.credibility import fetch_author_credibility
 from haf_fyp.embeddings import fetch_post_vectors, register_vector_type
 from haf_fyp.scoring import (
     bootstrap_vector_from_communities,
@@ -123,12 +124,19 @@ def run_cycle(conn) -> None:
         "embeddings available for %d / %d candidates", len(post_vectors), len(post_ids)
     )
 
+    # Pre-fetch credibility scores for all unique authors in one round-trip
+    authors = candidates["author"].unique().tolist()
+    author_credibility = fetch_author_credibility(conn, authors)
+    log.info(
+        "credibility scores for %d / %d authors", len(author_credibility), len(authors)
+    )
+
     # Global feed: no user vector, no community boost
     global_scored = compute_scores(
         candidates=candidates,
         user_vector=None,
         post_vectors={},
-        author_credibility={},
+        author_credibility=author_credibility,
         user_communities=set(),
         algorithm_weights=weights,
     )
@@ -159,7 +167,7 @@ def run_cycle(conn) -> None:
             candidates=candidates,
             user_vector=user_vector,
             post_vectors=post_vectors,
-            author_credibility={},
+            author_credibility=author_credibility,
             user_communities=communities,
             algorithm_weights=weights,
         )
