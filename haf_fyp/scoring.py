@@ -204,6 +204,16 @@ def fetch_user_communities(conn, username: str) -> set:
         return {row[0] for row in cur.fetchall()}
 
 
+def fetch_user_interests(conn, username: str) -> set:
+    """Return community_id ints from the user's declared interest-picker selections."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT community_id FROM haf_fyp_app.user_interests WHERE username = %s",
+            (username,),
+        )
+        return {row[0] for row in cur.fetchall()}
+
+
 def compute_scores(
     candidates: pd.DataFrame,
     user_vector,

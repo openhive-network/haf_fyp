@@ -2,8 +2,15 @@
 Ranker daemon — runs every 5 minutes, scores all active post candidates,
 writes results to feed_cache (personalized) and global_feed_cache (global).
 
-Phase 5 signals active: recency, engagement, community boost.
-Relevance (Phase 6) and credibility (Phase 7) return neutral defaults.
+All four signals active: recency, engagement, semantic relevance (HiveSense),
+and credibility (btracker + reptracker). Community boost applied post-sum.
+
+Cold-start priority per user:
+  1. Build vector from interaction history (votes + reblogs)
+  2. Fall back to stored vector in user_profile_vectors
+  3. Bootstrap from on-chain subscriptions (user_communities)
+  4. Bootstrap from declared interests (user_interests — Phase 8)
+  5. None → cold-start weights (relevance dropped, recency + engagement renormalised)
 """
 
 from __future__ import annotations
@@ -23,6 +30,7 @@ from haf_fyp.scoring import (
     build_user_profile_vector,
     compute_scores,
     fetch_user_communities,
+    fetch_user_interests,
     read_user_vector,
     write_feed_cache,
     write_global_feed_cache,
@@ -99,9 +107,16 @@ def _fetch_candidates(conn) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _fetch_community_users(conn) -> list[str]:
+def _fetch_personalised_users(conn) -> list[str]:
+    """All users who have either on-chain subscriptions or declared interests."""
     with conn.cursor() as cur:
-        cur.execute("SELECT DISTINCT username FROM haf_fyp_app.user_communities")
+        cur.execute(
+            """
+            SELECT username FROM haf_fyp_app.user_communities
+            UNION
+            SELECT username FROM haf_fyp_app.user_interests
+            """
+        )
         return [r[0] for r in cur.fetchall()]
 
 
@@ -143,22 +158,27 @@ def run_cycle(conn) -> None:
     write_global_feed_cache(conn, global_scored, algo_version)
     log.info("global feed written (%d posts)", min(len(global_scored), 200))
 
-    # Personalized feeds: users with on-chain community subscriptions
-    users = _fetch_community_users(conn)
+    # Personalized feeds: users with on-chain subscriptions OR declared interests
+    users = _fetch_personalised_users(conn)
     for username in users:
+        # Merge on-chain subscriptions + declared interests for boost and bootstrap
         communities = fetch_user_communities(conn, username)
+        interests = fetch_user_interests(conn, username)
+        all_communities = communities | interests
 
-        # Build fresh vector from interaction history; fall back to stored
-        # vector if no interactions have embeddings; fall back to community
-        # bootstrap for brand-new users with no interaction history at all.
+        # Cold-start priority:
+        #   1. fresh vector from interaction history
+        #   2. stored vector (built on a previous cycle)
+        #   3. bootstrap from all_communities (on-chain + declared)
+        #   4. None → renormalised weights, no relevance signal
         user_vector, sampled = build_user_profile_vector(conn, username, post_vectors)
         if user_vector is not None:
             write_user_vector(conn, username, user_vector, sampled)
         else:
             user_vector, _ = read_user_vector(conn, username)
-            if user_vector is None and communities:
+            if user_vector is None and all_communities:
                 user_vector = bootstrap_vector_from_communities(
-                    conn, communities, post_vectors
+                    conn, all_communities, post_vectors
                 )
                 if user_vector is not None:
                     write_user_vector(conn, username, user_vector, 0)
@@ -168,7 +188,7 @@ def run_cycle(conn) -> None:
             user_vector=user_vector,
             post_vectors=post_vectors,
             author_credibility=author_credibility,
-            user_communities=communities,
+            user_communities=all_communities,
             algorithm_weights=weights,
         )
         write_feed_cache(conn, username, scored, algo_version)
