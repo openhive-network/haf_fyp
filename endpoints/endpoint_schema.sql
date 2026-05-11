@@ -143,4 +143,71 @@ AS $$
     WHERE username = get_user_profile.username;
 $$;
 
+-- ---------------------------------------------------------------------------
+-- Score explainer — per-signal breakdown for a post in a user's feed cache
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_score_explanation(
+    username TEXT,
+    post_id  BIGINT
+)
+RETURNS TABLE (
+    post_id                 BIGINT,
+    author                  VARCHAR(16),
+    permlink                VARCHAR(256),
+    title                   TEXT,
+    final_score             FLOAT,
+    score_relevance         FLOAT,
+    score_recency           FLOAT,
+    score_engagement        FLOAT,
+    score_credibility       FLOAT,
+    community_boost_applied BOOLEAN,
+    rank                    INT,
+    algorithm_version       VARCHAR(16),
+    algorithm_weights       JSONB,
+    computed_at             TIMESTAMP
+)
+LANGUAGE sql STABLE
+AS $$
+    SELECT
+        fc.post_id,
+        pc.author,
+        pc.permlink,
+        pc.title,
+        fc.final_score,
+        fc.score_relevance,
+        fc.score_recency,
+        fc.score_engagement,
+        fc.score_credibility,
+        fc.community_boost_applied,
+        fc.rank,
+        fc.algorithm_version,
+        av.weights  AS algorithm_weights,
+        fc.computed_at
+    FROM haf_fyp_app.feed_cache fc
+    JOIN haf_fyp_app.post_candidates pc ON pc.post_id = fc.post_id
+    LEFT JOIN haf_fyp_app.algorithm_versions av ON av.version = fc.algorithm_version
+    WHERE fc.username = get_score_explanation.username
+      AND fc.post_id  = get_score_explanation.post_id;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Algorithm registry — all versions with active flag
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION haf_fyp_endpoints.list_algorithm_versions()
+RETURNS TABLE (
+    version     TEXT,
+    description TEXT,
+    weights     JSONB,
+    deployed_at TIMESTAMP,
+    is_active   BOOLEAN
+)
+LANGUAGE sql STABLE
+AS $$
+    SELECT version, description, weights, deployed_at, is_active
+    FROM haf_fyp_app.algorithm_versions
+    ORDER BY deployed_at DESC;
+$$;
+
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA haf_fyp_endpoints TO haf_fyp_user;

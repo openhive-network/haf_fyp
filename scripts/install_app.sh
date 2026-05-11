@@ -34,16 +34,16 @@ run_sql_file "${SCRIPT_DIR}/../db/process_communities.sql"
 # 7. Block range dispatcher (loads after all processors are defined)
 run_sql_file "${SCRIPT_DIR}/../db/process_block_range.sql"
 
-# 7. Seed data (algorithm versions)
+# 8. Seed data (algorithm versions)
 run_sql_file "${SCRIPT_DIR}/../db/seed_data.sql"
 
-# 8. API endpoints
+# 9. API endpoints (includes score explainer + algorithm registry — Phase 9)
 run_sql_file "${SCRIPT_DIR}/../endpoints/endpoint_schema.sql"
 
-# 9. Register HAF context (idempotent)
+# 10. Register HAF context (idempotent)
 psql_cmd -c "SELECT haf_fyp_app.create_context_if_not_exists();"
 
-# 10. Grant read access on current and future objects to haf_fyp_user
+# 11. Grant read access on current and future objects to haf_fyp_user
 psql_cmd -c "
     ALTER DEFAULT PRIVILEGES FOR ROLE haf_fyp_owner IN SCHEMA haf_fyp_app
         GRANT SELECT ON TABLES TO haf_fyp_user;

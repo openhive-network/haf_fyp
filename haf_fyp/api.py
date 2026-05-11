@@ -1,14 +1,13 @@
 """
 FastAPI overlay for haf_fyp.
 
-Handles write operations and advanced features that PostgREST cannot serve:
-  POST /v1/fyp/interests  — cold-start interest picker declarations
-  GET  /health            — service health check
+Handles write operations and admin actions that PostgREST cannot serve:
+  POST /v1/fyp/interests           — cold-start interest picker (rate-limited)
+  POST /v1/fyp/admin/algorithm     — activate an algorithm version (API-key gated)
+  GET  /health                     — service health check
 
 PostgREST (port 3001) serves all read endpoints from haf_fyp_endpoints schema.
-Redis pub/sub is used to signal the ranker for on-demand feed refresh; the
-ranker will pick up new interests on its next 5-minute cycle if Redis is
-unavailable.
+Redis pub/sub signals the ranker for on-demand feed refresh after interest updates.
 """
 
 from __future__ import annotations
@@ -20,12 +19,29 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 
 import psycopg2
+import psycopg2.extras
 import psycopg2.pool
 import redis as redis_lib
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Rate limiter — memory-backed by default; set REDIS_URL for multi-worker
+# ---------------------------------------------------------------------------
+
+limiter = Limiter(
+    key_func=get_remote_address,
+    storage_uri=os.environ.get("REDIS_URL", "memory://"),
+)
+
+# ---------------------------------------------------------------------------
+# DB connection pool
+# ---------------------------------------------------------------------------
 
 _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
@@ -51,7 +67,13 @@ async def lifespan(app: FastAPI):
     log.info("database pool closed")
 
 
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
 app = FastAPI(title="haf_fyp", version="1.0.0", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +89,10 @@ class InterestsRequest(BaseModel):
 class InterestsResponse(BaseModel):
     username: str
     communities_saved: int
+
+
+class AlgorithmActivateRequest(BaseModel):
+    version: str
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +111,7 @@ def _publish_refresh(username: str) -> None:
         )
         r.publish("haf_fyp:refresh", json.dumps({"username": username}))
     except Exception:
-        pass  # ranker will pick up interests on next scheduled cycle
+        pass  # ranker picks up interests on next scheduled cycle regardless
 
 
 # ---------------------------------------------------------------------------
@@ -99,19 +125,19 @@ def health():
 
 
 @app.post("/v1/fyp/interests", response_model=InterestsResponse)
-def post_interests(req: InterestsRequest):
+@limiter.limit("10/minute")
+def post_interests(request: Request, req: InterestsRequest):
     """
     Declare or replace a user's cold-start community interests.
 
     Upserts all supplied community_ids into user_interests and removes any
     previously declared communities not in the current list. Publishes a
     Redis refresh signal so the ranker can bootstrap the user's interest
-    vector immediately rather than waiting for the next 5-minute cycle.
+    vector on its next cycle.
     """
     conn = _pool.getconn()
     try:
         with conn.cursor() as cur:
-            # Upsert declared interests (replace weight + timestamp on conflict)
             psycopg2.extras.execute_values(
                 cur,
                 """
@@ -125,8 +151,6 @@ def post_interests(req: InterestsRequest):
                 [(req.username, cid, 1.0, "NOW()") for cid in req.communities],
                 template="(%s, %s, %s, NOW())",
             )
-
-            # Remove communities no longer in the declared set
             cur.execute(
                 """
                 DELETE FROM haf_fyp_app.user_interests
@@ -135,7 +159,6 @@ def post_interests(req: InterestsRequest):
                 """,
                 (req.username, req.communities),
             )
-
         conn.commit()
     except Exception as exc:
         conn.rollback()
@@ -145,7 +168,53 @@ def post_interests(req: InterestsRequest):
         _pool.putconn(conn)
 
     _publish_refresh(req.username)
-    return InterestsResponse(
-        username=req.username,
-        communities_saved=len(req.communities),
-    )
+    return InterestsResponse(username=req.username, communities_saved=len(req.communities))
+
+
+@app.post("/v1/fyp/admin/algorithm")
+@limiter.limit("5/minute")
+def activate_algorithm(
+    request: Request,
+    req: AlgorithmActivateRequest,
+    x_admin_key: Annotated[str, Header()],
+):
+    """
+    Activate a registered algorithm version.
+
+    Sets is_active = TRUE on the requested version and FALSE on all others.
+    Requires the X-Admin-Key header to match the ADMIN_API_KEY environment
+    variable. The ranker will pick up the new weights on its next cycle.
+    """
+    admin_key = os.environ.get("ADMIN_API_KEY", "")
+    if not admin_key or x_admin_key != admin_key:
+        raise HTTPException(status_code=403, detail="invalid admin key")
+
+    conn = _pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM haf_fyp_app.algorithm_versions WHERE version = %s",
+                (req.version,),
+            )
+            if cur.fetchone() is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"algorithm version {req.version!r} not found",
+                )
+            cur.execute("UPDATE haf_fyp_app.algorithm_versions SET is_active = FALSE")
+            cur.execute(
+                "UPDATE haf_fyp_app.algorithm_versions SET is_active = TRUE"
+                " WHERE version = %s",
+                (req.version,),
+            )
+        conn.commit()
+        log.info("algorithm version %s activated", req.version)
+        return {"activated": req.version}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        conn.rollback()
+        log.exception("failed to activate algorithm version %s", req.version)
+        raise HTTPException(status_code=500, detail="activation failed") from exc
+    finally:
+        _pool.putconn(conn)

@@ -5,3 +5,4 @@ pandas>=2.1
 redis>=5.0
 fastapi>=0.111
 uvicorn[standard]>=0.29
+slowapi>=0.1.9
