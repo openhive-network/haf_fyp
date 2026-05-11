@@ -51,4 +51,11 @@ psql_cmd -c "
         GRANT EXECUTE ON FUNCTIONS TO haf_fyp_user;
 "
 
+# 12. Cross-schema grants (hivesense_app, reptracker_app, btracker_app, hafd).
+#     Schemas that don't exist yet are skipped with a NOTICE — re-run
+#     scripts/grant_cross_schema.sh after installing each external app.
+run_sql_file "${SCRIPT_DIR}/../db/cross_schema_grants.sql"
+
 log "Installation complete."
+log "If any cross-schema NOTICEs appeared above, install the missing apps"
+log "then run: scripts/grant_cross_schema.sh"

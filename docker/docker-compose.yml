@@ -64,8 +64,11 @@ services:
       dockerfile: Dockerfile.python
     command: ["python", "-m", "haf_fyp.ranker_daemon"]
     environment:
-      HAF_DB_URL: postgresql://haf_fyp_user@haf/haf_block_log
-      REDIS_URL:  redis://redis:6379
+      POSTGRES_HOST: haf
+      POSTGRES_USER: haf_fyp_user
+      POSTGRES_DB:   haf_block_log
+      REDIS_HOST:    redis
+      REDIS_URL:     redis://redis:6379
     depends_on:
       haf-fyp-setup:
         condition: service_completed_successfully
@@ -81,8 +84,12 @@ services:
     ports:
       - "${FYP_API_PORT:-3002}:3002"
     environment:
-      HAF_DB_URL: postgresql://haf_fyp_user@haf/haf_block_log
-      REDIS_URL:  redis://redis:6379
+      POSTGRES_HOST: haf
+      POSTGRES_USER: haf_fyp_user
+      POSTGRES_DB:   haf_block_log
+      REDIS_HOST:    redis
+      REDIS_URL:     redis://redis:6379
+      ADMIN_API_KEY: "${FYP_ADMIN_API_KEY}"
     depends_on:
       haf-fyp-setup:
         condition: service_completed_successfully
