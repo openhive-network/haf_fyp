@@ -9,8 +9,8 @@
 
 CREATE TYPE haf_fyp_endpoints.feed_post_row AS (
     post_id bigint,
-    author varchar(16),
-    permlink varchar(256),
+    author varchar (16),
+    permlink varchar (256),
     title text,
     community_id int,
     created_at timestamp,
@@ -21,7 +21,7 @@ CREATE TYPE haf_fyp_endpoints.feed_post_row AS (
     score_relevance float,
     community_boost_applied boolean,
     rank int,
-    algorithm_version varchar(16),
+    algorithm_version varchar (16),
     computed_at timestamp
 );
 
