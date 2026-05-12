@@ -17,9 +17,9 @@
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_comments(
     _first_block INT,
-    _last_block  INT
+    _last_block INT
 )
-RETURNS void
+RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 DECLARE
@@ -76,9 +76,9 @@ $$;
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_reblogs(
     _first_block INT,
-    _last_block  INT
+    _last_block INT
 )
-RETURNS void
+RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 DECLARE
@@ -122,13 +122,13 @@ $$;
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_votes(
     _first_block INT,
-    _last_block  INT
+    _last_block INT
 )
-RETURNS void
+RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    _vote_op_id     INT := hive.get_op_type_id('vote_operation');
+    _vote_op_id INT := hive.get_op_type_id('vote_operation');
     _eff_vote_op_id INT := hive.get_op_type_id('effective_comment_vote_operation');
 BEGIN
     -- 6a: increment vote_count from non-virtual vote_operation
@@ -187,7 +187,7 @@ $$;
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_payout_windows(
     _last_block INT
 )
-RETURNS void
+RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 DECLARE
@@ -208,9 +208,9 @@ $$;
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_engagement(
     _first_block INT,
-    _last_block  INT
+    _last_block INT
 )
-RETURNS void
+RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 BEGIN

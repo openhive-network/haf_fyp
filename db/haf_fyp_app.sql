@@ -15,8 +15,8 @@ GRANT USAGE ON SCHEMA haf_fyp_endpoints TO haf_fyp_user;
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.app_status (
-    continue_processing  BOOL NOT NULL DEFAULT TRUE,
-    last_processed_block INT  NOT NULL DEFAULT 0
+    continue_processing BOOL NOT NULL DEFAULT TRUE,
+    last_processed_block INT NOT NULL DEFAULT 0
 );
 
 INSERT INTO haf_fyp_app.app_status VALUES (TRUE, 0)
@@ -38,14 +38,14 @@ AS $$
 $$;
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.allow_processing()
-RETURNS void
+RETURNS VOID
 LANGUAGE sql
 AS $$
     UPDATE haf_fyp_app.app_status SET continue_processing = TRUE;
 $$;
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.stop_processing()
-RETURNS void
+RETURNS VOID
 LANGUAGE sql
 AS $$
     UPDATE haf_fyp_app.app_status SET continue_processing = FALSE;
@@ -56,7 +56,7 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.create_context_if_not_exists()
-RETURNS void
+RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 BEGIN
@@ -77,7 +77,7 @@ CREATE OR REPLACE FUNCTION haf_fyp_app.process_block_range(
     _first_block INT,
     _last_block  INT
 )
-RETURNS void
+RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 BEGIN
@@ -92,7 +92,7 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.main()
-RETURNS void
+RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 DECLARE

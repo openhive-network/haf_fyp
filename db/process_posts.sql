@@ -34,9 +34,9 @@ $$;
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_posts(
     _first_block INT,
-    _last_block  INT
+    _last_block INT
 )
-RETURNS void
+RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 DECLARE

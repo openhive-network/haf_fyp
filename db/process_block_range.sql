@@ -3,9 +3,9 @@
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_block_range(
     _first_block INT,
-    _last_block  INT
+    _last_block INT
 )
-RETURNS void
+RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 BEGIN

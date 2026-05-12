@@ -14,16 +14,16 @@ $$;
 
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_health()
 RETURNS TABLE (
-    status               TEXT,
+    status TEXT,
     last_processed_block INT,
-    version              TEXT
+    version TEXT
 )
 LANGUAGE sql STABLE
 AS $$
     SELECT
-        'ok'::TEXT                                                AS status,
+        'ok'::TEXT AS status,
         s.last_processed_block,
-        (SELECT git_hash FROM haf_fyp_app.app_version LIMIT 1)   AS version
+        (SELECT git_hash FROM haf_fyp_app.app_version LIMIT 1) AS version
     FROM haf_fyp_app.app_status s
     LIMIT 1;
 $$;
@@ -34,9 +34,9 @@ $$;
 
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_algorithm()
 RETURNS TABLE (
-    version     TEXT,
+    version TEXT,
     description TEXT,
-    weights     JSONB,
+    weights JSONB,
     deployed_at TIMESTAMP
 )
 LANGUAGE sql STABLE
@@ -53,7 +53,7 @@ $$;
 
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_personalized_feed(
     username TEXT,
-    "limit"  INT DEFAULT 20,
+    "limit" INT DEFAULT 20,
     "offset" INT DEFAULT 0
 )
 RETURNS SETOF haf_fyp_endpoints.feed_post_row
@@ -88,8 +88,8 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_global_feed(
-    "limit"      INT DEFAULT 20,
-    "offset"     INT DEFAULT 0,
+    "limit" INT DEFAULT 20,
+    "offset" INT DEFAULT 0,
     community_id INT DEFAULT NULL
 )
 RETURNS SETOF haf_fyp_endpoints.feed_post_row
@@ -106,10 +106,10 @@ AS $$
         gfc.score_engagement,
         gfc.score_recency,
         gfc.score_credibility,
-        NULL::FLOAT        AS score_relevance,
-        FALSE              AS community_boost_applied,
+        NULL::FLOAT AS score_relevance,
+        FALSE AS community_boost_applied,
         gfc.rank,
-        NULL::VARCHAR(16)  AS algorithm_version,
+        NULL::VARCHAR(16) AS algorithm_version,
         gfc.computed_at
     FROM haf_fyp_app.global_feed_cache gfc
     JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
@@ -127,17 +127,17 @@ CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_user_profile(
     username TEXT
 )
 RETURNS TABLE (
-    has_vector      BOOLEAN,
-    posts_sampled   INT,
+    has_vector BOOLEAN,
+    posts_sampled INT,
     top_communities INT[],
-    updated_at      TIMESTAMP
+    updated_at TIMESTAMP
 )
 LANGUAGE sql STABLE
 AS $$
     SELECT
         interest_vector IS NOT NULL AS has_vector,
         posts_sampled,
-        communities                 AS top_communities,
+        communities AS top_communities,
         updated_at
     FROM haf_fyp_app.user_profile_vectors
     WHERE username = get_user_profile.username;
@@ -149,23 +149,23 @@ $$;
 
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_score_explanation(
     username TEXT,
-    post_id  BIGINT
+    post_id BIGINT
 )
 RETURNS TABLE (
-    post_id                 BIGINT,
-    author                  VARCHAR(16),
-    permlink                VARCHAR(256),
-    title                   TEXT,
-    final_score             FLOAT,
-    score_relevance         FLOAT,
-    score_recency           FLOAT,
-    score_engagement        FLOAT,
-    score_credibility       FLOAT,
+    post_id BIGINT,
+    author VARCHAR(16),
+    permlink VARCHAR(256),
+    title TEXT,
+    final_score FLOAT,
+    score_relevance FLOAT,
+    score_recency FLOAT,
+    score_engagement FLOAT,
+    score_credibility FLOAT,
     community_boost_applied BOOLEAN,
-    rank                    INT,
-    algorithm_version       VARCHAR(16),
-    algorithm_weights       JSONB,
-    computed_at             TIMESTAMP
+    rank INT,
+    algorithm_version VARCHAR(16),
+    algorithm_weights JSONB,
+    computed_at TIMESTAMP
 )
 LANGUAGE sql STABLE
 AS $$
@@ -182,13 +182,13 @@ AS $$
         fc.community_boost_applied,
         fc.rank,
         fc.algorithm_version,
-        av.weights  AS algorithm_weights,
+        av.weights AS algorithm_weights,
         fc.computed_at
     FROM haf_fyp_app.feed_cache fc
     JOIN haf_fyp_app.post_candidates pc ON pc.post_id = fc.post_id
     LEFT JOIN haf_fyp_app.algorithm_versions av ON av.version = fc.algorithm_version
     WHERE fc.username = get_score_explanation.username
-      AND fc.post_id  = get_score_explanation.post_id;
+      AND fc.post_id = get_score_explanation.post_id;
 $$;
 
 -- ---------------------------------------------------------------------------
@@ -197,11 +197,11 @@ $$;
 
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.list_algorithm_versions()
 RETURNS TABLE (
-    version     TEXT,
+    version TEXT,
     description TEXT,
-    weights     JSONB,
+    weights JSONB,
     deployed_at TIMESTAMP,
-    is_active   BOOLEAN
+    is_active BOOLEAN
 )
 LANGUAGE sql STABLE
 AS $$
