@@ -6,7 +6,7 @@
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_version()
-RETURNS TEXT
+RETURNS text
 LANGUAGE sql STABLE
 AS $$
     SELECT git_hash FROM haf_fyp_app.app_version LIMIT 1;
@@ -14,14 +14,14 @@ $$;
 
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_health()
 RETURNS TABLE (
-    status TEXT,
-    last_processed_block INT,
-    version TEXT
+    status text,
+    last_processed_block int,
+    version text
 )
 LANGUAGE sql STABLE
 AS $$
     SELECT
-        'ok'::TEXT AS status,
+        'ok'::text AS status,
         s.last_processed_block,
         (SELECT git_hash FROM haf_fyp_app.app_version LIMIT 1) AS version
     FROM haf_fyp_app.app_status s
@@ -34,10 +34,10 @@ $$;
 
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_algorithm()
 RETURNS TABLE (
-    version TEXT,
-    description TEXT,
-    weights JSONB,
-    deployed_at TIMESTAMP
+    version text,
+    description text,
+    weights jsonb,
+    deployed_at timestamp
 )
 LANGUAGE sql STABLE
 AS $$
@@ -52,9 +52,9 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_personalized_feed(
-    username TEXT,
-    "limit" INT DEFAULT 20,
-    "offset" INT DEFAULT 0
+    username text,
+    "limit" int DEFAULT 20,
+    "offset" int DEFAULT 0
 )
 RETURNS SETOF haf_fyp_endpoints.feed_post_row
 LANGUAGE sql STABLE
@@ -88,9 +88,9 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_global_feed(
-    "limit" INT DEFAULT 20,
-    "offset" INT DEFAULT 0,
-    community_id INT DEFAULT NULL
+    "limit" int DEFAULT 20,
+    "offset" int DEFAULT 0,
+    community_id int DEFAULT NULL
 )
 RETURNS SETOF haf_fyp_endpoints.feed_post_row
 LANGUAGE sql STABLE
@@ -106,10 +106,10 @@ AS $$
         gfc.score_engagement,
         gfc.score_recency,
         gfc.score_credibility,
-        NULL::FLOAT AS score_relevance,
+        NULL::float AS score_relevance,
         FALSE AS community_boost_applied,
         gfc.rank,
-        NULL::VARCHAR(16) AS algorithm_version,
+        NULL::varchar (16) AS algorithm_version,
         gfc.computed_at
     FROM haf_fyp_app.global_feed_cache gfc
     JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
@@ -124,13 +124,13 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_user_profile(
-    username TEXT
+    username text
 )
 RETURNS TABLE (
-    has_vector BOOLEAN,
-    posts_sampled INT,
-    top_communities INT[],
-    updated_at TIMESTAMP
+    has_vector boolean,
+    posts_sampled int,
+    top_communities int [],
+    updated_at timestamp
 )
 LANGUAGE sql STABLE
 AS $$
@@ -148,24 +148,24 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_score_explanation(
-    username TEXT,
-    post_id BIGINT
+    username text,
+    post_id bigint
 )
 RETURNS TABLE (
-    post_id BIGINT,
-    author VARCHAR(16),
-    permlink VARCHAR(256),
-    title TEXT,
-    final_score FLOAT,
-    score_relevance FLOAT,
-    score_recency FLOAT,
-    score_engagement FLOAT,
-    score_credibility FLOAT,
-    community_boost_applied BOOLEAN,
-    rank INT,
-    algorithm_version VARCHAR(16),
-    algorithm_weights JSONB,
-    computed_at TIMESTAMP
+    post_id bigint,
+    author varchar (16),
+    permlink varchar (256),
+    title text,
+    final_score float,
+    score_relevance float,
+    score_recency float,
+    score_engagement float,
+    score_credibility float,
+    community_boost_applied boolean,
+    rank int,
+    algorithm_version varchar (16),
+    algorithm_weights jsonb,
+    computed_at timestamp
 )
 LANGUAGE sql STABLE
 AS $$
@@ -197,11 +197,11 @@ $$;
 
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.list_algorithm_versions()
 RETURNS TABLE (
-    version TEXT,
-    description TEXT,
-    weights JSONB,
-    deployed_at TIMESTAMP,
-    is_active BOOLEAN
+    version text,
+    description text,
+    weights jsonb,
+    deployed_at timestamp,
+    is_active boolean
 )
 LANGUAGE sql STABLE
 AS $$

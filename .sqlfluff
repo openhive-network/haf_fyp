@@ -9,7 +9,10 @@ capitalisation_policy = upper
 capitalisation_policy = lower
 
 [sqlfluff:rules:capitalisation.types]
-capitalisation_policy = upper
+capitalisation_policy = lower
+
+[sqlfluff:rules:references.keywords]
+unquoted_identifiers_policy = aliases
 
 [sqlfluff:indentation]
 indent_unit = space

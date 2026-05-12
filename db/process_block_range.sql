@@ -2,10 +2,10 @@
 -- Add PERFORM calls here as each processor phase is completed.
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_block_range(
-    _first_block INT,
-    _last_block INT
+    _first_block int,
+    _last_block int
 )
-RETURNS VOID
+RETURNS void
 LANGUAGE plpgsql
 AS $$
 BEGIN

@@ -18,14 +18,14 @@
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_subscribe(
-    _first_block INT,
-    _last_block INT
+    _first_block int,
+    _last_block int
 )
-RETURNS VOID
+RETURNS void
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    _custom_json_op_id INT := hive.get_op_type_id('custom_json_operation');
+    _custom_json_op_id int := hive.get_op_type_id('custom_json_operation');
 BEGIN
     WITH events AS (
         SELECT
@@ -64,14 +64,14 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_unsubscribe(
-    _first_block INT,
-    _last_block INT
+    _first_block int,
+    _last_block int
 )
-RETURNS VOID
+RETURNS void
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    _custom_json_op_id INT := hive.get_op_type_id('custom_json_operation');
+    _custom_json_op_id int := hive.get_op_type_id('custom_json_operation');
 BEGIN
     WITH events AS (
         SELECT
@@ -109,10 +109,10 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_communities(
-    _first_block INT,
-    _last_block INT
+    _first_block int,
+    _last_block int
 )
-RETURNS VOID
+RETURNS void
 LANGUAGE plpgsql
 AS $$
 BEGIN

@@ -4,10 +4,10 @@
 -- Schemas
 -- ---------------------------------------------------------------------------
 
-CREATE SCHEMA IF NOT EXISTS haf_fyp_app       AUTHORIZATION haf_fyp_owner;
-CREATE SCHEMA IF NOT EXISTS haf_fyp_endpoints  AUTHORIZATION haf_fyp_owner;
+CREATE SCHEMA IF NOT EXISTS haf_fyp_app AUTHORIZATION haf_fyp_owner;
+CREATE SCHEMA IF NOT EXISTS haf_fyp_endpoints AUTHORIZATION haf_fyp_owner;
 
-GRANT USAGE ON SCHEMA haf_fyp_app       TO haf_fyp_user;
+GRANT USAGE ON SCHEMA haf_fyp_app TO haf_fyp_user;
 GRANT USAGE ON SCHEMA haf_fyp_endpoints TO haf_fyp_user;
 
 -- ---------------------------------------------------------------------------
@@ -15,15 +15,15 @@ GRANT USAGE ON SCHEMA haf_fyp_endpoints TO haf_fyp_user;
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.app_status (
-    continue_processing BOOL NOT NULL DEFAULT TRUE,
-    last_processed_block INT NOT NULL DEFAULT 0
+    continue_processing bool NOT NULL DEFAULT TRUE,
+    last_processed_block int NOT NULL DEFAULT 0
 );
 
 INSERT INTO haf_fyp_app.app_status VALUES (TRUE, 0)
 ON CONFLICT DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.app_version (
-    git_hash TEXT NOT NULL
+    git_hash text NOT NULL
 );
 
 -- ---------------------------------------------------------------------------
@@ -31,21 +31,21 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.app_version (
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.continue_processing()
-RETURNS BOOL
+RETURNS bool
 LANGUAGE sql STABLE
 AS $$
     SELECT continue_processing FROM haf_fyp_app.app_status LIMIT 1;
 $$;
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.allow_processing()
-RETURNS VOID
+RETURNS void
 LANGUAGE sql
 AS $$
     UPDATE haf_fyp_app.app_status SET continue_processing = TRUE;
 $$;
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.stop_processing()
-RETURNS VOID
+RETURNS void
 LANGUAGE sql
 AS $$
     UPDATE haf_fyp_app.app_status SET continue_processing = FALSE;
@@ -56,7 +56,7 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.create_context_if_not_exists()
-RETURNS VOID
+RETURNS void
 LANGUAGE plpgsql
 AS $$
 BEGIN
@@ -74,10 +74,10 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_block_range(
-    _first_block INT,
-    _last_block  INT
+    _first_block int,
+    _last_block int
 )
-RETURNS VOID
+RETURNS void
 LANGUAGE plpgsql
 AS $$
 BEGIN
@@ -92,7 +92,7 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.main()
-RETURNS VOID
+RETURNS void
 LANGUAGE plpgsql
 AS $$
 DECLARE

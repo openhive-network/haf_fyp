@@ -16,14 +16,14 @@
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_comments(
-    _first_block INT,
-    _last_block INT
+    _first_block int,
+    _last_block int
 )
-RETURNS VOID
+RETURNS void
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    _comment_op_id INT := hive.get_op_type_id('comment_operation');
+    _comment_op_id int := hive.get_op_type_id('comment_operation');
 BEGIN
     WITH raw_comments AS (
         -- Replies whose immediate parent is a tracked root post
@@ -75,14 +75,14 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_reblogs(
-    _first_block INT,
-    _last_block INT
+    _first_block int,
+    _last_block int
 )
-RETURNS VOID
+RETURNS void
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    _custom_json_op_id INT := hive.get_op_type_id('custom_json_operation');
+    _custom_json_op_id int := hive.get_op_type_id('custom_json_operation');
 BEGIN
     WITH reblogs AS (
         SELECT pl.post_id
@@ -121,15 +121,15 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_votes(
-    _first_block INT,
-    _last_block INT
+    _first_block int,
+    _last_block int
 )
-RETURNS VOID
+RETURNS void
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    _vote_op_id INT := hive.get_op_type_id('vote_operation');
-    _eff_vote_op_id INT := hive.get_op_type_id('effective_comment_vote_operation');
+    _vote_op_id int := hive.get_op_type_id('vote_operation');
+    _eff_vote_op_id int := hive.get_op_type_id('effective_comment_vote_operation');
 BEGIN
     -- 6a: increment vote_count from non-virtual vote_operation
     WITH votes AS (
@@ -157,7 +157,7 @@ BEGIN
         SELECT
             pl.post_id,
             SUM(COALESCE(
-                (ov.body::jsonb -> 'value' ->> 'rshares')::BIGINT,
+                (ov.body::jsonb -> 'value' ->> 'rshares')::bigint,
                 0
             )) AS total_rshares
         FROM hive.operations_view ov
@@ -185,13 +185,13 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_payout_windows(
-    _last_block INT
+    _last_block int
 )
-RETURNS VOID
+RETURNS void
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    _block_time TIMESTAMP;
+    _block_time timestamp;
 BEGIN
     SELECT created_at INTO _block_time FROM hafd.blocks WHERE num = _last_block;
 
@@ -207,10 +207,10 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_engagement(
-    _first_block INT,
-    _last_block INT
+    _first_block int,
+    _last_block int
 )
-RETURNS VOID
+RETURNS void
 LANGUAGE plpgsql
 AS $$
 BEGIN

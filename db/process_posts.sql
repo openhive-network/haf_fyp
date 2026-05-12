@@ -14,7 +14,7 @@
 -- Helper: safe JSON parser — returns NULL for empty, null, or malformed input
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION haf_fyp_app.safe_parse_json(_json_str TEXT)
+CREATE OR REPLACE FUNCTION haf_fyp_app.safe_parse_json(_json_str text)
 RETURNS jsonb
 LANGUAGE plpgsql STABLE
 AS $$
@@ -33,14 +33,14 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_posts(
-    _first_block INT,
-    _last_block INT
+    _first_block int,
+    _last_block int
 )
-RETURNS VOID
+RETURNS void
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    _comment_op_id INT := hive.get_op_type_id('comment_operation');
+    _comment_op_id int := hive.get_op_type_id('comment_operation');
 BEGIN
     -- Three-step CTE: RETURNING from step 1 feeds steps 2 and 3,
     -- so only genuinely new posts flow into post_lookup and engagement_metrics.

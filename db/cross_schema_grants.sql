@@ -58,5 +58,5 @@ $$;
 
 -- hafd is HAF core — accessible to haf_fyp_owner by default but
 -- haf_fyp_user (Python ranker) also needs hafd.accounts for name→id joins.
-GRANT USAGE  ON SCHEMA hafd        TO haf_fyp_user;
-GRANT SELECT ON hafd.accounts      TO haf_fyp_user;
+GRANT USAGE ON SCHEMA hafd TO haf_fyp_user;
+GRANT SELECT ON hafd.accounts TO haf_fyp_user;
