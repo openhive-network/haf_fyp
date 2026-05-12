@@ -109,7 +109,7 @@ AS $$
         NULL::float AS score_relevance,
         FALSE AS community_boost_applied,
         gfc.rank,
-        NULL::varchar (16) AS algorithm_version,
+        NULL::varchar(16) AS algorithm_version,
         gfc.computed_at
     FROM haf_fyp_app.global_feed_cache gfc
     JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
@@ -153,8 +153,8 @@ CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_score_explanation(
 )
 RETURNS TABLE (
     post_id bigint,
-    author varchar (16),
-    permlink varchar (256),
+    author varchar(16),
+    permlink varchar(256),
     title text,
     final_score float,
     score_relevance float,
@@ -163,7 +163,7 @@ RETURNS TABLE (
     score_credibility float,
     community_boost_applied boolean,
     rank int,
-    algorithm_version varchar (16),
+    algorithm_version varchar(16),
     algorithm_weights jsonb,
     computed_at timestamp
 )

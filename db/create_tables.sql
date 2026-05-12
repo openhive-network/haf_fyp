@@ -9,8 +9,8 @@
 
 CREATE TYPE haf_fyp_endpoints.feed_post_row AS (
     post_id bigint,
-    author varchar (16),
-    permlink varchar (256),
+    author varchar(16),
+    permlink varchar(256),
     title text,
     community_id int,
     created_at timestamp,
@@ -21,7 +21,7 @@ CREATE TYPE haf_fyp_endpoints.feed_post_row AS (
     score_relevance float,
     community_boost_applied boolean,
     rank int,
-    algorithm_version varchar (16),
+    algorithm_version varchar(16),
     computed_at timestamp
 );
 
@@ -31,12 +31,12 @@ CREATE TYPE haf_fyp_endpoints.feed_post_row AS (
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.post_candidates (
     post_id bigint NOT NULL,
-    author varchar (16) NOT NULL,
-    permlink varchar (256) NOT NULL,
+    author varchar(16) NOT NULL,
+    permlink varchar(256) NOT NULL,
     community_id int,
     title text,
     tags text [],
-    category varchar (64),
+    category varchar(64),
     created_at timestamp NOT NULL,
     body_length int,
     payout_window boolean NOT NULL DEFAULT TRUE,
@@ -51,8 +51,8 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.post_candidates (
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.post_lookup (
     post_id bigint NOT NULL,
-    author varchar (16) NOT NULL,
-    permlink varchar (256) NOT NULL,
+    author varchar(16) NOT NULL,
+    permlink varchar(256) NOT NULL,
     PRIMARY KEY (post_id),
     FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates (post_id)
 );
@@ -66,7 +66,7 @@ ON haf_fyp_app.post_lookup (author, permlink);
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.post_commenters (
     post_id bigint NOT NULL,
-    commenter varchar (16) NOT NULL,
+    commenter varchar(16) NOT NULL,
     PRIMARY KEY (post_id, commenter),
     FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates (post_id)
 );
@@ -95,8 +95,8 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.engagement_metrics (
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.user_profile_vectors (
-    username varchar (16) NOT NULL,
-    interest_vector vector (384),
+    username varchar(16) NOT NULL,
+    interest_vector vector(384),
     posts_sampled int NOT NULL DEFAULT 0,
     communities int [],
     updated_at timestamp,
@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.user_profile_vectors (
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_cache (
-    username varchar (16) NOT NULL,
+    username varchar(16) NOT NULL,
     post_id bigint NOT NULL,
     final_score float NOT NULL,
     score_engagement float,
@@ -117,7 +117,7 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_cache (
     score_relevance float,
     community_boost_applied boolean NOT NULL DEFAULT FALSE,
     rank int NOT NULL,
-    algorithm_version varchar (16),
+    algorithm_version varchar(16),
     computed_at timestamp,
     PRIMARY KEY (username, post_id)
 );
@@ -149,7 +149,7 @@ ON haf_fyp_app.global_feed_cache (rank ASC);
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.user_communities (
-    username varchar (16) NOT NULL,
+    username varchar(16) NOT NULL,
     community_id int NOT NULL,
     subscribed_at timestamp NOT NULL,
     PRIMARY KEY (username, community_id)
@@ -163,7 +163,7 @@ ON haf_fyp_app.user_communities (username);
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.user_interests (
-    username varchar (16) NOT NULL,
+    username varchar(16) NOT NULL,
     community_id int NOT NULL,
     weight float NOT NULL DEFAULT 1.0,
     declared_at timestamp NOT NULL,
@@ -175,7 +175,7 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.user_interests (
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.algorithm_versions (
-    version varchar (16) NOT NULL,
+    version varchar(16) NOT NULL,
     description text,
     weights jsonb NOT NULL,
     deployed_at timestamp NOT NULL,

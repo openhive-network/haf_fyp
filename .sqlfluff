@@ -11,8 +11,7 @@ capitalisation_policy = lower
 [sqlfluff:rules:capitalisation.types]
 capitalisation_policy = lower
 
-[sqlfluff:rules:references.keywords]
-unquoted_identifiers_policy = aliases
+exclude_rules = references.keywords
 
 [sqlfluff:indentation]
 indent_unit = space
