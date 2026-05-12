@@ -3,7 +3,9 @@ stages:
 
 sql-lint:
   stage: lint
-  image: sqlfluff/sqlfluff:latest
+  image:
+    name: sqlfluff/sqlfluff:latest
+    entrypoint: [""]
   script:
     - sqlfluff lint db/ endpoints/ --dialect postgres
   rules:
