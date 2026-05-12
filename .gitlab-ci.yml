@@ -3,8 +3,8 @@ stages:
 
 sql-lint:
   stage: lint
-  image: sqlfluff/sqlfluff:latest
   script:
+    - pip install --quiet sqlfluff
     - sqlfluff lint db/ endpoints/ --dialect postgres
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
