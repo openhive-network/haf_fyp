@@ -55,3 +55,66 @@ stages:
       method: GET
     response:
       status_code: 200
+
+---
+test_name: Version endpoint
+
+includes:
+  - !include common.yaml
+
+stages:
+  - name: GET /rpc/get_version returns 200
+    request:
+      url: "{api_url}/rpc/get_version"
+      method: GET
+    response:
+      status_code: 200
+
+---
+test_name: User profile returns empty for unknown user
+
+includes:
+  - !include common.yaml
+
+stages:
+  - name: GET /rpc/get_user_profile returns 200
+    request:
+      url: "{api_url}/rpc/get_user_profile"
+      method: GET
+      params:
+        username: unknownuser
+    response:
+      status_code: 200
+
+---
+test_name: Score explanation returns empty for unknown user and post
+
+includes:
+  - !include common.yaml
+
+stages:
+  - name: GET /rpc/get_score_explanation returns 200
+    request:
+      url: "{api_url}/rpc/get_score_explanation"
+      method: GET
+      params:
+        username: unknownuser
+        post_id: 0
+    response:
+      status_code: 200
+
+---
+test_name: Algorithm versions list
+
+includes:
+  - !include common.yaml
+
+stages:
+  - name: GET /rpc/list_algorithm_versions returns 200 with v1.0.0
+    request:
+      url: "{api_url}/rpc/list_algorithm_versions"
+      method: GET
+    response:
+      status_code: 200
+      json:
+        - version: "1.0.0"
