@@ -36,7 +36,7 @@ python-tests:
   image: python:3.11-slim
   script:
     - pip install -r requirements.txt pytest -q
-    - pytest tests/unit/ -v
+    - PYTHONPATH=. pytest tests/unit/ -v
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
