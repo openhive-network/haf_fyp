@@ -8,7 +8,7 @@ set -euo pipefail
 : "${POSTGRES_DB:=haf_block_log}"
 : "${POSTGRES_USER:=haf_fyp_owner}"
 
-HAF_FYP_SCHEMA="haf_fyp_app"
+export HAF_FYP_SCHEMA="haf_fyp_app"
 
 log() {
     echo "[haf_fyp $(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*"
