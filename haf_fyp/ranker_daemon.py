@@ -11,17 +11,29 @@ Cold-start priority per user:
   3. Bootstrap from on-chain subscriptions (user_communities)
   4. Bootstrap from declared interests (user_interests — Phase 8)
   5. None → cold-start weights (relevance dropped, recency + engagement renormalised)
+
+Force-refresh:
+  The FastAPI overlay publishes {"username": "..."} to the Redis channel
+  haf_fyp:refresh when a user saves their interest picker selections.
+  A background daemon thread subscribes to that channel and enqueues
+  usernames; the main loop drains the queue and runs a targeted per-user
+  cycle so the feed is updated within seconds rather than waiting up to
+  CYCLE_SECONDS.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import queue
+import threading
 import time
 
 import pandas as pd
 import psycopg2
 import psycopg2.extras
+import redis as redis_lib
 
 from haf_fyp.credibility import fetch_author_credibility
 from haf_fyp.embeddings import fetch_post_vectors, register_vector_type
@@ -40,7 +52,10 @@ from haf_fyp.scoring import (
 log = logging.getLogger(__name__)
 
 CYCLE_SECONDS = 300
+POLL_SECONDS = 5
 CANDIDATE_LIMIT = 5000
+
+_refresh_queue: queue.Queue[str] = queue.Queue()
 
 
 def _dsn() -> str:
@@ -63,6 +78,37 @@ def _connect() -> psycopg2.extensions.connection:
         except psycopg2.OperationalError as exc:
             log.warning("database not ready (%s) — retrying in 5s", exc)
             time.sleep(5)
+
+
+def _redis_subscriber(refresh_q: "queue.Queue[str]") -> None:
+    """
+    Daemon thread — subscribes to haf_fyp:refresh and enqueues usernames.
+    Reconnects automatically on any Redis error.
+    """
+    while True:
+        try:
+            r = redis_lib.Redis(
+                host=os.environ.get("REDIS_HOST", "redis"),
+                port=int(os.environ.get("REDIS_PORT", "6379")),
+                decode_responses=True,
+                socket_connect_timeout=5,
+            )
+            pubsub = r.pubsub(ignore_subscribe_messages=True)
+            pubsub.subscribe("haf_fyp:refresh")
+            log.info("subscribed to haf_fyp:refresh")
+            for message in pubsub.listen():
+                if message["type"] != "message":
+                    continue
+                try:
+                    username = json.loads(message["data"]).get("username")
+                    if username:
+                        refresh_q.put(username)
+                        log.debug("force-refresh queued for %s", username)
+                except Exception:
+                    pass
+        except Exception as exc:
+            log.warning("Redis subscriber error (%s) — retrying in 10s", exc)
+            time.sleep(10)
 
 
 def _fetch_algorithm(conn) -> tuple[str, dict]:
@@ -120,6 +166,43 @@ def _fetch_personalised_users(conn) -> list[str]:
         return [r[0] for r in cur.fetchall()]
 
 
+def _rank_user(
+    conn,
+    username: str,
+    candidates: pd.DataFrame,
+    post_vectors: dict,
+    author_credibility: dict,
+    algo_version: str,
+    weights: dict,
+) -> None:
+    """Score and write feed_cache for a single user."""
+    communities = fetch_user_communities(conn, username)
+    interests = fetch_user_interests(conn, username)
+    all_communities = communities | interests
+
+    user_vector, sampled = build_user_profile_vector(conn, username, post_vectors)
+    if user_vector is not None:
+        write_user_vector(conn, username, user_vector, sampled)
+    else:
+        user_vector, _ = read_user_vector(conn, username)
+        if user_vector is None and all_communities:
+            user_vector = bootstrap_vector_from_communities(
+                conn, all_communities, post_vectors
+            )
+            if user_vector is not None:
+                write_user_vector(conn, username, user_vector, 0)
+
+    scored = compute_scores(
+        candidates=candidates,
+        user_vector=user_vector,
+        post_vectors=post_vectors,
+        author_credibility=author_credibility,
+        user_communities=all_communities,
+        algorithm_weights=weights,
+    )
+    write_feed_cache(conn, username, scored, algo_version)
+
+
 def run_cycle(conn) -> None:
     register_vector_type(conn)
 
@@ -132,14 +215,12 @@ def run_cycle(conn) -> None:
 
     log.info("scoring %d candidates (algo %s)", len(candidates), algo_version)
 
-    # Pre-fetch all candidate embeddings in one round-trip
     post_ids = candidates["post_id"].tolist()
     post_vectors = fetch_post_vectors(conn, post_ids)
     log.info(
         "embeddings available for %d / %d candidates", len(post_vectors), len(post_ids)
     )
 
-    # Pre-fetch credibility scores for all unique authors in one round-trip
     authors = candidates["author"].unique().tolist()
     author_credibility = fetch_author_credibility(conn, authors)
     log.info(
@@ -158,43 +239,36 @@ def run_cycle(conn) -> None:
     write_global_feed_cache(conn, global_scored, algo_version)
     log.info("global feed written (%d posts)", min(len(global_scored), 200))
 
-    # Personalized feeds: users with on-chain subscriptions OR declared interests
     users = _fetch_personalised_users(conn)
     for username in users:
-        # Merge on-chain subscriptions + declared interests for boost and bootstrap
-        communities = fetch_user_communities(conn, username)
-        interests = fetch_user_interests(conn, username)
-        all_communities = communities | interests
-
-        # Cold-start priority:
-        #   1. fresh vector from interaction history
-        #   2. stored vector (built on a previous cycle)
-        #   3. bootstrap from all_communities (on-chain + declared)
-        #   4. None → renormalised weights, no relevance signal
-        user_vector, sampled = build_user_profile_vector(conn, username, post_vectors)
-        if user_vector is not None:
-            write_user_vector(conn, username, user_vector, sampled)
-        else:
-            user_vector, _ = read_user_vector(conn, username)
-            if user_vector is None and all_communities:
-                user_vector = bootstrap_vector_from_communities(
-                    conn, all_communities, post_vectors
-                )
-                if user_vector is not None:
-                    write_user_vector(conn, username, user_vector, 0)
-
-        scored = compute_scores(
-            candidates=candidates,
-            user_vector=user_vector,
-            post_vectors=post_vectors,
-            author_credibility=author_credibility,
-            user_communities=all_communities,
-            algorithm_weights=weights,
-        )
-        write_feed_cache(conn, username, scored, algo_version)
+        _rank_user(conn, username, candidates, post_vectors, author_credibility, algo_version, weights)
 
     if users:
         log.info("personalized feeds written for %d users", len(users))
+
+
+def _run_targeted_refresh(conn, usernames: set[str]) -> None:
+    """
+    Score and write feed_cache for specific users only — no global feed update.
+    Called when force-refresh signals arrive from the FastAPI overlay via Redis.
+    """
+    log.info("force-refresh for %d user(s): %s", len(usernames), sorted(usernames))
+    register_vector_type(conn)
+
+    algo_version, weights = _fetch_algorithm(conn)
+    candidates = _fetch_candidates(conn)
+    if candidates.empty:
+        log.info("no candidates for targeted refresh")
+        return
+
+    post_ids = candidates["post_id"].tolist()
+    post_vectors = fetch_post_vectors(conn, post_ids)
+    authors = candidates["author"].unique().tolist()
+    author_credibility = fetch_author_credibility(conn, authors)
+
+    for username in usernames:
+        _rank_user(conn, username, candidates, post_vectors, author_credibility, algo_version, weights)
+        log.info("force-refresh complete for %s", username)
 
 
 def main() -> None:
@@ -203,17 +277,49 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     log.info("haf_fyp ranker daemon starting")
+
+    threading.Thread(
+        target=_redis_subscriber,
+        args=(_refresh_queue,),
+        daemon=True,
+        name="redis-subscriber",
+    ).start()
+
     conn = _connect()
+    next_full_cycle = 0.0  # run immediately on startup
 
     while True:
-        try:
-            run_cycle(conn)
-        except psycopg2.OperationalError:
-            log.warning("database connection lost — reconnecting")
-            conn = _connect()
-        except Exception:
-            log.exception("ranking cycle failed")
-        time.sleep(CYCLE_SECONDS)
+        # Drain pending force-refresh requests
+        pending: set[str] = set()
+        while True:
+            try:
+                pending.add(_refresh_queue.get_nowait())
+            except queue.Empty:
+                break
+
+        if pending:
+            try:
+                _run_targeted_refresh(conn, pending)
+            except psycopg2.OperationalError:
+                log.warning("database connection lost (targeted refresh) — reconnecting")
+                conn = _connect()
+            except Exception:
+                log.exception("targeted refresh failed")
+
+        # Full cycle on schedule
+        if time.monotonic() >= next_full_cycle:
+            try:
+                run_cycle(conn)
+                next_full_cycle = time.monotonic() + CYCLE_SECONDS
+            except psycopg2.OperationalError:
+                log.warning("database connection lost — reconnecting")
+                conn = _connect()
+                next_full_cycle = time.monotonic() + CYCLE_SECONDS
+            except Exception:
+                log.exception("ranking cycle failed")
+                next_full_cycle = time.monotonic() + CYCLE_SECONDS
+
+        time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":

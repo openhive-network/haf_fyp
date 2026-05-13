@@ -1,5 +1,6 @@
 stages:
   - lint
+  - test
 
 sql-lint:
   stage: lint
@@ -26,6 +27,16 @@ python-lint:
   script:
     - pip install ruff -q
     - ruff check haf_fyp/
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+python-tests:
+  stage: test
+  image: python:3.11-slim
+  script:
+    - pip install -r requirements.txt pytest -q
+    - PYTHONPATH=. pytest tests/unit/ -v
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
