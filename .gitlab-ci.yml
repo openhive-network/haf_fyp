@@ -3,11 +3,29 @@ stages:
 
 sql-lint:
   stage: lint
-  image:
-    name: sqlfluff/sqlfluff:latest
-    entrypoint: [""]
+  image: python:3.12-slim
   script:
+    - pip install sqlfluff==3.3.0 -q
     - sqlfluff lint db/ endpoints/ --dialect postgres
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+shell-lint:
+  stage: lint
+  image: koalaman/shellcheck-alpine:latest
+  script:
+    - find scripts/ -name "*.sh" -exec shellcheck {} +
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+python-lint:
+  stage: lint
+  image: python:3.11-slim
+  script:
+    - pip install ruff -q
+    - ruff check haf_fyp/
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
