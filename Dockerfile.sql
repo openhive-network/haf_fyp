@@ -1,4 +1,4 @@
-FROM registry.gitlab.syncad.com/hive/common-ci-configuration/psql AS base
+FROM registry.gitlab.syncad.com/hive/common-ci-configuration/psql:14-2 AS base
 
 WORKDIR /app
 
