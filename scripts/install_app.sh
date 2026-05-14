@@ -4,10 +4,21 @@
 #
 # PREREQUISITE: pgvector must be installed on the PostgreSQL server:
 #   Run as superuser: CREATE EXTENSION IF NOT EXISTS vector;
+#
+# OPTIONS:
+#   --swagger-url=URL   Public hostname for Swagger UI example URLs (default: localhost)
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
+
+SWAGGER_URL="localhost"
+
+for arg in "$@"; do
+    case "$arg" in
+        --swagger-url=*) SWAGGER_URL="${arg#*=}" ;;
+    esac
+done
 
 wait_for_postgres
 
@@ -38,7 +49,7 @@ run_sql_file "${SCRIPT_DIR}/../db/process_block_range.sql"
 run_sql_file "${SCRIPT_DIR}/../db/seed_data.sql"
 
 # 9. API endpoints (includes score explainer + algorithm registry — Phase 9)
-run_sql_file "${SCRIPT_DIR}/../endpoints/endpoint_schema.sql"
+psql_cmd -c "SET custom.swagger_url = '${SWAGGER_URL}';" -f "${SCRIPT_DIR}/../endpoints/endpoint_schema.sql"
 
 # 10. Register HAF context (idempotent)
 psql_cmd -c "SELECT haf_fyp_app.create_context_if_not_exists();"
