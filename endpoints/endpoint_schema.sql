@@ -1,23 +1,680 @@
--- PostgREST-exposed API functions for haf_fyp.
--- All functions live in haf_fyp_endpoints and are callable by haf_fyp_user.
+SET ROLE haf_fyp_owner;
+
+/** openapi
+openapi: 3.1.0
+info:
+  title: HAF FYP — For You Page
+  description: >-
+    Personalized content feed API for the Hive blockchain.
+    Provides algorithmically ranked post feeds, user profiles,
+    and algorithm version management.
+  license:
+    name: MIT License
+    url: https://opensource.org/license/mit
+  version: 1.0.0
+externalDocs:
+  description: HAF FYP GitLab repository
+  url: https://gitlab.syncad.com/hive/haf_fyp
+tags:
+  - name: Feed
+    description: Personalized and global content feeds
+  - name: Algorithm
+    description: Algorithm version registry
+  - name: User
+    description: User profile information
+  - name: Other
+    description: Health and version endpoints
+servers:
+  - url: /haf-fyp-api
+ */
+
+/** openapi:components
+schemas:
+  feed_post_row:
+    type: object
+    x-sql-datatype: object
+    description: A single post entry in a feed result
+    properties:
+      post_id:
+        type: integer
+        description: Internal post identifier
+      author:
+        type: string
+        description: Hive account name of the post author
+      permlink:
+        type: string
+        description: Unique permlink of the post
+      title:
+        type: string
+      community_id:
+        type: integer
+        description: Community the post belongs to (null if none)
+      created_at:
+        type: string
+        format: date-time
+      final_score:
+        type: number
+        description: Composite ranking score [0, 1]
+      score_engagement:
+        type: number
+      score_recency:
+        type: number
+      score_credibility:
+        type: number
+      score_relevance:
+        type: number
+      community_boost_applied:
+        type: boolean
+      rank:
+        type: integer
+        description: Position in the feed (1-based)
+      algorithm_version:
+        type: string
+      computed_at:
+        type: string
+        format: date-time
+ */
+
+-- ---------------------------------------------------------------------------
+-- root() — serves the full OpenAPI spec at GET /
+-- ---------------------------------------------------------------------------
+
+DO $__$
+DECLARE
+    swagger_url TEXT;
+BEGIN
+    swagger_url := COALESCE(current_setting('custom.swagger_url', TRUE), 'localhost');
+
+    EXECUTE FORMAT(
+        'CREATE OR REPLACE FUNCTION haf_fyp_endpoints.root() RETURNS json
+        LANGUAGE plpgsql STABLE
+        AS $_$
+        DECLARE
+        -- openapi-spec
+-- openapi-generated-code-begin
+  openapi json = $$
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "HAF FYP \u00e2\u20ac\u201d For You Page",
+    "description": "Personalized content feed API for the Hive blockchain. Provides algorithmically ranked post feeds, user profiles, and algorithm version management.",
+    "license": {
+      "name": "MIT License",
+      "url": "https://opensource.org/license/mit"
+    },
+    "version": "1.0.0"
+  },
+  "externalDocs": {
+    "description": "HAF FYP GitLab repository",
+    "url": "https://gitlab.syncad.com/hive/haf_fyp"
+  },
+  "tags": [
+    {
+      "name": "Feed",
+      "description": "Personalized and global content feeds"
+    },
+    {
+      "name": "Algorithm",
+      "description": "Algorithm version registry"
+    },
+    {
+      "name": "User",
+      "description": "User profile information"
+    },
+    {
+      "name": "Other",
+      "description": "Health and version endpoints"
+    }
+  ],
+  "servers": [
+    {
+      "url": "/haf-fyp-api"
+    }
+  ],
+  "components": {
+    "schemas": {
+      "feed_post_row": {
+        "type": "object",
+        "x-sql-datatype": "object",
+        "description": "A single post entry in a feed result",
+        "properties": {
+          "post_id": {
+            "type": "integer",
+            "description": "Internal post identifier"
+          },
+          "author": {
+            "type": "string",
+            "description": "Hive account name of the post author"
+          },
+          "permlink": {
+            "type": "string",
+            "description": "Unique permlink of the post"
+          },
+          "title": {
+            "type": "string"
+          },
+          "community_id": {
+            "type": "integer",
+            "description": "Community the post belongs to (null if none)"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "final_score": {
+            "type": "number",
+            "description": "Composite ranking score [0, 1]"
+          },
+          "score_engagement": {
+            "type": "number"
+          },
+          "score_recency": {
+            "type": "number"
+          },
+          "score_credibility": {
+            "type": "number"
+          },
+          "score_relevance": {
+            "type": "number"
+          },
+          "community_boost_applied": {
+            "type": "boolean"
+          },
+          "rank": {
+            "type": "integer",
+            "description": "Position in the feed (1-based)"
+          },
+          "algorithm_version": {
+            "type": "string"
+          },
+          "computed_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/version": {
+      "get": {
+        "tags": [
+          "Other"
+        ],
+        "summary": "Application version",
+        "description": "Returns the git hash of the currently deployed version.",
+        "operationId": "haf_fyp_endpoints.get_version",
+        "responses": {
+          "200": {
+            "description": "Git hash string",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "Other"
+        ],
+        "summary": "Health check",
+        "description": "Returns service health and last processed block number.",
+        "operationId": "haf_fyp_endpoints.get_health",
+        "responses": {
+          "200": {
+            "description": "Health status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "x-sql-datatype": "TABLE(status text, last_processed_block int, version text)",
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    },
+                    "last_processed_block": {
+                      "type": "integer"
+                    },
+                    "version": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/fyp/algorithm": {
+      "get": {
+        "tags": [
+          "Algorithm"
+        ],
+        "summary": "Active algorithm",
+        "description": "Returns the currently active scoring algorithm version and its weights.",
+        "operationId": "haf_fyp_endpoints.get_algorithm",
+        "responses": {
+          "200": {
+            "description": "Active algorithm version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "x-sql-datatype": "TABLE(version text, description text, weights jsonb, deployed_at timestamp)",
+                  "type": "object",
+                  "properties": {
+                    "version": {
+                      "type": "string",
+                      "example": "1.0.0"
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "weights": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "example": {
+                        "relevance": 0.4,
+                        "recency": 0.3,
+                        "engagement": 0.2,
+                        "credibility": 0.1,
+                        "community_boost": 0.2
+                      }
+                    },
+                    "deployed_at": {
+                      "type": "string",
+                      "format": "date-time"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/fyp/algorithms": {
+      "get": {
+        "tags": [
+          "Algorithm"
+        ],
+        "summary": "All algorithm versions",
+        "description": "Lists all algorithm versions in the registry with their weights and active status.",
+        "operationId": "haf_fyp_endpoints.list_algorithm_versions",
+        "responses": {
+          "200": {
+            "description": "List of all algorithm versions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "x-sql-datatype": "TABLE(version text, description text, weights jsonb, deployed_at timestamp, is_active boolean)",
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "version": {
+                        "type": "string"
+                      },
+                      "description": {
+                        "type": "string"
+                      },
+                      "weights": {
+                        "type": "object",
+                        "additionalProperties": true
+                      },
+                      "deployed_at": {
+                        "type": "string",
+                        "format": "date-time"
+                      },
+                      "is_active": {
+                        "type": "boolean"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/fyp/feed/{username}": {
+      "get": {
+        "tags": [
+          "Feed"
+        ],
+        "summary": "Personalized feed",
+        "description": "Returns a ranked list of posts for the given user, ordered by final score.",
+        "operationId": "haf_fyp_endpoints.get_personalized_feed",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "username",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Hive account name"
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 20
+            },
+            "description": "Maximum number of posts to return"
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0
+            },
+            "description": "Pagination offset"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Ranked post list (empty array before first ranker cycle)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "x-sql-datatype": "SETOF haf_fyp_endpoints.feed_post_row",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/feed_post_row"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/fyp/global": {
+      "get": {
+        "tags": [
+          "Feed"
+        ],
+        "summary": "Global feed",
+        "description": "Returns the global unauthenticated feed, optionally filtered by community.",
+        "operationId": "haf_fyp_endpoints.get_global_feed",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 20
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0
+            }
+          },
+          {
+            "in": "query",
+            "name": "community_id",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": null
+            },
+            "description": "Filter results to a specific community (optional)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Global ranked post list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "x-sql-datatype": "SETOF haf_fyp_endpoints.feed_post_row",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/feed_post_row"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/fyp/profile/{username}": {
+      "get": {
+        "tags": [
+          "User"
+        ],
+        "summary": "User profile",
+        "description": "Returns a user's computed interest profile \u00e2\u20ac\u201d whether a vector has been built and which communities are tracked.",
+        "operationId": "haf_fyp_endpoints.get_user_profile",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "username",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Hive account name"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "User profile data (empty if user has not been ranked yet)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "x-sql-datatype": "TABLE(has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp)",
+                  "type": "object",
+                  "properties": {
+                    "has_vector": {
+                      "type": "boolean"
+                    },
+                    "posts_sampled": {
+                      "type": "integer"
+                    },
+                    "top_communities": {
+                      "type": "array",
+                      "items": {
+                        "type": "integer"
+                      }
+                    },
+                    "updated_at": {
+                      "type": "string",
+                      "format": "date-time"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/fyp/explain/{username}/{post_id}": {
+      "get": {
+        "tags": [
+          "Feed"
+        ],
+        "summary": "Score explanation",
+        "description": "Returns a per-signal score breakdown for a specific post in a user's feed cache.",
+        "operationId": "haf_fyp_endpoints.get_score_explanation",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "username",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Hive account name"
+          },
+          {
+            "in": "path",
+            "name": "post_id",
+            "required": true,
+            "schema": {
+              "x-sql-datatype": "BIGINT",
+              "type": "integer"
+            },
+            "description": "Internal post ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Score breakdown (empty if post not in user's feed cache)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "x-sql-datatype": "TABLE(post_id bigint, author varchar(16), permlink varchar(256), title text, final_score float, score_relevance float, score_recency float, score_engagement float, score_credibility float, community_boost_applied boolean, rank int, algorithm_version varchar(16), algorithm_weights jsonb, computed_at timestamp)",
+                  "type": "object",
+                  "properties": {
+                    "post_id": {
+                      "type": "integer"
+                    },
+                    "author": {
+                      "type": "string"
+                    },
+                    "permlink": {
+                      "type": "string"
+                    },
+                    "title": {
+                      "type": "string"
+                    },
+                    "final_score": {
+                      "type": "number"
+                    },
+                    "score_relevance": {
+                      "type": "number"
+                    },
+                    "score_recency": {
+                      "type": "number"
+                    },
+                    "score_engagement": {
+                      "type": "number"
+                    },
+                    "score_credibility": {
+                      "type": "number"
+                    },
+                    "community_boost_applied": {
+                      "type": "boolean"
+                    },
+                    "rank": {
+                      "type": "integer"
+                    },
+                    "algorithm_version": {
+                      "type": "string"
+                    },
+                    "algorithm_weights": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "computed_at": {
+                      "type": "string",
+                      "format": "date-time"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+$$;
+-- openapi-generated-code-end
+        -- openapi-generated-code-begin
+          openapi json = $${}$$;
+        -- openapi-generated-code-end
+        BEGIN
+          RETURN openapi;
+        END
+        $_$;'
+    , swagger_url);
+END
+$__$;
 
 -- ---------------------------------------------------------------------------
 -- Health / version
 -- ---------------------------------------------------------------------------
 
+/** openapi:paths
+/version:
+  get:
+    tags:
+      - Other
+    summary: Application version
+    description: Returns the git hash of the currently deployed version.
+    operationId: haf_fyp_endpoints.get_version
+    responses:
+      '200':
+        description: Git hash string
+        content:
+          application/json:
+            schema:
+              type: string
+ */
+-- openapi-generated-code-begin
+DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_version;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_version()
-RETURNS text
+RETURNS TEXT 
+-- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
     SELECT git_hash FROM haf_fyp_app.app_version LIMIT 1;
 $$;
 
+/** openapi:paths
+/health:
+  get:
+    tags:
+      - Other
+    summary: Health check
+    description: Returns service health and last processed block number.
+    operationId: haf_fyp_endpoints.get_health
+    responses:
+      '200':
+        description: Health status
+        content:
+          application/json:
+            schema:
+              x-sql-datatype: "TABLE(status text, last_processed_block int, version text)"
+              type: object
+              properties:
+                status:
+                  type: string
+                  example: ok
+                last_processed_block:
+                  type: integer
+                version:
+                  type: string
+ */
+-- openapi-generated-code-begin
+DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_health;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_health()
-RETURNS TABLE (
-    status text,
-    last_processed_block int,
-    version text
-)
+RETURNS TABLE(status text, last_processed_block int, version text) 
+-- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
     SELECT
@@ -32,13 +689,46 @@ $$;
 -- Algorithm version info
 -- ---------------------------------------------------------------------------
 
+/** openapi:paths
+/v1/fyp/algorithm:
+  get:
+    tags:
+      - Algorithm
+    summary: Active algorithm
+    description: Returns the currently active scoring algorithm version and its weights.
+    operationId: haf_fyp_endpoints.get_algorithm
+    responses:
+      '200':
+        description: Active algorithm version
+        content:
+          application/json:
+            schema:
+              x-sql-datatype: "TABLE(version text, description text, weights jsonb, deployed_at timestamp)"
+              type: object
+              properties:
+                version:
+                  type: string
+                  example: "1.0.0"
+                description:
+                  type: string
+                weights:
+                  type: object
+                  additionalProperties: true
+                  example:
+                    relevance: 0.40
+                    recency: 0.30
+                    engagement: 0.20
+                    credibility: 0.10
+                    community_boost: 0.20
+                deployed_at:
+                  type: string
+                  format: date-time
+ */
+-- openapi-generated-code-begin
+DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_algorithm;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_algorithm()
-RETURNS TABLE (
-    version text,
-    description text,
-    weights jsonb,
-    deployed_at timestamp
-)
+RETURNS TABLE(version text, description text, weights jsonb, deployed_at timestamp) 
+-- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
     SELECT version, description, weights, deployed_at
@@ -47,16 +737,103 @@ AS $$
     LIMIT 1;
 $$;
 
+/** openapi:paths
+/v1/fyp/algorithms:
+  get:
+    tags:
+      - Algorithm
+    summary: All algorithm versions
+    description: Lists all algorithm versions in the registry with their weights and active status.
+    operationId: haf_fyp_endpoints.list_algorithm_versions
+    responses:
+      '200':
+        description: List of all algorithm versions
+        content:
+          application/json:
+            schema:
+              x-sql-datatype: "TABLE(version text, description text, weights jsonb, deployed_at timestamp, is_active boolean)"
+              type: array
+              items:
+                type: object
+                properties:
+                  version:
+                    type: string
+                  description:
+                    type: string
+                  weights:
+                    type: object
+                    additionalProperties: true
+                  deployed_at:
+                    type: string
+                    format: date-time
+                  is_active:
+                    type: boolean
+ */
+-- openapi-generated-code-begin
+DROP FUNCTION IF EXISTS haf_fyp_endpoints.list_algorithm_versions;
+CREATE OR REPLACE FUNCTION haf_fyp_endpoints.list_algorithm_versions()
+RETURNS TABLE(version text, description text, weights jsonb, deployed_at timestamp, is_active boolean) 
+-- openapi-generated-code-end
+LANGUAGE sql STABLE
+AS $$
+    SELECT version, description, weights, deployed_at, is_active
+    FROM haf_fyp_app.algorithm_versions
+    ORDER BY deployed_at DESC;
+$$;
+
 -- ---------------------------------------------------------------------------
 -- Personalized feed
 -- ---------------------------------------------------------------------------
 
+/** openapi:paths
+/v1/fyp/feed/{username}:
+  get:
+    tags:
+      - Feed
+    summary: Personalized feed
+    description: Returns a ranked list of posts for the given user, ordered by final score.
+    operationId: haf_fyp_endpoints.get_personalized_feed
+    parameters:
+      - in: path
+        name: username
+        required: true
+        schema:
+          type: string
+        description: Hive account name
+      - in: query
+        name: limit
+        required: false
+        schema:
+          type: integer
+          default: 20
+        description: Maximum number of posts to return
+      - in: query
+        name: offset
+        required: false
+        schema:
+          type: integer
+          default: 0
+        description: Pagination offset
+    responses:
+      '200':
+        description: Ranked post list (empty array before first ranker cycle)
+        content:
+          application/json:
+            schema:
+              x-sql-datatype: "SETOF haf_fyp_endpoints.feed_post_row"
+              type: array
+              items:
+                $ref: '#/components/schemas/feed_post_row'
+ */
+-- openapi-generated-code-begin
+DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_personalized_feed;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_personalized_feed(
-    username text,
-    "limit" int DEFAULT 20,
-    "offset" int DEFAULT 0
+    "username" TEXT,
+    "limit" INT = 20,
+    "offset" INT = 0
 )
-RETURNS SETOF haf_fyp_endpoints.feed_post_row
+RETURNS SETOF haf_fyp_endpoints.feed_post_row 
+-- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
     SELECT
@@ -87,12 +864,54 @@ $$;
 -- Global (unauthenticated) feed
 -- ---------------------------------------------------------------------------
 
+/** openapi:paths
+/v1/fyp/global:
+  get:
+    tags:
+      - Feed
+    summary: Global feed
+    description: Returns the global unauthenticated feed, optionally filtered by community.
+    operationId: haf_fyp_endpoints.get_global_feed
+    parameters:
+      - in: query
+        name: limit
+        required: false
+        schema:
+          type: integer
+          default: 20
+      - in: query
+        name: offset
+        required: false
+        schema:
+          type: integer
+          default: 0
+      - in: query
+        name: community_id
+        required: false
+        schema:
+          type: integer
+          default: null
+        description: Filter results to a specific community (optional)
+    responses:
+      '200':
+        description: Global ranked post list
+        content:
+          application/json:
+            schema:
+              x-sql-datatype: "SETOF haf_fyp_endpoints.feed_post_row"
+              type: array
+              items:
+                $ref: '#/components/schemas/feed_post_row'
+ */
+-- openapi-generated-code-begin
+DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_global_feed;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_global_feed(
-    "limit" int DEFAULT 20,
-    "offset" int DEFAULT 0,
-    community_id int DEFAULT NULL
+    "limit" INT = 20,
+    "offset" INT = 0,
+    "community_id" INT = NULL
 )
-RETURNS SETOF haf_fyp_endpoints.feed_post_row
+RETURNS SETOF haf_fyp_endpoints.feed_post_row 
+-- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
     SELECT
@@ -123,15 +942,51 @@ $$;
 -- User profile
 -- ---------------------------------------------------------------------------
 
+/** openapi:paths
+/v1/fyp/profile/{username}:
+  get:
+    tags:
+      - User
+    summary: User profile
+    description: >-
+      Returns a user's computed interest profile — whether a vector has been
+      built and which communities are tracked.
+    operationId: haf_fyp_endpoints.get_user_profile
+    parameters:
+      - in: path
+        name: username
+        required: true
+        schema:
+          type: string
+        description: Hive account name
+    responses:
+      '200':
+        description: User profile data (empty if user has not been ranked yet)
+        content:
+          application/json:
+            schema:
+              x-sql-datatype: "TABLE(has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp)"
+              type: object
+              properties:
+                has_vector:
+                  type: boolean
+                posts_sampled:
+                  type: integer
+                top_communities:
+                  type: array
+                  items:
+                    type: integer
+                updated_at:
+                  type: string
+                  format: date-time
+ */
+-- openapi-generated-code-begin
+DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_user_profile;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_user_profile(
-    username text
+    "username" TEXT
 )
-RETURNS TABLE (
-    has_vector boolean,
-    posts_sampled int,
-    top_communities int [],
-    updated_at timestamp
-)
+RETURNS TABLE(has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp) 
+-- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
     SELECT
@@ -147,26 +1002,78 @@ $$;
 -- Score explainer — per-signal breakdown for a post in a user's feed cache
 -- ---------------------------------------------------------------------------
 
+/** openapi:paths
+/v1/fyp/explain/{username}/{post_id}:
+  get:
+    tags:
+      - Feed
+    summary: Score explanation
+    description: >-
+      Returns a per-signal score breakdown for a specific post in a user's
+      feed cache.
+    operationId: haf_fyp_endpoints.get_score_explanation
+    parameters:
+      - in: path
+        name: username
+        required: true
+        schema:
+          type: string
+        description: Hive account name
+      - in: path
+        name: post_id
+        required: true
+        schema:
+          x-sql-datatype: BIGINT
+          type: integer
+        description: Internal post ID
+    responses:
+      '200':
+        description: Score breakdown (empty if post not in user's feed cache)
+        content:
+          application/json:
+            schema:
+              x-sql-datatype: "TABLE(post_id bigint, author varchar(16), permlink varchar(256), title text, final_score float, score_relevance float, score_recency float, score_engagement float, score_credibility float, community_boost_applied boolean, rank int, algorithm_version varchar(16), algorithm_weights jsonb, computed_at timestamp)"
+              type: object
+              properties:
+                post_id:
+                  type: integer
+                author:
+                  type: string
+                permlink:
+                  type: string
+                title:
+                  type: string
+                final_score:
+                  type: number
+                score_relevance:
+                  type: number
+                score_recency:
+                  type: number
+                score_engagement:
+                  type: number
+                score_credibility:
+                  type: number
+                community_boost_applied:
+                  type: boolean
+                rank:
+                  type: integer
+                algorithm_version:
+                  type: string
+                algorithm_weights:
+                  type: object
+                  additionalProperties: true
+                computed_at:
+                  type: string
+                  format: date-time
+ */
+-- openapi-generated-code-begin
+DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_score_explanation;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_score_explanation(
-    username text,
-    post_id bigint
+    "username" TEXT,
+    "post_id" BIGINT
 )
-RETURNS TABLE (
-    post_id bigint,
-    author varchar(16),
-    permlink varchar(256),
-    title text,
-    final_score float,
-    score_relevance float,
-    score_recency float,
-    score_engagement float,
-    score_credibility float,
-    community_boost_applied boolean,
-    rank int,
-    algorithm_version varchar(16),
-    algorithm_weights jsonb,
-    computed_at timestamp
-)
+RETURNS TABLE(post_id bigint, author varchar(16), permlink varchar(256), title text, final_score float, score_relevance float, score_recency float, score_engagement float, score_credibility float, community_boost_applied boolean, rank int, algorithm_version varchar(16), algorithm_weights jsonb, computed_at timestamp) 
+-- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
     SELECT
@@ -191,23 +1098,6 @@ AS $$
       AND fc.post_id = get_score_explanation.post_id;
 $$;
 
--- ---------------------------------------------------------------------------
--- Algorithm registry — all versions with active flag
--- ---------------------------------------------------------------------------
-
-CREATE OR REPLACE FUNCTION haf_fyp_endpoints.list_algorithm_versions()
-RETURNS TABLE (
-    version text,
-    description text,
-    weights jsonb,
-    deployed_at timestamp,
-    is_active boolean
-)
-LANGUAGE sql STABLE
-AS $$
-    SELECT version, description, weights, deployed_at, is_active
-    FROM haf_fyp_app.algorithm_versions
-    ORDER BY deployed_at DESC;
-$$;
-
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA haf_fyp_endpoints TO haf_fyp_user;
+
+RESET ROLE;
