@@ -1,7 +1,5 @@
 FROM registry.gitlab.syncad.com/hive/common-ci-configuration/psql:14-2
 
-USER root
-
 WORKDIR /app
 
 COPY db/             /app/db/
