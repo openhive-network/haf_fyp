@@ -98,9 +98,9 @@ fastapi-tests:
     - sleep 5
     - PYTHONPATH=. uvicorn haf_fyp.api:app --host 0.0.0.0 --port 3002 &
     - sleep 3
-    - echo "variables:" > /tmp/tavern_cfg.yaml
-    - echo "  fastapi_url: ${FASTAPI_URL}" >> /tmp/tavern_cfg.yaml
-    - echo "  api_url: ${API_URL}" >> /tmp/tavern_cfg.yaml
+    - "echo 'variables:' > /tmp/tavern_cfg.yaml"
+    - "echo \"  fastapi_url: ${FASTAPI_URL}\" >> /tmp/tavern_cfg.yaml"
+    - "echo \"  api_url: ${API_URL}\" >> /tmp/tavern_cfg.yaml"
     - PYTHONPATH=. pytest tests/tavern/test_fastapi_endpoints.tavern.yaml --tavern-global-cfg=/tmp/tavern_cfg.yaml -k "not saves" -v
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
