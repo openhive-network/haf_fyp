@@ -1,0 +1,5 @@
+[run]
+omit =
+    haf_fyp/api.py
+    haf_fyp/ranker_daemon.py
+    haf_fyp/embeddings.py
