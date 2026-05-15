@@ -4,3 +4,4 @@ description: Shared variables for all haf_fyp Tavern tests
 
 variables:
   api_url: !env API_URL
+  fastapi_url: !env FASTAPI_URL
