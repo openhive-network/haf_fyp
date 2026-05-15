@@ -3,6 +3,14 @@ stages:
   - test
   - build
 
+.python-cache:
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  cache:
+    key: pip-$CI_COMMIT_REF_SLUG
+    paths:
+      - .pip-cache/
+
 sql-lint:
   stage: lint
   image: python:3.12-slim
@@ -23,21 +31,77 @@ shell-lint:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 python-lint:
+  extends: .python-cache
   stage: lint
   image: python:3.11-slim
   script:
-    - pip install ruff -q
+    - pip install ruff mypy types-redis -q
     - ruff check haf_fyp/
+    - mypy haf_fyp/ --ignore-missing-imports
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+hadolint:
+  stage: lint
+  image: hadolint/hadolint:latest-alpine
+  script:
+    - hadolint --ignore DL3006 Dockerfile.python Dockerfile.sql
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+compose-validate:
+  stage: lint
+  image: docker:24
+  variables:
+    HAF_REGISTRY: "registry.example.com"
+    HAF_VERSION: "latest"
+    POSTGREST_VERSION: "latest"
+    FYP_ADMIN_API_KEY: "dummy"
+  script:
+    - docker compose -f docker/docker-compose.yml config --quiet
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 python-tests:
+  extends: .python-cache
   stage: test
   image: python:3.11-slim
   script:
+    - pip install -r requirements.txt pytest pytest-cov -q
+    - PYTHONPATH=. pytest tests/unit/ -v --cov=haf_fyp --cov-report=term-missing --cov-fail-under=40
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+fastapi-tests:
+  extends: .python-cache
+  stage: test
+  image: python:3.11-slim
+  services:
+    - name: postgres:14-alpine
+      alias: haf
+  variables:
+    POSTGRES_DB: haf_block_log
+    POSTGRES_USER: haf_fyp_user
+    POSTGRES_HOST_AUTH_METHOD: trust
+    POSTGRES_HOST: haf
+    POSTGRES_PORT: "5432"
+    POSTGRES_PASSWORD: ""
+    ADMIN_API_KEY: ""
+    API_URL: "http://localhost:3001"
+    FASTAPI_URL: "http://localhost:3002"
+  script:
     - pip install -r requirements.txt pytest -q
-    - PYTHONPATH=. pytest tests/unit/ -v
+    - sleep 5
+    - PYTHONPATH=. uvicorn haf_fyp.api:app --host 0.0.0.0 --port 3002 &
+    - sleep 3
+    - "echo 'variables:' > /tmp/tavern_cfg.yaml"
+    - "echo \"  fastapi_url: ${FASTAPI_URL}\" >> /tmp/tavern_cfg.yaml"
+    - "echo \"  api_url: ${API_URL}\" >> /tmp/tavern_cfg.yaml"
+    - PYTHONPATH=. pytest tests/tavern/test_fastapi_endpoints.tavern.yaml --tavern-global-cfg=/tmp/tavern_cfg.yaml -k "not saves" -v
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

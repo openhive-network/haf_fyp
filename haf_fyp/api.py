@@ -135,7 +135,9 @@ def post_interests(request: Request, req: InterestsRequest):
     Redis refresh signal so the ranker can bootstrap the user's interest
     vector on its next cycle.
     """
-    conn = _pool.getconn()
+    assert _pool is not None
+    pool = _pool
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             psycopg2.extras.execute_values(
@@ -165,7 +167,7 @@ def post_interests(request: Request, req: InterestsRequest):
         log.exception("failed to save interests for %s", req.username)
         raise HTTPException(status_code=500, detail="failed to save interests") from exc
     finally:
-        _pool.putconn(conn)
+        pool.putconn(conn)
 
     _publish_refresh(req.username)
     return InterestsResponse(username=req.username, communities_saved=len(req.communities))
@@ -189,7 +191,9 @@ def activate_algorithm(
     if not admin_key or x_admin_key != admin_key:
         raise HTTPException(status_code=403, detail="invalid admin key")
 
-    conn = _pool.getconn()
+    assert _pool is not None
+    pool = _pool
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -217,4 +221,4 @@ def activate_algorithm(
         log.exception("failed to activate algorithm version %s", req.version)
         raise HTTPException(status_code=500, detail="activation failed") from exc
     finally:
-        _pool.putconn(conn)
+        pool.putconn(conn)

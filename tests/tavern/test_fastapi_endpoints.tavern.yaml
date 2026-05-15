@@ -1,9 +1,6 @@
 ---
 test_name: FastAPI health returns ok
 
-includes:
-  - !include common.yaml
-
 stages:
   - name: GET /health returns 200 with status ok
     request:
@@ -16,9 +13,6 @@ stages:
 
 ---
 test_name: POST /v1/fyp/interests saves user interests
-
-includes:
-  - !include common.yaml
 
 stages:
   - name: POST with valid body returns username and saved count
@@ -37,9 +31,6 @@ stages:
 ---
 test_name: POST /v1/fyp/interests rejects empty communities list
 
-includes:
-  - !include common.yaml
-
 stages:
   - name: POST with empty communities returns 422
     request:
@@ -54,9 +45,6 @@ stages:
 ---
 test_name: POST /v1/fyp/interests rejects missing body
 
-includes:
-  - !include common.yaml
-
 stages:
   - name: POST without body returns 422
     request:
@@ -67,9 +55,6 @@ stages:
 
 ---
 test_name: POST /v1/fyp/interests rejects username exceeding 16 characters
-
-includes:
-  - !include common.yaml
 
 stages:
   - name: POST with username longer than 16 chars returns 422
@@ -85,9 +70,6 @@ stages:
 ---
 test_name: POST /v1/fyp/admin/algorithm requires X-Admin-Key header
 
-includes:
-  - !include common.yaml
-
 stages:
   - name: POST without X-Admin-Key header returns 422
     request:
@@ -100,9 +82,6 @@ stages:
 
 ---
 test_name: POST /v1/fyp/admin/algorithm rejects wrong admin key
-
-includes:
-  - !include common.yaml
 
 stages:
   - name: POST with wrong X-Admin-Key returns 403
