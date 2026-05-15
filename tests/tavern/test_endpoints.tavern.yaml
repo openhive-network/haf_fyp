@@ -11,6 +11,8 @@ stages:
       method: GET
     response:
       status_code: 200
+      json:
+        - status: "ok"
 
 ---
 test_name: Algorithm version endpoint
@@ -41,6 +43,7 @@ stages:
         username: testuser
     response:
       status_code: 200
+      json: !anylist
 
 ---
 test_name: Global feed returns empty array before ranker runs
@@ -55,6 +58,7 @@ stages:
       method: GET
     response:
       status_code: 200
+      json: !anylist
 
 ---
 test_name: Version endpoint
@@ -85,6 +89,7 @@ stages:
         username: unknownuser
     response:
       status_code: 200
+      json: !anylist
 
 ---
 test_name: Score explanation returns empty for unknown user and post
@@ -102,6 +107,7 @@ stages:
         post_id: 0
     response:
       status_code: 200
+      json: !anylist
 
 ---
 test_name: Algorithm versions list
