@@ -46,7 +46,7 @@ hadolint:
   stage: lint
   image: hadolint/hadolint:latest-alpine
   script:
-    - hadolint Dockerfile.python Dockerfile.sql
+    - hadolint --config .hadolint.yaml Dockerfile.python Dockerfile.sql
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
