@@ -4,7 +4,7 @@
 --
 -- HAF API used:
 --   hive.operations_view          — non-virtual operations
---   hive.get_op_type_id()         — cached op type lookup
+--   hafd.operation_types          — op type id lookup (name includes hive::protocol:: prefix)
 --   hafd.blocks                   — block timestamps for subscribed_at
 --   haf_fyp_app.safe_parse_json() — defined in process_posts.sql
 --
@@ -25,7 +25,7 @@ RETURNS void
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    _custom_json_op_id int := hive.get_op_type_id('custom_json_operation');
+    _custom_json_op_id int := (SELECT id FROM hafd.operation_types WHERE name = 'hive::protocol::custom_json_operation' LIMIT 1);
 BEGIN
     WITH events AS (
         SELECT
@@ -71,7 +71,7 @@ RETURNS void
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    _custom_json_op_id int := hive.get_op_type_id('custom_json_operation');
+    _custom_json_op_id int := (SELECT id FROM hafd.operation_types WHERE name = 'hive::protocol::custom_json_operation' LIMIT 1);
 BEGIN
     WITH events AS (
         SELECT

@@ -59,9 +59,22 @@ CREATE OR REPLACE FUNCTION haf_fyp_app.create_context_if_not_exists()
 RETURNS void
 LANGUAGE plpgsql
 AS $$
+DECLARE
+    _stages hive.application_stages;
 BEGIN
     IF NOT hive.app_context_exists('haf_fyp') THEN
-        PERFORM hive.app_create_context('haf_fyp');
+        _stages := ARRAY[
+            hive.stage('MASSIVE_PROCESSING', 101, 10000, '20 seconds'),
+            hive.live_stage()
+        ]::hive.application_stages;
+        PERFORM hive.app_create_context(
+            _name   => 'haf_fyp'::hafd.CONTEXT_NAME,
+            _schema => 'haf_fyp_app',
+            _stages => _stages
+        );
+        PERFORM hive.app_context_set_non_forking('haf_fyp');
+        PERFORM hive.app_context_detach('haf_fyp');
+        PERFORM hive.app_set_current_block_num('haf_fyp', 0);
         RAISE NOTICE 'HAF context haf_fyp created.';
     ELSE
         RAISE NOTICE 'HAF context haf_fyp already exists, skipping.';
@@ -86,29 +99,37 @@ END;
 $$;
 
 -- ---------------------------------------------------------------------------
--- Main block-processing loop
--- hive.app_next_block(context_name) returns hive.blocks_range (first_block, last_block INT).
--- NULL return means no blocks yet — loop continues. Negative range means wait for live block.
+-- Main block-processing loop (PROCEDURE so CALL works and transactions commit).
+-- Uses hive.app_next_iteration() which automatically advances the context block
+-- pointer — unlike the older hive.app_next_block() function which does not.
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION haf_fyp_app.main()
-RETURNS void
+CREATE OR REPLACE PROCEDURE haf_fyp_app.main(
+    IN _context hafd.CONTEXT_NAME DEFAULT 'haf_fyp'
+)
 LANGUAGE plpgsql
 AS $$
 DECLARE
     _block_range hive.blocks_range;
 BEGIN
     PERFORM haf_fyp_app.allow_processing();
+    RAISE NOTICE 'haf_fyp starting. Last processed block: %', hive.app_get_current_block_num(_context);
 
     LOOP
-        _block_range := hive.app_next_block('haf_fyp');
+        CALL hive.app_next_iteration(_context, _block_range, NULL, NULL);
 
-        IF _block_range IS NOT NULL AND _block_range.first_block > 0 THEN
-            PERFORM haf_fyp_app.process_block_range(_block_range.first_block, _block_range.last_block);
-            UPDATE haf_fyp_app.app_status SET last_processed_block = _block_range.last_block;
+        IF NOT haf_fyp_app.continue_processing() THEN
+            ROLLBACK;
+            RAISE NOTICE 'haf_fyp stopped at block %', hive.app_get_current_block_num(_context);
+            RETURN;
         END IF;
 
-        EXIT WHEN NOT haf_fyp_app.continue_processing();
+        IF _block_range IS NULL THEN
+            CONTINUE;
+        END IF;
+
+        PERFORM haf_fyp_app.process_block_range(_block_range.first_block, _block_range.last_block);
+        UPDATE haf_fyp_app.app_status SET last_processed_block = _block_range.last_block;
     END LOOP;
 END;
 $$;

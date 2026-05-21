@@ -4,7 +4,7 @@
 --
 -- HAF API used:
 --   hive.operations_view    — confirmed correct read interface
---   hive.get_op_type_id()   — cached op type lookup
+--   hafd.operation_types    — op type id lookup (name includes hive::protocol:: prefix)
 --   hafd.blocks             — block timestamps
 --
 -- json_metadata is a user-supplied string field — may be empty, null, or
@@ -40,7 +40,7 @@ RETURNS void
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    _comment_op_id int := hive.get_op_type_id('comment_operation');
+    _comment_op_id int := (SELECT id FROM hafd.operation_types WHERE name = 'hive::protocol::comment_operation' LIMIT 1);
 BEGIN
     -- Three-step CTE: RETURNING from step 1 feeds steps 2 and 3,
     -- so only genuinely new posts flow into post_lookup and engagement_metrics.
