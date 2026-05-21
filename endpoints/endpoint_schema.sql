@@ -85,14 +85,11 @@ DECLARE
 BEGIN
     swagger_url := COALESCE(current_setting('custom.swagger_url', TRUE), 'localhost');
 
-    EXECUTE FORMAT(
-        'CREATE OR REPLACE FUNCTION haf_fyp_endpoints.root() RETURNS json
-        LANGUAGE plpgsql STABLE
-        AS $_$
-        DECLARE
-        -- openapi-spec
--- openapi-generated-code-begin
-  openapi json = $$
+    EXECUTE $exec$
+CREATE OR REPLACE FUNCTION haf_fyp_endpoints.root() RETURNS json
+LANGUAGE sql STABLE
+AS $func$
+    SELECT $api_json$
 {
   "openapi": "3.1.0",
   "info": {
@@ -602,16 +599,9 @@ BEGIN
     }
   }
 }
-$$;
--- openapi-generated-code-end
-        -- openapi-generated-code-begin
-          openapi json = $${}$$;
-        -- openapi-generated-code-end
-        BEGIN
-          RETURN openapi;
-        END
-        $_$;'
-    , swagger_url);
+$api_json$::json;
+$func$;
+$exec$;
 END
 $__$;
 
