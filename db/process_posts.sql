@@ -92,7 +92,6 @@ BEGIN
         WHERE ov.block_num BETWEEN _first_block AND _last_block
           AND ov.op_type_id = _comment_op_id
           AND ov.body::jsonb -> 'value' ->> 'parent_author' = ''
-          AND ov.is_virtual = FALSE
         ON CONFLICT (author, permlink) DO NOTHING
         RETURNING post_id, author, permlink
     ),

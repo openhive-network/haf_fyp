@@ -37,7 +37,6 @@ BEGIN
         WHERE ov.block_num BETWEEN _first_block AND _last_block
           AND ov.op_type_id = _comment_op_id
           AND ov.body::jsonb -> 'value' ->> 'parent_author' <> ''
-          AND ov.is_virtual = FALSE
     ),
     -- Total comment count per post (includes repeat commenters)
     comment_totals AS (
@@ -100,7 +99,6 @@ BEGIN
           AND ov.op_type_id = _custom_json_op_id
           AND ov.body::jsonb -> 'value' ->> 'id' = 'reblog'
           AND cj.parsed ->> 0 = 'reblog'
-          AND ov.is_virtual = FALSE
     ),
     reblog_counts AS (
         SELECT post_id, COUNT(*) AS cnt FROM reblogs GROUP BY post_id
@@ -140,7 +138,6 @@ BEGIN
             AND pl.permlink  = ov.body::jsonb -> 'value' ->> 'permlink'
         WHERE ov.block_num BETWEEN _first_block AND _last_block
           AND ov.op_type_id = _vote_op_id
-          AND ov.is_virtual = FALSE
     ),
     vote_counts AS (
         SELECT post_id, COUNT(*) AS cnt FROM votes GROUP BY post_id
@@ -166,7 +163,6 @@ BEGIN
             AND pl.permlink  = ov.body::jsonb -> 'value' ->> 'permlink'
         WHERE ov.block_num BETWEEN _first_block AND _last_block
           AND ov.op_type_id = _eff_vote_op_id
-          AND ov.is_virtual = TRUE
         GROUP BY pl.post_id
     )
     UPDATE haf_fyp_app.engagement_metrics em

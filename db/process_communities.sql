@@ -49,7 +49,6 @@ BEGIN
           AND ov.op_type_id = _custom_json_op_id
           AND ov.body::jsonb -> 'value' ->> 'id' = 'community'
           AND cj.parsed ->> 0 = 'subscribe'
-          AND ov.is_virtual = FALSE
     )
     INSERT INTO haf_fyp_app.user_communities (username, community_id, subscribed_at)
     SELECT username, community_id, subscribed_at
@@ -93,7 +92,6 @@ BEGIN
           AND ov.op_type_id = _custom_json_op_id
           AND ov.body::jsonb -> 'value' ->> 'id' = 'community'
           AND cj.parsed ->> 0 = 'unsubscribe'
-          AND ov.is_virtual = FALSE
     )
     DELETE FROM haf_fyp_app.user_communities uc
     USING events e
