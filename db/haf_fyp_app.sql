@@ -68,7 +68,7 @@ BEGIN
             hive.live_stage()
         ]::hive.application_stages;
         PERFORM hive.app_create_context(
-            _name   => 'haf_fyp'::hafd.CONTEXT_NAME,
+            _name   => 'haf_fyp'::hafd.context_name,
             _schema => 'haf_fyp_app',
             _stages => _stages
         );
@@ -105,7 +105,7 @@ $$;
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE PROCEDURE haf_fyp_app.main(
-    IN _context hafd.CONTEXT_NAME DEFAULT 'haf_fyp'
+    IN _context hafd.context_name DEFAULT 'haf_fyp'
 )
 LANGUAGE plpgsql
 AS $$
