@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.post_candidates (
     community_id int,
     title text,
     tags text [],
-    category varchar(64),
+    category varchar(256),
     created_at timestamp NOT NULL,
     body_length int,
     payout_window boolean NOT NULL DEFAULT TRUE,
