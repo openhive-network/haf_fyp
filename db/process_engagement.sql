@@ -4,7 +4,7 @@
 --
 -- HAF API used:
 --   hive.operations_view          — non-virtual and virtual operations
---   hive.get_op_type_id()         — cached op type lookup
+--   hafd.operation_types          — op type id lookup (name includes hive::protocol:: prefix)
 --   hafd.blocks                   — block timestamps (for payout window)
 --   haf_fyp_app.safe_parse_json() — defined in process_posts.sql
 --
@@ -23,7 +23,7 @@ RETURNS void
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    _comment_op_id int := hive.get_op_type_id('comment_operation');
+    _comment_op_id int := (SELECT id FROM hafd.operation_types WHERE name = 'hive::protocol::comment_operation' LIMIT 1);
 BEGIN
     WITH raw_comments AS (
         -- Replies whose immediate parent is a tracked root post
@@ -37,7 +37,6 @@ BEGIN
         WHERE ov.block_num BETWEEN _first_block AND _last_block
           AND ov.op_type_id = _comment_op_id
           AND ov.body::jsonb -> 'value' ->> 'parent_author' <> ''
-          AND ov.is_virtual = FALSE
     ),
     -- Total comment count per post (includes repeat commenters)
     comment_totals AS (
@@ -82,7 +81,7 @@ RETURNS void
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    _custom_json_op_id int := hive.get_op_type_id('custom_json_operation');
+    _custom_json_op_id int := (SELECT id FROM hafd.operation_types WHERE name = 'hive::protocol::custom_json_operation' LIMIT 1);
 BEGIN
     WITH reblogs AS (
         SELECT pl.post_id
@@ -100,7 +99,6 @@ BEGIN
           AND ov.op_type_id = _custom_json_op_id
           AND ov.body::jsonb -> 'value' ->> 'id' = 'reblog'
           AND cj.parsed ->> 0 = 'reblog'
-          AND ov.is_virtual = FALSE
     ),
     reblog_counts AS (
         SELECT post_id, COUNT(*) AS cnt FROM reblogs GROUP BY post_id
@@ -128,8 +126,8 @@ RETURNS void
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    _vote_op_id int := hive.get_op_type_id('vote_operation');
-    _eff_vote_op_id int := hive.get_op_type_id('effective_comment_vote_operation');
+    _vote_op_id int := (SELECT id FROM hafd.operation_types WHERE name = 'hive::protocol::vote_operation' LIMIT 1);
+    _eff_vote_op_id int := (SELECT id FROM hafd.operation_types WHERE name = 'hive::protocol::effective_comment_vote_operation' LIMIT 1);
 BEGIN
     -- 6a: increment vote_count from non-virtual vote_operation
     WITH votes AS (
@@ -140,7 +138,6 @@ BEGIN
             AND pl.permlink  = ov.body::jsonb -> 'value' ->> 'permlink'
         WHERE ov.block_num BETWEEN _first_block AND _last_block
           AND ov.op_type_id = _vote_op_id
-          AND ov.is_virtual = FALSE
     ),
     vote_counts AS (
         SELECT post_id, COUNT(*) AS cnt FROM votes GROUP BY post_id
@@ -166,7 +163,6 @@ BEGIN
             AND pl.permlink  = ov.body::jsonb -> 'value' ->> 'permlink'
         WHERE ov.block_num BETWEEN _first_block AND _last_block
           AND ov.op_type_id = _eff_vote_op_id
-          AND ov.is_virtual = TRUE
         GROUP BY pl.post_id
     )
     UPDATE haf_fyp_app.engagement_metrics em
