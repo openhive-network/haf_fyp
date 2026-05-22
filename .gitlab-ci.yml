@@ -125,8 +125,11 @@ postgrest-tests:
   variables:
     DOCKER_TLS_CERTDIR: "/certs"
   script:
-    - chmod +x scripts/run_tests.sh
-    - scripts/run_tests.sh
+    - docker compose -f docker/docker-compose-ci.yml up --detach
+    - docker compose -f docker/docker-compose-ci.yml wait tavern
+  after_script:
+    - docker compose -f docker/docker-compose-ci.yml logs tavern
+    - docker compose -f docker/docker-compose-ci.yml down -v
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

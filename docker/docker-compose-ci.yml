@@ -32,8 +32,7 @@ services:
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -f /ci_setup.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -f /create_tables.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -f /seed_data.sql &&
-        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log
-          -c "SET custom.swagger_url = 'localhost';" -f /endpoint_schema.sql
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -c "SET custom.swagger_url = 'localhost';" -f /endpoint_schema.sql
     volumes:
       - ../tests/ci_setup.sql:/ci_setup.sql:ro
       - ../db/create_tables.sql:/create_tables.sql:ro
