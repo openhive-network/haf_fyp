@@ -13,6 +13,8 @@ stages:
       status_code: 200
       json:
         - status: "ok"
+          last_processed_block: !anything
+          version: !anything
 
 ---
 test_name: Algorithm version endpoint
@@ -124,3 +126,7 @@ stages:
       status_code: 200
       json:
         - version: "1.0.0"
+          description: !anything
+          weights: !anything
+          deployed_at: !anything
+          is_active: !anything
