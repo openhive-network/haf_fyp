@@ -128,6 +128,7 @@ postgrest-tests:
     - docker compose -f docker/docker-compose-ci.yml up --detach
     - docker compose -f docker/docker-compose-ci.yml wait tavern
   after_script:
+    - docker compose -f docker/docker-compose-ci.yml logs setup
     - docker compose -f docker/docker-compose-ci.yml logs tavern
     - docker compose -f docker/docker-compose-ci.yml down -v
   rules:

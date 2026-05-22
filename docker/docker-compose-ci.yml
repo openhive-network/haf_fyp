@@ -63,5 +63,6 @@ services:
       - ../tests/tavern:/tests/tavern:ro
     environment:
       API_URL: "http://postgrest:3000"
+      FASTAPI_URL: "http://localhost:9999"
     depends_on:
       - postgrest
