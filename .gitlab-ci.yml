@@ -96,12 +96,37 @@ fastapi-tests:
   script:
     - pip install -r requirements.txt pytest -q
     - sleep 5
+    - |
+      python3 -c "
+      import psycopg2, os
+      c = psycopg2.connect(host=os.environ['POSTGRES_HOST'], port=os.environ['POSTGRES_PORT'],
+                           dbname=os.environ['POSTGRES_DB'], user=os.environ['POSTGRES_USER'],
+                           password=os.environ.get('POSTGRES_PASSWORD',''))
+      c.autocommit = True
+      c.cursor().execute(open('tests/ci_fastapi_setup.sql').read())
+      c.close()
+      print('DB setup complete')
+      "
     - PYTHONPATH=. uvicorn haf_fyp.api:app --host 0.0.0.0 --port 3002 &
     - sleep 3
-    - "echo 'variables:' > /tmp/tavern_cfg.yaml"
-    - "echo \"  fastapi_url: ${FASTAPI_URL}\" >> /tmp/tavern_cfg.yaml"
-    - "echo \"  api_url: ${API_URL}\" >> /tmp/tavern_cfg.yaml"
-    - PYTHONPATH=. pytest tests/tavern/test_fastapi_endpoints.tavern.yaml --tavern-global-cfg=/tmp/tavern_cfg.yaml -k "not saves" -v
+    - echo 'variables:' > /tmp/tavern_cfg.yaml
+    - 'echo "  fastapi_url: $FASTAPI_URL" >> /tmp/tavern_cfg.yaml'
+    - 'echo "  api_url: $API_URL" >> /tmp/tavern_cfg.yaml'
+    - PYTHONPATH=. pytest tests/tavern/test_fastapi_endpoints.tavern.yaml --tavern-global-cfg=/tmp/tavern_cfg.yaml -v
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+postgrest-tests:
+  stage: test
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - chmod +x scripts/run_tests.sh
+    - scripts/run_tests.sh
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
