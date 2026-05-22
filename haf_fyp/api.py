@@ -150,7 +150,7 @@ def post_interests(request: Request, req: InterestsRequest):
                     weight      = EXCLUDED.weight,
                     declared_at = EXCLUDED.declared_at
                 """,
-                [(req.username, cid, 1.0, "NOW()") for cid in req.communities],
+                [(req.username, cid, 1.0) for cid in req.communities],
                 template="(%s, %s, %s, NOW())",
             )
             cur.execute(

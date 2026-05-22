@@ -1,0 +1,68 @@
+version: "3.8"
+
+# CI test stack — plain postgres with pgvector (no HAF replay needed).
+# Tests all PostgREST endpoint functions against seeded app tables.
+#
+# Usage (from haf_fyp/):
+#   ./scripts/run_tests.sh              # run tests, tear down on exit
+#   ./scripts/run_tests.sh --keep       # leave stack running after tests
+#
+# Do NOT use --abort-on-container-exit — the setup container exits normally
+# after running SQL, which would abort postgrest before tavern finishes.
+# The script uses detached mode + "docker compose wait tavern" instead.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg14
+    environment:
+      POSTGRES_DB: haf_block_log
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d haf_block_log"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  setup:
+    image: postgres:14-alpine
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_setup.sql &&
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /create_tables.sql &&
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /seed_data.sql &&
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -c "SET custom.swagger_url = 'localhost';" -f /endpoint_schema.sql &&
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -c "GRANT SELECT ON ALL TABLES IN SCHEMA haf_fyp_app TO haf_fyp_user; GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA haf_fyp_endpoints TO haf_fyp_user;"
+    volumes:
+      - ../tests/ci_setup.sql:/ci_setup.sql:ro
+      - ../db/create_tables.sql:/create_tables.sql:ro
+      - ../db/seed_data.sql:/seed_data.sql:ro
+      - ../endpoints/endpoint_schema.sql:/endpoint_schema.sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgrest:
+    image: postgrest/postgrest:v12.2.3
+    environment:
+      PGRST_DB_URI: "postgres://postgres:postgres@postgres/haf_block_log"
+      PGRST_DB_SCHEMA: "haf_fyp_endpoints"
+      PGRST_DB_ANON_ROLE: "haf_fyp_user"
+      PGRST_DB_POOL: "5"
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+
+  tavern:
+    image: python:3.12-slim
+    command: >
+      sh -c "pip install tavern -q &&
+             pytest /tests/tavern/test_endpoints.tavern.yaml --tb=short -v"
+    volumes:
+      - ../tests/tavern:/tests/tavern:ro
+    environment:
+      API_URL: "http://postgrest:3000"
+      FASTAPI_URL: "http://localhost:9999"
+    depends_on:
+      - postgrest
