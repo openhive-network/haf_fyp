@@ -1,17 +1,19 @@
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'haf_fyp_owner') THEN
-        CREATE ROLE haf_fyp_owner NOLOGIN NOINHERIT;
-    END IF;
-
-    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'haf_fyp_user') THEN
-        CREATE ROLE haf_fyp_user NOLOGIN NOINHERIT;
-    END IF;
+  CREATE ROLE haf_fyp_owner WITH LOGIN INHERIT IN ROLE hive_applications_owner_group;
+EXCEPTION WHEN duplicate_object THEN RAISE NOTICE '%, skipping', SQLERRM USING ERRCODE = SQLSTATE;
 END
 $$;
 
--- haf_fyp_user is readable by haf_fyp_owner
-GRANT haf_fyp_user TO haf_fyp_owner;
+DO $$
+BEGIN
+  CREATE ROLE haf_fyp_user WITH LOGIN INHERIT IN ROLE hive_applications_group;
+EXCEPTION WHEN duplicate_object THEN RAISE NOTICE '%, skipping', SQLERRM USING ERRCODE = SQLSTATE;
+END
+$$;
 
--- haf_admin (HAF superrole) owns haf_fyp_owner
+-- Allow haf_admin to act as haf_fyp_owner (for installation scripts)
 GRANT haf_fyp_owner TO haf_admin;
+
+-- Allow haf_fyp_owner to act as haf_fyp_user (for testing)
+GRANT haf_fyp_user TO haf_fyp_owner;

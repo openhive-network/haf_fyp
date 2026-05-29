@@ -7,6 +7,8 @@
 CREATE SCHEMA IF NOT EXISTS haf_fyp_app AUTHORIZATION haf_fyp_owner;
 CREATE SCHEMA IF NOT EXISTS haf_fyp_endpoints AUTHORIZATION haf_fyp_owner;
 
+SET ROLE haf_fyp_owner;
+
 GRANT USAGE ON SCHEMA haf_fyp_app TO haf_fyp_user;
 GRANT USAGE ON SCHEMA haf_fyp_endpoints TO haf_fyp_user;
 

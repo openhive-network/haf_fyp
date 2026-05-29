@@ -51,8 +51,37 @@ run_sql_file "${SCRIPT_DIR}/../db/seed_data.sql"
 # 9. API endpoints (includes score explainer + algorithm registry — Phase 9)
 psql_cmd -c "SET custom.swagger_url = '${SWAGGER_URL}';" -f "${SCRIPT_DIR}/../endpoints/endpoint_schema.sql"
 
-# 10. Register HAF context (idempotent)
-psql_cmd -c "SELECT haf_fyp_app.create_context_if_not_exists();"
+# 10. Register HAF context (idempotent) — must run as haf_fyp_owner so that
+#     hafd.contexts.owner = haf_fyp_owner, satisfying the RLS policies in HAF.
+psql_cmd -c "SET ROLE haf_fyp_owner; SELECT haf_fyp_app.create_context_if_not_exists(); RESET ROLE;"
+
+# 10a. Reassign ownership of HAF-created schema objects to haf_fyp_owner.
+#      hive.app_create_context() runs as SECURITY DEFINER (haf_admin), so views
+#      and the internal tracking table are created owned by haf_admin. The process
+#      container connects as haf_fyp_owner and needs to own them for CREATE OR
+#      REPLACE VIEW to succeed during context attach.
+psql_cmd -c "
+DO \$\$
+DECLARE obj RECORD;
+BEGIN
+  FOR obj IN
+    SELECT c.relname, c.relkind::text AS kind
+    FROM pg_class c
+    JOIN pg_namespace n ON c.relnamespace = n.oid
+    WHERE n.nspname = 'haf_fyp_app'
+      AND c.relkind IN ('r', 'v', 'S')
+      AND c.relowner != (SELECT oid FROM pg_roles WHERE rolname = 'haf_fyp_owner')
+  LOOP
+    IF obj.kind = 'v' THEN
+      EXECUTE format('ALTER VIEW haf_fyp_app.%I OWNER TO haf_fyp_owner', obj.relname);
+    ELSIF obj.kind = 'r' THEN
+      EXECUTE format('ALTER TABLE haf_fyp_app.%I OWNER TO haf_fyp_owner', obj.relname);
+    ELSE
+      EXECUTE format('ALTER SEQUENCE haf_fyp_app.%I OWNER TO haf_fyp_owner', obj.relname);
+    END IF;
+  END LOOP;
+END
+\$\$;"
 
 # 11. Grant read access on current and future objects to haf_fyp_user
 psql_cmd -c "
