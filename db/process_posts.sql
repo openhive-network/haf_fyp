@@ -61,15 +61,13 @@ BEGIN
             ov.id,
             ov.body::jsonb -> 'value' ->> 'author',
             ov.body::jsonb -> 'value' ->> 'permlink',
-            -- community_id: strip 'hive-' prefix from json_metadata.community;
-            -- NULL for non-community posts or malformed metadata
-            NULLIF(
-                REPLACE(
-                    COALESCE(meta.parsed ->> 'community', ''),
-                    'hive-', ''
-                ),
-                ''
-            )::INT,
+            -- community_id: only set when community matches hive-<digits> format;
+            -- arbitrary community names (e.g. "fnait") are silently ignored.
+            CASE
+                WHEN (meta.parsed ->> 'community') ~ '^hive-[0-9]+$'
+                THEN (regexp_replace(meta.parsed ->> 'community', '^hive-', ''))::INT
+                ELSE NULL
+            END,
             ov.body::jsonb -> 'value' ->> 'title',
             -- tags: only extract if json_metadata.tags is a JSON array
             CASE
