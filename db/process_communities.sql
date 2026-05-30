@@ -30,13 +30,11 @@ BEGIN
     WITH events AS (
         SELECT
             ov.body_value -> 'required_posting_auths' ->> 0 AS username,
-            NULLIF(
-                REPLACE(
-                    COALESCE(cj.parsed -> 1 ->> 'community', ''),
-                    'hive-', ''
-                ),
-                ''
-            )::INT AS community_id,
+            CASE
+                WHEN (cj.parsed -> 1 ->> 'community') ~ '^hive-[0-9]+$'
+                THEN (regexp_replace(cj.parsed -> 1 ->> 'community', '^hive-', ''))::INT
+                ELSE NULL
+            END AS community_id,
             b.created_at AS subscribed_at
         FROM hafd.operations ov
         JOIN hafd.blocks b ON b.num = hafd.operation_id_to_block_num(ov.id)
@@ -75,13 +73,11 @@ BEGIN
     WITH events AS (
         SELECT
             ov.body_value -> 'required_posting_auths' ->> 0 AS username,
-            NULLIF(
-                REPLACE(
-                    COALESCE(cj.parsed -> 1 ->> 'community', ''),
-                    'hive-', ''
-                ),
-                ''
-            )::INT AS community_id
+            CASE
+                WHEN (cj.parsed -> 1 ->> 'community') ~ '^hive-[0-9]+$'
+                THEN (regexp_replace(cj.parsed -> 1 ->> 'community', '^hive-', ''))::INT
+                ELSE NULL
+            END AS community_id
         FROM hafd.operations ov
         CROSS JOIN LATERAL (
             SELECT haf_fyp_app.safe_parse_json(
