@@ -3,7 +3,7 @@
 -- into user_communities, which drives the community_boost signal in the ranker.
 --
 -- HAF API used:
---   hive.operations_view          — non-virtual operations
+--   hafd.operations               — non-virtual operations (direct, avoids hive.*_view full scans)
 --   hafd.operation_types          — op type id lookup (name includes hive::protocol:: prefix)
 --   hafd.blocks                   — block timestamps for subscribed_at
 --   haf_fyp_app.safe_parse_json() — defined in process_posts.sql
@@ -29,7 +29,7 @@ DECLARE
 BEGIN
     WITH events AS (
         SELECT
-            ov.body::jsonb -> 'value' -> 'required_posting_auths' ->> 0 AS username,
+            ov.body_value -> 'required_posting_auths' ->> 0 AS username,
             NULLIF(
                 REPLACE(
                     COALESCE(cj.parsed -> 1 ->> 'community', ''),
@@ -38,16 +38,16 @@ BEGIN
                 ''
             )::INT AS community_id,
             b.created_at AS subscribed_at
-        FROM hive.operations_view ov
-        JOIN hafd.blocks b ON b.num = ov.block_num
+        FROM hafd.operations ov
+        JOIN hafd.blocks b ON b.num = hafd.operation_id_to_block_num(ov.id)
         CROSS JOIN LATERAL (
             SELECT haf_fyp_app.safe_parse_json(
-                ov.body::jsonb -> 'value' ->> 'json'
+                ov.body_value ->> 'json'
             ) AS parsed
         ) cj
-        WHERE ov.block_num BETWEEN _first_block AND _last_block
+        WHERE hafd.operation_id_to_block_num(ov.id) BETWEEN _first_block AND _last_block
           AND ov.op_type_id = _custom_json_op_id
-          AND ov.body::jsonb -> 'value' ->> 'id' = 'community'
+          AND ov.body_value ->> 'id' = 'community'
           AND cj.parsed ->> 0 = 'subscribe'
     )
     INSERT INTO haf_fyp_app.user_communities (username, community_id, subscribed_at)
@@ -74,7 +74,7 @@ DECLARE
 BEGIN
     WITH events AS (
         SELECT
-            ov.body::jsonb -> 'value' -> 'required_posting_auths' ->> 0 AS username,
+            ov.body_value -> 'required_posting_auths' ->> 0 AS username,
             NULLIF(
                 REPLACE(
                     COALESCE(cj.parsed -> 1 ->> 'community', ''),
@@ -82,15 +82,15 @@ BEGIN
                 ),
                 ''
             )::INT AS community_id
-        FROM hive.operations_view ov
+        FROM hafd.operations ov
         CROSS JOIN LATERAL (
             SELECT haf_fyp_app.safe_parse_json(
-                ov.body::jsonb -> 'value' ->> 'json'
+                ov.body_value ->> 'json'
             ) AS parsed
         ) cj
-        WHERE ov.block_num BETWEEN _first_block AND _last_block
+        WHERE hafd.operation_id_to_block_num(ov.id) BETWEEN _first_block AND _last_block
           AND ov.op_type_id = _custom_json_op_id
-          AND ov.body::jsonb -> 'value' ->> 'id' = 'community'
+          AND ov.body_value ->> 'id' = 'community'
           AND cj.parsed ->> 0 = 'unsubscribe'
     )
     DELETE FROM haf_fyp_app.user_communities uc

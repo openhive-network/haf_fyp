@@ -3,7 +3,7 @@
 -- payout window expiry — all keyed against post_lookup for efficient joins.
 --
 -- HAF API used:
---   hive.operations_view          — non-virtual and virtual operations
+--   hafd.operations               — non-virtual and virtual operations (direct, avoids hive.*_view)
 --   hafd.operation_types          — op type id lookup (name includes hive::protocol:: prefix)
 --   hafd.blocks                   — block timestamps (for payout window)
 --   haf_fyp_app.safe_parse_json() — defined in process_posts.sql
@@ -29,14 +29,14 @@ BEGIN
         -- Replies whose immediate parent is a tracked root post
         SELECT
             pl.post_id,
-            ov.body::jsonb -> 'value' ->> 'author' AS commenter
-        FROM hive.operations_view ov
+            ov.body_value ->> 'author' AS commenter
+        FROM hafd.operations ov
         JOIN haf_fyp_app.post_lookup pl
-            ON  pl.author    = ov.body::jsonb -> 'value' ->> 'parent_author'
-            AND pl.permlink  = ov.body::jsonb -> 'value' ->> 'parent_permlink'
-        WHERE ov.block_num BETWEEN _first_block AND _last_block
+            ON  pl.author    = ov.body_value ->> 'parent_author'
+            AND pl.permlink  = ov.body_value ->> 'parent_permlink'
+        WHERE hafd.operation_id_to_block_num(ov.id) BETWEEN _first_block AND _last_block
           AND ov.op_type_id = _comment_op_id
-          AND ov.body::jsonb -> 'value' ->> 'parent_author' <> ''
+          AND ov.body_value ->> 'parent_author' <> ''
     ),
     -- Total comment count per post (includes repeat commenters)
     comment_totals AS (
@@ -85,19 +85,19 @@ DECLARE
 BEGIN
     WITH reblogs AS (
         SELECT pl.post_id
-        FROM hive.operations_view ov
+        FROM hafd.operations ov
         -- Parse the double-encoded json field once per row
         CROSS JOIN LATERAL (
             SELECT haf_fyp_app.safe_parse_json(
-                ov.body::jsonb -> 'value' ->> 'json'
+                ov.body_value ->> 'json'
             ) AS parsed
         ) cj
         JOIN haf_fyp_app.post_lookup pl
             ON  pl.author    = cj.parsed -> 1 ->> 'author'
             AND pl.permlink  = cj.parsed -> 1 ->> 'permlink'
-        WHERE ov.block_num BETWEEN _first_block AND _last_block
+        WHERE hafd.operation_id_to_block_num(ov.id) BETWEEN _first_block AND _last_block
           AND ov.op_type_id = _custom_json_op_id
-          AND ov.body::jsonb -> 'value' ->> 'id' = 'reblog'
+          AND ov.body_value ->> 'id' = 'reblog'
           AND cj.parsed ->> 0 = 'reblog'
     ),
     reblog_counts AS (
@@ -132,11 +132,11 @@ BEGIN
     -- 6a: increment vote_count from non-virtual vote_operation
     WITH votes AS (
         SELECT pl.post_id
-        FROM hive.operations_view ov
+        FROM hafd.operations ov
         JOIN haf_fyp_app.post_lookup pl
-            ON  pl.author    = ov.body::jsonb -> 'value' ->> 'author'
-            AND pl.permlink  = ov.body::jsonb -> 'value' ->> 'permlink'
-        WHERE ov.block_num BETWEEN _first_block AND _last_block
+            ON  pl.author    = ov.body_value ->> 'author'
+            AND pl.permlink  = ov.body_value ->> 'permlink'
+        WHERE hafd.operation_id_to_block_num(ov.id) BETWEEN _first_block AND _last_block
           AND ov.op_type_id = _vote_op_id
     ),
     vote_counts AS (
@@ -154,14 +154,14 @@ BEGIN
         SELECT
             pl.post_id,
             SUM(COALESCE(
-                (ov.body::jsonb -> 'value' ->> 'rshares')::bigint,
+                (ov.body_value ->> 'rshares')::bigint,
                 0
             )) AS total_rshares
-        FROM hive.operations_view ov
+        FROM hafd.operations ov
         JOIN haf_fyp_app.post_lookup pl
-            ON  pl.author    = ov.body::jsonb -> 'value' ->> 'author'
-            AND pl.permlink  = ov.body::jsonb -> 'value' ->> 'permlink'
-        WHERE ov.block_num BETWEEN _first_block AND _last_block
+            ON  pl.author    = ov.body_value ->> 'author'
+            AND pl.permlink  = ov.body_value ->> 'permlink'
+        WHERE hafd.operation_id_to_block_num(ov.id) BETWEEN _first_block AND _last_block
           AND ov.op_type_id = _eff_vote_op_id
         GROUP BY pl.post_id
     )

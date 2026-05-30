@@ -3,7 +3,7 @@
 -- and initialise engagement_metrics — all in a single CTE pass per block range.
 --
 -- HAF API used:
---   hive.operations_view    — confirmed correct read interface
+--   hafd.operations         — direct access (avoids hive.operations_view full scans)
 --   hafd.operation_types    — op type id lookup (name includes hive::protocol:: prefix)
 --   hafd.blocks             — block timestamps
 --
@@ -57,10 +57,10 @@ BEGIN
             body_length
         )
         SELECT
-            -- post_id: stable operation id from hive.operations_view
+            -- post_id: stable operation id from hafd.operations
             ov.id,
-            ov.body::jsonb -> 'value' ->> 'author',
-            ov.body::jsonb -> 'value' ->> 'permlink',
+            ov.body_value ->> 'author',
+            ov.body_value ->> 'permlink',
             -- community_id: only set when community matches hive-<digits> format;
             -- arbitrary community names (e.g. "fnait") are silently ignored.
             CASE
@@ -68,7 +68,7 @@ BEGIN
                 THEN (regexp_replace(meta.parsed ->> 'community', '^hive-', ''))::INT
                 ELSE NULL
             END,
-            ov.body::jsonb -> 'value' ->> 'title',
+            ov.body_value ->> 'title',
             -- tags: only extract if json_metadata.tags is a JSON array
             CASE
                 WHEN jsonb_typeof(meta.parsed -> 'tags') = 'array'
@@ -76,20 +76,20 @@ BEGIN
                 ELSE ARRAY[]::TEXT[]
             END,
             -- category = parent_permlink for root posts (tag or community slug)
-            ov.body::jsonb -> 'value' ->> 'parent_permlink',
+            ov.body_value ->> 'parent_permlink',
             b.created_at,
-            LENGTH(ov.body::jsonb -> 'value' ->> 'body')
-        FROM hive.operations_view ov
-        JOIN hafd.blocks b ON b.num = ov.block_num
+            LENGTH(ov.body_value ->> 'body')
+        FROM hafd.operations ov
+        JOIN hafd.blocks b ON b.num = hafd.operation_id_to_block_num(ov.id)
         -- Parse json_metadata once per row via a lateral subquery
         CROSS JOIN LATERAL (
             SELECT haf_fyp_app.safe_parse_json(
-                ov.body::jsonb -> 'value' ->> 'json_metadata'
+                ov.body_value ->> 'json_metadata'
             ) AS parsed
         ) meta
-        WHERE ov.block_num BETWEEN _first_block AND _last_block
+        WHERE hafd.operation_id_to_block_num(ov.id) BETWEEN _first_block AND _last_block
           AND ov.op_type_id = _comment_op_id
-          AND ov.body::jsonb -> 'value' ->> 'parent_author' = ''
+          AND ov.body_value ->> 'parent_author' = ''
         ON CONFLICT (author, permlink) DO NOTHING
         RETURNING post_id, author, permlink
     ),
