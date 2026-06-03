@@ -105,6 +105,28 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.user_profile_vectors (
 );
 
 -- ---------------------------------------------------------------------------
+-- User interactions — incremental record of each user's votes/reblogs on
+-- tracked posts, populated by process_interactions as blocks are processed.
+-- Replaces the per-cycle scan of hive.account_operations_view in the ranker:
+-- building a user's interest vector becomes an indexed lookup of a few rows
+-- instead of re-parsing thousands of raw operations every cycle. Deduplicated
+-- to one row per (user, post); the strongest action (reblog > vote) wins.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS haf_fyp_app.user_interactions (
+    username varchar(16) NOT NULL,
+    post_id bigint NOT NULL,
+    action_weight real NOT NULL,     -- 1.0 vote, 1.5 reblog
+    created_at timestamp NOT NULL,   -- block time of the interaction
+    block_num int NOT NULL,
+    PRIMARY KEY (username, post_id)
+);
+
+-- Lookup pattern: most-recent interactions for one user within a time window.
+CREATE INDEX IF NOT EXISTS idx_user_interactions_user_time
+ON haf_fyp_app.user_interactions (username, created_at DESC);
+
+-- ---------------------------------------------------------------------------
 -- Feed cache — precomputed ranked feeds (personalized)
 -- ---------------------------------------------------------------------------
 

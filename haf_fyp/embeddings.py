@@ -103,74 +103,37 @@ def fetch_user_interactions(
 ) -> list[tuple[int, float, float]]:
     """
     Return (post_id, action_weight, age_days) for the user's recent interactions
-    with indexed posts: votes = 1.0×, reblogs = 1.5×.
+    with tracked posts: votes = 1.0×, reblogs = 1.5×.
 
-    Driven by hive.account_operations_view, which is indexed by account_id, so we
-    seek directly to this account's vote/custom_json operations in the lookback
-    window rather than scanning all of hive.operations_view (the latter is far too
-    slow per user). The operation body is then joined in by operation_id to apply
-    the voter / reblogger predicates and resolve the target post's (author,
-    permlink) against haf_fyp_app.post_lookup.
+    Reads the incremental haf_fyp_app.user_interactions table (populated by the
+    process_interactions block processor) via the (username, created_at) index —
+    a cheap per-user lookup rather than scanning raw operations. This is what
+    makes per-user scoring fast enough to run at scale.
+
+    "Recent" is measured relative to the user's own latest recorded interaction,
+    not wall-clock now, so the signal still works while the app is backfilling
+    historical blocks (interaction times then trail real time by years). age_days
+    is likewise computed against that reference, so the user's most recent actions
+    decay from ~0.
     """
     with conn.cursor() as cur:
-        # Operation type ids come from hafd.operation_types, whose names carry
-        # the 'hive::protocol::' prefix (e.g. hive::protocol::vote_operation).
         cur.execute(
             """
-            SELECT name, id FROM hafd.operation_types
-             WHERE name IN ('hive::protocol::vote_operation',
-                            'hive::protocol::custom_json_operation')
-            """
-        )
-        op_ids = {name.rsplit("::", 1)[-1]: op_id for name, op_id in cur.fetchall()}
-        vote_op_id = op_ids["vote_operation"]
-        cj_op_id = op_ids["custom_json_operation"]
-
-        cur.execute(
-            f"""
-            WITH usr AS (
-                SELECT id FROM hafd.accounts WHERE name = %(username)s
-            ),
-            min_block AS (
-                SELECT COALESCE(MIN(num), 0) AS num
-                  FROM hafd.blocks
-                 WHERE created_at >= NOW() - INTERVAL '{lookback_days} days'
+            WITH ref AS (
+                SELECT MAX(created_at) AS now_ts
+                  FROM haf_fyp_app.user_interactions
+                 WHERE username = %(username)s
             )
             SELECT
-                pl.post_id,
-                CASE ao.op_type_id
-                    WHEN %(vote_op_id)s THEN 1.0
-                    ELSE 1.5
-                END AS action_weight,
-                EXTRACT(EPOCH FROM (NOW() - b.created_at)) / 86400.0 AS age_days
-            FROM hive.account_operations_view ao
-            JOIN usr ON usr.id = ao.account_id
-            JOIN hive.operations_view ov ON ov.id = ao.operation_id
-            JOIN hafd.blocks b ON b.num = ao.block_num
-            JOIN haf_fyp_app.post_lookup pl
-                ON  pl.author    = ov.body -> 'value' ->> 'author'
-                AND pl.permlink  = ov.body -> 'value' ->> 'permlink'
-            WHERE ao.op_type_id IN (%(vote_op_id)s, %(cj_op_id)s)
-              AND ao.block_num >= (SELECT num FROM min_block)
-              AND (
-                    (ao.op_type_id = %(vote_op_id)s
-                     AND ov.body -> 'value' ->> 'voter' = %(username)s)
-                 OR (ao.op_type_id = %(cj_op_id)s
-                     AND ov.body -> 'value' ->> 'id' = 'reblog'
-                     AND haf_fyp_app.safe_parse_json(
-                             ov.body -> 'value' ->> 'json'
-                         ) ->> 0 = 'reblog'
-                     AND ov.body -> 'value'
-                             -> 'required_posting_auths' ->> 0 = %(username)s)
-              )
-            ORDER BY b.created_at DESC
+                ui.post_id,
+                ui.action_weight,
+                EXTRACT(EPOCH FROM ((SELECT now_ts FROM ref) - ui.created_at)) / 86400.0 AS age_days
+            FROM haf_fyp_app.user_interactions ui
+            WHERE ui.username = %(username)s
+              AND ui.created_at >= (SELECT now_ts FROM ref) - make_interval(days => %(days)s)
+            ORDER BY ui.created_at DESC
             LIMIT %(limit)s
             """,
-            {
-                "vote_op_id": vote_op_id,
-                "cj_op_id": cj_op_id,
-                "username": username,
-                "limit": limit,
-            },
+            {"username": username, "days": lookback_days, "limit": limit},
         )
         return cur.fetchall()

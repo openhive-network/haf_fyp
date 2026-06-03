@@ -99,26 +99,11 @@ BEGIN
 END
 $$;
 
--- hafd is HAF core — accessible to haf_fyp_owner by default but
--- haf_fyp_user (Python ranker) also needs:
---   accounts        — name → id joins (credibility)
---   operation_types — resolve vote/custom_json op type ids (user interactions)
---   blocks          — block timestamps for the interaction lookback window
+-- hafd is HAF core — accessible to haf_fyp_owner by default but the Python
+-- ranker (haf_fyp_user) also needs hafd.accounts for name → id joins in the
+-- credibility query. The per-user interest signal now comes from the
+-- haf_fyp_app.user_interactions table (populated by process_interactions), so
+-- the ranker no longer reads hive.* or hafd operation_types/blocks directly —
+-- those are used only by the block processor, which runs as haf_fyp_owner.
 GRANT USAGE ON SCHEMA hafd TO haf_fyp_user;
-GRANT SELECT ON hafd.accounts, hafd.operation_types, hafd.blocks TO haf_fyp_user;
-
--- The per-user interest vector is built by scanning the user's recent votes and
--- reblogs from hive.operations_view (see fetch_user_interactions), so the ranker
--- needs read access to the HAF fork-manager API schema.
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.schemata WHERE schema_name = 'hive'
-    ) THEN
-        GRANT USAGE ON SCHEMA hive TO haf_fyp_user;
-        GRANT SELECT ON hive.operations_view TO haf_fyp_user;
-        GRANT SELECT ON hive.account_operations_view TO haf_fyp_user;
-        RAISE NOTICE 'hive: granted USAGE + operations/account_operations_view SELECT to haf_fyp_user';
-    END IF;
-END
-$$;
+GRANT SELECT ON hafd.accounts TO haf_fyp_user;
