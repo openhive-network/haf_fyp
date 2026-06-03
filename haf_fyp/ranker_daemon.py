@@ -204,21 +204,32 @@ def _fetch_author_credibility_safe(conn, authors: list[str]) -> dict:
 
 def _fetch_personalised_users(conn, limit: int) -> list[str]:
     """
-    Users for the scheduled cycle to refresh: those who already have a cached
-    feed, oldest-first, capped at `limit`.
+    Users for the scheduled cycle to (re)compute: accounts that have actually
+    interacted (so personalization has signal to work with), prioritising those
+    with no cached feed yet, then the stalest. Capped at `limit` so each pass is
+    bounded; over successive cycles this both bootstraps new active users and
+    keeps existing feeds fresh.
 
-    New users are not bulk-precomputed here — they enter the cache on demand the
-    first time they save interests (which fires a Redis force-refresh handled by
-    _run_targeted_refresh). This keeps each scheduled pass bounded regardless of
-    how many accounts have ever subscribed to a community.
+    Because per-user scoring is now cheap (an indexed user_interactions lookup,
+    not a raw-operation scan), this can run for a meaningful number of users per
+    cycle without starving core block processing.
+
+    NOTE: the DISTINCT over user_interactions is a full scan; fine at current
+    size, but as the table grows this should be bounded (e.g. recent activity
+    only, a maintained active-users set, or pruning interactions outside the
+    lookback window).
     """
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT username
-              FROM haf_fyp_app.feed_cache
-             GROUP BY username
-             ORDER BY MIN(computed_at) ASC
+            SELECT u.username
+              FROM (SELECT DISTINCT username FROM haf_fyp_app.user_interactions) u
+              LEFT JOIN (
+                    SELECT username, MIN(computed_at) AS computed_at
+                      FROM haf_fyp_app.feed_cache
+                     GROUP BY username
+              ) fc USING (username)
+             ORDER BY fc.computed_at ASC NULLS FIRST
              LIMIT %s
             """,
             (limit,),
