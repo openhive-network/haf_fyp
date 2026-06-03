@@ -92,7 +92,7 @@ def build_user_profile_vector(
     conn, username: str, post_vectors: dict, lookback_days: int = 90
 ) -> tuple:
     """
-    Build a 384-dim L2-normalised interest vector from the user's recent
+    Build a 1024-dim L2-normalised interest vector from the user's recent
     votes (1.0×) and reblogs (1.5×), weighted by 0.95^age_days time decay.
 
     Returns (vector: np.ndarray, posts_sampled: int) or (None, 0) if the

@@ -91,12 +91,13 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.engagement_metrics (
 );
 
 -- ---------------------------------------------------------------------------
--- User profile vectors — per-user 384-dim interest vector (pgvector)
+-- User profile vectors — per-user 1024-dim interest vector (pgvector)
+-- Dimension matches HiveSense embeddings (hivesense_app.posts_vectors, halfvec(1024)).
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.user_profile_vectors (
     username varchar(16) NOT NULL,
-    interest_vector vector(384),
+    interest_vector vector(1024),
     posts_sampled int NOT NULL DEFAULT 0,
     communities int [],
     updated_at timestamp,
@@ -189,3 +190,12 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.algorithm_versions (
 
 GRANT SELECT ON ALL TABLES IN SCHEMA haf_fyp_app TO haf_fyp_user;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA haf_fyp_endpoints TO haf_fyp_user;
+
+-- The Python ranker daemon runs as haf_fyp_user and writes the precomputed
+-- feed caches and per-user interest vectors. Block processing (post_candidates,
+-- engagement_metrics, etc.) is owned by haf_fyp_owner and remains read-only here.
+GRANT INSERT, UPDATE, DELETE ON
+    haf_fyp_app.global_feed_cache,
+    haf_fyp_app.feed_cache,
+    haf_fyp_app.user_profile_vectors
+TO haf_fyp_user;

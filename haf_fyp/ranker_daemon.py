@@ -55,6 +55,15 @@ CYCLE_SECONDS = 300
 POLL_SECONDS = 5
 CANDIDATE_LIMIT = 5000
 
+# Personalized feeds are computed on demand, not bulk-precomputed for every
+# account that ever subscribed to a community (there can be tens of thousands,
+# and per-user scoring is not free). A user enters the cache the first time they
+# save interests, which fires a Redis force-refresh handled by
+# _run_targeted_refresh. The scheduled cycle then only keeps already-cached
+# (i.e. active) users fresh, oldest-first, capped at MAX_USERS_PER_CYCLE so each
+# pass stays bounded no matter how large the subscriber base grows.
+MAX_USERS_PER_CYCLE = int(os.environ.get("MAX_USERS_PER_CYCLE", "200"))
+
 _refresh_queue: queue.Queue[str] = queue.Queue()
 
 
@@ -153,15 +162,66 @@ def _fetch_candidates(conn) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _fetch_personalised_users(conn) -> list[str]:
-    """All users who have either on-chain subscriptions or declared interests."""
+def _fetch_post_vectors_safe(conn, post_ids: list[int]) -> dict:
+    """
+    Fetch semantic embeddings, degrading gracefully on failure.
+
+    Semantic relevance is one of four signals; if it can't be fetched (e.g.
+    HiveSense/hivemind not yet caught up, a transient query error), the cycle
+    must still produce a feed from recency/engagement/credibility rather than
+    aborting. On any non-connection error we roll back the poisoned transaction
+    and return {} (relevance scored as neutral 0.5). OperationalError is left to
+    propagate so the main loop can reconnect.
+    """
+    try:
+        return fetch_post_vectors(conn, post_ids)
+    except psycopg2.OperationalError:
+        raise
+    except Exception:
+        log.exception("embedding fetch failed — continuing with relevance disabled")
+        conn.rollback()
+        return {}
+
+
+def _fetch_author_credibility_safe(conn, authors: list[str]) -> dict:
+    """
+    Fetch author credibility, degrading gracefully on failure.
+
+    Like the embedding fetch, credibility is one signal of four; scoring already
+    defaults missing authors to a neutral value, so a query failure must not
+    abort the cycle. Roll back the poisoned transaction and return {} on any
+    non-connection error; let OperationalError propagate to the reconnect path.
+    """
+    try:
+        return fetch_author_credibility(conn, authors)
+    except psycopg2.OperationalError:
+        raise
+    except Exception:
+        log.exception("credibility fetch failed — continuing with neutral credibility")
+        conn.rollback()
+        return {}
+
+
+def _fetch_personalised_users(conn, limit: int) -> list[str]:
+    """
+    Users for the scheduled cycle to refresh: those who already have a cached
+    feed, oldest-first, capped at `limit`.
+
+    New users are not bulk-precomputed here — they enter the cache on demand the
+    first time they save interests (which fires a Redis force-refresh handled by
+    _run_targeted_refresh). This keeps each scheduled pass bounded regardless of
+    how many accounts have ever subscribed to a community.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT username FROM haf_fyp_app.user_communities
-            UNION
-            SELECT username FROM haf_fyp_app.user_interests
-            """
+            SELECT username
+              FROM haf_fyp_app.feed_cache
+             GROUP BY username
+             ORDER BY MIN(computed_at) ASC
+             LIMIT %s
+            """,
+            (limit,),
         )
         return [r[0] for r in cur.fetchall()]
 
@@ -216,13 +276,13 @@ def run_cycle(conn) -> None:
     log.info("scoring %d candidates (algo %s)", len(candidates), algo_version)
 
     post_ids = candidates["post_id"].tolist()
-    post_vectors = fetch_post_vectors(conn, post_ids)
+    post_vectors = _fetch_post_vectors_safe(conn, post_ids)
     log.info(
         "embeddings available for %d / %d candidates", len(post_vectors), len(post_ids)
     )
 
     authors = candidates["author"].unique().tolist()
-    author_credibility = fetch_author_credibility(conn, authors)
+    author_credibility = _fetch_author_credibility_safe(conn, authors)
     log.info(
         "credibility scores for %d / %d authors", len(author_credibility), len(authors)
     )
@@ -239,12 +299,24 @@ def run_cycle(conn) -> None:
     write_global_feed_cache(conn, global_scored, algo_version)
     log.info("global feed written (%d posts)", min(len(global_scored), 200))
 
-    users = _fetch_personalised_users(conn)
+    users = _fetch_personalised_users(conn, MAX_USERS_PER_CYCLE)
+    processed = failed = 0
     for username in users:
-        _rank_user(conn, username, candidates, post_vectors, author_credibility, algo_version, weights)
+        try:
+            _rank_user(conn, username, candidates, post_vectors, author_credibility, algo_version, weights)
+            processed += 1
+        except psycopg2.OperationalError:
+            raise
+        except Exception:
+            conn.rollback()
+            failed += 1
+            log.exception("failed to rank user %s — skipping", username)
 
     if users:
-        log.info("personalized feeds written for %d users", len(users))
+        log.info(
+            "refreshed personalized feeds for %d/%d cached users (%d failed)",
+            processed, len(users), failed,
+        )
 
 
 def _run_targeted_refresh(conn, usernames: set[str]) -> None:
@@ -262,13 +334,19 @@ def _run_targeted_refresh(conn, usernames: set[str]) -> None:
         return
 
     post_ids = candidates["post_id"].tolist()
-    post_vectors = fetch_post_vectors(conn, post_ids)
+    post_vectors = _fetch_post_vectors_safe(conn, post_ids)
     authors = candidates["author"].unique().tolist()
-    author_credibility = fetch_author_credibility(conn, authors)
+    author_credibility = _fetch_author_credibility_safe(conn, authors)
 
     for username in usernames:
-        _rank_user(conn, username, candidates, post_vectors, author_credibility, algo_version, weights)
-        log.info("force-refresh complete for %s", username)
+        try:
+            _rank_user(conn, username, candidates, post_vectors, author_credibility, algo_version, weights)
+            log.info("force-refresh complete for %s", username)
+        except psycopg2.OperationalError:
+            raise
+        except Exception:
+            conn.rollback()
+            log.exception("force-refresh failed for %s — skipping", username)
 
 
 def main() -> None:

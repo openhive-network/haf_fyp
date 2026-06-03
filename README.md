@@ -59,7 +59,8 @@ The ranker degrades gracefully without these — relevance defaults to 0.5 and c
 
 | App | Provides | Degrades to |
 |-----|----------|-------------|
-| [HiveSense](https://gitlab.syncad.com/hive/hivesense) | 384-dim post embeddings (`hivesense_app.posts_vectors`) | relevance = 0.5 neutral |
+| [HiveSense](https://gitlab.syncad.com/hive/hivesense) | 1024-dim post embeddings (`hivesense_app.posts_vectors`, halfvec; keyed by hivemind post id) | relevance = 0.5 neutral |
+| [Hivemind](https://gitlab.syncad.com/hive/hivemind) | `(author, permlink)` → hivemind post id, the bridge to HiveSense embeddings (`hivemind_app.hive_posts`) | relevance = 0.5 neutral |
 | [reputation_tracker](https://gitlab.syncad.com/hive/reputation_tracker) | Per-account reputation scores (`reptracker_app.account_reputations`) | credibility = 0.3 neutral |
 | [balance_tracker](https://gitlab.syncad.com/hive/balance_tracker) | Per-account VESTS stake (`btracker_app.current_account_balances`) | credibility = 0.3 neutral |
 
@@ -145,7 +146,7 @@ if post.community_id ∈ user_subscribed_communities:
 
 | Signal | Range | Source |
 |--------|-------|--------|
-| `relevance` | [0, 1] | Cosine similarity: post embedding vs user interest vector (HiveSense 384-dim) |
+| `relevance` | [0, 1] | Cosine similarity: post embedding vs user interest vector (HiveSense 1024-dim) |
 | `recency` | [0, 1] | `exp(−ln2 × age_hours / 24)` — 24-hour half-life |
 | `engagement` | [0, 1] | Sigmoid-normalised unique commenters + reblogs + net rshares |
 | `credibility` | [0, 1] | 0.6 × normalised reputation + 0.4 × log-normalised VESTS |
@@ -169,7 +170,7 @@ haf_fyp_app
 ├── post_lookup           — (author, permlink) index for processor joins
 ├── post_commenters       — unique commenter pairs per post
 ├── engagement_metrics    — comment/reblog/vote counts, net rshares
-├── user_profile_vectors  — 384-dim interest vector per user (pgvector)
+├── user_profile_vectors  — 1024-dim interest vector per user (pgvector)
 ├── feed_cache            — precomputed top-200 ranked feeds
 ├── global_feed_cache     — unauthenticated global feed
 ├── user_communities      — on-chain community subscriptions
@@ -199,9 +200,10 @@ Before going live:
 - [ ] `FYP_ADMIN_API_KEY` set to a strong random value in `docker/.env.local`
 - [ ] `HAF_VERSION` pinned to a specific release tag (not `latest`)
 - [ ] HiveSense installed and synced → `grant_cross_schema.sh` re-run
+- [ ] Hivemind installed and synced (provides the (author, permlink) → hivemind post id bridge) → `grant_cross_schema.sh` re-run
 - [ ] balance_tracker installed and synced → `grant_cross_schema.sh` re-run
 - [ ] reputation_tracker installed and synced → `grant_cross_schema.sh` re-run
-- [ ] Verify `hivesense_app.posts_vectors` column name on live instance: `\d hivesense_app.posts_vectors` (expected: `embedding VECTOR(384)`)
+- [ ] Verify `hivesense_app.posts_vectors` on live instance: `\d hivesense_app.posts_vectors` (expected: `embedding halfvec(1024)`, keyed by hivemind post id, one row per chunk)
 - [ ] Smoke test all endpoints after first ranker cycle completes
 
 ## Development Phases
@@ -213,7 +215,7 @@ Before going live:
 | **3 — Engagement tracking** | ✅ | `process_engagement.sql` — comments, reblogs, votes, payout windows |
 | **4 — Community sync** | ✅ | `process_communities.sql` — subscribe/unsubscribe from custom_json |
 | **5 — Python ranker** | ✅ | `scoring.py` — recency + engagement scoring, feed_cache writes |
-| **6 — HiveSense** | ✅ | Semantic relevance via pgvector embeddings (384-dim, `posts_vectors`) |
+| **6 — HiveSense** | ✅ | Semantic relevance via pgvector embeddings (1024-dim halfvec, `posts_vectors`, bridged through hivemind post id) |
 | **7 — Credibility** | ✅ | btracker VESTS + reptracker reputation, cross-schema reads |
 | **8 — Cold start** | ✅ | Interest picker, `POST /v1/fyp/interests`, vector bootstrap chain |
 | **9 — Production** | ✅ | Rate limiting, score explainer, algorithm governance |
@@ -224,7 +226,7 @@ Before going live:
 |------|--------|-------|
 | T-0.3 — HAF sync loop API | ✅ Resolved | Correct function is `hive.app_next_block()` returning `hive.blocks_range`; `hive.app_next_iteration` does not exist |
 | T-0.7 — community custom_json format | ✅ Resolved | Double-encoded JSON array `["subscribe", {"community": "hive-NNNNNN"}]`; account from `required_posting_auths[0]` |
-| T-0.1 — HiveSense table and column names | ⚠️ Needs live check | Assumed `hivesense_app.posts_vectors.embedding VECTOR(384)`; verify with `\d hivesense_app.posts_vectors` on a live instance before first run |
+| T-0.1 — HiveSense table and column names | ✅ Resolved | Live: `hivesense_app.posts_vectors.embedding halfvec(1024)`, keyed by **hivemind post id** (`hive_posts.id`), one row per chunk. haf_fyp's own post_id keyspace does not overlap, so the ranker bridges via (author, permlink) → hivemind → hivesense and averages chunks |
 
 ## Running Tests
 
