@@ -194,8 +194,6 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA haf_fyp_endpoints TO haf_fyp_user;
 -- The Python ranker daemon runs as haf_fyp_user and writes the precomputed
 -- feed caches and per-user interest vectors. Block processing (post_candidates,
 -- engagement_metrics, etc.) is owned by haf_fyp_owner and remains read-only here.
-GRANT INSERT, UPDATE, DELETE ON
-    haf_fyp_app.global_feed_cache,
-    haf_fyp_app.feed_cache,
-    haf_fyp_app.user_profile_vectors
-TO haf_fyp_user;
+GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.global_feed_cache TO haf_fyp_user;
+GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.feed_cache TO haf_fyp_user;
+GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.user_profile_vectors TO haf_fyp_user;

@@ -128,6 +128,7 @@ def fetch_author_credibility(conn, authors: list[str]) -> dict[str, float]:
 
     # The relation name comes from a fixed allowlist (_BALANCE_CANDIDATES), never
     # user input, so interpolating it into the query text is safe.
+    params: tuple[object, ...]
     if balance_rel:
         query = f"""
             SELECT
