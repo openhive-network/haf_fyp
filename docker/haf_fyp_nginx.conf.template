@@ -1,0 +1,45 @@
+# nginx config for the haf_fyp PostgREST URL rewriter.
+# Provides clean REST URLs (e.g. /v1/fyp/feed/{username}) that map to PostgREST /rpc/ calls,
+# per the rewrite rules generated from the OpenAPI annotations (endpoints/rewrite_rules.conf).
+# Placeholders (${...}) are substituted at startup by docker/rewriter_entrypoint.sh.
+# Note: this fronts only the PostgREST feed/read API (haf_fyp_endpoints). The FastAPI admin
+# service (haf-fyp-api) is exposed separately and is not proxied here.
+worker_processes  2;
+error_log /dev/stdout info;
+worker_rlimit_nofile 8192;
+
+events {
+  worker_connections 4096;
+}
+
+http {
+    access_log /dev/stdout;
+
+    server {
+        listen 0.0.0.0:80 default_server;
+        server_name _;
+
+        location / {
+            include rewrite_rules.conf;
+            # ${REWRITE_LOG} is replaced by the entrypoint (rewrite logging on/off).
+            ${REWRITE_LOG}
+
+            proxy_pass http://${POSTGREST_HOST}:${POSTGREST_PORT};
+
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_hide_header Content-Location;
+            proxy_set_header Connection "";
+            proxy_http_version 1.1;
+        }
+    }
+
+    # lightweight health endpoint for container/orchestrator checks
+    server {
+        listen 0.0.0.0:81;
+        location /health {
+            return 204;
+        }
+    }
+}
