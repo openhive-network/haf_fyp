@@ -73,9 +73,6 @@ schemas:
       computed_at:
         type: string
         format: date-time
-      personalized:
-        type: boolean
-        description: True if this row is from the user's own computed feed; false if it is the global fallback
  */
 
 -- ---------------------------------------------------------------------------
@@ -190,10 +187,6 @@ AS $func$
           "computed_at": {
             "type": "string",
             "format": "date-time"
-          },
-          "personalized": {
-            "type": "boolean",
-            "description": "True if this row is from the user's own computed feed; false if it is the global fallback"
           }
         }
       }
@@ -863,8 +856,7 @@ AS $$
         fc.community_boost_applied,
         fc.rank,
         fc.algorithm_version,
-        fc.computed_at,
-        TRUE AS personalized
+        fc.computed_at
     FROM haf_fyp_app.feed_cache fc
     JOIN haf_fyp_app.post_candidates pc ON pc.post_id = fc.post_id
     WHERE fc.username = get_personalized_feed.username
@@ -888,8 +880,7 @@ AS $$
         FALSE AS community_boost_applied,
         gfc.rank,
         NULL::varchar(16) AS algorithm_version,
-        gfc.computed_at,
-        FALSE AS personalized
+        gfc.computed_at
     FROM haf_fyp_app.global_feed_cache gfc
     JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
     WHERE NOT (SELECT yes FROM has_personal)
@@ -967,8 +958,7 @@ AS $$
         FALSE AS community_boost_applied,
         gfc.rank,
         NULL::varchar(16) AS algorithm_version,
-        gfc.computed_at,
-        FALSE AS personalized
+        gfc.computed_at
     FROM haf_fyp_app.global_feed_cache gfc
     JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
     WHERE (get_global_feed.community_id IS NULL OR pc.community_id = get_global_feed.community_id)
