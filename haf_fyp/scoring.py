@@ -184,46 +184,51 @@ def read_user_vector(conn, username: str) -> tuple:
     return np.array(row[0], dtype=np.float32), int(row[1])
 
 
+def fetch_top_communities(conn, username: str, limit: int = 5) -> list[int]:
+    """
+    The user's top communities by engagement — the communities of the posts they
+    interacted with, most-interacted first. Used both for the profile's
+    top_communities and for the engaged tier of the community boost.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT pc.community_id
+            FROM haf_fyp_app.user_interactions ui
+            JOIN haf_fyp_app.post_candidates pc ON pc.post_id = ui.post_id
+            WHERE ui.username = %s
+              AND pc.community_id IS NOT NULL
+            GROUP BY pc.community_id
+            ORDER BY COUNT(*) DESC
+            LIMIT %s
+            """,
+            (username, limit),
+        )
+        return [int(r[0]) for r in cur.fetchall()]
+
+
 def write_user_vector(
-    conn, username: str, vector: np.ndarray, posts_sampled: int
+    conn, username: str, vector: np.ndarray, posts_sampled: int, communities: list[int]
 ) -> None:
     """
-    Upsert a user interest vector into user_profile_vectors.
-
-    Also records the user's top communities by engagement — the communities of
-    the posts they interacted with, most-interacted first — so the profile's
-    top_communities reflects actual behaviour (distinct from on-chain follows,
-    which live in user_communities).
+    Upsert a user interest vector into user_profile_vectors, recording the user's
+    top engaged communities (see fetch_top_communities) so the profile's
+    top_communities reflects actual behaviour — distinct from on-chain follows,
+    which live in user_communities.
     """
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO haf_fyp_app.user_profile_vectors
                 (username, interest_vector, posts_sampled, communities, updated_at)
-            VALUES (
-                %(username)s, %(vector)s, %(sampled)s,
-                (
-                    SELECT array_agg(community_id ORDER BY cnt DESC)
-                    FROM (
-                        SELECT pc.community_id, COUNT(*) AS cnt
-                        FROM haf_fyp_app.user_interactions ui
-                        JOIN haf_fyp_app.post_candidates pc ON pc.post_id = ui.post_id
-                        WHERE ui.username = %(username)s
-                          AND pc.community_id IS NOT NULL
-                        GROUP BY pc.community_id
-                        ORDER BY cnt DESC
-                        LIMIT 5
-                    ) top
-                ),
-                NOW()
-            )
+            VALUES (%s, %s, %s, %s, NOW())
             ON CONFLICT (username) DO UPDATE SET
                 interest_vector = EXCLUDED.interest_vector,
                 posts_sampled   = EXCLUDED.posts_sampled,
                 communities     = EXCLUDED.communities,
                 updated_at      = NOW()
             """,
-            {"username": username, "vector": vector.tolist(), "sampled": posts_sampled},
+            (username, vector.tolist(), posts_sampled, communities or None),
         )
     conn.commit()
 
@@ -253,7 +258,8 @@ def compute_scores(
     user_vector,
     post_vectors: dict,
     author_credibility: dict,
-    user_communities: set,
+    subscribed_communities: set,
+    engaged_communities: set,
     algorithm_weights: dict,
 ) -> pd.DataFrame:
     """
@@ -262,14 +268,19 @@ def compute_scores(
     Cold-start (user_vector is None): relevance is dropped and the remaining
     three weights are renormalised to sum to 1.0.
 
-    Community boost is applied post-sum:
-        final_score = min(1.0, final_score * (1 + community_boost))
+    Tiered community boost applied post-sum (subscribed wins over engaged; not
+    additive):
+        subscribed/declared community  -> final_score *= (1 + community_boost)
+        engaged community (top by interaction), not subscribed
+                                       -> final_score *= (1 + community_boost_engaged)
+    Each boosted post records boost_source = 'subscribed' | 'engaged' (NULL if none).
     """
     w_v = algorithm_weights.get("relevance", 0.40)
     w_r = algorithm_weights.get("recency", 0.30)
     w_e = algorithm_weights.get("engagement", 0.20)
     w_c = algorithm_weights.get("credibility", 0.10)
-    boost = algorithm_weights.get("community_boost", 0.20)
+    boost_sub = algorithm_weights.get("community_boost", 0.20)
+    boost_eng = algorithm_weights.get("community_boost_engaged", 0.10)
 
     if user_vector is None:
         total = w_r + w_e + w_c
@@ -289,12 +300,28 @@ def compute_scores(
     )
 
     df["community_boost_applied"] = False
-    if user_communities:
-        mask = df["community_id"].isin(user_communities)
-        df.loc[mask, "final_score"] = (
-            df.loc[mask, "final_score"] * (1.0 + boost)
-        ).clip(upper=1.0)
-        df.loc[mask, "community_boost_applied"] = True
+    df["boost_source"] = None
+    # Subscribed/declared communities take precedence; engaged-but-not-subscribed
+    # get the smaller boost. A post is never boosted by both tiers.
+    sub_mask = (
+        df["community_id"].isin(subscribed_communities)
+        if subscribed_communities
+        else pd.Series(False, index=df.index)
+    )
+    eng_mask = (
+        df["community_id"].isin(engaged_communities)
+        if engaged_communities
+        else pd.Series(False, index=df.index)
+    ) & ~sub_mask
+
+    for mask, factor, source in (
+        (sub_mask, 1.0 + boost_sub, "subscribed"),
+        (eng_mask, 1.0 + boost_eng, "engaged"),
+    ):
+        if mask.any():
+            df.loc[mask, "final_score"] = (df.loc[mask, "final_score"] * factor).clip(upper=1.0)
+            df.loc[mask, "community_boost_applied"] = True
+            df.loc[mask, "boost_source"] = source
 
     return df.sort_values("final_score", ascending=False).reset_index(drop=True)
 
@@ -315,6 +342,7 @@ def write_feed_cache(
             float(row.score_credibility),
             float(row.score_relevance),
             bool(row.community_boost_applied),
+            row.boost_source,
             rank + 1,
             algo_version,
             now,
@@ -331,7 +359,7 @@ def write_feed_cache(
             INSERT INTO haf_fyp_app.feed_cache
                 (username, post_id, final_score, score_engagement, score_recency,
                  score_credibility, score_relevance, community_boost_applied,
-                 rank, algorithm_version, computed_at)
+                 boost_source, rank, algorithm_version, computed_at)
             VALUES %s
             """,
             rows,

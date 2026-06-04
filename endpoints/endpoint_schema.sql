@@ -65,6 +65,10 @@ schemas:
         type: number
       community_boost_applied:
         type: boolean
+      boost_source:
+        type: string
+        nullable: true
+        description: Which tier applied the community boost - 'subscribed', 'engaged', or null
       rank:
         type: integer
         description: Position in the feed (1-based)
@@ -176,6 +180,11 @@ AS $func$
           },
           "community_boost_applied": {
             "type": "boolean"
+          },
+          "boost_source": {
+            "type": "string",
+            "nullable": true,
+            "description": "Which tier applied the community boost - 'subscribed', 'engaged', or null"
           },
           "rank": {
             "type": "integer",
@@ -546,7 +555,7 @@ AS $func$
             "content": {
               "application/json": {
                 "schema": {
-                  "x-sql-datatype": "TABLE(post_id bigint, author varchar(16), permlink varchar(256), title text, final_score float, score_relevance float, score_recency float, score_engagement float, score_credibility float, community_boost_applied boolean, rank int, algorithm_version varchar(16), algorithm_weights jsonb, computed_at timestamp)",
+                  "x-sql-datatype": "TABLE(post_id bigint, author varchar(16), permlink varchar(256), title text, final_score float, score_relevance float, score_recency float, score_engagement float, score_credibility float, community_boost_applied boolean, boost_source varchar(16), rank int, algorithm_version varchar(16), algorithm_weights jsonb, computed_at timestamp)",
                   "type": "object",
                   "properties": {
                     "post_id": {
@@ -578,6 +587,11 @@ AS $func$
                     },
                     "community_boost_applied": {
                       "type": "boolean"
+                    },
+                    "boost_source": {
+                      "type": "string",
+                      "nullable": true,
+                      "description": "Which tier applied the community boost - 'subscribed', 'engaged', or null"
                     },
                     "rank": {
                       "type": "integer"
@@ -854,6 +868,7 @@ AS $$
         fc.score_credibility,
         fc.score_relevance,
         fc.community_boost_applied,
+        fc.boost_source,
         fc.rank,
         fc.algorithm_version,
         fc.computed_at
@@ -878,6 +893,7 @@ AS $$
         gfc.score_credibility,
         NULL::float AS score_relevance,
         FALSE AS community_boost_applied,
+        NULL::varchar(16) AS boost_source,
         gfc.rank,
         NULL::varchar(16) AS algorithm_version,
         gfc.computed_at
@@ -956,6 +972,7 @@ AS $$
         gfc.score_credibility,
         NULL::float AS score_relevance,
         FALSE AS community_boost_applied,
+        NULL::varchar(16) AS boost_source,
         gfc.rank,
         NULL::varchar(16) AS algorithm_version,
         gfc.computed_at
@@ -1072,7 +1089,7 @@ $$;
         content:
           application/json:
             schema:
-              x-sql-datatype: "TABLE(post_id bigint, author varchar(16), permlink varchar(256), title text, final_score float, score_relevance float, score_recency float, score_engagement float, score_credibility float, community_boost_applied boolean, rank int, algorithm_version varchar(16), algorithm_weights jsonb, computed_at timestamp)"
+              x-sql-datatype: "TABLE(post_id bigint, author varchar(16), permlink varchar(256), title text, final_score float, score_relevance float, score_recency float, score_engagement float, score_credibility float, community_boost_applied boolean, boost_source varchar(16), rank int, algorithm_version varchar(16), algorithm_weights jsonb, computed_at timestamp)"
               type: object
               properties:
                 post_id:
@@ -1095,6 +1112,10 @@ $$;
                   type: number
                 community_boost_applied:
                   type: boolean
+                boost_source:
+                  type: string
+                  nullable: true
+                  description: Which tier applied the community boost - 'subscribed', 'engaged', or null
                 rank:
                   type: integer
                 algorithm_version:
@@ -1112,7 +1133,7 @@ CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_score_explanation(
     "username" TEXT,
     "post_id" BIGINT
 )
-RETURNS TABLE(post_id bigint, author varchar(16), permlink varchar(256), title text, final_score float, score_relevance float, score_recency float, score_engagement float, score_credibility float, community_boost_applied boolean, rank int, algorithm_version varchar(16), algorithm_weights jsonb, computed_at timestamp) 
+RETURNS TABLE(post_id bigint, author varchar(16), permlink varchar(256), title text, final_score float, score_relevance float, score_recency float, score_engagement float, score_credibility float, community_boost_applied boolean, boost_source varchar(16), rank int, algorithm_version varchar(16), algorithm_weights jsonb, computed_at timestamp) 
 -- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
@@ -1127,6 +1148,7 @@ AS $$
         fc.score_engagement,
         fc.score_credibility,
         fc.community_boost_applied,
+        fc.boost_source,
         fc.rank,
         fc.algorithm_version,
         av.weights AS algorithm_weights,
