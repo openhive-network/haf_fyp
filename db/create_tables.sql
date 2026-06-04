@@ -91,15 +91,53 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.engagement_metrics (
 );
 
 -- ---------------------------------------------------------------------------
--- User profile vectors — per-user 384-dim interest vector (pgvector)
+-- User profile vectors — per-user 1024-dim interest vector (pgvector)
+-- Dimension matches HiveSense embeddings (hivesense_app.posts_vectors, halfvec(1024)).
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.user_profile_vectors (
     username varchar(16) NOT NULL,
-    interest_vector vector(384),
+    interest_vector vector(1024),
     posts_sampled int NOT NULL DEFAULT 0,
     communities int [],
     updated_at timestamp,
+    PRIMARY KEY (username)
+);
+
+-- ---------------------------------------------------------------------------
+-- User interactions — incremental record of each user's votes/reblogs on
+-- tracked posts, populated by process_interactions as blocks are processed.
+-- Replaces the per-cycle scan of hive.account_operations_view in the ranker:
+-- building a user's interest vector becomes an indexed lookup of a few rows
+-- instead of re-parsing thousands of raw operations every cycle. Deduplicated
+-- to one row per (user, post); the strongest action (reblog > vote) wins.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS haf_fyp_app.user_interactions (
+    username varchar(16) NOT NULL,
+    post_id bigint NOT NULL,
+    action_weight real NOT NULL,     -- 1.0 vote, 1.5 reblog
+    created_at timestamp NOT NULL,   -- block time of the interaction
+    block_num int NOT NULL,
+    PRIMARY KEY (username, post_id)
+);
+
+-- Lookup pattern: most-recent interactions for one user within a time window.
+CREATE INDEX IF NOT EXISTS idx_user_interactions_user_time
+ON haf_fyp_app.user_interactions (username, created_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Active users — one row per account that has interacted, maintained by
+-- process_interactions. Lets the ranker pick which users to score each cycle
+-- by scanning ~one-row-per-user (bounded by the user count) instead of doing a
+-- DISTINCT over the whole, ever-growing user_interactions table.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS haf_fyp_app.active_users (
+    username varchar(16) NOT NULL,
+    last_interaction_at timestamp NOT NULL,
+    last_block int NOT NULL,
+    last_scored_at timestamp,        -- when the ranker last built this user's feed (NULL = never)
     PRIMARY KEY (username)
 );
 
@@ -189,3 +227,10 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.algorithm_versions (
 
 GRANT SELECT ON ALL TABLES IN SCHEMA haf_fyp_app TO haf_fyp_user;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA haf_fyp_endpoints TO haf_fyp_user;
+
+-- The Python ranker daemon runs as haf_fyp_user and writes the precomputed
+-- feed caches and per-user interest vectors. Block processing (post_candidates,
+-- engagement_metrics, etc.) is owned by haf_fyp_owner and remains read-only here.
+GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.global_feed_cache TO haf_fyp_user;
+GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.feed_cache TO haf_fyp_user;
+GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.user_profile_vectors TO haf_fyp_user;

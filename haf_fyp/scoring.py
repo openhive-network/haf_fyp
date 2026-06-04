@@ -92,22 +92,32 @@ def build_user_profile_vector(
     conn, username: str, post_vectors: dict, lookback_days: int = 90
 ) -> tuple:
     """
-    Build a 384-dim L2-normalised interest vector from the user's recent
+    Build a 1024-dim L2-normalised interest vector from the user's recent
     votes (1.0×) and reblogs (1.5×), weighted by 0.95^age_days time decay.
 
     Returns (vector: np.ndarray, posts_sampled: int) or (None, 0) if the
     user has no interactions with indexed posts that have embeddings.
     """
-    from haf_fyp.embeddings import fetch_user_interactions
+    from haf_fyp.embeddings import fetch_post_vectors, fetch_user_interactions
 
     interactions = fetch_user_interactions(conn, username, lookback_days)
     if not interactions:
         return None, 0
 
+    # Embeddings for the user's OWN interacted posts — which are generally NOT in
+    # the candidate set being ranked, so we must fetch them rather than relying on
+    # the candidate post_vectors dict. Reuse any candidate embeddings we already
+    # have and fetch only the rest.
+    interaction_ids = [int(pid) for pid, _, _ in interactions]
+    vectors = {pid: post_vectors[pid] for pid in interaction_ids if pid in post_vectors}
+    missing = [pid for pid in interaction_ids if pid not in vectors]
+    if missing:
+        vectors.update(fetch_post_vectors(conn, missing))
+
     weighted: list[np.ndarray] = []
     total_w = 0.0
     for post_id, action_weight, age_days in interactions:
-        vec = post_vectors.get(int(post_id))
+        vec = vectors.get(int(post_id))
         if vec is None:
             continue
         w = action_weight * (0.95 ** float(age_days))
@@ -301,6 +311,13 @@ def write_feed_cache(
             VALUES %s
             """,
             rows,
+        )
+        # Stamp scoring time on the active_users index so the scheduled cycle
+        # can pick stalest-scored users without scanning feed_cache. No-ops for
+        # users not in active_users (e.g. opted-in but never interacted).
+        cur.execute(
+            "UPDATE haf_fyp_app.active_users SET last_scored_at = %s WHERE username = %s",
+            (now, username),
         )
     conn.commit()
 

@@ -42,6 +42,9 @@ run_sql_file "${SCRIPT_DIR}/../db/process_engagement.sql"
 # 6. Phase 4: community subscription sync
 run_sql_file "${SCRIPT_DIR}/../db/process_communities.sql"
 
+# 6b. Phase 8: per-user interaction recording (feeds the ranker's interest vectors)
+run_sql_file "${SCRIPT_DIR}/../db/process_interactions.sql"
+
 # 7. Block range dispatcher (loads after all processors are defined)
 run_sql_file "${SCRIPT_DIR}/../db/process_block_range.sql"
 
