@@ -73,6 +73,9 @@ schemas:
       computed_at:
         type: string
         format: date-time
+      personalized:
+        type: boolean
+        description: True if this row is from the user's own computed feed; false if it is the global fallback
  */
 
 -- ---------------------------------------------------------------------------
@@ -187,6 +190,10 @@ AS $func$
           "computed_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "personalized": {
+            "type": "boolean",
+            "description": "True if this row is from the user's own computed feed; false if it is the global fallback"
           }
         }
       }
@@ -476,13 +483,17 @@ AS $func$
         ],
         "responses": {
           "200": {
-            "description": "User profile data (empty if user has not been ranked yet)",
+            "description": "User profile data (always one row; has_feed/has_vector are false if the user has not been ranked yet)",
             "content": {
               "application/json": {
                 "schema": {
-                  "x-sql-datatype": "TABLE(has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp)",
+                  "x-sql-datatype": "TABLE(has_feed boolean, has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp)",
                   "type": "object",
                   "properties": {
+                    "has_feed": {
+                      "type": "boolean",
+                      "description": "True if the user has a precomputed personalized feed (vs the global fallback)"
+                    },
                     "has_vector": {
                       "type": "boolean"
                     },
@@ -852,7 +863,8 @@ AS $$
         fc.community_boost_applied,
         fc.rank,
         fc.algorithm_version,
-        fc.computed_at
+        fc.computed_at,
+        TRUE AS personalized
     FROM haf_fyp_app.feed_cache fc
     JOIN haf_fyp_app.post_candidates pc ON pc.post_id = fc.post_id
     WHERE fc.username = get_personalized_feed.username
@@ -876,7 +888,8 @@ AS $$
         FALSE AS community_boost_applied,
         gfc.rank,
         NULL::varchar(16) AS algorithm_version,
-        gfc.computed_at
+        gfc.computed_at,
+        FALSE AS personalized
     FROM haf_fyp_app.global_feed_cache gfc
     JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
     WHERE NOT (SELECT yes FROM has_personal)
@@ -954,7 +967,8 @@ AS $$
         FALSE AS community_boost_applied,
         gfc.rank,
         NULL::varchar(16) AS algorithm_version,
-        gfc.computed_at
+        gfc.computed_at,
+        FALSE AS personalized
     FROM haf_fyp_app.global_feed_cache gfc
     JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
     WHERE (get_global_feed.community_id IS NULL OR pc.community_id = get_global_feed.community_id)
@@ -986,13 +1000,16 @@ $$;
         description: Hive account name
     responses:
       '200':
-        description: User profile data (empty if user has not been ranked yet)
+        description: User profile data (always one row; has_feed/has_vector are false if the user has not been ranked yet)
         content:
           application/json:
             schema:
-              x-sql-datatype: "TABLE(has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp)"
+              x-sql-datatype: "TABLE(has_feed boolean, has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp)"
               type: object
               properties:
+                has_feed:
+                  type: boolean
+                  description: True if the user has a precomputed personalized feed (vs the global fallback)
                 has_vector:
                   type: boolean
                 posts_sampled:
@@ -1010,17 +1027,25 @@ DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_user_profile;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_user_profile(
     "username" TEXT
 )
-RETURNS TABLE(has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp) 
+RETURNS TABLE(has_feed boolean, has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp)
 -- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
+    -- Always returns exactly one row, even when the user has no profile yet, so
+    -- the endpoint never returns an empty array. has_feed indicates whether the
+    -- user has a precomputed personalized feed (vs falling back to the global
+    -- feed); has_vector indicates whether a semantic interest vector was built.
     SELECT
-        interest_vector IS NOT NULL AS has_vector,
-        posts_sampled,
-        communities AS top_communities,
-        updated_at
-    FROM haf_fyp_app.user_profile_vectors
-    WHERE username = get_user_profile.username;
+        EXISTS (
+            SELECT 1 FROM haf_fyp_app.feed_cache fc
+            WHERE fc.username = get_user_profile.username
+        ) AS has_feed,
+        COALESCE(upv.interest_vector IS NOT NULL, FALSE) AS has_vector,
+        COALESCE(upv.posts_sampled, 0) AS posts_sampled,
+        upv.communities AS top_communities,
+        upv.updated_at
+    FROM (SELECT get_user_profile.username AS username) base
+    LEFT JOIN haf_fyp_app.user_profile_vectors upv USING (username);
 $$;
 
 -- ---------------------------------------------------------------------------

@@ -22,7 +22,8 @@ CREATE TYPE haf_fyp_endpoints.feed_post_row AS (
     community_boost_applied boolean,
     rank int,
     algorithm_version varchar (16),
-    computed_at timestamp
+    computed_at timestamp,
+    personalized boolean
 );
 
 -- ---------------------------------------------------------------------------
