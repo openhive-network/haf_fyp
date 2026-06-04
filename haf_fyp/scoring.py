@@ -98,16 +98,26 @@ def build_user_profile_vector(
     Returns (vector: np.ndarray, posts_sampled: int) or (None, 0) if the
     user has no interactions with indexed posts that have embeddings.
     """
-    from haf_fyp.embeddings import fetch_user_interactions
+    from haf_fyp.embeddings import fetch_post_vectors, fetch_user_interactions
 
     interactions = fetch_user_interactions(conn, username, lookback_days)
     if not interactions:
         return None, 0
 
+    # Embeddings for the user's OWN interacted posts — which are generally NOT in
+    # the candidate set being ranked, so we must fetch them rather than relying on
+    # the candidate post_vectors dict. Reuse any candidate embeddings we already
+    # have and fetch only the rest.
+    interaction_ids = [int(pid) for pid, _, _ in interactions]
+    vectors = {pid: post_vectors[pid] for pid in interaction_ids if pid in post_vectors}
+    missing = [pid for pid in interaction_ids if pid not in vectors]
+    if missing:
+        vectors.update(fetch_post_vectors(conn, missing))
+
     weighted: list[np.ndarray] = []
     total_w = 0.0
     for post_id, action_weight, age_days in interactions:
-        vec = post_vectors.get(int(post_id))
+        vec = vectors.get(int(post_id))
         if vec is None:
             continue
         w = action_weight * (0.95 ** float(age_days))
