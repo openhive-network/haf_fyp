@@ -187,19 +187,43 @@ def read_user_vector(conn, username: str) -> tuple:
 def write_user_vector(
     conn, username: str, vector: np.ndarray, posts_sampled: int
 ) -> None:
-    """Upsert a user interest vector into user_profile_vectors."""
+    """
+    Upsert a user interest vector into user_profile_vectors.
+
+    Also records the user's top communities by engagement — the communities of
+    the posts they interacted with, most-interacted first — so the profile's
+    top_communities reflects actual behaviour (distinct from on-chain follows,
+    which live in user_communities).
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO haf_fyp_app.user_profile_vectors
-                (username, interest_vector, posts_sampled, updated_at)
-            VALUES (%s, %s, %s, NOW())
+                (username, interest_vector, posts_sampled, communities, updated_at)
+            VALUES (
+                %(username)s, %(vector)s, %(sampled)s,
+                (
+                    SELECT array_agg(community_id ORDER BY cnt DESC)
+                    FROM (
+                        SELECT pc.community_id, COUNT(*) AS cnt
+                        FROM haf_fyp_app.user_interactions ui
+                        JOIN haf_fyp_app.post_candidates pc ON pc.post_id = ui.post_id
+                        WHERE ui.username = %(username)s
+                          AND pc.community_id IS NOT NULL
+                        GROUP BY pc.community_id
+                        ORDER BY cnt DESC
+                        LIMIT 5
+                    ) top
+                ),
+                NOW()
+            )
             ON CONFLICT (username) DO UPDATE SET
                 interest_vector = EXCLUDED.interest_vector,
                 posts_sampled   = EXCLUDED.posts_sampled,
+                communities     = EXCLUDED.communities,
                 updated_at      = NOW()
             """,
-            (username, vector.tolist(), posts_sampled),
+            {"username": username, "vector": vector.tolist(), "sampled": posts_sampled},
         )
     conn.commit()
 
