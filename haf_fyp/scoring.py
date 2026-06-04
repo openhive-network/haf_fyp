@@ -302,6 +302,13 @@ def write_feed_cache(
             """,
             rows,
         )
+        # Stamp scoring time on the active_users index so the scheduled cycle
+        # can pick stalest-scored users without scanning feed_cache. No-ops for
+        # users not in active_users (e.g. opted-in but never interacted).
+        cur.execute(
+            "UPDATE haf_fyp_app.active_users SET last_scored_at = %s WHERE username = %s",
+            (now, username),
+        )
     conn.commit()
 
 

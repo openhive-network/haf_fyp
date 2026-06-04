@@ -127,6 +127,21 @@ CREATE INDEX IF NOT EXISTS idx_user_interactions_user_time
 ON haf_fyp_app.user_interactions (username, created_at DESC);
 
 -- ---------------------------------------------------------------------------
+-- Active users — one row per account that has interacted, maintained by
+-- process_interactions. Lets the ranker pick which users to score each cycle
+-- by scanning ~one-row-per-user (bounded by the user count) instead of doing a
+-- DISTINCT over the whole, ever-growing user_interactions table.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS haf_fyp_app.active_users (
+    username varchar(16) NOT NULL,
+    last_interaction_at timestamp NOT NULL,
+    last_block int NOT NULL,
+    last_scored_at timestamp,        -- when the ranker last built this user's feed (NULL = never)
+    PRIMARY KEY (username)
+);
+
+-- ---------------------------------------------------------------------------
 -- Feed cache — precomputed ranked feeds (personalized)
 -- ---------------------------------------------------------------------------
 

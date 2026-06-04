@@ -214,22 +214,19 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
     not a raw-operation scan), this can run for a meaningful number of users per
     cycle without starving core block processing.
 
-    NOTE: the DISTINCT over user_interactions is a full scan; fine at current
-    size, but as the table grows this should be bounded (e.g. recent activity
-    only, a maintained active-users set, or pruning interactions outside the
-    lookback window).
+    Reads only the maintained active_users table (one row per account that has
+    interacted, with last_scored_at stamped by write_feed_cache), so the whole
+    selection scales with the user count — independent of both the ever-growing
+    user_interactions volume and feed_cache size. Within a cycle: never-scored
+    users first, then the stalest; among equals, the most recently active.
     """
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT u.username
-              FROM (SELECT DISTINCT username FROM haf_fyp_app.user_interactions) u
-              LEFT JOIN (
-                    SELECT username, MIN(computed_at) AS computed_at
-                      FROM haf_fyp_app.feed_cache
-                     GROUP BY username
-              ) fc USING (username)
-             ORDER BY fc.computed_at ASC NULLS FIRST
+            SELECT username
+              FROM haf_fyp_app.active_users
+             ORDER BY last_scored_at ASC NULLS FIRST,
+                      last_interaction_at DESC
              LIMIT %s
             """,
             (limit,),

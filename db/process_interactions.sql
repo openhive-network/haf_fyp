@@ -78,13 +78,27 @@ BEGIN
         FROM interactions
         WHERE username IS NOT NULL
         ORDER BY username, post_id, action_weight DESC, block_num DESC
+    ),
+    -- Upsert the interactions; RETURNING feeds the active_users maintenance
+    -- below so we don't rescan the operations for it.
+    ins AS (
+        INSERT INTO haf_fyp_app.user_interactions AS ui
+            (username, post_id, action_weight, created_at, block_num)
+        SELECT username, post_id, action_weight, created_at, block_num FROM deduped
+        ON CONFLICT (username, post_id) DO UPDATE SET
+            action_weight = GREATEST(ui.action_weight, EXCLUDED.action_weight),
+            created_at    = GREATEST(ui.created_at, EXCLUDED.created_at),
+            block_num     = GREATEST(ui.block_num, EXCLUDED.block_num)
+        RETURNING username, created_at, block_num
     )
-    INSERT INTO haf_fyp_app.user_interactions AS ui
-        (username, post_id, action_weight, created_at, block_num)
-    SELECT username, post_id, action_weight, created_at, block_num FROM deduped
-    ON CONFLICT (username, post_id) DO UPDATE SET
-        action_weight = GREATEST(ui.action_weight, EXCLUDED.action_weight),
-        created_at    = GREATEST(ui.created_at, EXCLUDED.created_at),
-        block_num     = GREATEST(ui.block_num, EXCLUDED.block_num);
+    -- Maintain the one-row-per-user active_users index (latest activity).
+    INSERT INTO haf_fyp_app.active_users AS au
+        (username, last_interaction_at, last_block)
+    SELECT username, MAX(created_at), MAX(block_num)
+    FROM ins
+    GROUP BY username
+    ON CONFLICT (username) DO UPDATE SET
+        last_interaction_at = GREATEST(au.last_interaction_at, EXCLUDED.last_interaction_at),
+        last_block          = GREATEST(au.last_block, EXCLUDED.last_block);
 END;
 $$;
