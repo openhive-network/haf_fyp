@@ -3,7 +3,7 @@ SET ROLE haf_fyp_owner;
 /** openapi
 openapi: 3.1.0
 info:
-  title: HAF FYP — For You Page
+  title: HAF FYP - For You Page
   description: >-
     Personalized content feed API for the Hive blockchain.
     Provides algorithmically ranked post feeds, user profiles,
@@ -76,7 +76,7 @@ schemas:
  */
 
 -- ---------------------------------------------------------------------------
--- root() — serves the full OpenAPI spec at GET /
+-- root() - serves the full OpenAPI spec at GET /
 -- ---------------------------------------------------------------------------
 
 DO $__$
@@ -93,7 +93,7 @@ AS $func$
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "HAF FYP \u00e2\u20ac\u201d For You Page",
+    "title": "HAF FYP - For You Page",
     "description": "Personalized content feed API for the Hive blockchain. Provides algorithmically ranked post feeds, user profiles, and algorithm version management.",
     "license": {
       "name": "MIT License",
@@ -461,7 +461,7 @@ AS $func$
           "User"
         ],
         "summary": "User profile",
-        "description": "Returns a user's computed interest profile \u00e2\u20ac\u201d whether a vector has been built and which communities are tracked.",
+        "description": "Returns a user's computed interest profile - whether a vector has been built and which communities are tracked.",
         "operationId": "haf_fyp_endpoints.get_user_profile",
         "parameters": [
           {
@@ -476,13 +476,17 @@ AS $func$
         ],
         "responses": {
           "200": {
-            "description": "User profile data (empty if user has not been ranked yet)",
+            "description": "User profile data (always one row; has_feed/has_vector are false if the user has not been ranked yet)",
             "content": {
               "application/json": {
                 "schema": {
-                  "x-sql-datatype": "TABLE(has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp)",
+                  "x-sql-datatype": "TABLE(has_feed boolean, has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp)",
                   "type": "object",
                   "properties": {
+                    "has_feed": {
+                      "type": "boolean",
+                      "description": "True if the user has a precomputed personalized feed (vs the global fallback)"
+                    },
                     "has_vector": {
                       "type": "boolean"
                     },
@@ -974,7 +978,7 @@ $$;
       - User
     summary: User profile
     description: >-
-      Returns a user's computed interest profile — whether a vector has been
+      Returns a user's computed interest profile - whether a vector has been
       built and which communities are tracked.
     operationId: haf_fyp_endpoints.get_user_profile
     parameters:
@@ -986,13 +990,16 @@ $$;
         description: Hive account name
     responses:
       '200':
-        description: User profile data (empty if user has not been ranked yet)
+        description: User profile data (always one row; has_feed/has_vector are false if the user has not been ranked yet)
         content:
           application/json:
             schema:
-              x-sql-datatype: "TABLE(has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp)"
+              x-sql-datatype: "TABLE(has_feed boolean, has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp)"
               type: object
               properties:
+                has_feed:
+                  type: boolean
+                  description: True if the user has a precomputed personalized feed (vs the global fallback)
                 has_vector:
                   type: boolean
                 posts_sampled:
@@ -1010,21 +1017,29 @@ DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_user_profile;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_user_profile(
     "username" TEXT
 )
-RETURNS TABLE(has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp) 
+RETURNS TABLE(has_feed boolean, has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp)
 -- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
+    -- Always returns exactly one row, even when the user has no profile yet, so
+    -- the endpoint never returns an empty array. has_feed indicates whether the
+    -- user has a precomputed personalized feed (vs falling back to the global
+    -- feed); has_vector indicates whether a semantic interest vector was built.
     SELECT
-        interest_vector IS NOT NULL AS has_vector,
-        posts_sampled,
-        communities AS top_communities,
-        updated_at
-    FROM haf_fyp_app.user_profile_vectors
-    WHERE username = get_user_profile.username;
+        EXISTS (
+            SELECT 1 FROM haf_fyp_app.feed_cache fc
+            WHERE fc.username = get_user_profile.username
+        ) AS has_feed,
+        COALESCE(upv.interest_vector IS NOT NULL, FALSE) AS has_vector,
+        COALESCE(upv.posts_sampled, 0) AS posts_sampled,
+        upv.communities AS top_communities,
+        upv.updated_at
+    FROM (SELECT get_user_profile.username AS username) base
+    LEFT JOIN haf_fyp_app.user_profile_vectors upv USING (username);
 $$;
 
 -- ---------------------------------------------------------------------------
--- Score explainer — per-signal breakdown for a post in a user's feed cache
+-- Score explainer - per-signal breakdown for a post in a user's feed cache
 -- ---------------------------------------------------------------------------
 
 /** openapi:paths
