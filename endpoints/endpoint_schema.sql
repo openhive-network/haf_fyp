@@ -826,6 +826,17 @@ RETURNS SETOF haf_fyp_endpoints.feed_post_row
 -- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
+    -- Cold-start fallback: users without a precomputed personalized feed
+    -- (no interactions yet, or never scored) get the global feed instead of an
+    -- empty result, so the "For You" page is never blank. Personalization kicks
+    -- in automatically once the user has a cached feed.
+    WITH has_personal AS (
+        SELECT EXISTS (
+            SELECT 1 FROM haf_fyp_app.feed_cache
+            WHERE username = get_personalized_feed.username
+        ) AS yes
+    )
+    -- Personalized feed
     SELECT
         fc.post_id,
         pc.author,
@@ -845,7 +856,31 @@ AS $$
     FROM haf_fyp_app.feed_cache fc
     JOIN haf_fyp_app.post_candidates pc ON pc.post_id = fc.post_id
     WHERE fc.username = get_personalized_feed.username
-    ORDER BY fc.rank ASC
+      AND (SELECT yes FROM has_personal)
+
+    UNION ALL
+
+    -- Global feed fallback (only when the user has no personalized feed)
+    SELECT
+        gfc.post_id,
+        pc.author,
+        pc.permlink,
+        pc.title,
+        pc.community_id,
+        pc.created_at,
+        gfc.final_score,
+        gfc.score_engagement,
+        gfc.score_recency,
+        gfc.score_credibility,
+        NULL::float AS score_relevance,
+        FALSE AS community_boost_applied,
+        gfc.rank,
+        NULL::varchar(16) AS algorithm_version,
+        gfc.computed_at
+    FROM haf_fyp_app.global_feed_cache gfc
+    JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
+    WHERE NOT (SELECT yes FROM has_personal)
+    ORDER BY rank ASC
     LIMIT get_personalized_feed."limit"
     OFFSET get_personalized_feed."offset";
 $$;
