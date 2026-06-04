@@ -61,15 +61,15 @@ BEGIN
             ov.id,
             ov.body::jsonb -> 'value' ->> 'author',
             ov.body::jsonb -> 'value' ->> 'permlink',
-            -- community_id: strip 'hive-' prefix from json_metadata.community;
-            -- NULL for non-community posts or malformed metadata
-            NULLIF(
-                REPLACE(
-                    COALESCE(meta.parsed ->> 'community', ''),
-                    'hive-', ''
-                ),
-                ''
-            )::INT,
+            -- community_id: a post belongs to a community when the root post's
+            -- parent_permlink is the community account 'hive-NNNNNN' (the number
+            -- is the community id, matching user_communities). NULL otherwise
+            -- (non-community posts, where parent_permlink is just the first tag).
+            CASE
+                WHEN (ov.body::jsonb -> 'value' ->> 'parent_permlink') ~ '^hive-[0-9]+$'
+                THEN REPLACE(ov.body::jsonb -> 'value' ->> 'parent_permlink', 'hive-', '')::INT
+                ELSE NULL
+            END,
             ov.body::jsonb -> 'value' ->> 'title',
             -- tags: only extract if json_metadata.tags is a JSON array
             CASE

@@ -17,6 +17,7 @@ _WEIGHTS = {
     "engagement": 0.20,
     "credibility": 0.10,
     "community_boost": 0.20,
+    "community_boost_engaged": 0.10,
 }
 
 
@@ -132,38 +133,55 @@ class TestComputeCredibility:
 
 class TestComputeScores:
     def test_returns_sorted_descending(self):
-        result = compute_scores(_candidates(), None, {}, {}, set(), _WEIGHTS)
+        result = compute_scores(_candidates(), None, {}, {}, set(), set(), _WEIGHTS)
         assert list(result["final_score"]) == sorted(result["final_score"], reverse=True)
 
     def test_final_scores_in_unit_interval(self):
-        result = compute_scores(_candidates(), None, {}, {}, set(), _WEIGHTS)
+        result = compute_scores(_candidates(), None, {}, {}, set(), set(), _WEIGHTS)
         assert (result["final_score"] >= 0.0).all()
         assert (result["final_score"] <= 1.0).all()
 
     def test_cold_start_relevance_signal_dropped(self):
         # With user_vector=None, relevance weight is redistributed — all scores
         # should still be positive and finite
-        result = compute_scores(_candidates(), None, {}, {}, set(), _WEIGHTS)
+        result = compute_scores(_candidates(), None, {}, {}, set(), set(), _WEIGHTS)
         assert result["score_relevance"].notna().all()
 
     def test_community_boost_flag_set_for_matching_posts(self):
-        result = compute_scores(_candidates(), None, {}, {}, {123}, _WEIGHTS)
+        result = compute_scores(_candidates(), None, {}, {}, {123}, set(), _WEIGHTS)
         boosted = result.loc[result["post_id"] == 0, "community_boost_applied"]
         assert boosted.iloc[0] is True or bool(boosted.iloc[0])
 
     def test_community_boost_increases_score(self):
         df = _candidates(1)  # single post with community_id=123
-        without = compute_scores(df.copy(), None, {}, {}, set(), _WEIGHTS)["final_score"].iloc[0]
-        with_ = compute_scores(df.copy(), None, {}, {}, {123}, _WEIGHTS)["final_score"].iloc[0]
+        without = compute_scores(df.copy(), None, {}, {}, set(), set(), _WEIGHTS)["final_score"].iloc[0]
+        with_ = compute_scores(df.copy(), None, {}, {}, {123}, set(), _WEIGHTS)["final_score"].iloc[0]
         assert with_ >= without
 
     def test_community_boost_does_not_exceed_one(self):
         df = _candidates(1)
-        result = compute_scores(df, None, {}, {}, {123}, _WEIGHTS)
+        result = compute_scores(df, None, {}, {}, {123}, set(), _WEIGHTS)
         assert result["final_score"].iloc[0] <= 1.0
+
+    def test_subscribed_tier_labels_boost_source(self):
+        result = compute_scores(_candidates(1), None, {}, {}, {123}, set(), _WEIGHTS)
+        assert result.loc[0, "boost_source"] == "subscribed"
+
+    def test_engaged_tier_smaller_and_labelled(self):
+        df = _candidates(1)  # single post, community_id=123
+        sub = compute_scores(df.copy(), None, {}, {}, {123}, set(), _WEIGHTS)
+        eng = compute_scores(df.copy(), None, {}, {}, set(), {123}, _WEIGHTS)
+        assert sub.loc[0, "boost_source"] == "subscribed"
+        assert eng.loc[0, "boost_source"] == "engaged"
+        # engaged multiplier (0.10) is smaller than subscribed (0.20)
+        assert eng.loc[0, "final_score"] < sub.loc[0, "final_score"]
+
+    def test_subscribed_wins_when_both_apply(self):
+        result = compute_scores(_candidates(1), None, {}, {}, {123}, {123}, _WEIGHTS)
+        assert result.loc[0, "boost_source"] == "subscribed"
 
     def test_with_user_vector_relevance_defaults_to_neutral(self):
         vec = np.ones(384, dtype=np.float32) / np.sqrt(384)
-        result = compute_scores(_candidates(), vec, {}, {}, set(), _WEIGHTS)
+        result = compute_scores(_candidates(), vec, {}, {}, set(), set(), _WEIGHTS)
         # With a user vector but no post vectors, semantic relevance defaults to 0.5
         assert np.allclose(result["score_relevance"].values, 0.5, atol=1e-6)

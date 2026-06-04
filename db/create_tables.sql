@@ -20,6 +20,7 @@ CREATE TYPE haf_fyp_endpoints.feed_post_row AS (
     score_credibility float,
     score_relevance float,
     community_boost_applied boolean,
+    boost_source varchar (16),
     rank int,
     algorithm_version varchar (16),
     computed_at timestamp
@@ -154,6 +155,7 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_cache (
     score_credibility float,
     score_relevance float,
     community_boost_applied boolean NOT NULL DEFAULT FALSE,
+    boost_source varchar(16),
     rank int NOT NULL,
     algorithm_version varchar(16),
     computed_at timestamp,

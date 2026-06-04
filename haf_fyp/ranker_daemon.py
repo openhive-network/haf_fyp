@@ -41,6 +41,7 @@ from haf_fyp.scoring import (
     bootstrap_vector_from_communities,
     build_user_profile_vector,
     compute_scores,
+    fetch_top_communities,
     fetch_user_communities,
     fetch_user_interests,
     read_user_vector,
@@ -244,28 +245,30 @@ def _rank_user(
     weights: dict,
 ) -> None:
     """Score and write feed_cache for a single user."""
-    communities = fetch_user_communities(conn, username)
-    interests = fetch_user_interests(conn, username)
-    all_communities = communities | interests
+    # Explicit communities (on-chain subscriptions + declared interests) get the
+    # full boost; engaged communities (top by interaction) get the smaller tier.
+    subscribed = fetch_user_communities(conn, username) | fetch_user_interests(conn, username)
+    engaged = set(fetch_top_communities(conn, username))
 
     user_vector, sampled = build_user_profile_vector(conn, username, post_vectors)
     if user_vector is not None:
-        write_user_vector(conn, username, user_vector, sampled)
+        write_user_vector(conn, username, user_vector, sampled, sorted(engaged))
     else:
         user_vector, _ = read_user_vector(conn, username)
-        if user_vector is None and all_communities:
+        if user_vector is None and subscribed:
             user_vector = bootstrap_vector_from_communities(
-                conn, all_communities, post_vectors
+                conn, subscribed, post_vectors
             )
             if user_vector is not None:
-                write_user_vector(conn, username, user_vector, 0)
+                write_user_vector(conn, username, user_vector, 0, sorted(engaged))
 
     scored = compute_scores(
         candidates=candidates,
         user_vector=user_vector,
         post_vectors=post_vectors,
         author_credibility=author_credibility,
-        user_communities=all_communities,
+        subscribed_communities=subscribed,
+        engaged_communities=engaged,
         algorithm_weights=weights,
     )
     write_feed_cache(conn, username, scored, algo_version)
@@ -301,7 +304,8 @@ def run_cycle(conn) -> None:
         user_vector=None,
         post_vectors={},
         author_credibility=author_credibility,
-        user_communities=set(),
+        subscribed_communities=set(),
+        engaged_communities=set(),
         algorithm_weights=weights,
     )
     write_global_feed_cache(conn, global_scored, algo_version)
