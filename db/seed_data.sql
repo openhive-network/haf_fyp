@@ -12,7 +12,7 @@ VALUES (
         "credibility":     0.10,
         "community_boost": 0.20
     }'::jsonb,
-    NOW() - INTERVAL '1 day',
+    NOW() - interval '1 day',
     FALSE
 ),
 (
