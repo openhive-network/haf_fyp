@@ -3,7 +3,7 @@ SET ROLE haf_fyp_owner;
 /** openapi
 openapi: 3.1.0
 info:
-  title: HAF FYP — For You Page
+  title: HAF FYP - For You Page
   description: >-
     Personalized content feed API for the Hive blockchain.
     Provides algorithmically ranked post feeds, user profiles,
@@ -79,7 +79,7 @@ schemas:
  */
 
 -- ---------------------------------------------------------------------------
--- root() — serves the full OpenAPI spec at GET /
+-- root() - serves the full OpenAPI spec at GET /
 -- ---------------------------------------------------------------------------
 
 DO $__$
@@ -96,7 +96,7 @@ AS $func$
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "HAF FYP \u00e2\u20ac\u201d For You Page",
+    "title": "HAF FYP - For You Page",
     "description": "Personalized content feed API for the Hive blockchain. Provides algorithmically ranked post feeds, user profiles, and algorithm version management.",
     "license": {
       "name": "MIT License",
@@ -468,7 +468,7 @@ AS $func$
           "User"
         ],
         "summary": "User profile",
-        "description": "Returns a user's computed interest profile \u00e2\u20ac\u201d whether a vector has been built and which communities are tracked.",
+        "description": "Returns a user's computed interest profile - whether a vector has been built and which communities are tracked.",
         "operationId": "haf_fyp_endpoints.get_user_profile",
         "parameters": [
           {
@@ -988,7 +988,7 @@ $$;
       - User
     summary: User profile
     description: >-
-      Returns a user's computed interest profile — whether a vector has been
+      Returns a user's computed interest profile - whether a vector has been
       built and which communities are tracked.
     operationId: haf_fyp_endpoints.get_user_profile
     parameters:
@@ -1049,7 +1049,7 @@ AS $$
 $$;
 
 -- ---------------------------------------------------------------------------
--- Score explainer — per-signal breakdown for a post in a user's feed cache
+-- Score explainer - per-signal breakdown for a post in a user's feed cache
 -- ---------------------------------------------------------------------------
 
 /** openapi:paths
