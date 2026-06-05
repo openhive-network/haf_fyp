@@ -230,9 +230,15 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.algorithm_versions (
 GRANT SELECT ON ALL TABLES IN SCHEMA haf_fyp_app TO haf_fyp_user;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA haf_fyp_endpoints TO haf_fyp_user;
 
--- The Python ranker daemon runs as haf_fyp_user and writes the precomputed
--- feed caches and per-user interest vectors. Block processing (post_candidates,
--- engagement_metrics, etc.) is owned by haf_fyp_owner and remains read-only here.
+-- haf_fyp_user is both the ranker daemon and the FastAPI overlay. The ranker
+-- writes the precomputed feed caches, per-user interest vectors, and the
+-- active_users scoring index. The FastAPI overlay writes declared interests
+-- (interest picker) and toggles the active algorithm version (admin endpoint).
+-- Block processing tables (post_candidates, engagement_metrics, etc.) are owned
+-- by haf_fyp_owner and remain read-only here.
 GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.global_feed_cache TO haf_fyp_user;
 GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.feed_cache TO haf_fyp_user;
 GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.user_profile_vectors TO haf_fyp_user;
+GRANT UPDATE ON haf_fyp_app.active_users TO haf_fyp_user;
+GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.user_interests TO haf_fyp_user;
+GRANT UPDATE ON haf_fyp_app.algorithm_versions TO haf_fyp_user;
