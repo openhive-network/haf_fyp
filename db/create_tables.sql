@@ -21,9 +21,7 @@ CREATE TYPE haf_fyp_endpoints.feed_post_row AS (
     score_relevance float,
     community_boost_applied boolean,
     boost_source varchar (16),
-    rank int,
-    algorithm_version varchar (16),
-    computed_at timestamp
+    rank int
 );
 
 -- ---------------------------------------------------------------------------
