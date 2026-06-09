@@ -72,11 +72,6 @@ schemas:
       rank:
         type: integer
         description: Position in the feed (1-based)
-      algorithm_version:
-        type: string
-      computed_at:
-        type: string
-        format: date-time
  */
 
 -- ---------------------------------------------------------------------------
@@ -189,13 +184,6 @@ AS $func$
           "rank": {
             "type": "integer",
             "description": "Position in the feed (1-based)"
-          },
-          "algorithm_version": {
-            "type": "string"
-          },
-          "computed_at": {
-            "type": "string",
-            "format": "date-time"
           }
         }
       }
@@ -869,9 +857,7 @@ AS $$
         fc.score_relevance,
         fc.community_boost_applied,
         fc.boost_source,
-        fc.rank,
-        fc.algorithm_version,
-        fc.computed_at
+        fc.rank
     FROM haf_fyp_app.feed_cache fc
     JOIN haf_fyp_app.post_candidates pc ON pc.post_id = fc.post_id
     WHERE fc.username = get_personalized_feed.username
@@ -894,9 +880,7 @@ AS $$
         NULL::float AS score_relevance,
         FALSE AS community_boost_applied,
         NULL::varchar(16) AS boost_source,
-        gfc.rank,
-        NULL::varchar(16) AS algorithm_version,
-        gfc.computed_at
+        gfc.rank
     FROM haf_fyp_app.global_feed_cache gfc
     JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
     WHERE NOT (SELECT yes FROM has_personal)
@@ -973,9 +957,7 @@ AS $$
         NULL::float AS score_relevance,
         FALSE AS community_boost_applied,
         NULL::varchar(16) AS boost_source,
-        gfc.rank,
-        NULL::varchar(16) AS algorithm_version,
-        gfc.computed_at
+        gfc.rank
     FROM haf_fyp_app.global_feed_cache gfc
     JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
     WHERE (get_global_feed.community_id IS NULL OR pc.community_id = get_global_feed.community_id)
