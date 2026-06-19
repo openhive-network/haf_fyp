@@ -108,6 +108,61 @@ schemas:
         type: string
       fyp:
         $ref: '#/components/schemas/fyp_ranking'
+    example:
+      author: cryptoandcoffee
+      permlink: will-we-see-the-hydration-break-next-season
+      category: hive-115814
+      title: Will We See The Hydration / Advertising Break In The Premier League Next Season?
+      body: "<center><img src=\"https://images.hive.blog/p/cover.png\"/></center>\n\nMarkdown body of the post..."
+      json_metadata:
+        app: leothreads/0.3
+        format: markdown
+        tags: [sports, football, premierleague, advertising]
+        image: ["https://images.hive.blog/p/cover.png"]
+      created: "2026-06-19T16:33:57"
+      updated: "2026-06-19T16:33:57"
+      depth: 0
+      children: 4
+      community: hive-115814
+      community_title: Sportsblock
+      url: /hive-115814/@cryptoandcoffee/will-we-see-the-hydration-break-next-season
+      author_reputation: 84.5
+      author_role: guest
+      author_title: ""
+      payout: 3.655
+      pending_payout_value: 3.655 HBD
+      author_payout_value: 0.000 HBD
+      curator_payout_value: 0.000 HBD
+      max_accepted_payout: 1000000.000 HBD
+      percent_hbd: 10000
+      is_paidout: false
+      payout_at: "2026-06-26T16:33:57"
+      net_rshares: 50938299772643
+      beneficiaries:
+        - account: leo.voter
+          weight: 500
+      blacklists: []
+      reblogs: 0
+      replies: []
+      active_votes:
+        - voter: team
+          rshares: 30982500342
+        - voter: roelandp
+          rshares: 15794227518
+      stats:
+        hide: false
+        gray: false
+        total_votes: 127
+        flag_weight: 0.0
+      fyp:
+        rank: 1
+        final_score: 0.9178
+        score_relevance: 0.62
+        score_recency: 0.9926
+        score_engagement: 0.9805
+        score_credibility: 0.5679
+        community_boost_applied: true
+        boost_source: subscribed
  */
 
 -- ---------------------------------------------------------------------------
@@ -256,6 +311,64 @@ AS $func$
           },
           "fyp": {
             "$ref": "#/components/schemas/fyp_ranking"
+          }
+        },
+        "example": {
+          "author": "cryptoandcoffee",
+          "permlink": "will-we-see-the-hydration-break-next-season",
+          "category": "hive-115814",
+          "title": "Will We See The Hydration / Advertising Break In The Premier League Next Season?",
+          "body": "<center><img src=\"https://images.hive.blog/p/cover.png\"/></center>\n\nMarkdown body of the post...",
+          "json_metadata": {
+            "app": "leothreads/0.3",
+            "format": "markdown",
+            "tags": ["sports", "football", "premierleague", "advertising"],
+            "image": ["https://images.hive.blog/p/cover.png"]
+          },
+          "created": "2026-06-19T16:33:57",
+          "updated": "2026-06-19T16:33:57",
+          "depth": 0,
+          "children": 4,
+          "community": "hive-115814",
+          "community_title": "Sportsblock",
+          "url": "/hive-115814/@cryptoandcoffee/will-we-see-the-hydration-break-next-season",
+          "author_reputation": 84.5,
+          "author_role": "guest",
+          "author_title": "",
+          "payout": 3.655,
+          "pending_payout_value": "3.655 HBD",
+          "author_payout_value": "0.000 HBD",
+          "curator_payout_value": "0.000 HBD",
+          "max_accepted_payout": "1000000.000 HBD",
+          "percent_hbd": 10000,
+          "is_paidout": false,
+          "payout_at": "2026-06-26T16:33:57",
+          "net_rshares": 50938299772643,
+          "beneficiaries": [
+            { "account": "leo.voter", "weight": 500 }
+          ],
+          "blacklists": [],
+          "reblogs": 0,
+          "replies": [],
+          "active_votes": [
+            { "voter": "team", "rshares": 30982500342 },
+            { "voter": "roelandp", "rshares": 15794227518 }
+          ],
+          "stats": {
+            "hide": false,
+            "gray": false,
+            "total_votes": 127,
+            "flag_weight": 0.0
+          },
+          "fyp": {
+            "rank": 1,
+            "final_score": 0.9178,
+            "score_relevance": 0.62,
+            "score_recency": 0.9926,
+            "score_engagement": 0.9805,
+            "score_credibility": 0.5679,
+            "community_boost_applied": true,
+            "boost_source": "subscribed"
           }
         }
       }
