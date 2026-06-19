@@ -4,27 +4,6 @@
 --   CREATE EXTENSION IF NOT EXISTS vector;
 
 -- ---------------------------------------------------------------------------
--- Composite type for PostgREST feed endpoint responses
--- ---------------------------------------------------------------------------
-
-CREATE TYPE haf_fyp_endpoints.feed_post_row AS (
-    post_id bigint,
-    author varchar (16),
-    permlink varchar (256),
-    title text,
-    community_id int,
-    created_at timestamp,
-    final_score float,
-    score_engagement float,
-    score_recency float,
-    score_credibility float,
-    score_relevance float,
-    community_boost_applied boolean,
-    boost_source varchar (16),
-    rank int
-);
-
--- ---------------------------------------------------------------------------
 -- Post candidates — root posts eligible for ranking
 -- ---------------------------------------------------------------------------
 

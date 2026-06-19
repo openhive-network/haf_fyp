@@ -31,6 +31,13 @@ $$;
 -- own encoded id. The ranker bridges the two via (author, permlink) through
 -- hivemind_app.hive_accounts / hive_permlink_data / hive_posts, so it needs read
 -- access to those tables.
+--
+-- The feed endpoints additionally reuse Hivemind's own post builders
+-- (hivemind_app.get_full_post_view_by_id + hivemind_postgrest_utilities.
+-- create_bridge_post_object) to return posts in the exact bridge.get_ranked_posts
+-- shape, so haf_fyp_user also needs EXECUTE on the Hivemind functions (which are
+-- SECURITY INVOKER and run as the caller). GRANT SELECT ON ALL TABLES covers
+-- views such as hive_accounts_view that those builders read.
 DO $$
 BEGIN
     IF EXISTS (
@@ -39,9 +46,35 @@ BEGIN
     ) THEN
         GRANT USAGE ON SCHEMA hivemind_app TO haf_fyp_user;
         GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_app TO haf_fyp_user;
-        RAISE NOTICE 'hivemind_app: granted SELECT to haf_fyp_user';
+        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_app TO haf_fyp_user;
+        RAISE NOTICE 'hivemind_app: granted SELECT + EXECUTE to haf_fyp_user';
     ELSE
         RAISE NOTICE 'hivemind_app not found — install Hivemind then re-run grant_cross_schema.sh';
+    END IF;
+END
+$$;
+
+-- create_bridge_post_object and its transitive helpers (list_votes, json_date,
+-- amount/reputation formatting, ...) live in hivemind_postgrest_utilities.
+--
+-- Trade-off: this grants EXECUTE on *every* function in the two schemas, where
+-- strictly only get_full_post_view_by_id + create_bridge_post_object and their
+-- transitive closure are needed. A least-privilege per-function grant would have
+-- to enumerate that closure and break whenever Hivemind adds a helper, so the
+-- blanket grant is used for maintainability (mirroring how Hivemind's own roles
+-- are granted). Both entry points are SECURITY INVOKER, so there is no privilege
+-- escalation today; revisit if a SECURITY DEFINER helper is ever added there.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.schemata
+        WHERE schema_name = 'hivemind_postgrest_utilities'
+    ) THEN
+        GRANT USAGE ON SCHEMA hivemind_postgrest_utilities TO haf_fyp_user;
+        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user;
+        RAISE NOTICE 'hivemind_postgrest_utilities: granted EXECUTE to haf_fyp_user';
+    ELSE
+        RAISE NOTICE 'hivemind_postgrest_utilities not found — install Hivemind then re-run grant_cross_schema.sh';
     END IF;
 END
 $$;

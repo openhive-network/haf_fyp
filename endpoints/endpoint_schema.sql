@@ -11,7 +11,7 @@ info:
   license:
     name: MIT License
     url: https://opensource.org/license/mit
-  version: 1.0.0
+  version: 2.0.0
 externalDocs:
   description: HAF FYP GitLab repository
   url: https://gitlab.syncad.com/hive/haf_fyp
@@ -30,38 +30,26 @@ servers:
 
 /** openapi:components
 schemas:
-  feed_post_row:
+  fyp_ranking:
     type: object
     x-sql-datatype: object
-    description: A single post entry in a feed result
+    description: This app's ranking data for the post (the FYP-specific signal).
     properties:
-      post_id:
+      rank:
         type: integer
-        description: Internal post identifier
-      author:
-        type: string
-        description: Hive account name of the post author
-      permlink:
-        type: string
-        description: Unique permlink of the post
-      title:
-        type: string
-      community_id:
-        type: integer
-        description: Community the post belongs to (null if none)
-      created_at:
-        type: string
-        format: date-time
+        description: Position in the feed (1-based)
       final_score:
         type: number
         description: Composite ranking score [0, 1]
-      score_engagement:
+      score_relevance:
         type: number
+        nullable: true
+        description: Semantic relevance to the user's interest vector (null in the global feed)
       score_recency:
         type: number
-      score_credibility:
+      score_engagement:
         type: number
-      score_relevance:
+      score_credibility:
         type: number
       community_boost_applied:
         type: boolean
@@ -69,9 +57,57 @@ schemas:
         type: string
         nullable: true
         description: Which tier applied the community boost - 'subscribed', 'engaged', or null
-      rank:
+ */
+
+/** openapi:components
+schemas:
+  feed_entry:
+    type: object
+    x-sql-datatype: object
+    description: >-
+      A ranked post. The post itself is returned in the exact shape produced by
+      Hivemind's bridge.get_ranked_posts (author, permlink, title, body,
+      json_metadata, category, created/updated, payout / pending_payout /
+      is_paidout / payout_at, author_reputation, author_role/title, children,
+      net_rshares, active_votes, stats, beneficiaries, percent_hbd,
+      max_accepted_payout, community / community_title, url, blacklists, reblogs,
+      ...), so any front end that renders trending / hot / new can render this
+      feed unchanged. A nested "fyp" object adds this app's ranking data.
+    properties:
+      author:
+        type: string
+      permlink:
+        type: string
+      title:
+        type: string
+      body:
+        type: string
+      category:
+        type: string
+      community:
+        type: string
+        nullable: true
+      created:
+        type: string
+        format: date-time
+      payout:
+        type: number
+      author_reputation:
+        type: number
+      children:
         type: integer
-        description: Position in the feed (1-based)
+      json_metadata:
+        type: object
+      active_votes:
+        type: array
+        items:
+          type: object
+      stats:
+        type: object
+      url:
+        type: string
+      fyp:
+        $ref: '#/components/schemas/fyp_ranking'
  */
 
 -- ---------------------------------------------------------------------------
@@ -98,7 +134,7 @@ AS $func$
       "name": "MIT License",
       "url": "https://opensource.org/license/mit"
     },
-    "version": "1.0.0"
+    "version": "2.0.0"
   },
   "externalDocs": {
     "description": "HAF FYP GitLab repository",
@@ -129,48 +165,31 @@ AS $func$
   ],
   "components": {
     "schemas": {
-      "feed_post_row": {
+      "fyp_ranking": {
         "type": "object",
         "x-sql-datatype": "object",
-        "description": "A single post entry in a feed result",
+        "description": "This app's ranking data for the post (the FYP-specific signal).",
         "properties": {
-          "post_id": {
+          "rank": {
             "type": "integer",
-            "description": "Internal post identifier"
-          },
-          "author": {
-            "type": "string",
-            "description": "Hive account name of the post author"
-          },
-          "permlink": {
-            "type": "string",
-            "description": "Unique permlink of the post"
-          },
-          "title": {
-            "type": "string"
-          },
-          "community_id": {
-            "type": "integer",
-            "description": "Community the post belongs to (null if none)"
-          },
-          "created_at": {
-            "type": "string",
-            "format": "date-time"
+            "description": "Position in the feed (1-based)"
           },
           "final_score": {
             "type": "number",
             "description": "Composite ranking score [0, 1]"
           },
-          "score_engagement": {
-            "type": "number"
+          "score_relevance": {
+            "type": "number",
+            "nullable": true,
+            "description": "Semantic relevance to the user's interest vector (null in the global feed)"
           },
           "score_recency": {
             "type": "number"
           },
-          "score_credibility": {
+          "score_engagement": {
             "type": "number"
           },
-          "score_relevance": {
+          "score_credibility": {
             "type": "number"
           },
           "community_boost_applied": {
@@ -180,10 +199,63 @@ AS $func$
             "type": "string",
             "nullable": true,
             "description": "Which tier applied the community boost - 'subscribed', 'engaged', or null"
+          }
+        }
+      },
+      "feed_entry": {
+        "type": "object",
+        "x-sql-datatype": "object",
+        "description": "A ranked post. The post itself is returned in the exact shape produced by Hivemind's bridge.get_ranked_posts (author, permlink, title, body, json_metadata, category, created/updated, payout / pending_payout / is_paidout / payout_at, author_reputation, author_role/title, children, net_rshares, active_votes, stats, beneficiaries, percent_hbd, max_accepted_payout, community / community_title, url, blacklists, reblogs, ...), so any front end that renders trending / hot / new can render this feed unchanged. A nested \"fyp\" object adds this app's ranking data.",
+        "properties": {
+          "author": {
+            "type": "string"
           },
-          "rank": {
-            "type": "integer",
-            "description": "Position in the feed (1-based)"
+          "permlink": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "community": {
+            "type": "string",
+            "nullable": true
+          },
+          "created": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "payout": {
+            "type": "number"
+          },
+          "author_reputation": {
+            "type": "number"
+          },
+          "children": {
+            "type": "integer"
+          },
+          "json_metadata": {
+            "type": "object"
+          },
+          "active_votes": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "stats": {
+            "type": "object"
+          },
+          "url": {
+            "type": "string"
+          },
+          "fyp": {
+            "$ref": "#/components/schemas/fyp_ranking"
           }
         }
       }
@@ -345,7 +417,7 @@ AS $func$
           "Feed"
         ],
         "summary": "Personalized feed",
-        "description": "Returns a ranked list of posts for the given user, ordered by final score.",
+        "description": "Returns a ranked list of posts for the given user, ordered by final score. Each post is returned in the same shape as Hivemind's bridge.get_ranked_posts (the structure front ends already render for trending / hot / new), plus a nested \"fyp\" object carrying this app's ranking data, so the feed is a drop-in alternative content source. Falls back to the global feed until the ranker has cached a feed for the user.",
         "operationId": "haf_fyp_endpoints.get_personalized_feed",
         "parameters": [
           {
@@ -359,23 +431,33 @@ AS $func$
           },
           {
             "in": "query",
-            "name": "limit",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 1
+            },
+            "description": "1-based page number"
+          },
+          {
+            "in": "query",
+            "name": "page-size",
             "required": false,
             "schema": {
               "type": "integer",
               "default": 20
             },
-            "description": "Maximum number of posts to return"
+            "description": "Posts per page (max 100)"
           },
           {
             "in": "query",
-            "name": "offset",
+            "name": "truncate_body",
             "required": false,
             "schema": {
               "type": "integer",
               "default": 0
             },
-            "description": "Pagination offset"
+            "description": "Truncate each post body to this many characters (0 = full body)"
           }
         ],
         "responses": {
@@ -384,10 +466,10 @@ AS $func$
             "content": {
               "application/json": {
                 "schema": {
-                  "x-sql-datatype": "SETOF haf_fyp_endpoints.feed_post_row",
+                  "x-sql-datatype": "jsonb",
                   "type": "array",
                   "items": {
-                    "$ref": "#/components/schemas/feed_post_row"
+                    "$ref": "#/components/schemas/feed_entry"
                   }
                 }
               }
@@ -402,26 +484,28 @@ AS $func$
           "Feed"
         ],
         "summary": "Global feed",
-        "description": "Returns the global unauthenticated feed, optionally filtered by community.",
+        "description": "Returns the global unauthenticated feed, optionally filtered by community. Each post is returned in the same shape as Hivemind's bridge.get_ranked_posts, plus a nested \"fyp\" object with this app's ranking data, so the feed is a drop-in alternative content source for front ends.",
         "operationId": "haf_fyp_endpoints.get_global_feed",
         "parameters": [
           {
             "in": "query",
-            "name": "limit",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 1
+            },
+            "description": "1-based page number"
+          },
+          {
+            "in": "query",
+            "name": "page-size",
             "required": false,
             "schema": {
               "type": "integer",
               "default": 20
-            }
-          },
-          {
-            "in": "query",
-            "name": "offset",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "default": 0
-            }
+            },
+            "description": "Posts per page (max 100)"
           },
           {
             "in": "query",
@@ -432,6 +516,16 @@ AS $func$
               "default": null
             },
             "description": "Filter results to a specific community (optional)"
+          },
+          {
+            "in": "query",
+            "name": "truncate_body",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0
+            },
+            "description": "Truncate each post body to this many characters (0 = full body)"
           }
         ],
         "responses": {
@@ -440,10 +534,10 @@ AS $func$
             "content": {
               "application/json": {
                 "schema": {
-                  "x-sql-datatype": "SETOF haf_fyp_endpoints.feed_post_row",
+                  "x-sql-datatype": "jsonb",
                   "type": "array",
                   "items": {
-                    "$ref": "#/components/schemas/feed_post_row"
+                    "$ref": "#/components/schemas/feed_entry"
                   }
                 }
               }
@@ -778,6 +872,60 @@ AS $$
 $$;
 
 -- ---------------------------------------------------------------------------
+-- Bridge post enrichment
+--
+-- Builds the exact post object that Hivemind's bridge.get_ranked_posts returns
+-- (the structure every Hive front end already renders for trending / hot / new),
+-- so an FYP feed can be dropped in as an alternative content source with no
+-- rendering changes. It reuses Hivemind's own get_full_post_view_by_id +
+-- create_bridge_post_object rather than duplicating the payout / reputation /
+-- vote math, which keeps the output byte-identical to bridge as Hivemind evolves.
+-- Returns NULL when the post no longer exists in Hivemind (e.g. it was deleted
+-- after the ranker cached it) so the caller can filter it out of the feed.
+--
+-- _post_id here is the Hivemind hive_posts.id (resolved by the feed endpoints
+-- from the cached (author, permlink)), NOT the FYP post_candidates.post_id.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION haf_fyp_app.get_bridge_post(
+    _post_id int,
+    _observer_id int,
+    _truncate_body int
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    _result jsonb;
+BEGIN
+    -- Clamp: create_bridge_post_object treats 0 as "no truncation"; a negative
+    -- value would make left(body, n) keep "all but the last n chars". 0 = full.
+    _truncate_body := GREATEST(_truncate_body, 0);
+    SELECT hivemind_postgrest_utilities.create_bridge_post_object(
+        _observer_id, r, _truncate_body, NULL, r.is_pinned, TRUE
+    )
+    INTO _result
+    FROM (
+        SELECT
+            hp.id, hp.author, hp.parent_author, hp.author_rep, hp.root_title,
+            hp.beneficiaries, hp.max_accepted_payout, hp.percent_hbd, hp.url,
+            hp.permlink, hp.parent_permlink_or_category, hp.title, hp.body,
+            hp.category, hp.depth, hp.payout, hp.pending_payout, hp.payout_at,
+            hp.is_paidout, hp.children, hp.votes, hp.created_at, hp.updated_at,
+            hp.rshares, hp.abs_rshares, hp.json, hp.is_hidden, hp.is_grayed,
+            hp.total_votes, hp.sc_trend, hp.role_title, hp.community_title,
+            hp.role_id, hp.is_pinned, hp.curator_payout_value, hp.is_muted,
+            hp.source AS blacklists, hp.muted_reasons
+        FROM hivemind_app.get_full_post_view_by_id(_post_id, _observer_id) AS hp
+    ) AS r;
+    RETURN _result;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION haf_fyp_app.get_bridge_post(int, int, int) TO haf_fyp_user;
+
+-- ---------------------------------------------------------------------------
 -- Personalized feed
 -- ---------------------------------------------------------------------------
 
@@ -787,7 +935,13 @@ $$;
     tags:
       - Feed
     summary: Personalized feed
-    description: Returns a ranked list of posts for the given user, ordered by final score.
+    description: >-
+      Returns a ranked list of posts for the given user, ordered by final score.
+      Each post is returned in the same shape as Hivemind's
+      bridge.get_ranked_posts (the structure front ends already render for
+      trending / hot / new), plus a nested "fyp" object carrying this app's
+      ranking data, so the feed is a drop-in alternative content source.
+      Falls back to the global feed until the ranker has cached a feed for the user.
     operationId: haf_fyp_endpoints.get_personalized_feed
     parameters:
       - in: path
@@ -797,96 +951,165 @@ $$;
           type: string
         description: Hive account name
       - in: query
-        name: limit
+        name: page
+        required: false
+        schema:
+          type: integer
+          default: 1
+        description: 1-based page number
+      - in: query
+        name: page-size
         required: false
         schema:
           type: integer
           default: 20
-        description: Maximum number of posts to return
+        description: Posts per page (max 100)
       - in: query
-        name: offset
+        name: truncate_body
         required: false
         schema:
           type: integer
           default: 0
-        description: Pagination offset
+        description: Truncate each post body to this many characters (0 = full body)
     responses:
       '200':
         description: Ranked post list (empty array before first ranker cycle)
         content:
           application/json:
             schema:
-              x-sql-datatype: "SETOF haf_fyp_endpoints.feed_post_row"
+              x-sql-datatype: "jsonb"
               type: array
               items:
-                $ref: '#/components/schemas/feed_post_row'
+                $ref: '#/components/schemas/feed_entry'
  */
 -- openapi-generated-code-begin
 DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_personalized_feed;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_personalized_feed(
     "username" TEXT,
-    "limit" INT = 20,
-    "offset" INT = 0
+    "page" INT = 1,
+    "page-size" INT = 20,
+    "truncate_body" INT = 0
 )
-RETURNS SETOF haf_fyp_endpoints.feed_post_row 
+RETURNS jsonb
 -- openapi-generated-code-end
-LANGUAGE sql STABLE
+LANGUAGE plpgsql STABLE
 AS $$
-    -- Cold-start fallback: users without a precomputed personalized feed
-    -- (no interactions yet, or never scored) get the global feed instead of an
-    -- empty result, so the "For You" page is never blank. Personalization kicks
-    -- in automatically once the user has a cached feed.
-    WITH has_personal AS (
-        SELECT EXISTS (
-            SELECT 1 FROM haf_fyp_app.feed_cache
-            WHERE username = get_personalized_feed.username
-        ) AS yes
-    )
-    -- Personalized feed
-    SELECT
-        fc.post_id,
-        pc.author,
-        pc.permlink,
-        pc.title,
-        pc.community_id,
-        pc.created_at,
-        fc.final_score,
-        fc.score_engagement,
-        fc.score_recency,
-        fc.score_credibility,
-        fc.score_relevance,
-        fc.community_boost_applied,
-        fc.boost_source,
-        fc.rank
-    FROM haf_fyp_app.feed_cache fc
-    JOIN haf_fyp_app.post_candidates pc ON pc.post_id = fc.post_id
-    WHERE fc.username = get_personalized_feed.username
-      AND (SELECT yes FROM has_personal)
+DECLARE
+    _observer_id int;
+    _result jsonb;
+    -- Pagination uses page / page-size (not limit / offset, which PostgREST
+    -- reserves for result-set slicing and would not forward as arguments).
+    -- Enrichment is the costly step, so the window is applied in-query and
+    -- page-size is capped to bound per-request work.
+    _limit int := LEAST(GREATEST(get_personalized_feed."page-size", 1), 100);
+    _offset int := (GREATEST(get_personalized_feed."page", 1) - 1) * _limit;
+BEGIN
+    -- Personalized feed. Each cached (author, permlink) is resolved to its
+    -- Hivemind post id and enriched into the bridge post object, then tagged
+    -- with the FYP ranking data under "fyp". The Hivemind joins are reached only
+    -- when the user actually has a cached feed, so an empty feed never touches
+    -- Hivemind (keeps the endpoint usable before the ranker runs / in CI).
+    IF EXISTS (
+        SELECT 1 FROM haf_fyp_app.feed_cache fc
+        WHERE fc.username = get_personalized_feed.username
+    ) THEN
+        -- Observer context makes active_votes / muted state account-aware,
+        -- exactly as a logged-in trending feed would be.
+        _observer_id := COALESCE(
+            (SELECT ha.id FROM hivemind_app.hive_accounts ha
+             WHERE ha.name = get_personalized_feed.username), 0
+        );
+        SELECT COALESCE(
+            jsonb_agg(s.post ORDER BY s.rank) FILTER (WHERE s.post IS NOT NULL),
+            '[]'::jsonb
+        )
+        INTO _result
+        FROM (
+            -- Enrich only the page: get_bridge_post runs at this level, over the
+            -- already-windowed "page" rows, so the Hivemind builders are called
+            -- at most page-size times regardless of the join plan (the inner
+            -- LIMIT is a cardinality barrier the projection cannot cross).
+            SELECT
+                page.rank,
+                haf_fyp_app.get_bridge_post(page.post_id, _observer_id, get_personalized_feed.truncate_body)
+                || jsonb_build_object('fyp', page.fyp) AS post
+            FROM (
+                SELECT
+                    hp.id AS post_id,
+                    fc.rank AS rank,
+                    jsonb_build_object(
+                        'rank', fc.rank,
+                        'final_score', fc.final_score,
+                        'score_relevance', fc.score_relevance,
+                        'score_recency', fc.score_recency,
+                        'score_engagement', fc.score_engagement,
+                        'score_credibility', fc.score_credibility,
+                        'community_boost_applied', fc.community_boost_applied,
+                        'boost_source', fc.boost_source
+                    ) AS fyp
+                FROM haf_fyp_app.feed_cache fc
+                JOIN haf_fyp_app.post_candidates pc ON pc.post_id = fc.post_id
+                JOIN hivemind_app.hive_accounts ha ON ha.name = pc.author
+                JOIN hivemind_app.hive_permlink_data pd ON pd.permlink = pc.permlink
+                JOIN hivemind_app.hive_posts hp
+                    ON hp.author_id = ha.id AND hp.permlink_id = pd.id AND hp.counter_deleted = 0
+                WHERE fc.username = get_personalized_feed.username
+                ORDER BY fc.rank
+                LIMIT _limit
+                OFFSET _offset
+            ) AS page
+        ) AS s;
+        RETURN _result;
+    END IF;
 
-    UNION ALL
+    -- Cold-start fallback: a user without a cached personalized feed gets the
+    -- global feed instead of an empty result, so the "For You" page is never
+    -- blank. Personalization kicks in automatically once the ranker caches a feed.
+    IF EXISTS (SELECT 1 FROM haf_fyp_app.global_feed_cache) THEN
+        _observer_id := COALESCE(
+            (SELECT ha.id FROM hivemind_app.hive_accounts ha
+             WHERE ha.name = get_personalized_feed.username), 0
+        );
+        SELECT COALESCE(
+            jsonb_agg(s.post ORDER BY s.rank) FILTER (WHERE s.post IS NOT NULL),
+            '[]'::jsonb
+        )
+        INTO _result
+        FROM (
+            SELECT
+                page.rank,
+                haf_fyp_app.get_bridge_post(page.post_id, _observer_id, get_personalized_feed.truncate_body)
+                || jsonb_build_object('fyp', page.fyp) AS post
+            FROM (
+                SELECT
+                    hp.id AS post_id,
+                    gfc.rank AS rank,
+                    jsonb_build_object(
+                        'rank', gfc.rank,
+                        'final_score', gfc.final_score,
+                        'score_relevance', NULL::float,
+                        'score_recency', gfc.score_recency,
+                        'score_engagement', gfc.score_engagement,
+                        'score_credibility', gfc.score_credibility,
+                        'community_boost_applied', FALSE,
+                        'boost_source', NULL::text
+                    ) AS fyp
+                FROM haf_fyp_app.global_feed_cache gfc
+                JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
+                JOIN hivemind_app.hive_accounts ha ON ha.name = pc.author
+                JOIN hivemind_app.hive_permlink_data pd ON pd.permlink = pc.permlink
+                JOIN hivemind_app.hive_posts hp
+                    ON hp.author_id = ha.id AND hp.permlink_id = pd.id AND hp.counter_deleted = 0
+                ORDER BY gfc.rank
+                LIMIT _limit
+                OFFSET _offset
+            ) AS page
+        ) AS s;
+        RETURN _result;
+    END IF;
 
-    -- Global feed fallback (only when the user has no personalized feed)
-    SELECT
-        gfc.post_id,
-        pc.author,
-        pc.permlink,
-        pc.title,
-        pc.community_id,
-        pc.created_at,
-        gfc.final_score,
-        gfc.score_engagement,
-        gfc.score_recency,
-        gfc.score_credibility,
-        NULL::float AS score_relevance,
-        FALSE AS community_boost_applied,
-        NULL::varchar(16) AS boost_source,
-        gfc.rank
-    FROM haf_fyp_app.global_feed_cache gfc
-    JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
-    WHERE NOT (SELECT yes FROM has_personal)
-    ORDER BY rank ASC
-    LIMIT get_personalized_feed."limit"
-    OFFSET get_personalized_feed."offset";
+    RETURN '[]'::jsonb;
+END;
 $$;
 
 -- ---------------------------------------------------------------------------
@@ -899,21 +1122,27 @@ $$;
     tags:
       - Feed
     summary: Global feed
-    description: Returns the global unauthenticated feed, optionally filtered by community.
+    description: >-
+      Returns the global unauthenticated feed, optionally filtered by community.
+      Each post is returned in the same shape as Hivemind's
+      bridge.get_ranked_posts, plus a nested "fyp" object with this app's ranking
+      data, so the feed is a drop-in alternative content source for front ends.
     operationId: haf_fyp_endpoints.get_global_feed
     parameters:
       - in: query
-        name: limit
+        name: page
+        required: false
+        schema:
+          type: integer
+          default: 1
+        description: 1-based page number
+      - in: query
+        name: page-size
         required: false
         schema:
           type: integer
           default: 20
-      - in: query
-        name: offset
-        required: false
-        schema:
-          type: integer
-          default: 0
+        description: Posts per page (max 100)
       - in: query
         name: community_id
         required: false
@@ -921,49 +1150,92 @@ $$;
           type: integer
           default: null
         description: Filter results to a specific community (optional)
+      - in: query
+        name: truncate_body
+        required: false
+        schema:
+          type: integer
+          default: 0
+        description: Truncate each post body to this many characters (0 = full body)
     responses:
       '200':
         description: Global ranked post list
         content:
           application/json:
             schema:
-              x-sql-datatype: "SETOF haf_fyp_endpoints.feed_post_row"
+              x-sql-datatype: "jsonb"
               type: array
               items:
-                $ref: '#/components/schemas/feed_post_row'
+                $ref: '#/components/schemas/feed_entry'
  */
 -- openapi-generated-code-begin
 DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_global_feed;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_global_feed(
-    "limit" INT = 20,
-    "offset" INT = 0,
-    "community_id" INT = NULL
+    "page" INT = 1,
+    "page-size" INT = 20,
+    "community_id" INT = NULL,
+    "truncate_body" INT = 0
 )
-RETURNS SETOF haf_fyp_endpoints.feed_post_row 
+RETURNS jsonb
 -- openapi-generated-code-end
-LANGUAGE sql STABLE
+LANGUAGE plpgsql STABLE
 AS $$
-    SELECT
-        gfc.post_id,
-        pc.author,
-        pc.permlink,
-        pc.title,
-        pc.community_id,
-        pc.created_at,
-        gfc.final_score,
-        gfc.score_engagement,
-        gfc.score_recency,
-        gfc.score_credibility,
-        NULL::float AS score_relevance,
-        FALSE AS community_boost_applied,
-        NULL::varchar(16) AS boost_source,
-        gfc.rank
-    FROM haf_fyp_app.global_feed_cache gfc
-    JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
-    WHERE (get_global_feed.community_id IS NULL OR pc.community_id = get_global_feed.community_id)
-    ORDER BY gfc.rank ASC
-    LIMIT get_global_feed."limit"
-    OFFSET get_global_feed."offset";
+DECLARE
+    _result jsonb;
+    -- See get_personalized_feed: page / page-size, capped, windowed in-query.
+    _limit int := LEAST(GREATEST(get_global_feed."page-size", 1), 100);
+    _offset int := (GREATEST(get_global_feed."page", 1) - 1) * _limit;
+BEGIN
+    -- Global feed is unauthenticated, so observer_id is 0 (no account-specific
+    -- vote / mute context). Hivemind is only joined when the cache has rows.
+    IF EXISTS (SELECT 1 FROM haf_fyp_app.global_feed_cache) THEN
+        SELECT COALESCE(
+            jsonb_agg(s.post ORDER BY s.rank) FILTER (WHERE s.post IS NOT NULL),
+            '[]'::jsonb
+        )
+        INTO _result
+        FROM (
+            -- Enrich only the page (see get_personalized_feed): get_bridge_post
+            -- runs over the already-windowed "page" rows, so the Hivemind
+            -- builders are called at most page-size times regardless of plan.
+            SELECT
+                page.rank,
+                haf_fyp_app.get_bridge_post(page.post_id, 0, get_global_feed.truncate_body)
+                || jsonb_build_object('fyp', page.fyp) AS post
+            FROM (
+                SELECT
+                    hp.id AS post_id,
+                    gfc.rank AS rank,
+                    jsonb_build_object(
+                        'rank', gfc.rank,
+                        'final_score', gfc.final_score,
+                        'score_relevance', NULL::float,
+                        'score_recency', gfc.score_recency,
+                        'score_engagement', gfc.score_engagement,
+                        'score_credibility', gfc.score_credibility,
+                        'community_boost_applied', FALSE,
+                        'boost_source', NULL::text
+                    ) AS fyp
+                FROM haf_fyp_app.global_feed_cache gfc
+                JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
+                JOIN hivemind_app.hive_accounts ha ON ha.name = pc.author
+                JOIN hivemind_app.hive_permlink_data pd ON pd.permlink = pc.permlink
+                JOIN hivemind_app.hive_posts hp
+                    ON hp.author_id = ha.id AND hp.permlink_id = pd.id AND hp.counter_deleted = 0
+                WHERE (
+                    get_global_feed.community_id IS NULL
+                    OR pc.community_id = get_global_feed.community_id
+                )
+                ORDER BY gfc.rank
+                LIMIT _limit
+                OFFSET _offset
+            ) AS page
+        ) AS s;
+        RETURN _result;
+    END IF;
+
+    RETURN '[]'::jsonb;
+END;
 $$;
 
 -- ---------------------------------------------------------------------------
