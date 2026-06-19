@@ -11,7 +11,7 @@ info:
   license:
     name: MIT License
     url: https://opensource.org/license/mit
-  version: 1.0.0
+  version: 2.0.0
 externalDocs:
   description: HAF FYP GitLab repository
   url: https://gitlab.syncad.com/hive/haf_fyp
@@ -134,7 +134,7 @@ AS $func$
       "name": "MIT License",
       "url": "https://opensource.org/license/mit"
     },
-    "version": "1.0.0"
+    "version": "2.0.0"
   },
   "externalDocs": {
     "description": "HAF FYP GitLab repository",
@@ -899,6 +899,9 @@ AS $$
 DECLARE
     _result jsonb;
 BEGIN
+    -- Clamp: create_bridge_post_object treats 0 as "no truncation"; a negative
+    -- value would make left(body, n) keep "all but the last n chars". 0 = full.
+    _truncate_body := GREATEST(_truncate_body, 0);
     SELECT hivemind_postgrest_utilities.create_bridge_post_object(
         _observer_id, r, _truncate_body, NULL, r.is_pinned, TRUE
     )
@@ -1022,11 +1025,19 @@ BEGIN
         )
         INTO _result
         FROM (
+            -- Enrich only the page: get_bridge_post runs at this level, over the
+            -- already-windowed "page" rows, so the Hivemind builders are called
+            -- at most page-size times regardless of the join plan (the inner
+            -- LIMIT is a cardinality barrier the projection cannot cross).
             SELECT
-                fc.rank,
-                haf_fyp_app.get_bridge_post(hp.id, _observer_id, get_personalized_feed.truncate_body)
-                || jsonb_build_object(
-                    'fyp', jsonb_build_object(
+                page.rank,
+                haf_fyp_app.get_bridge_post(page.post_id, _observer_id, get_personalized_feed.truncate_body)
+                || jsonb_build_object('fyp', page.fyp) AS post
+            FROM (
+                SELECT
+                    hp.id AS post_id,
+                    fc.rank AS rank,
+                    jsonb_build_object(
                         'rank', fc.rank,
                         'final_score', fc.final_score,
                         'score_relevance', fc.score_relevance,
@@ -1035,18 +1046,18 @@ BEGIN
                         'score_credibility', fc.score_credibility,
                         'community_boost_applied', fc.community_boost_applied,
                         'boost_source', fc.boost_source
-                    )
-                ) AS post
-            FROM haf_fyp_app.feed_cache fc
-            JOIN haf_fyp_app.post_candidates pc ON pc.post_id = fc.post_id
-            JOIN hivemind_app.hive_accounts ha ON ha.name = pc.author
-            JOIN hivemind_app.hive_permlink_data pd ON pd.permlink = pc.permlink
-            JOIN hivemind_app.hive_posts hp
-                ON hp.author_id = ha.id AND hp.permlink_id = pd.id AND hp.counter_deleted = 0
-            WHERE fc.username = get_personalized_feed.username
-            ORDER BY fc.rank
-            LIMIT _limit
-            OFFSET _offset
+                    ) AS fyp
+                FROM haf_fyp_app.feed_cache fc
+                JOIN haf_fyp_app.post_candidates pc ON pc.post_id = fc.post_id
+                JOIN hivemind_app.hive_accounts ha ON ha.name = pc.author
+                JOIN hivemind_app.hive_permlink_data pd ON pd.permlink = pc.permlink
+                JOIN hivemind_app.hive_posts hp
+                    ON hp.author_id = ha.id AND hp.permlink_id = pd.id AND hp.counter_deleted = 0
+                WHERE fc.username = get_personalized_feed.username
+                ORDER BY fc.rank
+                LIMIT _limit
+                OFFSET _offset
+            ) AS page
         ) AS s;
         RETURN _result;
     END IF;
@@ -1066,10 +1077,14 @@ BEGIN
         INTO _result
         FROM (
             SELECT
-                gfc.rank,
-                haf_fyp_app.get_bridge_post(hp.id, _observer_id, get_personalized_feed.truncate_body)
-                || jsonb_build_object(
-                    'fyp', jsonb_build_object(
+                page.rank,
+                haf_fyp_app.get_bridge_post(page.post_id, _observer_id, get_personalized_feed.truncate_body)
+                || jsonb_build_object('fyp', page.fyp) AS post
+            FROM (
+                SELECT
+                    hp.id AS post_id,
+                    gfc.rank AS rank,
+                    jsonb_build_object(
                         'rank', gfc.rank,
                         'final_score', gfc.final_score,
                         'score_relevance', NULL::float,
@@ -1078,17 +1093,17 @@ BEGIN
                         'score_credibility', gfc.score_credibility,
                         'community_boost_applied', FALSE,
                         'boost_source', NULL::text
-                    )
-                ) AS post
-            FROM haf_fyp_app.global_feed_cache gfc
-            JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
-            JOIN hivemind_app.hive_accounts ha ON ha.name = pc.author
-            JOIN hivemind_app.hive_permlink_data pd ON pd.permlink = pc.permlink
-            JOIN hivemind_app.hive_posts hp
-                ON hp.author_id = ha.id AND hp.permlink_id = pd.id AND hp.counter_deleted = 0
-            ORDER BY gfc.rank
-            LIMIT _limit
-            OFFSET _offset
+                    ) AS fyp
+                FROM haf_fyp_app.global_feed_cache gfc
+                JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
+                JOIN hivemind_app.hive_accounts ha ON ha.name = pc.author
+                JOIN hivemind_app.hive_permlink_data pd ON pd.permlink = pc.permlink
+                JOIN hivemind_app.hive_posts hp
+                    ON hp.author_id = ha.id AND hp.permlink_id = pd.id AND hp.counter_deleted = 0
+                ORDER BY gfc.rank
+                LIMIT _limit
+                OFFSET _offset
+            ) AS page
         ) AS s;
         RETURN _result;
     END IF;
@@ -1180,11 +1195,18 @@ BEGIN
         )
         INTO _result
         FROM (
+            -- Enrich only the page (see get_personalized_feed): get_bridge_post
+            -- runs over the already-windowed "page" rows, so the Hivemind
+            -- builders are called at most page-size times regardless of plan.
             SELECT
-                gfc.rank,
-                haf_fyp_app.get_bridge_post(hp.id, 0, get_global_feed.truncate_body)
-                || jsonb_build_object(
-                    'fyp', jsonb_build_object(
+                page.rank,
+                haf_fyp_app.get_bridge_post(page.post_id, 0, get_global_feed.truncate_body)
+                || jsonb_build_object('fyp', page.fyp) AS post
+            FROM (
+                SELECT
+                    hp.id AS post_id,
+                    gfc.rank AS rank,
+                    jsonb_build_object(
                         'rank', gfc.rank,
                         'final_score', gfc.final_score,
                         'score_relevance', NULL::float,
@@ -1193,21 +1215,21 @@ BEGIN
                         'score_credibility', gfc.score_credibility,
                         'community_boost_applied', FALSE,
                         'boost_source', NULL::text
-                    )
-                ) AS post
-            FROM haf_fyp_app.global_feed_cache gfc
-            JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
-            JOIN hivemind_app.hive_accounts ha ON ha.name = pc.author
-            JOIN hivemind_app.hive_permlink_data pd ON pd.permlink = pc.permlink
-            JOIN hivemind_app.hive_posts hp
-                ON hp.author_id = ha.id AND hp.permlink_id = pd.id AND hp.counter_deleted = 0
-            WHERE (
-                get_global_feed.community_id IS NULL
-                OR pc.community_id = get_global_feed.community_id
-            )
-            ORDER BY gfc.rank
-            LIMIT _limit
-            OFFSET _offset
+                    ) AS fyp
+                FROM haf_fyp_app.global_feed_cache gfc
+                JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
+                JOIN hivemind_app.hive_accounts ha ON ha.name = pc.author
+                JOIN hivemind_app.hive_permlink_data pd ON pd.permlink = pc.permlink
+                JOIN hivemind_app.hive_posts hp
+                    ON hp.author_id = ha.id AND hp.permlink_id = pd.id AND hp.counter_deleted = 0
+                WHERE (
+                    get_global_feed.community_id IS NULL
+                    OR pc.community_id = get_global_feed.community_id
+                )
+                ORDER BY gfc.rank
+                LIMIT _limit
+                OFFSET _offset
+            ) AS page
         ) AS s;
         RETURN _result;
     END IF;

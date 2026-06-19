@@ -56,6 +56,14 @@ $$;
 
 -- create_bridge_post_object and its transitive helpers (list_votes, json_date,
 -- amount/reputation formatting, ...) live in hivemind_postgrest_utilities.
+--
+-- Trade-off: this grants EXECUTE on *every* function in the two schemas, where
+-- strictly only get_full_post_view_by_id + create_bridge_post_object and their
+-- transitive closure are needed. A least-privilege per-function grant would have
+-- to enumerate that closure and break whenever Hivemind adds a helper, so the
+-- blanket grant is used for maintainability (mirroring how Hivemind's own roles
+-- are granted). Both entry points are SECURITY INVOKER, so there is no privilege
+-- escalation today; revisit if a SECURITY DEFINER helper is ever added there.
 DO $$
 BEGIN
     IF EXISTS (
