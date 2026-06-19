@@ -431,23 +431,23 @@ AS $func$
           },
           {
             "in": "query",
-            "name": "limit",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 1
+            },
+            "description": "1-based page number"
+          },
+          {
+            "in": "query",
+            "name": "page-size",
             "required": false,
             "schema": {
               "type": "integer",
               "default": 20
             },
-            "description": "Maximum number of posts to return"
-          },
-          {
-            "in": "query",
-            "name": "offset",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "default": 0
-            },
-            "description": "Pagination offset"
+            "description": "Posts per page (max 100)"
           },
           {
             "in": "query",
@@ -489,21 +489,23 @@ AS $func$
         "parameters": [
           {
             "in": "query",
-            "name": "limit",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 1
+            },
+            "description": "1-based page number"
+          },
+          {
+            "in": "query",
+            "name": "page-size",
             "required": false,
             "schema": {
               "type": "integer",
               "default": 20
-            }
-          },
-          {
-            "in": "query",
-            "name": "offset",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "default": 0
-            }
+            },
+            "description": "Posts per page (max 100)"
           },
           {
             "in": "query",
@@ -946,19 +948,19 @@ GRANT EXECUTE ON FUNCTION haf_fyp_app.get_bridge_post(int, int, int) TO haf_fyp_
           type: string
         description: Hive account name
       - in: query
-        name: limit
+        name: page
+        required: false
+        schema:
+          type: integer
+          default: 1
+        description: 1-based page number
+      - in: query
+        name: page-size
         required: false
         schema:
           type: integer
           default: 20
-        description: Maximum number of posts to return
-      - in: query
-        name: offset
-        required: false
-        schema:
-          type: integer
-          default: 0
-        description: Pagination offset
+        description: Posts per page (max 100)
       - in: query
         name: truncate_body
         required: false
@@ -981,8 +983,8 @@ GRANT EXECUTE ON FUNCTION haf_fyp_app.get_bridge_post(int, int, int) TO haf_fyp_
 DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_personalized_feed;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_personalized_feed(
     "username" TEXT,
-    "limit" INT = 20,
-    "offset" INT = 0,
+    "page" INT = 1,
+    "page-size" INT = 20,
     "truncate_body" INT = 0
 )
 RETURNS jsonb
@@ -992,6 +994,12 @@ AS $$
 DECLARE
     _observer_id int;
     _result jsonb;
+    -- Pagination uses page / page-size (not limit / offset, which PostgREST
+    -- reserves for result-set slicing and would not forward as arguments).
+    -- Enrichment is the costly step, so the window is applied in-query and
+    -- page-size is capped to bound per-request work.
+    _limit int := LEAST(GREATEST(get_personalized_feed."page-size", 1), 100);
+    _offset int := (GREATEST(get_personalized_feed."page", 1) - 1) * _limit;
 BEGIN
     -- Personalized feed. Each cached (author, permlink) is resolved to its
     -- Hivemind post id and enriched into the bridge post object, then tagged
@@ -1037,8 +1045,8 @@ BEGIN
                 ON hp.author_id = ha.id AND hp.permlink_id = pd.id AND hp.counter_deleted = 0
             WHERE fc.username = get_personalized_feed.username
             ORDER BY fc.rank
-            LIMIT get_personalized_feed."limit"
-            OFFSET get_personalized_feed."offset"
+            LIMIT _limit
+            OFFSET _offset
         ) AS s;
         RETURN _result;
     END IF;
@@ -1079,8 +1087,8 @@ BEGIN
             JOIN hivemind_app.hive_posts hp
                 ON hp.author_id = ha.id AND hp.permlink_id = pd.id AND hp.counter_deleted = 0
             ORDER BY gfc.rank
-            LIMIT get_personalized_feed."limit"
-            OFFSET get_personalized_feed."offset"
+            LIMIT _limit
+            OFFSET _offset
         ) AS s;
         RETURN _result;
     END IF;
@@ -1107,17 +1115,19 @@ $$;
     operationId: haf_fyp_endpoints.get_global_feed
     parameters:
       - in: query
-        name: limit
+        name: page
+        required: false
+        schema:
+          type: integer
+          default: 1
+        description: 1-based page number
+      - in: query
+        name: page-size
         required: false
         schema:
           type: integer
           default: 20
-      - in: query
-        name: offset
-        required: false
-        schema:
-          type: integer
-          default: 0
+        description: Posts per page (max 100)
       - in: query
         name: community_id
         required: false
@@ -1146,8 +1156,8 @@ $$;
 -- openapi-generated-code-begin
 DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_global_feed;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_global_feed(
-    "limit" INT = 20,
-    "offset" INT = 0,
+    "page" INT = 1,
+    "page-size" INT = 20,
     "community_id" INT = NULL,
     "truncate_body" INT = 0
 )
@@ -1157,6 +1167,9 @@ LANGUAGE plpgsql STABLE
 AS $$
 DECLARE
     _result jsonb;
+    -- See get_personalized_feed: page / page-size, capped, windowed in-query.
+    _limit int := LEAST(GREATEST(get_global_feed."page-size", 1), 100);
+    _offset int := (GREATEST(get_global_feed."page", 1) - 1) * _limit;
 BEGIN
     -- Global feed is unauthenticated, so observer_id is 0 (no account-specific
     -- vote / mute context). Hivemind is only joined when the cache has rows.
@@ -1193,8 +1206,8 @@ BEGIN
                 OR pc.community_id = get_global_feed.community_id
             )
             ORDER BY gfc.rank
-            LIMIT get_global_feed."limit"
-            OFFSET get_global_feed."offset"
+            LIMIT _limit
+            OFFSET _offset
         ) AS s;
         RETURN _result;
     END IF;
