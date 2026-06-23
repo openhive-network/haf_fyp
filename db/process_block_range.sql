@@ -22,6 +22,10 @@ BEGIN
     -- of a few blocks is retried on later batches); permanently-unresolvable rows
     -- fall outside the window and are not re-probed. Best-effort (see the function).
     SELECT created_at INTO _block_time FROM hafd.blocks WHERE num = _last_block;
-    PERFORM haf_fyp_app.resolve_hivemind_post_ids(_block_time - INTERVAL '7 days');
+    -- Guard: a NULL block time would pass NULL _since (open lower bound) and turn
+    -- the bounded incremental resolve into a full-history scan every batch.
+    IF _block_time IS NOT NULL THEN
+        PERFORM haf_fyp_app.resolve_hivemind_post_ids(_block_time - INTERVAL '7 days');
+    END IF;
 END;
 $$;
