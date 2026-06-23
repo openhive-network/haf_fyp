@@ -1144,11 +1144,26 @@ BEGIN
             -- LIMIT is a cardinality barrier the projection cannot cross).
             SELECT
                 page.rank,
-                haf_fyp_app.get_bridge_post(page.post_id, _observer_id, get_personalized_feed.truncate_body)
+                -- Serve the pre-rendered bridge JSON from post_bridge_cache when
+                -- present (re-applying truncate_body to the cached full body),
+                -- else render live. The cache is observer-agnostic (observer_id 0);
+                -- the live fallback keeps observer context on a miss.
+                COALESCE(
+                    CASE
+                        WHEN page.cached IS NOT NULL AND get_personalized_feed.truncate_body > 0
+                        THEN jsonb_set(
+                                 page.cached, '{body}',
+                                 to_jsonb(left(page.cached ->> 'body', get_personalized_feed.truncate_body))
+                             )
+                        ELSE page.cached
+                    END,
+                    haf_fyp_app.get_bridge_post(page.hive_post_id, _observer_id, get_personalized_feed.truncate_body)
+                )
                 || jsonb_build_object('fyp', page.fyp) AS post
             FROM (
                 SELECT
-                    pc.hive_post_id AS post_id,
+                    pc.hive_post_id AS hive_post_id,
+                    pbc.bridge AS cached,
                     fc.rank AS rank,
                     jsonb_build_object(
                         'rank', fc.rank,
@@ -1168,6 +1183,7 @@ BEGIN
                 -- resolves them.
                 FROM haf_fyp_app.feed_cache fc
                 JOIN haf_fyp_app.post_candidates pc ON pc.post_id = fc.post_id
+                LEFT JOIN haf_fyp_app.post_bridge_cache pbc ON pbc.post_id = fc.post_id
                 WHERE fc.username = get_personalized_feed.username
                   AND pc.hive_post_id IS NOT NULL
                 ORDER BY fc.rank
@@ -1194,11 +1210,26 @@ BEGIN
         FROM (
             SELECT
                 page.rank,
-                haf_fyp_app.get_bridge_post(page.post_id, _observer_id, get_personalized_feed.truncate_body)
+                -- Serve the pre-rendered bridge JSON from post_bridge_cache when
+                -- present (re-applying truncate_body to the cached full body),
+                -- else render live. The cache is observer-agnostic (observer_id 0);
+                -- the live fallback keeps observer context on a miss.
+                COALESCE(
+                    CASE
+                        WHEN page.cached IS NOT NULL AND get_personalized_feed.truncate_body > 0
+                        THEN jsonb_set(
+                                 page.cached, '{body}',
+                                 to_jsonb(left(page.cached ->> 'body', get_personalized_feed.truncate_body))
+                             )
+                        ELSE page.cached
+                    END,
+                    haf_fyp_app.get_bridge_post(page.hive_post_id, _observer_id, get_personalized_feed.truncate_body)
+                )
                 || jsonb_build_object('fyp', page.fyp) AS post
             FROM (
                 SELECT
-                    pc.hive_post_id AS post_id,
+                    pc.hive_post_id AS hive_post_id,
+                    pbc.bridge AS cached,
                     gfc.rank AS rank,
                     jsonb_build_object(
                         'rank', gfc.rank,
@@ -1214,6 +1245,7 @@ BEGIN
                 -- per-request Hivemind join (single PK join to post_candidates).
                 FROM haf_fyp_app.global_feed_cache gfc
                 JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
+                LEFT JOIN haf_fyp_app.post_bridge_cache pbc ON pbc.post_id = gfc.post_id
                 WHERE pc.hive_post_id IS NOT NULL
                 ORDER BY gfc.rank
                 LIMIT _limit
@@ -1315,11 +1347,25 @@ BEGIN
             -- builders are called at most page-size times regardless of plan.
             SELECT
                 page.rank,
-                haf_fyp_app.get_bridge_post(page.post_id, 0, get_global_feed.truncate_body)
+                -- See get_personalized_feed: serve cached bridge if present (the
+                -- global feed is observer-agnostic, so the cache is an exact match),
+                -- else render live.
+                COALESCE(
+                    CASE
+                        WHEN page.cached IS NOT NULL AND get_global_feed.truncate_body > 0
+                        THEN jsonb_set(
+                                 page.cached, '{body}',
+                                 to_jsonb(left(page.cached ->> 'body', get_global_feed.truncate_body))
+                             )
+                        ELSE page.cached
+                    END,
+                    haf_fyp_app.get_bridge_post(page.hive_post_id, 0, get_global_feed.truncate_body)
+                )
                 || jsonb_build_object('fyp', page.fyp) AS post
             FROM (
                 SELECT
-                    pc.hive_post_id AS post_id,
+                    pc.hive_post_id AS hive_post_id,
+                    pbc.bridge AS cached,
                     gfc.rank AS rank,
                     jsonb_build_object(
                         'rank', gfc.rank,
@@ -1337,6 +1383,7 @@ BEGIN
                 -- so this is a tiny PK-joined scan, not a perf concern).
                 FROM haf_fyp_app.global_feed_cache gfc
                 JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
+                LEFT JOIN haf_fyp_app.post_bridge_cache pbc ON pbc.post_id = gfc.post_id
                 WHERE pc.hive_post_id IS NOT NULL
                   AND (
                     get_global_feed.community_id IS NULL

@@ -177,6 +177,29 @@ CREATE INDEX IF NOT EXISTS idx_global_feed_rank
 ON haf_fyp_app.global_feed_cache (rank ASC);
 
 -- ---------------------------------------------------------------------------
+-- Post bridge cache — pre-rendered bridge.get_ranked_posts JSON per post
+--
+-- The feed endpoints' dominant cost is the per-post Hivemind bridge build
+-- (get_full_post_view_by_id + create_bridge_post_object, ~25-30 ms/post). The
+-- expensive fields (payout / votes / reputation) are volatile only during a
+-- post's ~7-day payout window, then freeze, so the rendered object is cacheable.
+-- The ranker renders the OBSERVER-AGNOSTIC bridge (observer_id = 0) for the posts
+-- it places into feeds and refreshes in-payout-window entries each cycle; once a
+-- post is paid out its entry is frozen (is_paidout). The feed endpoints read this
+-- directly (single PK-indexed read) and fall back to a live render only on a
+-- cache miss, so they work while the cache is still warming.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS haf_fyp_app.post_bridge_cache (
+    post_id bigint NOT NULL,
+    bridge jsonb NOT NULL,
+    is_paidout boolean NOT NULL DEFAULT FALSE,
+    computed_at timestamp NOT NULL DEFAULT now(),
+    PRIMARY KEY (post_id),
+    FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates (post_id)
+);
+
+-- ---------------------------------------------------------------------------
 -- User communities — on-chain subscription state (synced from custom_json)
 -- NOTE (T-0.7): verify community custom_json_operation format on live node.
 -- ---------------------------------------------------------------------------
@@ -229,3 +252,5 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA haf_fyp_endpoints TO haf_fyp_user;
 GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.global_feed_cache TO haf_fyp_user;
 GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.feed_cache TO haf_fyp_user;
 GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.user_profile_vectors TO haf_fyp_user;
+-- The ranker also renders and refreshes the post bridge cache.
+GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.post_bridge_cache TO haf_fyp_user;
