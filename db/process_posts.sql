@@ -109,3 +109,57 @@ BEGIN
     ON CONFLICT (post_id) DO NOTHING;
 END;
 $$;
+
+-- ---------------------------------------------------------------------------
+-- resolve_hivemind_post_ids: fill post_candidates.hive_post_id
+--
+-- The feed endpoints return posts in Hivemind's bridge shape via
+-- get_bridge_post(hive_posts.id, ...). Resolving (author, permlink) -> hive_posts.id
+-- per request meant a 3-way join into the large hivemind_app.hive_accounts /
+-- hive_permlink_data / hive_posts tables on EVERY feed call. We resolve it ONCE
+-- here (driven by process_block_range) and store it on post_candidates, so the
+-- endpoints become a single PK join and never touch those Hivemind tables to look
+-- up an id.
+--
+-- Idempotent: only NULL rows are touched, so a resolved post is never re-probed;
+-- a post Hivemind has not indexed yet stays NULL and is retried on a later batch
+-- (handles the small lag between this app and Hivemind). _since bounds the scan to
+-- recently-created posts (by block time), so permanently-unresolvable rows
+-- (deleted, or never indexed) are not re-probed forever. Pass NULL for a one-time
+-- full backfill on an already-synced node.
+--
+-- Best-effort: the whole body is guarded so a missing hivemind_app schema
+-- (CI / stub stack) or a missing owner SELECT grant (before cross_schema_grants is
+-- re-run) can never abort block processing — resolution is an optimization, not a
+-- correctness input to the feed (an unresolved post is simply skipped until the
+-- next batch resolves it).
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION haf_fyp_app.resolve_hivemind_post_ids(_since timestamp DEFAULT NULL)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF to_regclass('hivemind_app.hive_posts') IS NULL THEN
+        RETURN;  -- stub / CI stack without Hivemind
+    END IF;
+
+    UPDATE haf_fyp_app.post_candidates pc
+    SET hive_post_id = hp.id
+    FROM hivemind_app.hive_accounts ha,
+         hivemind_app.hive_permlink_data pd,
+         hivemind_app.hive_posts hp
+    WHERE pc.hive_post_id IS NULL
+      AND (_since IS NULL OR pc.created_at >= _since)
+      AND ha.name = pc.author
+      AND pd.permlink = pc.permlink
+      AND hp.author_id = ha.id
+      AND hp.permlink_id = pd.id
+      AND hp.counter_deleted = 0;
+EXCEPTION WHEN OTHERS THEN
+    -- e.g. insufficient_privilege before the owner grant is applied, or a
+    -- transient Hivemind issue. Never break the processor for optional
+    -- enrichment; the next batch retries.
+    RETURN;
+END;
+$$;

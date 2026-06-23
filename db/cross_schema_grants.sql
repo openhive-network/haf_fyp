@@ -47,7 +47,15 @@ BEGIN
         GRANT USAGE ON SCHEMA hivemind_app TO haf_fyp_user;
         GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_app TO haf_fyp_user;
         GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_app TO haf_fyp_user;
-        RAISE NOTICE 'hivemind_app: granted SELECT + EXECUTE to haf_fyp_user';
+        -- The block processor (haf_fyp_owner) also resolves (author, permlink) ->
+        -- hive_posts.id via resolve_hivemind_post_ids() to precompute
+        -- post_candidates.hive_post_id, so it needs read access to the three bridge
+        -- tables (hive_accounts / hive_permlink_data / hive_posts). SELECT on ALL
+        -- TABLES covers them; the resolver is exception-guarded, so it degrades to a
+        -- no-op if this grant has not been applied yet.
+        GRANT USAGE ON SCHEMA hivemind_app TO haf_fyp_owner;
+        GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_app TO haf_fyp_owner;
+        RAISE NOTICE 'hivemind_app: granted SELECT + EXECUTE to haf_fyp_user, SELECT to haf_fyp_owner';
     ELSE
         RAISE NOTICE 'hivemind_app not found — install Hivemind then re-run grant_cross_schema.sh';
     END IF;

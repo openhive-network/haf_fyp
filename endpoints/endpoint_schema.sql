@@ -1148,7 +1148,7 @@ BEGIN
                 || jsonb_build_object('fyp', page.fyp) AS post
             FROM (
                 SELECT
-                    hp.id AS post_id,
+                    pc.hive_post_id AS post_id,
                     fc.rank AS rank,
                     jsonb_build_object(
                         'rank', fc.rank,
@@ -1160,13 +1160,16 @@ BEGIN
                         'community_boost_applied', fc.community_boost_applied,
                         'boost_source', fc.boost_source
                     ) AS fyp
+                -- hive_post_id is precomputed by resolve_hivemind_post_ids (see
+                -- db/process_posts.sql), so the feed no longer joins
+                -- hive_accounts / hive_permlink_data / hive_posts per request; it
+                -- is a single PK join to post_candidates. Posts not yet resolved
+                -- (hive_post_id IS NULL) are skipped until a later processor batch
+                -- resolves them.
                 FROM haf_fyp_app.feed_cache fc
                 JOIN haf_fyp_app.post_candidates pc ON pc.post_id = fc.post_id
-                JOIN hivemind_app.hive_accounts ha ON ha.name = pc.author
-                JOIN hivemind_app.hive_permlink_data pd ON pd.permlink = pc.permlink
-                JOIN hivemind_app.hive_posts hp
-                    ON hp.author_id = ha.id AND hp.permlink_id = pd.id AND hp.counter_deleted = 0
                 WHERE fc.username = get_personalized_feed.username
+                  AND pc.hive_post_id IS NOT NULL
                 ORDER BY fc.rank
                 LIMIT _limit
                 OFFSET _offset
@@ -1195,7 +1198,7 @@ BEGIN
                 || jsonb_build_object('fyp', page.fyp) AS post
             FROM (
                 SELECT
-                    hp.id AS post_id,
+                    pc.hive_post_id AS post_id,
                     gfc.rank AS rank,
                     jsonb_build_object(
                         'rank', gfc.rank,
@@ -1207,12 +1210,11 @@ BEGIN
                         'community_boost_applied', FALSE,
                         'boost_source', NULL::text
                     ) AS fyp
+                -- See get_personalized_feed: hive_post_id is precomputed, so no
+                -- per-request Hivemind join (single PK join to post_candidates).
                 FROM haf_fyp_app.global_feed_cache gfc
                 JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
-                JOIN hivemind_app.hive_accounts ha ON ha.name = pc.author
-                JOIN hivemind_app.hive_permlink_data pd ON pd.permlink = pc.permlink
-                JOIN hivemind_app.hive_posts hp
-                    ON hp.author_id = ha.id AND hp.permlink_id = pd.id AND hp.counter_deleted = 0
+                WHERE pc.hive_post_id IS NOT NULL
                 ORDER BY gfc.rank
                 LIMIT _limit
                 OFFSET _offset
@@ -1317,7 +1319,7 @@ BEGIN
                 || jsonb_build_object('fyp', page.fyp) AS post
             FROM (
                 SELECT
-                    hp.id AS post_id,
+                    pc.hive_post_id AS post_id,
                     gfc.rank AS rank,
                     jsonb_build_object(
                         'rank', gfc.rank,
@@ -1329,16 +1331,17 @@ BEGIN
                         'community_boost_applied', FALSE,
                         'boost_source', NULL::text
                     ) AS fyp
+                -- See get_personalized_feed: hive_post_id is precomputed, so no
+                -- per-request Hivemind join. The community filter stays on
+                -- post_candidates (global_feed_cache is capped at the top ~200 posts,
+                -- so this is a tiny PK-joined scan, not a perf concern).
                 FROM haf_fyp_app.global_feed_cache gfc
                 JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
-                JOIN hivemind_app.hive_accounts ha ON ha.name = pc.author
-                JOIN hivemind_app.hive_permlink_data pd ON pd.permlink = pc.permlink
-                JOIN hivemind_app.hive_posts hp
-                    ON hp.author_id = ha.id AND hp.permlink_id = pd.id AND hp.counter_deleted = 0
-                WHERE (
+                WHERE pc.hive_post_id IS NOT NULL
+                  AND (
                     get_global_feed.community_id IS NULL
                     OR pc.community_id = get_global_feed.community_id
-                )
+                  )
                 ORDER BY gfc.rank
                 LIMIT _limit
                 OFFSET _offset

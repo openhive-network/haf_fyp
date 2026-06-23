@@ -19,9 +19,25 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.post_candidates (
     body_length int,
     payout_window boolean NOT NULL DEFAULT TRUE,
     in_discovery boolean NOT NULL DEFAULT TRUE,
+    -- hive_post_id: the hivemind hive_posts.id for this (author, permlink),
+    -- resolved once by resolve_hivemind_post_ids() so the feed endpoints can call
+    -- get_bridge_post directly instead of re-joining hive_accounts /
+    -- hive_permlink_data / hive_posts on every request. NULL until resolved (or for
+    -- posts Hivemind has not indexed yet / has deleted).
+    hive_post_id int,
     PRIMARY KEY (post_id),
     UNIQUE (author, permlink)
 );
+
+-- Added via ALTER as well so in-place upgrades pick up the column (the CREATE
+-- above is IF NOT EXISTS and is a no-op on an already-installed table).
+ALTER TABLE haf_fyp_app.post_candidates
+ADD COLUMN IF NOT EXISTS hive_post_id int;
+
+-- Bounds resolve_hivemind_post_ids()'s scan to the not-yet-resolved posts.
+CREATE INDEX IF NOT EXISTS idx_post_candidates_unresolved
+ON haf_fyp_app.post_candidates (created_at)
+WHERE hive_post_id IS NULL;
 
 -- ---------------------------------------------------------------------------
 -- Post lookup — indexed (author, permlink) for efficient joins in processors
