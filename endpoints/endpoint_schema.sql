@@ -560,7 +560,7 @@ AS $func$
               "type": "integer",
               "default": 20
             },
-            "description": "Posts per page (max 20)"
+            "description": "Posts per page (max 50)"
           },
           {
             "in": "query",
@@ -618,7 +618,7 @@ AS $func$
               "type": "integer",
               "default": 20
             },
-            "description": "Posts per page (max 20)"
+            "description": "Posts per page (max 50)"
           },
           {
             "in": "query",
@@ -1076,7 +1076,7 @@ GRANT EXECUTE ON FUNCTION haf_fyp_app.get_bridge_post(int, int, int) TO haf_fyp_
         schema:
           type: integer
           default: 20
-        description: Posts per page (max 20)
+        description: Posts per page (max 50)
       - in: query
         name: truncate_body
         required: false
@@ -1114,7 +1114,7 @@ DECLARE
     -- reserves for result-set slicing and would not forward as arguments).
     -- Enrichment is the costly step, so the window is applied in-query and
     -- page-size is capped to bound per-request work.
-    _limit int := LEAST(GREATEST(get_personalized_feed."page-size", 1), 20);
+    _limit int := LEAST(GREATEST(get_personalized_feed."page-size", 1), 50);
     _offset int := (GREATEST(get_personalized_feed."page", 1) - 1) * _limit;
 BEGIN
     -- Personalized feed. Each cached (author, permlink) is resolved to its
@@ -1289,7 +1289,7 @@ $$;
         schema:
           type: integer
           default: 20
-        description: Posts per page (max 20)
+        description: Posts per page (max 50)
       - in: query
         name: community_id
         required: false
@@ -1330,7 +1330,7 @@ AS $$
 DECLARE
     _result jsonb;
     -- See get_personalized_feed: page / page-size, capped, windowed in-query.
-    _limit int := LEAST(GREATEST(get_global_feed."page-size", 1), 20);
+    _limit int := LEAST(GREATEST(get_global_feed."page-size", 1), 50);
     _offset int := (GREATEST(get_global_feed."page", 1) - 1) * _limit;
 BEGIN
     -- Global feed is unauthenticated, so observer_id is 0 (no account-specific
