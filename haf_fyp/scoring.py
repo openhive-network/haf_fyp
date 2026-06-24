@@ -14,11 +14,15 @@ and credibility (btracker VESTS + reptracker reputation).
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
+import psycopg2
 import psycopg2.extras
+
+log = logging.getLogger(__name__)
 
 
 def compute_recency(created_at: pd.Series, half_life_hours: float = 24.0) -> pd.Series:
@@ -290,7 +294,9 @@ def compute_scores(
     df["score_recency"] = compute_recency(df["created_at"])
     df["score_engagement"] = compute_engagement_quality(df, algorithm_weights)
     df["score_credibility"] = compute_credibility(df["author"], author_credibility)
-    df["score_relevance"] = compute_semantic_relevance(df["post_id"], post_vectors, user_vector)
+    df["score_relevance"] = compute_semantic_relevance(
+        df["post_id"], post_vectors, user_vector
+    )
 
     df["final_score"] = (
         w_v * df["score_relevance"]
@@ -319,11 +325,71 @@ def compute_scores(
         (eng_mask, 1.0 + boost_eng, "engaged"),
     ):
         if mask.any():
-            df.loc[mask, "final_score"] = (df.loc[mask, "final_score"] * factor).clip(upper=1.0)
+            df.loc[mask, "final_score"] = (df.loc[mask, "final_score"] * factor).clip(
+                upper=1.0
+            )
             df.loc[mask, "community_boost_applied"] = True
             df.loc[mask, "boost_source"] = source
 
     return df.sort_values("final_score", ascending=False).reset_index(drop=True)
+
+
+def render_bridge_for_posts(conn, post_ids: list[int]) -> None:
+    """Render and cache the observer-agnostic bridge JSON for the given posts.
+
+    The feed endpoints' dominant cost is the per-post Hivemind bridge build; this
+    precomputes it into haf_fyp_app.post_bridge_cache so feeds become a single
+    indexed read. Called by the feed-cache writers for the posts they place into
+    feeds, so only posts that actually appear in a feed are ever rendered.
+
+    A single set-based upsert that:
+      - skips posts already cached and paid out (frozen) or rendered in the last
+        5 minutes (an in-payout-window post shared across many users' feeds is
+        rendered at most once per cycle, not once per feed), and
+      - resolves the SKIP before the expensive get_bridge_post LATERAL, so frozen
+        posts cost nothing.
+    Best-effort: a Hivemind hiccup must never break a ranking cycle.
+    """
+    if not post_ids:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO haf_fyp_app.post_bridge_cache
+                    (post_id, bridge, is_paidout, computed_at)
+                SELECT s.post_id, b.bridge,
+                       COALESCE((b.bridge->>'is_paidout')::boolean, FALSE), now()
+                FROM (
+                    SELECT pc.post_id, pc.hive_post_id
+                    FROM haf_fyp_app.post_candidates pc
+                    WHERE pc.post_id = ANY(%s)
+                      AND pc.hive_post_id IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM haf_fyp_app.post_bridge_cache c
+                          WHERE c.post_id = pc.post_id
+                            AND (c.is_paidout
+                                 OR c.computed_at > now() - INTERVAL '5 minutes')
+                      )
+                ) s
+                CROSS JOIN LATERAL
+                    haf_fyp_app.get_bridge_post(s.hive_post_id, 0, 0) AS b(bridge)
+                WHERE b.bridge IS NOT NULL
+                ON CONFLICT (post_id) DO UPDATE
+                    SET bridge = EXCLUDED.bridge,
+                        is_paidout = EXCLUDED.is_paidout,
+                        computed_at = now()
+                """,
+                (post_ids,),
+            )
+        conn.commit()
+    except psycopg2.Error:
+        conn.rollback()
+        log.warning(
+            "bridge cache render failed for %d posts (continuing)",
+            len(post_ids),
+            exc_info=True,
+        )
 
 
 def write_feed_cache(
@@ -372,11 +438,12 @@ def write_feed_cache(
             (now, username),
         )
     conn.commit()
+    # Precompute the bridge JSON for this user's feed so the endpoint serves it
+    # from cache instead of rendering each post live (the dominant feed cost).
+    render_bridge_for_posts(conn, [int(x) for x in top["post_id"].tolist()])
 
 
-def write_global_feed_cache(
-    conn, scored_df: pd.DataFrame, algo_version: str
-) -> None:
+def write_global_feed_cache(conn, scored_df: pd.DataFrame, algo_version: str) -> None:
     """Replace global_feed_cache with the top 200 posts by base score."""
     top = scored_df.head(200)
     now = datetime.utcnow()
@@ -405,3 +472,7 @@ def write_global_feed_cache(
             rows,
         )
     conn.commit()
+    # Precompute the bridge JSON for the global feed (observer-agnostic, which is
+    # exactly what the unauthenticated global endpoint serves) so it reads from
+    # cache instead of rendering each post live.
+    render_bridge_for_posts(conn, [int(x) for x in top["post_id"].tolist()])
