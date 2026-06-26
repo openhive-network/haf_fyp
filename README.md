@@ -108,6 +108,8 @@ All read endpoints are served by PostgREST on port 3001. The FastAPI overlay on 
 | GET | `/rpc/list_algorithm_versions` | All registered algorithm versions |
 | GET | `/rpc/get_personalized_feed?username=alice&limit=20` | Ranked feed for a user |
 | GET | `/rpc/get_global_feed?limit=20` | Unauthenticated global feed |
+
+Every feed entry carries a nested `fyp.source` field — `personalized` when the user has a precomputed personalized feed, or `global` when `get_personalized_feed` serves the cold-start global fallback (it is uniform across all entries in one response). A client can therefore tell directly from a feed call whether the user is getting their own ranked feed or the global fallback, without a separate `get_user_profile` lookup (`has_feed`).
 | GET | `/rpc/get_user_profile?username=alice` | User vector status and top communities |
 | GET | `/rpc/get_score_explanation?username=alice&post_id=123` | Per-signal score breakdown |
 
