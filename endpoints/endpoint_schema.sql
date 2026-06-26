@@ -35,6 +35,13 @@ schemas:
     x-sql-datatype: object
     description: This app's ranking data for the post (the FYP-specific signal).
     properties:
+      source:
+        type: string
+        enum: [personalized, global]
+        description: >-
+          Which feed produced this entry - 'personalized' when the user has a
+          precomputed personalized feed, 'global' when served the cold-start
+          global fallback. Uniform across all entries in a single response.
       rank:
         type: integer
         description: Position in the feed (1-based)
@@ -155,6 +162,7 @@ schemas:
         total_votes: 127
         flag_weight: 0.0
       fyp:
+        source: personalized
         rank: 1
         final_score: 0.9178
         score_relevance: 0.62
@@ -225,6 +233,11 @@ AS $func$
         "x-sql-datatype": "object",
         "description": "This app's ranking data for the post (the FYP-specific signal).",
         "properties": {
+          "source": {
+            "type": "string",
+            "enum": ["personalized", "global"],
+            "description": "Which feed produced this entry - 'personalized' when the user has a precomputed personalized feed, 'global' when served the cold-start global fallback. Uniform across all entries in a single response."
+          },
           "rank": {
             "type": "integer",
             "description": "Position in the feed (1-based)"
@@ -361,6 +374,7 @@ AS $func$
             "flag_weight": 0.0
           },
           "fyp": {
+            "source": "personalized",
             "rank": 1,
             "final_score": 0.9178,
             "score_relevance": 0.62,
@@ -1166,6 +1180,7 @@ BEGIN
                     pbc.bridge AS cached,
                     fc.rank AS rank,
                     jsonb_build_object(
+                        'source', 'personalized',
                         'rank', fc.rank,
                         'final_score', fc.final_score,
                         'score_relevance', fc.score_relevance,
@@ -1232,6 +1247,7 @@ BEGIN
                     pbc.bridge AS cached,
                     gfc.rank AS rank,
                     jsonb_build_object(
+                        'source', 'global',
                         'rank', gfc.rank,
                         'final_score', gfc.final_score,
                         'score_relevance', NULL::float,
@@ -1368,6 +1384,7 @@ BEGIN
                     pbc.bridge AS cached,
                     gfc.rank AS rank,
                     jsonb_build_object(
+                        'source', 'global',
                         'rank', gfc.rank,
                         'final_score', gfc.final_score,
                         'score_relevance', NULL::float,
