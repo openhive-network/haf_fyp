@@ -28,7 +28,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from .auth import verify_interests
+from .auth import KeyLookupUnavailable, verify_interests
 
 log = logging.getLogger(__name__)
 
@@ -148,6 +148,8 @@ def post_interests(request: Request, req: InterestsRequest):
         verify_interests(req.username, req.timestamp, req.communities, req.signature)
     except PermissionError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except KeyLookupUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     assert _pool is not None
     pool = _pool

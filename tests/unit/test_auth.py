@@ -2,7 +2,7 @@
 
 Covers the crypto happy path (which the tavern HTTP tests can't, since they
 can't produce a signature matching a real on-chain account) plus the rejection
-paths. The on-chain key lookup is monkeypatched so tests need no network.
+paths. The on-chain authority lookup is monkeypatched so tests need no network.
 """
 
 import hashlib
@@ -22,10 +22,11 @@ def _sign(priv: coincurve.PrivateKey, message: str) -> str:
 
 @pytest.fixture
 def keypair(monkeypatch):
-    """A fresh key whose STM pubkey is injected as the account's posting key."""
+    """A fresh key whose STM pubkey is injected as the account's posting
+    authority (single key, weight 1, threshold 1)."""
     priv = coincurve.PrivateKey()
     stm = auth._encode_pubkey(priv.public_key.format(compressed=True))
-    monkeypatch.setattr(auth, "account_posting_keys", lambda _username: [stm])
+    monkeypatch.setattr(auth, "account_posting_authority", lambda _u: ([(stm, 1)], 1))
     return priv, stm
 
 
@@ -89,6 +90,38 @@ def test_wrong_account_key_rejected(monkeypatch):
     comms = [146620]
     sig = _sign(priv, auth.build_message("alice", ts, comms))
     # account authority lists some *other* key
-    monkeypatch.setattr(auth, "account_posting_keys", lambda _u: ["STM8GC13uCZbP44HzMLV6zPZGwVQ8Nzhmviqo4pXtEfQATcHNJ8s1"])
+    monkeypatch.setattr(
+        auth, "account_posting_authority",
+        lambda _u: ([("STM8GC13uCZbP44HzMLV6zPZGwVQ8Nzhmviqo4pXtEfQATcHNJ8s1", 1)], 1),
+    )
     with pytest.raises(PermissionError):
+        auth.verify_interests("alice", ts, comms, sig)
+
+
+def test_single_key_below_multisig_threshold_rejected(monkeypatch):
+    # Recovered key is genuine but its weight (1) < threshold (2): a lone key of
+    # a 2-of-N posting authority cannot authorize on its own.
+    priv = coincurve.PrivateKey()
+    stm = auth._encode_pubkey(priv.public_key.format(compressed=True))
+    ts = int(time.time())
+    comms = [146620]
+    sig = _sign(priv, auth.build_message("alice", ts, comms))
+    monkeypatch.setattr(auth, "account_posting_authority", lambda _u: ([(stm, 1), ("STMother", 1)], 2))
+    with pytest.raises(PermissionError):
+        auth.verify_interests("alice", ts, comms, sig)
+
+
+def test_key_lookup_unavailable_propagates(monkeypatch):
+    # Infra failure (RPC down / unconfigured) must surface as KeyLookupUnavailable
+    # (→ 503), distinct from an auth failure (→ 401).
+    priv = coincurve.PrivateKey()
+    ts = int(time.time())
+    comms = [146620]
+    sig = _sign(priv, auth.build_message("alice", ts, comms))
+
+    def _raise(_u):
+        raise auth.KeyLookupUnavailable("node down")
+
+    monkeypatch.setattr(auth, "account_posting_authority", _raise)
+    with pytest.raises(auth.KeyLookupUnavailable):
         auth.verify_interests("alice", ts, comms, sig)
