@@ -84,12 +84,42 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 class InterestsRequest(BaseModel):
-    username: Annotated[str, Field(min_length=1, max_length=16)]
-    communities: Annotated[list[int], Field(min_length=1, max_length=50)]
+    username: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=16,
+            description="Hive account whose cold-start interests are being set; must match the account that signed the request.",
+            examples=["alice"],
+        ),
+    ]
+    communities: Annotated[
+        list[int],
+        Field(
+            min_length=1,
+            max_length=50,
+            description="Community ids the user is interested in (1-50). Order is irrelevant and duplicates are ignored (the signed challenge uses the sorted, de-duplicated set).",
+            examples=[[12, 34, 56]],
+        ),
+    ]
     # Proof the caller controls `username`: a posting-key signature over the
-    # canonical challenge (see auth.build_message) plus its unix timestamp.
-    timestamp: int
-    signature: Annotated[str, Field(min_length=130, max_length=130)]  # 65 bytes hex
+    # canonical challenge (see the endpoint description / auth.build_message).
+    timestamp: Annotated[
+        int,
+        Field(
+            description="Unix time (seconds) at which the challenge was signed. Must be within INTERESTS_SIG_MAX_AGE (default 300s) of server time, or the request is rejected (401).",
+            examples=[1751370000],
+        ),
+    ]
+    signature: Annotated[
+        str,
+        Field(
+            min_length=130,
+            max_length=130,
+            description="Posting-key signature proving control of `username`: the 65-byte graphene compact signature as hex, produced by signing sha256 of the canonical challenge (see endpoint description) with the account's posting key (Hive Keychain requestSignBuffer / HiveAuth).",
+            examples=["1f" + "a1b2c3d4e5f6" * 10 + "a1b2c3d4"],
+        ),
+    ]
 
 
 class InterestsResponse(BaseModel):
@@ -141,8 +171,22 @@ def post_interests(request: Request, req: InterestsRequest):
     Redis refresh signal so the ranker can bootstrap the user's interest
     vector on its next cycle.
 
-    Authenticated: the request must carry a posting-key signature (timestamp +
-    signature) proving the caller controls `username`. See auth.verify_interests.
+    Authenticated: the request must carry a posting-key signature proving the
+    caller controls `username`. The client signs the canonical UTF-8 challenge
+
+        hivefy:interests:v1:<username>:<timestamp>:<ids>
+
+    where `<ids>` is the comma-separated, ascending, de-duplicated list of the
+    `communities` in this request — for example
+
+        hivefy:interests:v1:alice:1751370000:12,34,56
+
+    The message is sha256-hashed and signed with the account's posting key (Hive
+    Keychain requestSignBuffer / HiveAuth); send the same unix `timestamp` and
+    the 65-byte compact signature as hex in `signature`. Requests must arrive
+    within INTERESTS_SIG_MAX_AGE (default 300s). Unsigned/malformed requests fail
+    with 422, bad or stale signatures with 401, and an unreachable/unconfigured
+    key-lookup node with 503.
     """
     try:
         verify_interests(req.username, req.timestamp, req.communities, req.signature)
