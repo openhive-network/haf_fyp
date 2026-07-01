@@ -148,6 +148,8 @@ def bootstrap_vector_from_communities(
     if not community_ids:
         return None
 
+    from haf_fyp.embeddings import fetch_post_vectors
+
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -160,9 +162,22 @@ def bootstrap_vector_from_communities(
             """,
             (list(community_ids),),
         )
-        rows = cur.fetchall()
+        post_ids = [r[0] for r in cur.fetchall()]
 
-    vecs = [post_vectors[r[0]] for r in rows if r[0] in post_vectors]
+    if not post_ids:
+        return None
+
+    # A community's top-earning posts are almost always older than the recent
+    # candidate window, so they are NOT in the candidate post_vectors dict. Reuse
+    # any candidate embeddings we already have and fetch the rest directly, or the
+    # bootstrap would find nothing for every established community and never build
+    # a cold-start vector.
+    vectors = {pid: post_vectors[pid] for pid in post_ids if pid in post_vectors}
+    missing = [pid for pid in post_ids if pid not in vectors]
+    if missing:
+        vectors.update(fetch_post_vectors(conn, missing))
+
+    vecs = [vectors[pid] for pid in post_ids if pid in vectors]
     if not vecs:
         return None
 
