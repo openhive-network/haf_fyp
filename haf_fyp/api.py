@@ -28,6 +28,8 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
+from .auth import verify_interests
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -84,6 +86,10 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 class InterestsRequest(BaseModel):
     username: Annotated[str, Field(min_length=1, max_length=16)]
     communities: Annotated[list[int], Field(min_length=1, max_length=50)]
+    # Proof the caller controls `username`: a posting-key signature over the
+    # canonical challenge (see auth.build_message) plus its unix timestamp.
+    timestamp: int
+    signature: Annotated[str, Field(min_length=130, max_length=130)]  # 65 bytes hex
 
 
 class InterestsResponse(BaseModel):
@@ -134,7 +140,15 @@ def post_interests(request: Request, req: InterestsRequest):
     previously declared communities not in the current list. Publishes a
     Redis refresh signal so the ranker can bootstrap the user's interest
     vector on its next cycle.
+
+    Authenticated: the request must carry a posting-key signature (timestamp +
+    signature) proving the caller controls `username`. See auth.verify_interests.
     """
+    try:
+        verify_interests(req.username, req.timestamp, req.communities, req.signature)
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
     assert _pool is not None
     pool = _pool
     conn = pool.getconn()

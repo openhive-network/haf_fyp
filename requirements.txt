@@ -6,4 +6,6 @@ redis>=5.0
 fastapi>=0.111
 uvicorn[standard]>=0.29
 slowapi>=0.1.9
+coincurve>=19.0
+base58>=2.1
 tavern>=2.9
