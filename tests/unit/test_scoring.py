@@ -4,7 +4,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import haf_fyp.embeddings as embeddings
 from haf_fyp.scoring import (
+    bootstrap_vector_from_communities,
     compute_credibility,
     compute_engagement_quality,
     compute_recency,
@@ -185,3 +187,78 @@ class TestComputeScores:
         result = compute_scores(_candidates(), vec, {}, {}, set(), set(), _WEIGHTS)
         # With a user vector but no post vectors, semantic relevance defaults to 0.5
         assert np.allclose(result["score_relevance"].values, 0.5, atol=1e-6)
+
+
+class _FakeCursor:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self._captured = params
+
+    def fetchall(self):
+        return self._rows
+
+
+class _FakeConn:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def cursor(self):
+        return _FakeCursor(self._rows)
+
+
+class TestBootstrapVectorFromCommunities:
+    def test_no_communities_returns_none(self):
+        assert bootstrap_vector_from_communities(_FakeConn([]), set(), {}) is None
+
+    def test_no_top_posts_returns_none(self):
+        assert bootstrap_vector_from_communities(_FakeConn([]), {123}, {}) is None
+
+    def test_fetches_embeddings_missing_from_candidate_pool(self, monkeypatch):
+        # The regression: a community's top-earning posts are older than the recent
+        # candidate window, so none are in the candidate post_vectors dict. The
+        # bootstrap must fetch them directly rather than returning None.
+        top_posts = [(101,), (102,), (103,)]
+        fetched = {
+            101: np.array([1.0, 0.0], dtype=np.float32),
+            102: np.array([0.0, 1.0], dtype=np.float32),
+            103: np.array([1.0, 0.0], dtype=np.float32),
+        }
+        calls = {}
+
+        def fake_fetch(conn, ids):
+            calls["ids"] = list(ids)
+            return {pid: fetched[pid] for pid in ids}
+
+        monkeypatch.setattr(embeddings, "fetch_post_vectors", fake_fetch)
+
+        # Empty candidate post_vectors — exactly the failing production case.
+        result = bootstrap_vector_from_communities(_FakeConn(top_posts), {123}, {})
+
+        assert result is not None
+        assert sorted(calls["ids"]) == [101, 102, 103]
+        assert np.isclose(np.linalg.norm(result), 1.0, atol=1e-6)
+
+    def test_reuses_candidate_vectors_without_refetching(self, monkeypatch):
+        top_posts = [(201,), (202,)]
+        provided = {
+            201: np.array([1.0, 0.0], dtype=np.float32),
+            202: np.array([0.0, 1.0], dtype=np.float32),
+        }
+
+        def fail_fetch(conn, ids):  # pragma: no cover - must not be called
+            raise AssertionError(f"should not fetch already-present ids: {ids}")
+
+        monkeypatch.setattr(embeddings, "fetch_post_vectors", fail_fetch)
+
+        result = bootstrap_vector_from_communities(_FakeConn(top_posts), {123}, provided)
+
+        assert result is not None
+        assert np.isclose(np.linalg.norm(result), 1.0, atol=1e-6)
