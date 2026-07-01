@@ -12,10 +12,13 @@ stages:
         status: "ok"
 
 ---
-test_name: POST /v1/fyp/interests saves user interests
+test_name: POST /v1/fyp/interests requires a signature
 
+# The happy path needs a posting-key signature matching a real on-chain account,
+# which CI cannot produce; it is covered by tests/unit/test_auth.py. Here we
+# assert the endpoint rejects unauthenticated and invalid requests.
 stages:
-  - name: POST with valid body returns username and saved count
+  - name: POST without signature/timestamp returns 422
     request:
       url: "{fastapi_url}/v1/fyp/interests"
       method: POST
@@ -23,10 +26,23 @@ stages:
         username: "testuser"
         communities: [1234, 5678]
     response:
-      status_code: 200
+      status_code: 422
+
+---
+test_name: POST /v1/fyp/interests rejects a stale/invalid signature
+
+stages:
+  - name: well-formed body but stale timestamp returns 401
+    request:
+      url: "{fastapi_url}/v1/fyp/interests"
+      method: POST
       json:
         username: "testuser"
-        communities_saved: 2
+        communities: [1234, 5678]
+        timestamp: 1
+        signature: "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    response:
+      status_code: 401
 
 ---
 test_name: POST /v1/fyp/interests rejects empty communities list

@@ -90,6 +90,10 @@ services:
       REDIS_HOST:    redis
       REDIS_URL:     redis://redis:6379
       ADMIN_API_KEY: "${FYP_ADMIN_API_KEY}"
+      # TRUSTED Hive RPC for interest-write signature verification. Defaults to
+      # the local hived; never a public API (a hostile node can forge posting
+      # keys and bypass auth). Unset ⇒ interest writes fail closed (503).
+      HIVE_RPC_URL:  "${HIVE_RPC_URL:-http://haf:8091}"
     depends_on:
       haf-fyp-setup:
         condition: service_completed_successfully
