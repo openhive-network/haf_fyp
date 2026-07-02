@@ -47,6 +47,11 @@ WHERE hive_post_id IS NULL;
 -- (payout_window = TRUE), turning that UPDATE into a sub-millisecond index range scan.
 -- On an already-populated node, build it once with CREATE INDEX CONCURRENTLY (non-blocking);
 -- at install the table is empty so a plain CREATE INDEX is instant.
+-- NOTE (existing nodes): CREATE INDEX does not force long-lived sessions to re-plan, so after
+-- building the index restart the block processor (haf-fyp-sync) — otherwise its cached plpgsql
+-- plan for the payout UPDATE, compiled before the index existed, keeps sequential-scanning. Its
+-- re-planned generic plan then adopts the index (EXPLAIN (GENERIC_PLAN) -> Index Scan). Fresh
+-- installs are unaffected (the plan is first built with the index already present).
 CREATE INDEX IF NOT EXISTS idx_post_candidates_payout_window
 ON haf_fyp_app.post_candidates (created_at)
 WHERE payout_window;
