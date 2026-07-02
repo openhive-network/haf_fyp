@@ -39,6 +39,18 @@ CREATE INDEX IF NOT EXISTS idx_post_candidates_unresolved
 ON haf_fyp_app.post_candidates (created_at)
 WHERE hive_post_id IS NULL;
 
+-- process_payout_windows() runs an UPDATE ... WHERE payout_window AND created_at <= cutoff
+-- every block. Without this, that is a sequential scan of the whole post_candidates table
+-- (25M+ rows / 17GB on mainnet) every ~3s, even though only a few thousand rows have an
+-- open payout window — it dominated the haf_fyp processor's CPU (~98% of per-block time)
+-- and starved co-located apps. This partial index holds only the open-window rows
+-- (payout_window = TRUE), turning that UPDATE into a sub-millisecond index range scan.
+-- On an already-populated node, build it once with CREATE INDEX CONCURRENTLY (non-blocking);
+-- at install the table is empty so a plain CREATE INDEX is instant.
+CREATE INDEX IF NOT EXISTS idx_post_candidates_payout_window
+ON haf_fyp_app.post_candidates (created_at)
+WHERE payout_window;
+
 -- ---------------------------------------------------------------------------
 -- Post lookup — indexed (author, permlink) for efficient joins in processors
 -- ---------------------------------------------------------------------------
