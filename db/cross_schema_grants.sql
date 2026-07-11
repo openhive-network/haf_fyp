@@ -5,23 +5,14 @@
 -- If a schema is missing, a NOTICE is raised and that block is skipped —
 -- run this script again after installing the missing app.
 --
--- Durability (hivemind): the plain GRANTs below are dropped whenever Hivemind
--- recreates an object during an upgrade (e.g. DROP/CREATE of hive_accounts_view),
--- which silently 401s the Discover feed. To make the read grants self-healing this
--- script also sets ALTER DEFAULT PRIVILEGES for SELECT, keyed to every role that
--- owns a table/view in hivemind_app, so anything Hivemind (re)creates auto-grants
--- to haf_fyp. That step needs the installing role to be a superuser or a member of
--- the owner role (haf_admin is), and degrades to a NOTICE otherwise.
---
--- Only SELECT is self-healed, and that is sufficient: a recreated table/view starts
--- with no access (hence the outage), whereas a recreated function is executable by
--- PUBLIC by default and Hivemind does not revoke that — so EXECUTE never lapses.
---
--- Still requires re-running this script:
---   * A full DROP/CREATE of the hivemind_app schema itself — default privileges are
---     recorded per (owner role, schema) and are discarded along with the schema.
---   * A Hivemind change that revokes PUBLIC EXECUTE on its functions.
--- See hive/haf_fyp#6.
+-- Durability: a plain GRANT only covers objects that exist at the time it runs. When
+-- a foreign app drops and recreates one of its relations (upgrade, schema reinstall,
+-- index rebuild) PostgreSQL discards that object's grants and nothing restores them —
+-- which is how the Discover feed ended up returning 401 "permission denied for view
+-- hive_accounts_view". To make the read grants self-healing, the block at the bottom
+-- of this file sets ALTER DEFAULT PRIVILEGES (SELECT) for every foreign schema we
+-- read, keyed to every role that owns objects in it, so anything those apps recreate
+-- auto-grants to haf_fyp. See hive/haf_fyp#6.
 --
 -- Schemas granted:
 --   hivesense_app  — post embedding vectors (semantic relevance signal)
@@ -57,12 +48,6 @@ $$;
 -- SECURITY INVOKER and run as the caller). GRANT SELECT ON ALL TABLES covers
 -- views such as hive_accounts_view that those builders read.
 DO $$
-DECLARE
-    -- Every distinct role that owns a table/view in hivemind_app. Default
-    -- privileges are per-owner-role, so we set them for all of them rather than
-    -- assuming a single owner.
-    _owner text;
-    _owners_seen int := 0;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata
@@ -79,53 +64,6 @@ BEGIN
         -- no-op if this grant has not been applied yet.
         GRANT USAGE ON SCHEMA hivemind_app TO haf_fyp_owner;
         GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_app TO haf_fyp_owner;
-
-        -- Self-healing SELECT: the GRANTs above only cover objects that exist right
-        -- now. When Hivemind recreates a view on upgrade (DROP/CREATE) the grant is
-        -- lost and the Discover feed 401s — get_global_feed is SECURITY INVOKER and
-        -- reads hive_accounts_view as haf_fyp_user. Default privileges keyed to the
-        -- owning role make anything Hivemind (re)creates auto-grant to haf_fyp.
-        -- Owners are discovered dynamically (not hard-coded to 'hivemind') and we
-        -- iterate over ALL of them, since default privileges apply per owner role.
-        --
-        -- Only SELECT is self-healed, because only SELECT is actually at risk:
-        -- PostgreSQL grants no default access on a newly created table/view, so a
-        -- recreated view loses haf_fyp's SELECT — that is exactly the failure we hit
-        -- (401 "permission denied for view hive_accounts_view"). Functions are the
-        -- opposite: PostgreSQL grants EXECUTE to PUBLIC on creation and Hivemind does
-        -- not revoke it (its function ACLs carry the `=X/` PUBLIC entry), so functions
-        -- Hivemind recreates stay executable by haf_fyp_user with no grant at all.
-        -- Adding default EXECUTE privileges would therefore be redundant surface, so
-        -- we don't. The blanket GRANT EXECUTE above is kept as belt-and-braces in case
-        -- Hivemind ever does revoke PUBLIC; if that happens, re-run this script.
-        --
-        -- Note: default privileges are recorded per (owner role, schema). A full
-        -- DROP/CREATE of the hivemind_app schema itself discards them, so this script
-        -- must still be re-run after a complete Hivemind reinstall.
-        -- See hive/haf_fyp#6.
-        FOR _owner IN
-            SELECT DISTINCT pg_get_userbyid(c.relowner)
-              FROM pg_class c
-              JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE n.nspname = 'hivemind_app'
-               AND c.relkind IN ('r', 'v', 'm')
-        LOOP
-            BEGIN
-                EXECUTE format(
-                    'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA hivemind_app '
-                    'GRANT SELECT ON TABLES TO haf_fyp_user, haf_fyp_owner',
-                    _owner);
-                _owners_seen := _owners_seen + 1;
-                RAISE NOTICE 'hivemind_app: default SELECT privileges set for owner role % (auto re-grant on recreation)', _owner;
-            EXCEPTION WHEN insufficient_privilege THEN
-                RAISE NOTICE 'hivemind_app: could not set default privileges for owner role % (needs superuser or membership in it) — re-run grant_cross_schema.sh after Hivemind upgrades', _owner;
-            END;
-        END LOOP;
-
-        IF _owners_seen = 0 THEN
-            RAISE NOTICE 'hivemind_app: no default privileges set — grants will need a re-run after Hivemind upgrades';
-        END IF;
-
         RAISE NOTICE 'hivemind_app: granted SELECT + EXECUTE to haf_fyp_user, SELECT to haf_fyp_owner';
     ELSE
         RAISE NOTICE 'hivemind_app not found — install Hivemind then re-run grant_cross_schema.sh';
@@ -143,13 +81,12 @@ $$;
 -- blanket grant is used for maintainability (mirroring how Hivemind's own roles
 -- are granted). Both entry points are SECURITY INVOKER, so there is no privilege
 -- escalation today; revisit if a SECURITY DEFINER helper is ever added there.
--- No ALTER DEFAULT PRIVILEGES here, by design: this schema is functions-only, and
--- function EXECUTE does not need self-healing. PostgreSQL grants EXECUTE to PUBLIC
--- on newly created functions and Hivemind does not revoke it, so functions Hivemind
--- recreates on upgrade remain executable by haf_fyp_user regardless of any grant.
--- (This is why the observed outage was SELECT-on-views only.) The blanket EXECUTE
--- below is kept as belt-and-braces should Hivemind ever revoke PUBLIC — in which
--- case re-run grant_cross_schema.sh. See hive/haf_fyp#6.
+--
+-- This schema is not functions-only: it also holds the nai_currency_map lookup
+-- table. Nothing haf_fyp calls reads it today, but a SECURITY INVOKER bridge helper
+-- that starts reading it would fail as haf_fyp_user without SELECT — so we grant
+-- SELECT ON ALL TABLES here too, and the self-healing pass at the bottom of this
+-- file keeps it granted across recreations.
 DO $$
 BEGIN
     IF EXISTS (
@@ -158,7 +95,8 @@ BEGIN
     ) THEN
         GRANT USAGE ON SCHEMA hivemind_postgrest_utilities TO haf_fyp_user;
         GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user;
-        RAISE NOTICE 'hivemind_postgrest_utilities: granted EXECUTE to haf_fyp_user';
+        GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user;
+        RAISE NOTICE 'hivemind_postgrest_utilities: granted EXECUTE + SELECT to haf_fyp_user';
     ELSE
         RAISE NOTICE 'hivemind_postgrest_utilities not found — install Hivemind then re-run grant_cross_schema.sh';
     END IF;
@@ -226,3 +164,105 @@ $$;
 -- those are used only by the block processor, which runs as haf_fyp_owner.
 GRANT USAGE ON SCHEMA hafd TO haf_fyp_user;
 GRANT SELECT ON hafd.accounts TO haf_fyp_user;
+
+-- =============================================================================
+-- Self-healing SELECT grants
+-- =============================================================================
+-- Everything above only grants objects that exist right now. PostgreSQL gives a
+-- newly created table/view NO default access, so the moment a foreign app drops and
+-- recreates one of its relations (an upgrade, a schema reinstall, an index rebuild)
+-- haf_fyp's SELECT is silently discarded and nothing restores it. That is what took
+-- the Discover feed down: get_global_feed is SECURITY INVOKER and reads
+-- hivemind_app.hive_accounts_view as haf_fyp_user, so a recreated view produced
+-- HTTP 401 "permission denied for view hive_accounts_view" on every request.
+--
+-- The same defect applies to every foreign schema we read, and it does not always
+-- surface as an HTTP error: the Python ranker reads hivesense_app.posts_vectors
+-- directly as haf_fyp_user, so losing that grant fails a *background job* — feeds
+-- quietly go stale instead of erroring. hivesense is also the component rebuilt most
+-- often, so it is the most exposed.
+--
+-- ALTER DEFAULT PRIVILEGES fixes this at the source: it is keyed to the role that
+-- CREATES an object, so anything that role (re)creates in the schema is granted
+-- automatically. Default privileges are recorded per (owner role, schema), so we
+-- iterate over EVERY distinct owner role — hivemind_app and hivesense_app are both
+-- multi-owner today, and taking only the majority owner would silently under-cover.
+--
+-- Only SELECT is self-healed, and that is sufficient. Functions are the opposite of
+-- tables: PostgreSQL grants EXECUTE to PUBLIC on creation and none of these apps
+-- revoke it, so a recreated function stays executable by haf_fyp_user with no grant
+-- at all. Schema-level USAGE likewise does not lapse when objects are recreated.
+--
+-- Scope — only the schemas whose loss is a hard failure are self-healed:
+--   * hivemind_app / hivemind_postgrest_utilities — the feed endpoints read these
+--     as haf_fyp_user; losing SELECT 401s Discover outright.
+--   * hivesense_app — the Python ranker reads posts_vectors directly; losing SELECT
+--     makes every ranking attempt throw, users get skipped, and feeds silently go
+--     stale with no HTTP error to notice. hivesense is also rebuilt most often.
+--
+-- reptracker_app / btracker_app / btracker_backend / hafbe_bal are deliberately NOT
+-- included. They feed the credibility signal, which is designed to fail soft:
+-- ranker_daemon._fetch_author_credibility_safe() catches the error, rolls back and
+-- continues with neutral credibility. Losing those grants degrades ranking quality
+-- until this script is re-run, but never breaks a request or a cycle — so they do
+-- not warrant writing default-privilege policy into other apps' owner roles. Tracked
+-- separately.
+--
+-- Still requires re-running this script:
+--   * A full DROP/CREATE of a schema itself — default privileges are recorded
+--     against the schema and are discarded along with it.
+--   * A foreign app that starts revoking PUBLIC EXECUTE on its functions.
+--
+-- See hive/haf_fyp#6.
+DO $$
+DECLARE
+    -- schema name -> roles that need SELECT on it (mirrors the grants above).
+    _targets CONSTANT text[][] := ARRAY[
+        ['hivemind_app',                 'haf_fyp_user, haf_fyp_owner'],
+        ['hivemind_postgrest_utilities', 'haf_fyp_user'],
+        ['hivesense_app',                'haf_fyp_user']
+    ];
+    _schema   text;
+    _grantees text;
+    _owner    text;
+    _healed   int := 0;
+BEGIN
+    FOR _i IN 1 .. array_length(_targets, 1) LOOP
+        _schema   := _targets[_i][1];
+        _grantees := _targets[_i][2];
+
+        CONTINUE WHEN NOT EXISTS (
+            SELECT 1 FROM information_schema.schemata WHERE schema_name = _schema
+        );
+
+        FOR _owner IN
+            SELECT DISTINCT pg_get_userbyid(c.relowner)
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = _schema
+               AND c.relkind IN ('r', 'v', 'm')
+        LOOP
+            BEGIN
+                EXECUTE format(
+                    'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I '
+                    'GRANT SELECT ON TABLES TO %s',
+                    _owner, _schema, _grantees
+                );
+                _healed := _healed + 1;
+                RAISE NOTICE '%: default SELECT set for owner role % -> % (auto re-grant on recreation)',
+                    _schema, _owner, _grantees;
+            EXCEPTION WHEN insufficient_privilege THEN
+                -- Needs superuser, or membership in the owner role. Fall back to the
+                -- previous behaviour: grants stay one-shot and the script must be
+                -- re-run after that app is upgraded.
+                RAISE NOTICE '%: could not set default privileges for owner role % (needs superuser or membership) — re-run grant_cross_schema.sh after % upgrades',
+                    _schema, _owner, _schema;
+            END;
+        END LOOP;
+    END LOOP;
+
+    IF _healed = 0 THEN
+        RAISE NOTICE 'No default privileges were set — cross-schema grants will need a re-run after any foreign app is upgraded';
+    END IF;
+END
+$$;
