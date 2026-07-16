@@ -138,19 +138,41 @@ CREATE INDEX IF NOT EXISTS idx_user_interactions_user_time
 ON haf_fyp_app.user_interactions (username, created_at DESC);
 
 -- ---------------------------------------------------------------------------
--- Active users — one row per account that has interacted, maintained by
--- process_interactions. Lets the ranker pick which users to score each cycle
--- by scanning ~one-row-per-user (bounded by the user count) instead of doing a
--- DISTINCT over the whole, ever-growing user_interactions table.
+-- Active users — one row per account the ranker keeps fresh ("users we rank",
+-- not merely "users who interacted"). Rows arrive two ways:
+--   * process_interactions upserts on every vote/comment/reblog, stamping
+--     last_interaction_at / last_block;
+--   * the interests endpoint (api.py) and write_feed_cache (scoring.py) insert
+--     opted-in users who have never interacted — their last_interaction_at /
+--     last_block stay NULL until a first interaction fills them in. Without
+--     this, an opt-in lurker's feed was built once at onboarding and never
+--     re-ranked, freezing their For You page while Discover stayed fresh (#9).
+-- Lets the ranker pick which users to score each cycle by scanning
+-- ~one-row-per-user (bounded by the user count) instead of doing a DISTINCT
+-- over the whole, ever-growing user_interactions table.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.active_users (
     username varchar(16) NOT NULL,
-    last_interaction_at timestamp NOT NULL,
-    last_block int NOT NULL,
+    last_interaction_at timestamp,   -- NULL = opted in but never interacted
+    last_block int,                  -- NULL = opted in but never interacted
     last_scored_at timestamp,        -- when the ranker last built this user's feed (NULL = never)
     PRIMARY KEY (username)
 );
+
+-- In-place upgrade for pre-#9 installs (the CREATE above is IF NOT EXISTS, a
+-- no-op on an already-installed table). DROP NOT NULL is idempotent.
+ALTER TABLE haf_fyp_app.active_users
+ALTER COLUMN last_interaction_at DROP NOT NULL,
+ALTER COLUMN last_block DROP NOT NULL;
+
+-- Backfill for pre-#9 installs (idempotent, no-op on fresh installs): users who
+-- opted in before this fix exist in user_interests but were never added to
+-- active_users, so the scheduled cycle never re-ranked them. Insert them with
+-- last_scored_at NULL so upcoming cycles pick them up first (NULLS FIRST).
+INSERT INTO haf_fyp_app.active_users (username)
+SELECT DISTINCT username FROM haf_fyp_app.user_interests
+ON CONFLICT (username) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- Feed cache — precomputed ranked feeds (personalized)

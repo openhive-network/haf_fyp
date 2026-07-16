@@ -446,11 +446,18 @@ def write_feed_cache(
             rows,
         )
         # Stamp scoring time on the active_users index so the scheduled cycle
-        # can pick stalest-scored users without scanning feed_cache. No-ops for
-        # users not in active_users (e.g. opted-in but never interacted).
+        # can pick stalest-scored users without scanning feed_cache. Upsert, not
+        # UPDATE: opted-in users who never interacted have no process_interactions
+        # row, and the old UPDATE silently no-opped for them — so they never
+        # entered the scheduled rotation and their feed froze at onboarding (#9).
+        # last_interaction_at / last_block stay NULL until a first interaction.
         cur.execute(
-            "UPDATE haf_fyp_app.active_users SET last_scored_at = %s WHERE username = %s",
-            (now, username),
+            """
+            INSERT INTO haf_fyp_app.active_users (username, last_scored_at)
+            VALUES (%s, %s)
+            ON CONFLICT (username) DO UPDATE SET last_scored_at = EXCLUDED.last_scored_at
+            """,
+            (username, now),
         )
     conn.commit()
     # Precompute the bridge JSON for this user's feed so the endpoint serves it
