@@ -166,13 +166,8 @@ ALTER TABLE haf_fyp_app.active_users
 ALTER COLUMN last_interaction_at DROP NOT NULL,
 ALTER COLUMN last_block DROP NOT NULL;
 
--- Backfill for pre-#9 installs (idempotent, no-op on fresh installs): users who
--- opted in before this fix exist in user_interests but were never added to
--- active_users, so the scheduled cycle never re-ranked them. Insert them with
--- last_scored_at NULL so upcoming cycles pick them up first (NULLS FIRST).
-INSERT INTO haf_fyp_app.active_users (username)
-SELECT DISTINCT username FROM haf_fyp_app.user_interests
-ON CONFLICT (username) DO NOTHING;
+-- (The matching backfill of pre-#9 opt-ins lives below the user_interests
+-- definition — that table is created later in this file.)
 
 -- ---------------------------------------------------------------------------
 -- Feed cache — precomputed ranked feeds (personalized)
@@ -264,6 +259,16 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.user_interests (
     declared_at timestamp NOT NULL,
     PRIMARY KEY (username, community_id)
 );
+
+-- Backfill for pre-#9 installs (idempotent, no-op on fresh installs): users who
+-- opted in before the #9 fix exist in user_interests but were never added to
+-- active_users, so the scheduled cycle never re-ranked them. Insert them with
+-- last_scored_at NULL so upcoming cycles pick them up first (NULLS FIRST).
+-- Placed here rather than with active_users above because user_interests is
+-- created later in this file.
+INSERT INTO haf_fyp_app.active_users (username)
+SELECT DISTINCT username FROM haf_fyp_app.user_interests
+ON CONFLICT (username) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- Algorithm versions — version registry with JSONB weights
