@@ -200,7 +200,13 @@ def read_user_vector(conn, username: str) -> tuple:
         row = cur.fetchone()
     if row is None or row[0] is None:
         return None, 0
-    return np.array(row[0], dtype=np.float32), int(row[1])
+    # _to_numpy, not np.array: with pgvector-python >= 0.5 the registered
+    # adapter returns a Vector wrapper, which np.array() cannot coerce.
+    # (Deferred import, matching this module's other embeddings imports —
+    # embeddings is only needed on paths that actually touch vectors.)
+    from haf_fyp.embeddings import _to_numpy
+
+    return _to_numpy(row[0]), int(row[1])
 
 
 def fetch_top_communities(conn, username: str, limit: int = 5) -> list[int]:

@@ -44,9 +44,26 @@ def register_vector_type(conn) -> None:
 
 
 def _to_numpy(v) -> np.ndarray:
-    """Convert pgvector output (numpy array, list, or '[x,y,...]' string) to float32."""
+    """
+    Convert pgvector output (numpy array, Vector/HalfVector wrapper, list, or
+    '[x,y,...]' string) to float32.
+
+    pgvector-python >= 0.5 changed register_vector to return Vector/HalfVector
+    wrapper objects instead of bare numpy arrays. Unwrap them via their own API
+    (duck-typed so both old and new pgvector versions work): letting them fall
+    through to the string branch broke every ranking cycle, because
+    str(Vector([...])) is 'Vector([...])' — which np.fromstring cannot parse
+    ('unmatched data') — and strip("[]") only removes bracket chars at the
+    very ends of the string.
+    """
     if isinstance(v, np.ndarray):
         return v.astype(np.float32)
+    to_numpy = getattr(v, "to_numpy", None)
+    if callable(to_numpy):
+        return to_numpy().astype(np.float32)
+    to_list = getattr(v, "to_list", None)
+    if callable(to_list):
+        return np.array(to_list(), dtype=np.float32)
     if isinstance(v, (list, tuple)):
         return np.array(v, dtype=np.float32)
     return np.fromstring(str(v).strip("[]"), sep=",", dtype=np.float32)
