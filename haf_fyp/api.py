@@ -166,10 +166,11 @@ def post_interests(request: Request, req: InterestsRequest):
     """
     Declare or replace a user's cold-start community interests.
 
-    Upserts all supplied community_ids into user_interests and removes any
-    previously declared communities not in the current list. Publishes a
-    Redis refresh signal so the ranker can bootstrap the user's interest
-    vector on its next cycle.
+    Upserts all supplied community_ids into user_interests, removes any
+    previously declared communities not in the current list, and registers the
+    user in active_users so the scheduled ranking cycle keeps their feed fresh
+    even if they never interact (#9). Publishes a Redis refresh signal so the
+    ranker can bootstrap the user's interest vector immediately.
 
     Authenticated: the request must carry a posting-key signature proving the
     caller controls `username`. The client signs the canonical UTF-8 challenge
@@ -220,6 +221,21 @@ def post_interests(request: Request, req: InterestsRequest):
                   AND community_id <> ALL(%s)
                 """,
                 (req.username, req.communities),
+            )
+            # Register the opt-in in the ranking rotation (same transaction as
+            # the interests write, so membership is durable even if the Redis
+            # refresh below is lost). Without this row the scheduled cycle never
+            # re-ranks a user who never interacts and their feed freezes at
+            # onboarding (#9). Interaction columns stay NULL until they interact;
+            # write_feed_cache stamps last_scored_at when the feed is built —
+            # DO NOTHING here so an existing stamp/interaction row is untouched.
+            cur.execute(
+                """
+                INSERT INTO haf_fyp_app.active_users (username)
+                VALUES (%s)
+                ON CONFLICT (username) DO NOTHING
+                """,
+                (req.username,),
             )
         conn.commit()
     except Exception as exc:

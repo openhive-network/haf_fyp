@@ -205,21 +205,29 @@ def _fetch_author_credibility_safe(conn, authors: list[str]) -> dict:
 
 def _fetch_personalised_users(conn, limit: int) -> list[str]:
     """
-    Users for the scheduled cycle to (re)compute: accounts that have actually
-    interacted (so personalization has signal to work with), prioritising those
-    with no cached feed yet, then the stalest. Capped at `limit` so each pass is
-    bounded; over successive cycles this both bootstraps new active users and
-    keeps existing feeds fresh.
+    Users for the scheduled cycle to (re)compute: every account we rank —
+    accounts that have interacted (personalization has engagement signal) plus
+    opted-in interest-picker users who never have (#9: their interest vector is
+    static, but the candidate pool moves, so re-ranking still surfaces new
+    in-interest posts). Prioritises those with no cached feed yet, then the
+    stalest. Capped at `limit` so each pass is bounded regardless of how many
+    users the rotation holds; over successive cycles this both bootstraps new
+    users and keeps existing feeds fresh.
 
     Because per-user scoring is now cheap (an indexed user_interactions lookup,
     not a raw-operation scan), this can run for a meaningful number of users per
     cycle without starving core block processing.
 
-    Reads only the maintained active_users table (one row per account that has
-    interacted, with last_scored_at stamped by write_feed_cache), so the whole
-    selection scales with the user count — independent of both the ever-growing
-    user_interactions volume and feed_cache size. Within a cycle: never-scored
-    users first, then the stalest; among equals, the most recently active.
+    Reads only the maintained active_users table (one row per ranked account,
+    inserted by process_interactions on interaction and by the interests
+    endpoint / write_feed_cache on opt-in, with last_scored_at stamped by
+    write_feed_cache), so the whole selection scales with the user count —
+    independent of both the ever-growing user_interactions volume and
+    feed_cache size. Within a cycle: never-scored users first, then the
+    stalest; among equals, the most recently active. NULLS LAST on the
+    tie-break is load-bearing: Postgres defaults DESC to NULLS FIRST, which
+    would hand never-interacted lurkers priority over engaged users at equal
+    staleness — engagement signal should win ties.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -227,7 +235,7 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
             SELECT username
               FROM haf_fyp_app.active_users
              ORDER BY last_scored_at ASC NULLS FIRST,
-                      last_interaction_at DESC
+                      last_interaction_at DESC NULLS LAST
              LIMIT %s
             """,
             (limit,),
