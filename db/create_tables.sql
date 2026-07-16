@@ -298,3 +298,8 @@ GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.feed_cache TO haf_fyp_user;
 GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.user_profile_vectors TO haf_fyp_user;
 -- The ranker also renders and refreshes the post bridge cache.
 GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.post_bridge_cache TO haf_fyp_user;
+-- #9: write_feed_cache (ranker) upserts the last_scored_at stamp and the
+-- interests endpoint (API — same role) registers opt-ins, so haf_fyp_user
+-- needs INSERT as well as UPDATE on the rotation index. No DELETE — rows are
+-- only ever added or restamped from the Python side.
+GRANT INSERT, UPDATE ON haf_fyp_app.active_users TO haf_fyp_user;
