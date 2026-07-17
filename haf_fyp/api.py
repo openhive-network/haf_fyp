@@ -3,6 +3,7 @@ FastAPI overlay for haf_fyp.
 
 Handles write operations and admin actions that PostgREST cannot serve:
   POST /v1/fyp/interests           — cold-start interest picker (rate-limited)
+  POST /v1/fyp/events              — impression / engagement telemetry (batched)
   POST /v1/fyp/admin/algorithm     — activate an algorithm version (API-key gated)
   GET  /health                     — service health check
 
@@ -16,7 +17,8 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Annotated
+from datetime import datetime, timezone
+from typing import Annotated, Literal, Optional
 
 import psycopg2
 import psycopg2.extras
@@ -125,6 +127,46 @@ class InterestsRequest(BaseModel):
 class InterestsResponse(BaseModel):
     username: str
     communities_saved: int
+
+
+_MAX_MS = 24 * 60 * 60 * 1000  # clamp durations to 24h — anything larger is junk
+
+
+class FeedEvent(BaseModel):
+    """A single telemetry event. All fields except `t` are optional so one shape
+    covers impressions, opens, video watch-time and client-observed actions."""
+
+    t: Literal["impression", "open", "video", "action"] = Field(
+        description="Event type: 'impression' (card shown as the active slide), 'open' (post reader opened), 'video' (watch-time sample), 'action' (client-observed vote/comment/reblog/follow)."
+    )
+    post_id: Annotated[Optional[int], Field(default=None, gt=0)] = None
+    rank: Annotated[Optional[int], Field(default=None, ge=0, le=100000)] = None
+    source: Optional[Literal["personalized", "global"]] = None
+    algo_version: Annotated[Optional[str], Field(default=None, max_length=16)] = None
+    dwell_ms: Annotated[Optional[int], Field(default=None, ge=0, le=_MAX_MS)] = None
+    watch_ms: Annotated[Optional[int], Field(default=None, ge=0, le=_MAX_MS)] = None
+    duration_ms: Annotated[Optional[int], Field(default=None, ge=0, le=_MAX_MS)] = None
+    kind: Optional[Literal["vote", "comment", "reblog", "follow"]] = None
+    ts: Annotated[
+        Optional[int],
+        Field(default=None, description="Client event time, unix epoch milliseconds (untrusted; used for ordering/dwell only)."),
+    ] = None
+
+
+class EventsBatch(BaseModel):
+    session: Annotated[
+        str,
+        Field(min_length=1, max_length=64, description="Opaque random client session id (no fingerprinting)."),
+    ]
+    username: Annotated[
+        Optional[str],
+        Field(default=None, max_length=16, description="Client-claimed Hive account, or null for anonymous browsing. NON-AUTHORITATIVE — telemetry only, never trusted for engagement."),
+    ] = None
+    events: Annotated[list[FeedEvent], Field(min_length=1, max_length=200)]
+
+
+class EventsResponse(BaseModel):
+    accepted: int
 
 
 class AlgorithmActivateRequest(BaseModel):
@@ -247,6 +289,79 @@ def post_interests(request: Request, req: InterestsRequest):
 
     _publish_refresh(req.username)
     return InterestsResponse(username=req.username, communities_saved=len(req.communities))
+
+
+@app.post("/v1/fyp/events", response_model=EventsResponse, status_code=202)
+@limiter.limit("120/minute")
+def post_events(request: Request, req: EventsBatch):
+    """
+    Ingest a batch of feed telemetry events (impressions, opens, video
+    watch-time, client-observed actions).
+
+    This is the missing signal for measuring feed quality: the chain records
+    only actions, never what a user saw-and-skipped. With impressions (post +
+    rank + feed source + algorithm_version) we can compute CTR@rank, dwell and
+    watch-time, and A/B tune the ranking by algorithm_version.
+
+    Unauthenticated and best-effort by design:
+      * `session` is a random client id; `username` (if any) is client-claimed
+        and NON-AUTHORITATIVE — on-chain ops remain the source of truth for
+        engagement. Nothing here is consensus-relevant.
+      * The endpoint returns 202 (accepted) even if the write fails, so a
+        telemetry hiccup never disrupts the client; failures are logged
+        server-side. Malformed batches are rejected with 422.
+
+    Rate-limited per IP; batches are capped at 200 events. Send it fire-and-forget
+    (e.g. navigator.sendBeacon on visibilitychange).
+    """
+    rows = []
+    for ev in req.events:
+        event_ts = (
+            datetime.fromtimestamp(ev.ts / 1000, tz=timezone.utc)
+            if ev.ts is not None
+            else None
+        )
+        rows.append(
+            (
+                event_ts,
+                req.session,
+                req.username,
+                ev.t,
+                ev.post_id,
+                ev.rank,
+                ev.source,
+                ev.algo_version,
+                ev.dwell_ms,
+                ev.watch_ms,
+                ev.duration_ms,
+                ev.kind,
+            )
+        )
+
+    assert _pool is not None
+    pool = _pool
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(
+                cur,
+                """
+                INSERT INTO haf_fyp_app.feed_events
+                    (event_ts, session, username, event_type, post_id, rank,
+                     source, algorithm_version, dwell_ms, watch_ms, duration_ms, kind)
+                VALUES %s
+                """,
+                rows,
+            )
+        conn.commit()
+    except Exception:
+        # Best-effort telemetry: never fail the client on an ingest error.
+        conn.rollback()
+        log.exception("failed to ingest %d feed events", len(rows))
+    finally:
+        pool.putconn(conn)
+
+    return EventsResponse(accepted=len(rows))
 
 
 @app.post("/v1/fyp/admin/algorithm")

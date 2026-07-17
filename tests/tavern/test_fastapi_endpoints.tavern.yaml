@@ -112,3 +112,88 @@ stages:
       status_code: 403
       json:
         detail: "invalid admin key"
+
+---
+test_name: POST /v1/fyp/events accepts a valid telemetry batch
+
+stages:
+  - name: signed-in batch of impression + action returns 202 accepted
+    request:
+      url: "{fastapi_url}/v1/fyp/events"
+      method: POST
+      json:
+        session: "sess-abc-123"
+        username: "alice"
+        events:
+          - t: "impression"
+            post_id: 123
+            rank: 4
+            source: "personalized"
+            algo_version: "v7"
+            dwell_ms: 4200
+            ts: 1751370000000
+          - t: "action"
+            post_id: 123
+            kind: "vote"
+            ts: 1751370005000
+    response:
+      status_code: 202
+      json:
+        accepted: 2
+
+---
+test_name: POST /v1/fyp/events accepts anonymous impressions (no username)
+
+stages:
+  - name: anonymous batch returns 202
+    request:
+      url: "{fastapi_url}/v1/fyp/events"
+      method: POST
+      json:
+        session: "anon-xyz"
+        events:
+          - t: "video"
+            post_id: 55
+            watch_ms: 18000
+            duration_ms: 62000
+    response:
+      status_code: 202
+      json:
+        accepted: 1
+
+---
+test_name: POST /v1/fyp/events validates the batch
+
+stages:
+  - name: empty events list returns 422
+    request:
+      url: "{fastapi_url}/v1/fyp/events"
+      method: POST
+      json:
+        session: "s1"
+        events: []
+    response:
+      status_code: 422
+
+  - name: unknown event type returns 422
+    request:
+      url: "{fastapi_url}/v1/fyp/events"
+      method: POST
+      json:
+        session: "s1"
+        events:
+          - t: "not-a-real-event"
+            post_id: 1
+    response:
+      status_code: 422
+
+  - name: missing session returns 422
+    request:
+      url: "{fastapi_url}/v1/fyp/events"
+      method: POST
+      json:
+        events:
+          - t: "impression"
+            post_id: 1
+    response:
+      status_code: 422

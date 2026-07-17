@@ -284,6 +284,52 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.algorithm_versions (
 );
 
 -- ---------------------------------------------------------------------------
+-- Feed events — raw impression / engagement telemetry (#12)
+--
+-- Append-only log of what users actually SAW (not just what they acted on): a
+-- card impression (with rank, feed source and algorithm_version), post opens,
+-- video watch-time, and client-observed actions. This is the missing signal
+-- needed to measure feed quality (CTR@rank, dwell, watch-time) and to A/B tune
+-- weights by algorithm_version — the chain only records actions, never
+-- what was shown-and-skipped.
+--
+-- NON-AUTHORITATIVE: written by the unauthenticated FastAPI /v1/fyp/events
+-- endpoint. `username` is client-claimed (never a source of truth — on-chain
+-- ops remain authoritative for engagement); `session` is a random client id.
+-- `created_at` is the trusted server ingest time; `event_ts` is the untrusted
+-- client event time (kept for ordering / dwell only).
+--
+-- Retention / rollup are a deliberate follow-up: this raw table should be
+-- capped by a retention job (e.g. DELETE created_at < now() - N days) and/or
+-- rolled up into a daily aggregate. Not implemented here to keep the ingest
+-- path minimal; see #12.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_events (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    created_at timestamptz NOT NULL DEFAULT now(),  -- trusted server ingest time
+    event_ts timestamptz,                           -- untrusted client event time
+    session varchar(64) NOT NULL,                   -- random client session id
+    username varchar(16),                           -- client-claimed; NULL = anonymous
+    event_type varchar(16) NOT NULL
+    CHECK (event_type IN ('impression', 'open', 'video', 'action')),
+    post_id bigint,
+    rank int,
+    source varchar(16),                             -- 'personalized' | 'global'
+    algorithm_version varchar(16),
+    dwell_ms int,                                   -- impression: time as active card
+    watch_ms int,                                   -- video: watched duration
+    duration_ms int,                                -- video: total duration
+    kind varchar(16)                                -- action: vote|comment|reblog|follow
+);
+
+-- Time-range scans (retention, dashboards) and A/B slices by algorithm_version.
+CREATE INDEX IF NOT EXISTS idx_feed_events_created_at
+ON haf_fyp_app.feed_events (created_at);
+CREATE INDEX IF NOT EXISTS idx_feed_events_algo_created
+ON haf_fyp_app.feed_events (algorithm_version, created_at);
+
+-- ---------------------------------------------------------------------------
 -- Default privileges — grant haf_fyp_user read access on all app tables
 -- ---------------------------------------------------------------------------
 
@@ -303,3 +349,8 @@ GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.post_bridge_cache TO haf_fyp_user;
 -- needs INSERT as well as UPDATE on the rotation index. No DELETE — rows are
 -- only ever added or restamped from the Python side.
 GRANT INSERT, UPDATE ON haf_fyp_app.active_users TO haf_fyp_user;
+-- #12: the FastAPI /v1/fyp/events endpoint (API — same role) appends telemetry.
+-- INSERT only — the ingest path never updates or deletes; retention/rollup jobs
+-- run as the owner. (A GENERATED ALWAYS AS IDENTITY column needs no separate
+-- sequence USAGE grant — the server fills it under the table INSERT privilege.)
+GRANT INSERT ON haf_fyp_app.feed_events TO haf_fyp_user;
