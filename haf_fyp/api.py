@@ -149,7 +149,10 @@ class FeedEvent(BaseModel):
     kind: Optional[Literal["vote", "comment", "reblog", "follow"]] = None
     ts: Annotated[
         Optional[int],
-        Field(default=None, description="Client event time, unix epoch milliseconds (untrusted; used for ordering/dwell only)."),
+        # Bounded so pydantic rejects a junk timestamp with 422 rather than
+        # letting datetime.fromtimestamp() raise OSError → unhandled 500 (the
+        # conversion runs before the DB try/except). Upper bound = 2100-01-01.
+        Field(default=None, ge=0, le=4102444800000, description="Client event time, unix epoch milliseconds (untrusted; used for ordering/dwell only)."),
     ] = None
 
 

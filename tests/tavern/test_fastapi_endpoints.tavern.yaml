@@ -197,3 +197,16 @@ stages:
             post_id: 1
     response:
       status_code: 422
+
+  - name: out-of-range ts returns 422 (must not reach fromtimestamp -> 500)
+    request:
+      url: "{fastapi_url}/v1/fyp/events"
+      method: POST
+      json:
+        session: "s1"
+        events:
+          - t: "impression"
+            post_id: 1
+            ts: 1000000000000000000
+    response:
+      status_code: 422
