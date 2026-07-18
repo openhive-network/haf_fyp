@@ -267,6 +267,15 @@ AS $func$
             "type": "string",
             "nullable": true,
             "description": "Which tier applied the community boost - 'subscribed', 'engaged', or null"
+          },
+          "post_id": {
+            "type": "integer",
+            "description": "Internal post id (joins feed_events.post_id); a stable key for client telemetry."
+          },
+          "algorithm_version": {
+            "type": "string",
+            "nullable": true,
+            "description": "Ranking algorithm version that produced this entry, for A/B analysis (null in the global feed)."
           }
         }
       },
@@ -1188,7 +1197,12 @@ BEGIN
                         'score_engagement', fc.score_engagement,
                         'score_credibility', fc.score_credibility,
                         'community_boost_applied', fc.community_boost_applied,
-                        'boost_source', fc.boost_source
+                        'boost_source', fc.boost_source,
+                        -- Exposed for client telemetry (#12): post_id is the
+                        -- joinable key (matches feed_events.post_id) and
+                        -- algorithm_version lets impressions be sliced for A/B.
+                        'post_id', fc.post_id,
+                        'algorithm_version', fc.algorithm_version
                     ) AS fyp
                 -- hive_post_id is precomputed by resolve_hivemind_post_ids (see
                 -- db/process_posts.sql), so the feed no longer joins
@@ -1255,7 +1269,11 @@ BEGIN
                         'score_engagement', gfc.score_engagement,
                         'score_credibility', gfc.score_credibility,
                         'community_boost_applied', FALSE,
-                        'boost_source', NULL::text
+                        'boost_source', NULL::text,
+                        -- #12: joinable key for client telemetry. The global
+                        -- cache carries no algorithm_version, so it's null here.
+                        'post_id', gfc.post_id,
+                        'algorithm_version', NULL::varchar
                     ) AS fyp
                 -- See get_personalized_feed: hive_post_id is precomputed, so no
                 -- per-request Hivemind join (single PK join to post_candidates).
@@ -1392,7 +1410,11 @@ BEGIN
                         'score_engagement', gfc.score_engagement,
                         'score_credibility', gfc.score_credibility,
                         'community_boost_applied', FALSE,
-                        'boost_source', NULL::text
+                        'boost_source', NULL::text,
+                        -- #12: joinable key for client telemetry. The global
+                        -- cache carries no algorithm_version, so it's null here.
+                        'post_id', gfc.post_id,
+                        'algorithm_version', NULL::varchar
                     ) AS fyp
                 -- See get_personalized_feed: hive_post_id is precomputed, so no
                 -- per-request Hivemind join. The community filter stays on
