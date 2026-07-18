@@ -64,6 +64,13 @@ schemas:
         type: string
         nullable: true
         description: Which tier applied the community boost - 'subscribed', 'engaged', or null
+      post_id:
+        type: integer
+        description: Internal post id (joins feed_events.post_id); a stable key for client telemetry.
+      algorithm_version:
+        type: string
+        nullable: true
+        description: Ranking algorithm version that produced this entry, for A/B analysis (null in the global feed).
  */
 
 /** openapi:components
@@ -1126,7 +1133,7 @@ CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_personalized_feed(
     "page-size" INT = 20,
     "truncate_body" INT = 0
 )
-RETURNS jsonb
+RETURNS jsonb 
 -- openapi-generated-code-end
 LANGUAGE plpgsql STABLE
 AS $$
@@ -1357,7 +1364,7 @@ CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_global_feed(
     "community_id" INT = NULL,
     "truncate_body" INT = 0
 )
-RETURNS jsonb
+RETURNS jsonb 
 -- openapi-generated-code-end
 LANGUAGE plpgsql STABLE
 AS $$
@@ -1490,7 +1497,7 @@ DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_user_profile;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_user_profile(
     "username" TEXT
 )
-RETURNS TABLE(has_feed boolean, has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp)
+RETURNS TABLE(has_feed boolean, has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp) 
 -- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
