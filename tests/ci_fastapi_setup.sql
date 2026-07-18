@@ -23,3 +23,22 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.active_users (
     last_scored_at TIMESTAMP,
     PRIMARY KEY (username)
 );
+
+-- #12: the /v1/fyp/events endpoint appends telemetry, so FastAPI writes this too.
+CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_events (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    event_ts TIMESTAMPTZ,
+    session VARCHAR(64) NOT NULL,
+    username VARCHAR(16),
+    event_type VARCHAR(16) NOT NULL
+        CHECK (event_type IN ('impression', 'open', 'video', 'action')),
+    post_id BIGINT,
+    rank INT,
+    source VARCHAR(16),
+    algorithm_version VARCHAR(16),
+    dwell_ms INT,
+    watch_ms INT,
+    duration_ms INT,
+    kind VARCHAR(16)
+);
