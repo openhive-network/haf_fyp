@@ -65,8 +65,12 @@ schemas:
         nullable: true
         description: Which tier applied the community boost - 'subscribed', 'engaged', or null
       post_id:
-        type: integer
-        description: Internal post id (joins feed_events.post_id); a stable key for client telemetry.
+        type: string
+        description: >-
+          Internal post id (joins feed_events.post_id). Serialized as a STRING
+          because the id exceeds JavaScript's 2^53 safe-integer limit - a JS
+          Number would lose precision and break the telemetry join; echo it back
+          verbatim in POST /v1/fyp/events.
       algorithm_version:
         type: string
         nullable: true
@@ -276,8 +280,8 @@ AS $func$
             "description": "Which tier applied the community boost - 'subscribed', 'engaged', or null"
           },
           "post_id": {
-            "type": "integer",
-            "description": "Internal post id (joins feed_events.post_id); a stable key for client telemetry."
+            "type": "string",
+            "description": "Internal post id (joins feed_events.post_id). Serialized as a STRING because the id exceeds JavaScript's 2^53 safe-integer limit - a JS Number would lose precision and break the telemetry join; echo it back verbatim in POST /v1/fyp/events."
           },
           "algorithm_version": {
             "type": "string",
@@ -1208,7 +1212,7 @@ BEGIN
                         -- Exposed for client telemetry (#12): post_id is the
                         -- joinable key (matches feed_events.post_id) and
                         -- algorithm_version lets impressions be sliced for A/B.
-                        'post_id', fc.post_id,
+                        'post_id', fc.post_id::text,
                         'algorithm_version', fc.algorithm_version
                     ) AS fyp
                 -- hive_post_id is precomputed by resolve_hivemind_post_ids (see
@@ -1279,7 +1283,7 @@ BEGIN
                         'boost_source', NULL::text,
                         -- #12: joinable key for client telemetry. The global
                         -- cache carries no algorithm_version, so it's null here.
-                        'post_id', gfc.post_id,
+                        'post_id', gfc.post_id::text,
                         'algorithm_version', NULL::varchar
                     ) AS fyp
                 -- See get_personalized_feed: hive_post_id is precomputed, so no
@@ -1420,7 +1424,7 @@ BEGIN
                         'boost_source', NULL::text,
                         -- #12: joinable key for client telemetry. The global
                         -- cache carries no algorithm_version, so it's null here.
-                        'post_id', gfc.post_id,
+                        'post_id', gfc.post_id::text,
                         'algorithm_version', NULL::varchar
                     ) AS fyp
                 -- See get_personalized_feed: hive_post_id is precomputed, so no
