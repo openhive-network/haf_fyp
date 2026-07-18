@@ -188,17 +188,16 @@ schemas:
 -- root() - serves the full OpenAPI spec at GET /
 -- ---------------------------------------------------------------------------
 
-DO $__$
-DECLARE
-    swagger_url TEXT;
-BEGIN
-    swagger_url := COALESCE(current_setting('custom.swagger_url', TRUE), 'localhost');
-
-    EXECUTE $exec$
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.root() RETURNS json
-LANGUAGE sql STABLE
+LANGUAGE plpgsql STABLE
 AS $func$
-    SELECT $api_json$
+DECLARE
+    -- The OpenAPI spec below is generated from the /** openapi ... */ annotations
+    -- in this file by scripts/openapi_rewrite.sh (it fills the block after the
+    -- "-- openapi-spec" marker). Edit the annotations, not the generated JSON.
+-- openapi-spec
+-- openapi-generated-code-begin
+  openapi json = $$
 {
   "openapi": "3.1.0",
   "info": {
@@ -246,7 +245,10 @@ AS $func$
         "properties": {
           "source": {
             "type": "string",
-            "enum": ["personalized", "global"],
+            "enum": [
+              "personalized",
+              "global"
+            ],
             "description": "Which feed produced this entry - 'personalized' when the user has a precomputed personalized feed, 'global' when served the cold-start global fallback. Uniform across all entries in a single response."
           },
           "rank": {
@@ -355,8 +357,15 @@ AS $func$
           "json_metadata": {
             "app": "leothreads/0.3",
             "format": "markdown",
-            "tags": ["sports", "football", "premierleague", "advertising"],
-            "image": ["https://images.hive.blog/p/cover.png"]
+            "tags": [
+              "sports",
+              "football",
+              "premierleague",
+              "advertising"
+            ],
+            "image": [
+              "https://images.hive.blog/p/cover.png"
+            ]
           },
           "created": "2026-06-19T16:33:57",
           "updated": "2026-06-19T16:33:57",
@@ -378,14 +387,23 @@ AS $func$
           "payout_at": "2026-06-26T16:33:57",
           "net_rshares": 50938299772643,
           "beneficiaries": [
-            { "account": "leo.voter", "weight": 500 }
+            {
+              "account": "leo.voter",
+              "weight": 500
+            }
           ],
           "blacklists": [],
           "reblogs": 0,
           "replies": [],
           "active_votes": [
-            { "voter": "team", "rshares": 30982500342 },
-            { "voter": "roelandp", "rshares": 15794227518 }
+            {
+              "voter": "team",
+              "rshares": 30982500342
+            },
+            {
+              "voter": "roelandp",
+              "rshares": 15794227518
+            }
           ],
           "stats": {
             "hide": false,
@@ -846,11 +864,12 @@ AS $func$
     }
   }
 }
-$api_json$::json;
+$$;
+-- openapi-generated-code-end
+BEGIN
+    RETURN openapi;
+END;
 $func$;
-$exec$;
-END
-$__$;
 
 -- ---------------------------------------------------------------------------
 -- Health / version
