@@ -42,3 +42,37 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_events (
     duration_ms INT,
     kind VARCHAR(16)
 );
+
+-- #12 retention/rollup: the rollup target, watermark, and a minimal
+-- algorithm_versions (the rollup folds unknown versions against it). Enough for
+-- the pg-backed maintenance test (tests/integration/test_feed_events_maintenance_db.py).
+CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_metrics_daily (
+    day DATE NOT NULL,
+    algorithm_version VARCHAR(16) NOT NULL DEFAULT '',
+    source VARCHAR(16) NOT NULL DEFAULT '',
+    rank INT NOT NULL DEFAULT -1,
+    impressions BIGINT NOT NULL DEFAULT 0,
+    opens BIGINT NOT NULL DEFAULT 0,
+    actions BIGINT NOT NULL DEFAULT 0,
+    videos BIGINT NOT NULL DEFAULT 0,
+    dwell_ms_sum BIGINT NOT NULL DEFAULT 0,
+    watch_ms_sum BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, algorithm_version, source, rank)
+);
+
+CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_events_rollup_state (
+    only_row BOOLEAN PRIMARY KEY DEFAULT TRUE,
+    last_rolled_id BIGINT NOT NULL DEFAULT 0,
+    CONSTRAINT feed_events_rollup_state_singleton CHECK (only_row)
+);
+INSERT INTO haf_fyp_app.feed_events_rollup_state (only_row) VALUES (TRUE)
+ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS haf_fyp_app.algorithm_versions (
+    version VARCHAR(16) PRIMARY KEY,
+    is_active BOOLEAN NOT NULL DEFAULT FALSE
+);
+INSERT INTO haf_fyp_app.algorithm_versions (version, is_active) VALUES ('1.1.0', TRUE)
+ON CONFLICT DO NOTHING;
+-- The rollup/prune FUNCTIONS are loaded by the maintenance test itself from
+-- db/feed_events_maintenance.sql (psql \i does not work through psycopg2).

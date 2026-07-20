@@ -353,6 +353,18 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_metrics_daily (
     PRIMARY KEY (day, algorithm_version, source, rank)
 );
 
+-- Rollup watermark (#12): one row holding the last feed_events.id folded into
+-- feed_metrics_daily, so rollup_feed_events() aggregates incrementally and
+-- pruning raw can never corrupt the durable history. See feed_events_maintenance.sql.
+CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_events_rollup_state (
+    only_row boolean PRIMARY KEY DEFAULT TRUE,
+    last_rolled_id bigint NOT NULL DEFAULT 0,
+    CONSTRAINT feed_events_rollup_state_singleton CHECK (only_row)
+);
+INSERT INTO haf_fyp_app.feed_events_rollup_state (only_row)
+VALUES (TRUE)
+ON CONFLICT DO NOTHING;
+
 -- ---------------------------------------------------------------------------
 -- Default privileges — grant haf_fyp_user read access on all app tables
 -- ---------------------------------------------------------------------------
@@ -379,8 +391,9 @@ GRANT INSERT, UPDATE ON haf_fyp_app.active_users TO haf_fyp_user;
 -- sequence USAGE grant — the server fills it under the table INSERT privilege.)
 GRANT INSERT ON haf_fyp_app.feed_events TO haf_fyp_user;
 -- #12: the ranker daemon (haf_fyp_user) runs the daily rollup + retention prune
--- (rollup_feed_events / prune_feed_events). It needs DELETE on the raw log and
--- INSERT/DELETE on the rollup (recompute-and-replace per day). SELECT on the
--- rollup comes from the blanket grant above.
+-- (rollup_feed_events / prune_feed_events). It needs DELETE on the raw log,
+-- INSERT/UPDATE (incremental ON CONFLICT add) + DELETE (age-out) on the rollup,
+-- and SELECT/UPDATE on the watermark row. SELECT comes from the blanket grant.
 GRANT DELETE ON haf_fyp_app.feed_events TO haf_fyp_user;
-GRANT INSERT, DELETE ON haf_fyp_app.feed_metrics_daily TO haf_fyp_user;
+GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.feed_metrics_daily TO haf_fyp_user;
+GRANT UPDATE ON haf_fyp_app.feed_events_rollup_state TO haf_fyp_user;

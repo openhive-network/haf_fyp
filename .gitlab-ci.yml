@@ -107,6 +107,8 @@ fastapi-tests:
       c.close()
       print('DB setup complete')
       "
+    # #12: pg-backed rollup/retention test (loads the functions itself)
+    - PYTHONPATH=. pytest tests/integration/test_feed_events_maintenance_db.py -v
     - PYTHONPATH=. uvicorn haf_fyp.api:app --host 0.0.0.0 --port 3002 &
     - sleep 3
     - echo 'variables:' > /tmp/tavern_cfg.yaml

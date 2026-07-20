@@ -56,7 +56,10 @@ CYCLE_SECONDS = 300
 POLL_SECONDS = 5
 
 # Feed-events (#12) retention + rollup, run periodically off the same loop.
-FEED_EVENTS_MAINT_SECONDS = int(os.environ.get("FEED_EVENTS_MAINT_SECONDS", str(6 * 60 * 60)))
+# Hourly by default: the raw log is unauthenticated, so a shorter interval bounds
+# the worst-case flood window between prune passes (the rollup is incremental and
+# the prune a bounded delete, so running often is cheap).
+FEED_EVENTS_MAINT_SECONDS = int(os.environ.get("FEED_EVENTS_MAINT_SECONDS", str(60 * 60)))
 FEED_EVENTS_RETAIN_DAYS = int(os.environ.get("FEED_EVENTS_RETAIN_DAYS", "14"))
 FEED_EVENTS_MAX_ROWS = int(os.environ.get("FEED_EVENTS_MAX_ROWS", "20000000"))
 CANDIDATE_LIMIT = 5000
