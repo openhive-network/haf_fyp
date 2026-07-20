@@ -33,6 +33,9 @@ run_sql_file "${SCRIPT_DIR}/../db/haf_fyp_app.sql"
 # 3. Application tables and composite type
 run_sql_file "${SCRIPT_DIR}/../db/create_tables.sql"
 
+# 3b. Feed-events retention + rollup functions (#12) — needs the tables above
+run_sql_file "${SCRIPT_DIR}/../db/feed_events_maintenance.sql"
+
 # 4. Phase 2: post ingestion
 run_sql_file "${SCRIPT_DIR}/../db/process_posts.sql"
 

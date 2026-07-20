@@ -54,6 +54,14 @@ log = logging.getLogger(__name__)
 
 CYCLE_SECONDS = 300
 POLL_SECONDS = 5
+
+# Feed-events (#12) retention + rollup, run periodically off the same loop.
+# Hourly by default: the raw log is unauthenticated, so a shorter interval bounds
+# the worst-case flood window between prune passes (the rollup is incremental and
+# the prune a bounded delete, so running often is cheap).
+FEED_EVENTS_MAINT_SECONDS = int(os.environ.get("FEED_EVENTS_MAINT_SECONDS", str(60 * 60)))
+FEED_EVENTS_RETAIN_DAYS = int(os.environ.get("FEED_EVENTS_RETAIN_DAYS", "14"))
+FEED_EVENTS_MAX_ROWS = int(os.environ.get("FEED_EVENTS_MAX_ROWS", "20000000"))
 CANDIDATE_LIMIT = 5000
 
 # Personalized feeds are computed on demand, not bulk-precomputed for every
@@ -369,6 +377,30 @@ def _run_targeted_refresh(conn, usernames: set[str]) -> None:
             log.exception("force-refresh failed for %s — skipping", username)
 
 
+def _run_feed_events_maintenance(conn) -> None:
+    """
+    Roll up feed_events into feed_metrics_daily, then prune the raw log (#12).
+
+    Rollup first so a day's aggregates are captured before its raw rows can be
+    removed. Best-effort: a maintenance failure must never take down ranking.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT haf_fyp_app.rollup_feed_events()")
+            cur.execute(
+                "SELECT haf_fyp_app.prune_feed_events(%s, %s)",
+                (FEED_EVENTS_RETAIN_DAYS, FEED_EVENTS_MAX_ROWS),
+            )
+            pruned = cur.fetchone()[0]
+        conn.commit()
+        log.info("feed_events maintenance: rolled up + pruned %s raw rows", pruned)
+    except psycopg2.OperationalError:
+        raise
+    except Exception:
+        conn.rollback()
+        log.exception("feed_events maintenance failed — skipping")
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -385,6 +417,7 @@ def main() -> None:
 
     conn = _connect()
     next_full_cycle = 0.0  # run immediately on startup
+    next_feed_maint = 0.0  # run feed_events rollup/prune immediately on startup
 
     while True:
         # Drain pending force-refresh requests
@@ -416,6 +449,15 @@ def main() -> None:
             except Exception:
                 log.exception("ranking cycle failed")
                 next_full_cycle = time.monotonic() + CYCLE_SECONDS
+
+        # Feed-events rollup + retention on its own (slower) schedule
+        if time.monotonic() >= next_feed_maint:
+            try:
+                _run_feed_events_maintenance(conn)
+            except psycopg2.OperationalError:
+                log.warning("database connection lost (feed maintenance) — reconnecting")
+                conn = _connect()
+            next_feed_maint = time.monotonic() + FEED_EVENTS_MAINT_SECONDS
 
         time.sleep(POLL_SECONDS)
 
