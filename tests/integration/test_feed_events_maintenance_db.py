@@ -74,7 +74,7 @@ def test_rollup_survives_pruning_of_its_raw(conn):
         _insert(cur, 10, days_ago=20, dwell=1000)  # old day D (20d ago) — will be pruned
         _insert(cur, 4, days_ago=0, dwell=500)     # today — retained
 
-        cur.execute("SELECT haf_fyp_app.rollup_feed_events()")
+        cur.execute("SELECT haf_fyp_app.rollup_feed_events(0)")
         assert _agg(cur, 20) == (10, 10000), "old day rolled up before prune"
         assert _agg(cur, 0) == (4, 2000)
 
@@ -84,7 +84,7 @@ def test_rollup_survives_pruning_of_its_raw(conn):
         assert cur.fetchone()[0] == 0, "old raw pruned"
 
         # Roll up again — the pruned day's aggregate must be UNCHANGED (the bug).
-        cur.execute("SELECT haf_fyp_app.rollup_feed_events()")
+        cur.execute("SELECT haf_fyp_app.rollup_feed_events(0)")
         assert _agg(cur, 20) == (10, 10000), "pruned day's aggregate intact, not decayed"
         assert _agg(cur, 0) == (4, 2000)
 
@@ -92,17 +92,39 @@ def test_rollup_survives_pruning_of_its_raw(conn):
 def test_rollup_is_incremental_and_idempotent(conn):
     with conn.cursor() as cur:
         _insert(cur, 3, days_ago=0)
-        cur.execute("SELECT haf_fyp_app.rollup_feed_events()")
+        cur.execute("SELECT haf_fyp_app.rollup_feed_events(0)")
         assert _agg(cur, 0) == (3, 3000)
 
         # No new rows → re-running must not double-count (watermark).
-        cur.execute("SELECT haf_fyp_app.rollup_feed_events()")
+        cur.execute("SELECT haf_fyp_app.rollup_feed_events(0)")
         assert _agg(cur, 0) == (3, 3000)
 
         # New rows → added incrementally on top.
         _insert(cur, 2, days_ago=0)
-        cur.execute("SELECT haf_fyp_app.rollup_feed_events()")
+        cur.execute("SELECT haf_fyp_app.rollup_feed_events(0)")
         assert _agg(cur, 0) == (5, 5000)
+
+
+def test_safety_lag_holds_back_unsettled_rows(conn):
+    """
+    Commit-safe watermark: a row younger than the lag must NOT advance the
+    watermark past it (else a concurrently-committing lower id would be dropped).
+    With a non-zero lag a fresh row is skipped this pass and picked up once it
+    ages past the lag; lag=0 rolls it up immediately.
+    """
+    with conn.cursor() as cur:
+        _insert(cur, 3, days_ago=0)  # created_at = now(): inside any positive lag
+
+        # A generous lag leaves the fresh rows unsettled → nothing rolled up yet,
+        # and the watermark must not advance (so they aren't lost).
+        cur.execute("SELECT haf_fyp_app.rollup_feed_events(3600)")
+        assert _agg(cur, 0) == (0, 0), "rows younger than the lag are not rolled up"
+        cur.execute("SELECT last_rolled_id FROM haf_fyp_app.feed_events_rollup_state")
+        assert cur.fetchone()[0] == 0, "watermark not advanced past unsettled rows"
+
+        # No lag → the same rows now roll up (nothing was dropped).
+        cur.execute("SELECT haf_fyp_app.rollup_feed_events(0)")
+        assert _agg(cur, 0) == (3, 3000)
 
 
 def test_cardinality_clamps(conn):
@@ -110,7 +132,7 @@ def test_cardinality_clamps(conn):
     with conn.cursor() as cur:
         _insert(cur, 1, days_ago=0, algo="EVIL-VERSION", rank=99999)
         _insert(cur, 1, days_ago=0, algo="1.1.0", rank=5)
-        cur.execute("SELECT haf_fyp_app.rollup_feed_events()")
+        cur.execute("SELECT haf_fyp_app.rollup_feed_events(0)")
         cur.execute(
             "SELECT algorithm_version, rank FROM haf_fyp_app.feed_metrics_daily ORDER BY rank"
         )

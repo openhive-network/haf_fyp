@@ -26,7 +26,11 @@
 -- rollup_feed_events — incremental daily aggregation (watermark-driven)
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION haf_fyp_app.rollup_feed_events()
+-- The signature changed (added lag_seconds), so drop the old zero-arg version
+-- on re-install rather than leaving a stale overload behind.
+DROP FUNCTION IF EXISTS haf_fyp_app.rollup_feed_events();
+
+CREATE OR REPLACE FUNCTION haf_fyp_app.rollup_feed_events(lag_seconds int DEFAULT 60)
 RETURNS void
 LANGUAGE plpgsql
 AS $$
@@ -35,9 +39,19 @@ DECLARE
     hi bigint;
 BEGIN
     SELECT last_rolled_id INTO wm FROM haf_fyp_app.feed_events_rollup_state;
-    SELECT max(id) INTO hi FROM haf_fyp_app.feed_events;
+    -- Commit-safe watermark: id (GENERATED ALWAYS AS IDENTITY) is assigned at
+    -- INSERT time, but commit order can lag id order under concurrency — a txn
+    -- can hold a low id uncommitted while a later id commits first. Advancing the
+    -- watermark to raw max(id) would then step past the low id, and once it commits
+    -- it is id <= wm and never re-scanned → silently dropped before it is pruned.
+    -- So only advance past rows old enough that their inserting txn has certainly
+    -- committed. Telemetry inserts are sub-second single-statement batches, so the
+    -- default 60s lag settles them with room to spare; the trailing <lag window
+    -- simply rolls up on the next pass. lag_seconds=0 disables it (tests).
+    SELECT max(id) INTO hi FROM haf_fyp_app.feed_events
+    WHERE created_at < now() - make_interval(secs => lag_seconds);
     IF hi IS NULL OR hi <= wm THEN
-        RETURN;  -- nothing new since the last pass
+        RETURN;  -- nothing new (and settled) since the last pass
     END IF;
 
     INSERT INTO haf_fyp_app.feed_metrics_daily (
@@ -116,5 +130,5 @@ BEGIN
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION haf_fyp_app.rollup_feed_events() TO haf_fyp_user;
+GRANT EXECUTE ON FUNCTION haf_fyp_app.rollup_feed_events(int) TO haf_fyp_user;
 GRANT EXECUTE ON FUNCTION haf_fyp_app.prune_feed_events(int, bigint, int) TO haf_fyp_user;
