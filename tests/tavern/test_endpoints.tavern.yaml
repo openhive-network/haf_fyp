@@ -118,13 +118,18 @@ includes:
   - !include common.yaml
 
 stages:
-  - name: GET /rpc/list_algorithm_versions returns 200, newest first (v1.1.0 active)
+  - name: GET /rpc/list_algorithm_versions returns 200, newest first (1.2.0 challenger inactive, 1.1.0 active)
     request:
       url: "{api_url}/rpc/list_algorithm_versions"
       method: GET
     response:
       status_code: 200
       json:
+        - version: "1.2.0"
+          description: !anything
+          weights: !anything
+          deployed_at: !anything
+          is_active: false
         - version: "1.1.0"
           description: !anything
           weights: !anything

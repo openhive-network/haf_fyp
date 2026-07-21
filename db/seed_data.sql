@@ -26,7 +26,7 @@ VALUES (
         "community_boost":         0.20,
         "community_boost_engaged": 0.10
     }'::jsonb,
-    NOW(),
+    NOW() - interval '1 hour',
     TRUE
 ),
 (
