@@ -278,6 +278,39 @@ def fetch_user_interests(conn, username: str) -> set:
         return {row[0] for row in cur.fetchall()}
 
 
+def _apply_diversity_cap(df: pd.DataFrame, cap: int) -> pd.DataFrame:
+    """
+    Per-community diversity cap (#11). df must already be sorted best-first.
+
+    Walk the ranking in score order and let at most `cap` posts from any one
+    community take a leading position; posts beyond a community's quota are held
+    back and appended after all capped posts, still in score order. Because the
+    walk is score-ordered, the head of the feed stays maximally diverse while the
+    overflow only ever sinks — no post is dropped and total ordering is preserved
+    otherwise. Posts with no community_id (community_id NULL/NaN) are never
+    capped: they can't form a single-community bubble.
+
+    Without this, the multiplicative community boost can fill a narrow
+    subscriber's whole page from one community (the observed 18/20 case).
+    """
+    if cap <= 0 or df.empty:
+        return df
+    counts: dict = {}
+    keep: list = []
+    overflow: list = []
+    for idx, cid in zip(df.index, df["community_id"]):
+        if cid is None or (isinstance(cid, float) and pd.isna(cid)):
+            keep.append(idx)  # uncommunitied posts are exempt
+            continue
+        seen = counts.get(cid, 0)
+        if seen < cap:
+            counts[cid] = seen + 1
+            keep.append(idx)
+        else:
+            overflow.append(idx)
+    return df.loc[keep + overflow].reset_index(drop=True)
+
+
 def compute_scores(
     candidates: pd.DataFrame,
     user_vector,
@@ -299,6 +332,10 @@ def compute_scores(
         engaged community (top by interaction), not subscribed
                                        -> final_score *= (1 + community_boost_engaged)
     Each boosted post records boost_source = 'subscribed' | 'engaged' (NULL if none).
+
+    If algorithm_weights sets max_per_community, a diversity cap is applied after
+    sorting so no single community occupies more than that many leading positions
+    (#11). Absent the key, ranking is unchanged.
     """
     w_v = algorithm_weights.get("relevance", 0.40)
     w_r = algorithm_weights.get("recency", 0.30)
@@ -352,7 +389,16 @@ def compute_scores(
             df.loc[mask, "community_boost_applied"] = True
             df.loc[mask, "boost_source"] = source
 
-    return df.sort_values("final_score", ascending=False).reset_index(drop=True)
+    ranked = df.sort_values("final_score", ascending=False).reset_index(drop=True)
+
+    # Diversity cap (#11): optionally bound how many leading posts may come from a
+    # single community so the boost can't collapse a narrow subscriber's page into
+    # one community. Off unless the active algorithm version sets max_per_community,
+    # so default ranking is unchanged.
+    cap = algorithm_weights.get("max_per_community")
+    if cap:
+        ranked = _apply_diversity_cap(ranked, int(cap))
+    return ranked
 
 
 def render_bridge_for_posts(conn, post_ids: list[int]) -> None:
