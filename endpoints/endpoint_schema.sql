@@ -861,6 +861,119 @@ DECLARE
           }
         }
       }
+    },
+    "/v1/fyp/metrics": {
+      "get": {
+        "tags": [
+          "Feed"
+        ],
+        "summary": "Feed quality metrics",
+        "description": "Aggregated feed-quality metrics from the telemetry rollup (feed_metrics_daily, #12), summed over a date range and grouped by algorithm_version / source / rank. Enables engagement-rate@rank, open rate, and average dwell/watch \u2014 and A/B comparison across algorithm_version. NON-AUTHORITATIVE: derived from the unauthenticated /v1/fyp/events log (username is client-claimed), so treat figures as directional and corroborate against on-chain engagement. Global-feed rows carry algorithm_version '' (no per-version A/B on the global feed).",
+        "operationId": "haf_fyp_endpoints.get_feed_metrics",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "from_date",
+            "required": false,
+            "schema": {
+              "x-sql-datatype": "DATE",
+              "type": "string",
+              "format": "date",
+              "default": null
+            },
+            "description": "Inclusive start date (YYYY-MM-DD). Default 30 days ago."
+          },
+          {
+            "in": "query",
+            "name": "to_date",
+            "required": false,
+            "schema": {
+              "x-sql-datatype": "DATE",
+              "type": "string",
+              "format": "date",
+              "default": null
+            },
+            "description": "Inclusive end date (YYYY-MM-DD). Default today."
+          },
+          {
+            "in": "query",
+            "name": "algorithm_version",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": null
+            },
+            "description": "Filter to one algorithm version (optional)"
+          },
+          {
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": null
+            },
+            "description": "Filter to 'personalized' or 'global' (optional)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Aggregated metric rows",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "x-sql-datatype": "jsonb",
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "algorithm_version": {
+                        "type": "string"
+                      },
+                      "source": {
+                        "type": "string"
+                      },
+                      "rank": {
+                        "type": "integer"
+                      },
+                      "impressions": {
+                        "type": "integer"
+                      },
+                      "opens": {
+                        "type": "integer"
+                      },
+                      "actions": {
+                        "type": "integer"
+                      },
+                      "videos": {
+                        "type": "integer"
+                      },
+                      "engagement_rate": {
+                        "type": "number",
+                        "nullable": true,
+                        "description": "actions (vote+comment+reblog+follow) / impressions"
+                      },
+                      "open_rate": {
+                        "type": "number",
+                        "nullable": true,
+                        "description": "opens / impressions (closest to a click-through)"
+                      },
+                      "avg_dwell_ms": {
+                        "type": "number",
+                        "nullable": true
+                      },
+                      "avg_watch_ms": {
+                        "type": "number",
+                        "nullable": true
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
   }
 }
@@ -1644,6 +1757,153 @@ AS $$
     LEFT JOIN haf_fyp_app.algorithm_versions av ON av.version = fc.algorithm_version
     WHERE fc.username = get_score_explanation.username
       AND fc.post_id = get_score_explanation.post_id;
+$$;
+
+/** openapi:paths
+/v1/fyp/metrics:
+  get:
+    tags:
+      - Feed
+    summary: Feed quality metrics
+    description: >-
+      Aggregated feed-quality metrics from the telemetry rollup
+      (feed_metrics_daily, #12), summed over a date range and grouped by
+      algorithm_version / source / rank. Enables engagement-rate@rank, open rate,
+      and average dwell/watch — and A/B comparison across algorithm_version.
+      NON-AUTHORITATIVE: derived from the unauthenticated /v1/fyp/events log
+      (username is client-claimed), so treat figures as directional and
+      corroborate against on-chain engagement. Global-feed rows carry
+      algorithm_version '' (no per-version A/B on the global feed).
+    operationId: haf_fyp_endpoints.get_feed_metrics
+    parameters:
+      - in: query
+        name: from_date
+        required: false
+        schema:
+          x-sql-datatype: DATE
+          type: string
+          format: date
+          default: null
+        description: Inclusive start date (YYYY-MM-DD). Default 30 days ago.
+      - in: query
+        name: to_date
+        required: false
+        schema:
+          x-sql-datatype: DATE
+          type: string
+          format: date
+          default: null
+        description: Inclusive end date (YYYY-MM-DD). Default today.
+      - in: query
+        name: algorithm_version
+        required: false
+        schema:
+          type: string
+          default: null
+        description: Filter to one algorithm version (optional)
+      - in: query
+        name: source
+        required: false
+        schema:
+          type: string
+          default: null
+        description: Filter to 'personalized' or 'global' (optional)
+    responses:
+      '200':
+        description: Aggregated metric rows
+        content:
+          application/json:
+            schema:
+              x-sql-datatype: "jsonb"
+              type: array
+              items:
+                type: object
+                properties:
+                  algorithm_version:
+                    type: string
+                  source:
+                    type: string
+                  rank:
+                    type: integer
+                  impressions:
+                    type: integer
+                  opens:
+                    type: integer
+                  actions:
+                    type: integer
+                  videos:
+                    type: integer
+                  engagement_rate:
+                    type: number
+                    nullable: true
+                    description: actions (vote+comment+reblog+follow) / impressions
+                  open_rate:
+                    type: number
+                    nullable: true
+                    description: opens / impressions (closest to a click-through)
+                  avg_dwell_ms:
+                    type: number
+                    nullable: true
+                  avg_watch_ms:
+                    type: number
+                    nullable: true
+ */
+-- openapi-generated-code-begin
+DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_feed_metrics;
+CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_feed_metrics(
+    "from_date" DATE = NULL,
+    "to_date" DATE = NULL,
+    "algorithm_version" TEXT = NULL,
+    "source" TEXT = NULL
+)
+RETURNS jsonb 
+-- openapi-generated-code-end
+LANGUAGE sql STABLE
+AS $$
+    WITH agg AS (
+        SELECT
+            m.algorithm_version,
+            m.source,
+            m.rank,
+            sum(m.impressions)  AS impressions,
+            sum(m.opens)        AS opens,
+            sum(m.actions)      AS actions,
+            sum(m.videos)       AS videos,
+            sum(m.dwell_ms_sum) AS dwell_ms_sum,
+            sum(m.watch_ms_sum) AS watch_ms_sum
+        FROM haf_fyp_app.feed_metrics_daily m
+        WHERE m.day >= COALESCE(get_feed_metrics."from_date", now()::date - 30)
+          AND m.day <= COALESCE(get_feed_metrics."to_date", now()::date)
+          AND (get_feed_metrics."algorithm_version" IS NULL
+               OR m.algorithm_version = get_feed_metrics."algorithm_version")
+          AND (get_feed_metrics."source" IS NULL
+               OR m.source = get_feed_metrics."source")
+        GROUP BY m.algorithm_version, m.source, m.rank
+    )
+    SELECT COALESCE(
+        jsonb_agg(
+            jsonb_build_object(
+                'algorithm_version', algorithm_version,
+                'source', source,
+                'rank', rank,
+                'impressions', impressions,
+                'opens', opens,
+                'actions', actions,
+                'videos', videos,
+                'engagement_rate', CASE WHEN impressions > 0
+                    THEN round(actions::numeric / impressions, 4) END,
+                'open_rate', CASE WHEN impressions > 0
+                    THEN round(opens::numeric / impressions, 4) END,
+                'avg_dwell_ms', CASE WHEN impressions > 0
+                    THEN round(dwell_ms_sum::numeric / impressions, 1) END,
+                'avg_watch_ms', CASE WHEN videos > 0
+                    THEN round(watch_ms_sum::numeric / videos, 1) END
+            )
+            ORDER BY algorithm_version, source, rank
+        ),
+        '[]'::jsonb
+    )
+    FROM agg;
 $$;
 
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA haf_fyp_endpoints TO haf_fyp_user;
