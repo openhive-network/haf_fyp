@@ -6,6 +6,7 @@ import pytest
 
 import haf_fyp.embeddings as embeddings
 from haf_fyp.scoring import (
+    _apply_diversity_cap,
     bootstrap_vector_from_communities,
     compute_credibility,
     compute_engagement_quality,
@@ -262,3 +263,69 @@ class TestBootstrapVectorFromCommunities:
 
         assert result is not None
         assert np.isclose(np.linalg.norm(result), 1.0, atol=1e-6)
+
+
+def _ranked(community_ids: list) -> pd.DataFrame:
+    """A DataFrame already sorted best-first (descending final_score)."""
+    n = len(community_ids)
+    return pd.DataFrame(
+        {
+            "post_id": list(range(n)),
+            "community_id": community_ids,
+            "final_score": [1.0 - i * 0.01 for i in range(n)],
+        }
+    )
+
+
+class TestDiversityCap:
+    def test_caps_leading_positions_per_community(self):
+        # score order: A A A B B A ; cap=2
+        out = _apply_diversity_cap(_ranked([100, 100, 100, 200, 200, 100]), 2)
+        # leading 4 respect the cap (<=2 per community); overflow A-posts sink last
+        head = out["community_id"].tolist()[:4]
+        assert head.count(100) == 2 and head.count(200) == 2
+        # overflow preserves score order: the two demoted A posts were post_id 2 then 5
+        assert out["post_id"].tolist()[-2:] == [2, 5]
+        # nothing dropped
+        assert sorted(out["post_id"]) == [0, 1, 2, 3, 4, 5]
+
+    def test_uncommunitied_posts_are_exempt(self):
+        # community None must never be capped even beyond `cap`
+        out = _apply_diversity_cap(_ranked([None, None, None, None]), 1)
+        assert out["post_id"].tolist() == [0, 1, 2, 3]
+
+    def test_cap_zero_or_empty_is_noop(self):
+        df = _ranked([100, 100, 200])
+        assert _apply_diversity_cap(df, 0)["post_id"].tolist() == [0, 1, 2]
+        assert _apply_diversity_cap(df.iloc[0:0], 2).empty
+
+    def test_compute_scores_without_cap_is_unchanged(self):
+        # _WEIGHTS has no max_per_community -> ranking identical to plain sort
+        base = compute_scores(_candidates(3), None, {}, {}, set(), set(), _WEIGHTS)
+        assert list(base["final_score"]) == sorted(base["final_score"], reverse=True)
+
+    def test_compute_scores_applies_cap_when_configured(self):
+        # 5 posts all in community 500, one in 600; subscribe to 500 so all get boosted
+        now = _now()
+        df = pd.DataFrame(
+            [
+                {
+                    "post_id": i,
+                    "author": f"a{i}",
+                    "permlink": f"p{i}",
+                    "community_id": 500 if i < 5 else 600,
+                    "created_at": now - timedelta(hours=i),
+                    "unique_commenters": 1,
+                    "reblog_count": 0,
+                    "net_rshares": 1_000_000,
+                    "vote_count": 1,
+                }
+                for i in range(6)
+            ]
+        )
+        weights = {**_WEIGHTS, "max_per_community": 2}
+        out = compute_scores(df, None, {}, {}, {500}, set(), weights)
+        # community 500 may occupy at most 2 of the leading 3 positions
+        assert out["community_id"].tolist()[:3].count(500) <= 2
+        # every post still present
+        assert sorted(out["post_id"]) == [0, 1, 2, 3, 4, 5]
