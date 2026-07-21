@@ -135,3 +135,31 @@ stages:
           weights: !anything
           deployed_at: !anything
           is_active: false
+
+---
+test_name: Feed metrics endpoint (#13)
+
+includes:
+  - !include common.yaml
+
+stages:
+  - name: GET /rpc/get_feed_metrics returns 200 (empty rollup -> [])
+    request:
+      url: "{api_url}/rpc/get_feed_metrics"
+      method: GET
+    response:
+      status_code: 200
+      json: !anylist
+
+  - name: GET /rpc/get_feed_metrics with filters returns 200
+    request:
+      url: "{api_url}/rpc/get_feed_metrics"
+      method: GET
+      params:
+        from_date: "2026-01-01"
+        to_date: "2026-12-31"
+        algorithm_version: "1.1.0"
+        source: "personalized"
+    response:
+      status_code: 200
+      json: !anylist
