@@ -4,6 +4,16 @@
 
 CREATE SCHEMA IF NOT EXISTS haf_fyp_app;
 
+-- #14: the pg-backed maintenance test loads db/feed_events_maintenance.sql, which
+-- REVOKE/GRANTs EXECUTE to/from haf_fyp_owner and haf_fyp_user. haf_fyp_user is
+-- the container's own role; create haf_fyp_owner so those grants resolve here
+-- (the full install creates it via builtin_roles.sql). NOLOGIN, no privileges.
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'haf_fyp_owner') THEN
+        CREATE ROLE haf_fyp_owner NOLOGIN;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS haf_fyp_app.user_interests (
     username VARCHAR(16) NOT NULL,
     community_id INT NOT NULL,
