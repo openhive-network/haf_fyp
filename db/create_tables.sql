@@ -366,34 +366,60 @@ VALUES (TRUE)
 ON CONFLICT DO NOTHING;
 
 -- ---------------------------------------------------------------------------
--- Default privileges — grant haf_fyp_user read access on all app tables
--- ---------------------------------------------------------------------------
+-- Roles & privileges (#14) — least-privilege split
+--
+-- Two roles share the app schema:
+--   * haf_fyp_owner — owns every app object. The ranker/maintenance DAEMON now
+--     connects as this role (docker-compose: haf-fyp-ranker POSTGRES_USER), so
+--     all its writes and the rollup/prune functions run with implicit owner
+--     privileges — no per-table daemon grants needed.
+--   * haf_fyp_user  — the UNAUTHENTICATED-facing role PostgREST + the FastAPI
+--     overlay run as. It gets read access everywhere plus ONLY the narrow writes
+--     the HTTP endpoints perform. It must not hold the daemon's delete/rollup
+--     privileges — a DELETE on the telemetry log reachable from an anonymous
+--     endpoint is exactly what #14 removes.
+--
+-- Ownership normalisation: create_tables runs as the install superuser (no SET
+-- ROLE), so tables it CREATEs are owned by that role, not haf_fyp_owner. Reassign
+-- every app table to haf_fyp_owner so the daemon-as-owner has implicit privileges
+-- on the whole schema (fresh installs and older mixed-ownership deployments
+-- alike). Idempotent: already-owned tables are skipped.
+DO $$
+DECLARE _t TEXT;
+BEGIN
+    FOR _t IN
+        SELECT tablename FROM pg_tables
+        WHERE schemaname = 'haf_fyp_app' AND tableowner <> 'haf_fyp_owner'
+    LOOP
+        EXECUTE format('ALTER TABLE haf_fyp_app.%I OWNER TO haf_fyp_owner', _t);
+    END LOOP;
+END $$;
 
+-- Read access for the API/PostgREST role across all app tables + endpoint fns.
 GRANT SELECT ON ALL TABLES IN SCHEMA haf_fyp_app TO haf_fyp_user;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA haf_fyp_endpoints TO haf_fyp_user;
 
--- The Python ranker daemon runs as haf_fyp_user and writes the precomputed
--- feed caches and per-user interest vectors. Block processing (post_candidates,
--- engagement_metrics, etc.) is owned by haf_fyp_owner and remains read-only here.
-GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.global_feed_cache TO haf_fyp_user;
-GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.feed_cache TO haf_fyp_user;
-GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.user_profile_vectors TO haf_fyp_user;
--- The ranker also renders and refreshes the post bridge cache.
-GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.post_bridge_cache TO haf_fyp_user;
--- #9: write_feed_cache (ranker) upserts the last_scored_at stamp and the
--- interests endpoint (API — same role) registers opt-ins, so haf_fyp_user
--- needs INSERT as well as UPDATE on the rotation index. No DELETE — rows are
--- only ever added or restamped from the Python side.
-GRANT INSERT, UPDATE ON haf_fyp_app.active_users TO haf_fyp_user;
--- #12: the FastAPI /v1/fyp/events endpoint (API — same role) appends telemetry.
--- INSERT only — the ingest path never updates or deletes; retention/rollup jobs
--- run as the owner. (A GENERATED ALWAYS AS IDENTITY column needs no separate
--- sequence USAGE grant — the server fills it under the table INSERT privilege.)
-GRANT INSERT ON haf_fyp_app.feed_events TO haf_fyp_user;
--- #12: the ranker daemon (haf_fyp_user) runs the daily rollup + retention prune
--- (rollup_feed_events / prune_feed_events). It needs DELETE on the raw log,
--- INSERT/UPDATE (incremental ON CONFLICT add) + DELETE (age-out) on the rollup,
--- and SELECT/UPDATE on the watermark row. SELECT comes from the blanket grant.
-GRANT DELETE ON haf_fyp_app.feed_events TO haf_fyp_user;
-GRANT INSERT, UPDATE, DELETE ON haf_fyp_app.feed_metrics_daily TO haf_fyp_user;
-GRANT UPDATE ON haf_fyp_app.feed_events_rollup_state TO haf_fyp_user;
+-- Narrow API writes — exactly what the HTTP endpoints perform, nothing more:
+--   POST /v1/fyp/events            -> INSERT feed_events
+--   POST /v1/fyp/interests         -> INSERT/DELETE user_interests, INSERT active_users
+--   POST /v1/fyp/admin/algorithm   -> UPDATE algorithm_versions (API-key gated)
+-- (active_users: INSERT only — opt-in is ON CONFLICT DO NOTHING; the ranker's
+--  last_scored_at UPSERT runs as owner. GENERATED-IDENTITY feed_events.id needs
+--  no separate sequence grant.)
+GRANT INSERT ON haf_fyp_app.feed_events        TO haf_fyp_user;
+GRANT INSERT, DELETE ON haf_fyp_app.user_interests TO haf_fyp_user;
+GRANT INSERT ON haf_fyp_app.active_users       TO haf_fyp_user;
+GRANT UPDATE ON haf_fyp_app.algorithm_versions TO haf_fyp_user;
+
+-- Strip the daemon/maintenance writes off the anon-facing role (#14). The ranker
+-- holds these implicitly as owner now; REVOKE narrows an already-deployed
+-- haf_fyp_user too (no-op on a fresh install). SELECT is retained from the
+-- blanket grant above, so PostgREST still reads the caches to serve feeds.
+REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.feed_cache           FROM haf_fyp_user;
+REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.global_feed_cache    FROM haf_fyp_user;
+REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.user_profile_vectors FROM haf_fyp_user;
+REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.post_bridge_cache    FROM haf_fyp_user;
+REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.feed_metrics_daily   FROM haf_fyp_user;
+REVOKE UPDATE               ON haf_fyp_app.feed_events_rollup_state FROM haf_fyp_user;
+REVOKE DELETE               ON haf_fyp_app.feed_events            FROM haf_fyp_user;
+REVOKE UPDATE               ON haf_fyp_app.active_users           FROM haf_fyp_user;

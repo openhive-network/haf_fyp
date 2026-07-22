@@ -65,7 +65,11 @@ services:
     command: ["python", "-m", "haf_fyp.ranker_daemon"]
     environment:
       POSTGRES_HOST: haf
-      POSTGRES_USER: haf_fyp_user
+      # #14: the ranker/maintenance daemon connects as haf_fyp_owner (owns the app
+      # schema -> implicit write/rollup/prune privileges). This keeps the daemon's
+      # DELETE/maintenance rights off haf_fyp_user, the role the unauthenticated
+      # PostgREST + FastAPI api run as.
+      POSTGRES_USER: haf_fyp_owner
       POSTGRES_DB:   haf_block_log
       REDIS_HOST:    redis
       REDIS_URL:     redis://redis:6379

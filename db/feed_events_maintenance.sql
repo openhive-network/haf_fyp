@@ -2,7 +2,7 @@
 --
 -- feed_events is an append-only, UNAUTHENTICATED telemetry log — it must be
 -- bounded or it grows without limit. Two functions, run daily by the ranker
--- daemon (haf_fyp_user):
+-- daemon (which connects as haf_fyp_owner — see #14):
 --
 --   rollup_feed_events()  — INCREMENTALLY fold new raw rows into
 --                           feed_metrics_daily, so CTR@rank / dwell / watch-time
@@ -130,5 +130,13 @@ BEGIN
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION haf_fyp_app.rollup_feed_events(int) TO haf_fyp_user;
-GRANT EXECUTE ON FUNCTION haf_fyp_app.prune_feed_events(int, bigint, int) TO haf_fyp_user;
+-- #14: maintenance is daemon-only. The ranker connects as haf_fyp_owner (which
+-- owns feed_events / feed_metrics_daily / the watermark), so these run with
+-- implicit privileges. Lock EXECUTE to the owner and off PUBLIC / the anon-facing
+-- haf_fyp_user, which must not be able to invoke rollup/prune.
+REVOKE EXECUTE ON FUNCTION haf_fyp_app.rollup_feed_events(int) FROM public;
+REVOKE EXECUTE ON FUNCTION haf_fyp_app.prune_feed_events(int, bigint, int) FROM public;
+REVOKE EXECUTE ON FUNCTION haf_fyp_app.rollup_feed_events(int) FROM haf_fyp_user;
+REVOKE EXECUTE ON FUNCTION haf_fyp_app.prune_feed_events(int, bigint, int) FROM haf_fyp_user;
+GRANT EXECUTE ON FUNCTION haf_fyp_app.rollup_feed_events(int) TO haf_fyp_owner;
+GRANT EXECUTE ON FUNCTION haf_fyp_app.prune_feed_events(int, bigint, int) TO haf_fyp_owner;

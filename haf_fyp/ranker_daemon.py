@@ -81,7 +81,9 @@ def _dsn() -> str:
         f"host={os.environ.get('POSTGRES_HOST', 'haf')} "
         f"port={os.environ.get('POSTGRES_PORT', '5432')} "
         f"dbname={os.environ.get('POSTGRES_DB', 'haf_block_log')} "
-        f"user={os.environ.get('POSTGRES_USER', 'haf_fyp_user')} "
+        # #14: the daemon connects as haf_fyp_owner (owns the app schema), keeping
+        # its write/delete/maintenance rights off the anon-facing haf_fyp_user.
+        f"user={os.environ.get('POSTGRES_USER', 'haf_fyp_owner')} "
         f"password={os.environ.get('POSTGRES_PASSWORD', '')}"
     )
 
