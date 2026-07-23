@@ -1,4 +1,11 @@
--- Cross-schema read grants for haf_fyp_user.
+-- Cross-schema read grants for haf_fyp_user (API/PostgREST) AND haf_fyp_owner.
+--
+-- #14: the ranker/maintenance daemon now connects as haf_fyp_owner, and it reads
+-- the same foreign schemas the ranker used to read as haf_fyp_user — hivesense_app
+-- (embeddings), reptracker_app / btracker* / hafbe_bal (credibility), and, via
+-- get_bridge_post, hivemind_app + hivemind_postgrest_utilities (bridge render). So
+-- every grant the ranker depends on is applied to BOTH roles below. (haf_fyp_owner
+-- already reads hafd.* by default and reads hafd.accounts, so no hafd change.)
 --
 -- Run as haf_admin AFTER HiveSense, btracker, and reptracker are installed.
 -- Safe to re-run: each block checks for schema existence first.
@@ -27,9 +34,9 @@ BEGIN
         SELECT 1 FROM information_schema.schemata
         WHERE schema_name = 'hivesense_app'
     ) THEN
-        GRANT USAGE ON SCHEMA hivesense_app TO haf_fyp_user;
-        GRANT SELECT ON ALL TABLES IN SCHEMA hivesense_app TO haf_fyp_user;
-        RAISE NOTICE 'hivesense_app: granted SELECT to haf_fyp_user';
+        GRANT USAGE ON SCHEMA hivesense_app TO haf_fyp_user, haf_fyp_owner;
+        GRANT SELECT ON ALL TABLES IN SCHEMA hivesense_app TO haf_fyp_user, haf_fyp_owner;
+        RAISE NOTICE 'hivesense_app: granted SELECT to haf_fyp_user, haf_fyp_owner';
     ELSE
         RAISE NOTICE 'hivesense_app not found — install HiveSense then re-run grant_cross_schema.sh';
     END IF;
@@ -64,6 +71,7 @@ BEGIN
         -- no-op if this grant has not been applied yet.
         GRANT USAGE ON SCHEMA hivemind_app TO haf_fyp_owner;
         GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_app TO haf_fyp_owner;
+        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_app TO haf_fyp_owner;
         RAISE NOTICE 'hivemind_app: granted SELECT + EXECUTE to haf_fyp_user, SELECT to haf_fyp_owner';
     ELSE
         RAISE NOTICE 'hivemind_app not found — install Hivemind then re-run grant_cross_schema.sh';
@@ -93,10 +101,10 @@ BEGIN
         SELECT 1 FROM information_schema.schemata
         WHERE schema_name = 'hivemind_postgrest_utilities'
     ) THEN
-        GRANT USAGE ON SCHEMA hivemind_postgrest_utilities TO haf_fyp_user;
-        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user;
-        GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user;
-        RAISE NOTICE 'hivemind_postgrest_utilities: granted EXECUTE + SELECT to haf_fyp_user';
+        GRANT USAGE ON SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
+        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
+        GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
+        RAISE NOTICE 'hivemind_postgrest_utilities: granted EXECUTE + SELECT to haf_fyp_user, haf_fyp_owner';
     ELSE
         RAISE NOTICE 'hivemind_postgrest_utilities not found — install Hivemind then re-run grant_cross_schema.sh';
     END IF;
@@ -109,9 +117,9 @@ BEGIN
         SELECT 1 FROM information_schema.schemata
         WHERE schema_name = 'reptracker_app'
     ) THEN
-        GRANT USAGE ON SCHEMA reptracker_app TO haf_fyp_user;
-        GRANT SELECT ON ALL TABLES IN SCHEMA reptracker_app TO haf_fyp_user;
-        RAISE NOTICE 'reptracker_app: granted SELECT to haf_fyp_user';
+        GRANT USAGE ON SCHEMA reptracker_app TO haf_fyp_user, haf_fyp_owner;
+        GRANT SELECT ON ALL TABLES IN SCHEMA reptracker_app TO haf_fyp_user, haf_fyp_owner;
+        RAISE NOTICE 'reptracker_app: granted SELECT to haf_fyp_user, haf_fyp_owner';
     ELSE
         RAISE NOTICE 'reptracker_app not found — install reputation_tracker then re-run grant_cross_schema.sh';
     END IF;
@@ -124,9 +132,9 @@ BEGIN
         SELECT 1 FROM information_schema.schemata
         WHERE schema_name = 'btracker_app'
     ) THEN
-        GRANT USAGE ON SCHEMA btracker_app TO haf_fyp_user;
-        GRANT SELECT ON ALL TABLES IN SCHEMA btracker_app TO haf_fyp_user;
-        RAISE NOTICE 'btracker_app: granted SELECT to haf_fyp_user';
+        GRANT USAGE ON SCHEMA btracker_app TO haf_fyp_user, haf_fyp_owner;
+        GRANT SELECT ON ALL TABLES IN SCHEMA btracker_app TO haf_fyp_user, haf_fyp_owner;
+        RAISE NOTICE 'btracker_app: granted SELECT to haf_fyp_user, haf_fyp_owner';
     ELSE
         RAISE NOTICE 'btracker_app not found — install balance_tracker then re-run grant_cross_schema.sh';
     END IF;
@@ -142,16 +150,16 @@ BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata WHERE schema_name = 'btracker_backend'
     ) THEN
-        GRANT USAGE ON SCHEMA btracker_backend TO haf_fyp_user;
-        GRANT SELECT ON ALL TABLES IN SCHEMA btracker_backend TO haf_fyp_user;
-        RAISE NOTICE 'btracker_backend: granted SELECT to haf_fyp_user';
+        GRANT USAGE ON SCHEMA btracker_backend TO haf_fyp_user, haf_fyp_owner;
+        GRANT SELECT ON ALL TABLES IN SCHEMA btracker_backend TO haf_fyp_user, haf_fyp_owner;
+        RAISE NOTICE 'btracker_backend: granted SELECT to haf_fyp_user, haf_fyp_owner';
     END IF;
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata WHERE schema_name = 'hafbe_bal'
     ) THEN
-        GRANT USAGE ON SCHEMA hafbe_bal TO haf_fyp_user;
-        GRANT SELECT ON ALL TABLES IN SCHEMA hafbe_bal TO haf_fyp_user;
-        RAISE NOTICE 'hafbe_bal: granted SELECT to haf_fyp_user';
+        GRANT USAGE ON SCHEMA hafbe_bal TO haf_fyp_user, haf_fyp_owner;
+        GRANT SELECT ON ALL TABLES IN SCHEMA hafbe_bal TO haf_fyp_user, haf_fyp_owner;
+        RAISE NOTICE 'hafbe_bal: granted SELECT to haf_fyp_user, haf_fyp_owner';
     END IF;
 END
 $$;
@@ -219,8 +227,8 @@ DECLARE
     -- schema name -> roles that need SELECT on it (mirrors the grants above).
     _targets CONSTANT text[][] := ARRAY[
         ['hivemind_app',                 'haf_fyp_user, haf_fyp_owner'],
-        ['hivemind_postgrest_utilities', 'haf_fyp_user'],
-        ['hivesense_app',                'haf_fyp_user']
+        ['hivemind_postgrest_utilities', 'haf_fyp_user, haf_fyp_owner'],
+        ['hivesense_app',                'haf_fyp_user, haf_fyp_owner']
     ];
     _schema   text;
     _grantees text;
