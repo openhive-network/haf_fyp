@@ -62,6 +62,12 @@ POLL_SECONDS = 5
 FEED_EVENTS_MAINT_SECONDS = int(os.environ.get("FEED_EVENTS_MAINT_SECONDS", str(60 * 60)))
 FEED_EVENTS_RETAIN_DAYS = int(os.environ.get("FEED_EVENTS_RETAIN_DAYS", "14"))
 FEED_EVENTS_MAX_ROWS = int(os.environ.get("FEED_EVENTS_MAX_ROWS", "20000000"))
+
+# Embedding-coverage rollup (#15) — trailing window the GET /metrics health signal
+# reports. Refreshed on the same hourly cadence as feed-events maintenance; the
+# underlying candidate scan is multi-second, which is exactly why it runs here in
+# the background rather than inline in the endpoint.
+EMBEDDING_COVERAGE_DAYS = int(os.environ.get("EMBEDDING_COVERAGE_DAYS", "14"))
 CANDIDATE_LIMIT = 5000
 
 # Personalized feeds are computed on demand, not bulk-precomputed for every
@@ -403,6 +409,29 @@ def _run_feed_events_maintenance(conn) -> None:
         log.exception("feed_events maintenance failed — skipping")
 
 
+def _run_embedding_coverage_maintenance(conn) -> None:
+    """
+    Refresh the per-day embedding-coverage rollup that GET /metrics serves (#15).
+
+    The candidate scan behind it is multi-second (post_candidates has only partial
+    created_at indexes), so it runs here on the hourly maintenance cadence rather
+    than inline in the endpoint. Best-effort: a failure must never take down ranking.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT haf_fyp_app.refresh_embedding_coverage(%s)",
+                (EMBEDDING_COVERAGE_DAYS,),
+            )
+        conn.commit()
+        log.info("embedding-coverage rollup refreshed (%d-day window)", EMBEDDING_COVERAGE_DAYS)
+    except psycopg2.OperationalError:
+        raise
+    except Exception:
+        conn.rollback()
+        log.exception("embedding-coverage maintenance failed — skipping")
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -452,12 +481,14 @@ def main() -> None:
                 log.exception("ranking cycle failed")
                 next_full_cycle = time.monotonic() + CYCLE_SECONDS
 
-        # Feed-events rollup + retention on its own (slower) schedule
+        # Feed-events rollup + retention and the embedding-coverage rollup share
+        # the same (slower) hourly schedule.
         if time.monotonic() >= next_feed_maint:
             try:
                 _run_feed_events_maintenance(conn)
+                _run_embedding_coverage_maintenance(conn)
             except psycopg2.OperationalError:
-                log.warning("database connection lost (feed maintenance) — reconnecting")
+                log.warning("database connection lost (maintenance) — reconnecting")
                 conn = _connect()
             next_feed_maint = time.monotonic() + FEED_EVENTS_MAINT_SECONDS
 

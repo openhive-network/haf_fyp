@@ -6,6 +6,7 @@ Handles write operations and admin actions that PostgREST cannot serve:
   POST /v1/fyp/events              — impression / engagement telemetry (batched)
   POST /v1/fyp/admin/algorithm     — activate an algorithm version (API-key gated)
   GET  /health                     — service health check
+  GET  /metrics                    — embedding-coverage health metric (#15)
 
 PostgREST (port 3001) serves all read endpoints from haf_fyp_endpoints schema.
 Redis pub/sub signals the ranker for on-demand feed refresh after interest updates.
@@ -31,6 +32,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from .auth import KeyLookupUnavailable, verify_interests
+from .metrics import build_coverage_report, fetch_coverage_rows
 
 log = logging.getLogger(__name__)
 
@@ -203,6 +205,31 @@ def _publish_refresh(username: str) -> None:
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+def metrics():
+    """
+    Embedding-coverage health metric (#15).
+
+    Per-day share of ranking candidates that have a HiveSense embedding, read from
+    the precomputed haf_fyp_app.embedding_coverage_daily rollup (refreshed hourly by
+    the ranker daemon — the underlying candidate scan is multi-second, so it is
+    never run inline here). A settled day whose coverage falls far below the recent
+    steady state (~80%; short posts legitimately have no embedding) is listed in
+    suspected_hole_days, catching a HiveSense embedding gap proactively rather than
+    by sampling served feeds. The current UTC day is reported but never flagged —
+    mid-day it reads low simply because the latest posts are not embedded yet.
+    """
+    assert _pool is not None
+    pool = _pool
+    conn = pool.getconn()
+    try:
+        rows = fetch_coverage_rows(conn)
+    finally:
+        pool.putconn(conn)
+    today = datetime.now(tz=timezone.utc).date()
+    return build_coverage_report(rows, today)
 
 
 @app.post("/v1/fyp/interests", response_model=InterestsResponse)
