@@ -35,7 +35,13 @@ python-lint:
   stage: lint
   image: python:3.11-slim
   script:
-    - pip install ruff mypy types-redis -q
+    # ruff is pinned: an unpinned `pip install ruff` is non-deterministic — a
+    # drifting build silently widens the enforced ruleset and fails on unchanged
+    # code that a prior pipeline passed (seen on !38, where a fresh ruff flagged
+    # pre-existing UP045/BLE001/DTZ003 across files the MR never touched). Pin so
+    # the lint result is reproducible; bump deliberately, cleaning findings in the
+    # same commit.
+    - pip install ruff==0.15.12 mypy types-redis -q
     - ruff check haf_fyp/
     - mypy haf_fyp/ --ignore-missing-imports
   rules:
