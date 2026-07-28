@@ -12,6 +12,21 @@ stages:
         status: "ok"
 
 ---
+test_name: FastAPI metrics returns 200 (#15 embedding coverage)
+
+# Smoke test only: the DB state depends on the integration test that ran just
+# before this in the same job, so we assert reachability / no-500, not exact
+# values. The report logic is covered deterministically by tests/unit/test_metrics.py
+# and the underlying SQL by tests/integration/test_embedding_coverage_db.py.
+stages:
+  - name: GET /metrics returns 200
+    request:
+      url: "{fastapi_url}/metrics"
+      method: GET
+    response:
+      status_code: 200
+
+---
 test_name: POST /v1/fyp/interests requires a signature
 
 # The happy path needs a posting-key signature matching a real on-chain account,

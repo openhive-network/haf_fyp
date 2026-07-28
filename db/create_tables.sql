@@ -366,6 +366,28 @@ VALUES (TRUE)
 ON CONFLICT DO NOTHING;
 
 -- ---------------------------------------------------------------------------
+-- Embedding coverage (daily rollup, #15)
+--
+-- Per-day count of ranking candidates and how many have a HiveSense embedding.
+-- Backs the GET /metrics health signal: a day whose coverage falls far below the
+-- ~80% steady state indicates a HiveSense embedding gap (the 2026-07-02 sync
+-- interruption that motivated #15 would have shown as ~0% coverage that day).
+-- Refreshed on the ranker daemon's hourly maintenance cadence by
+-- haf_fyp_app.refresh_embedding_coverage() (db/embedding_coverage_maintenance.sql).
+-- Precomputed rather than queried inline because the candidate scan is a
+-- multi-second sequential scan (post_candidates has only PARTIAL created_at
+-- indexes), so the endpoint reads this tiny table instead.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS haf_fyp_app.embedding_coverage_daily (
+    day date NOT NULL,
+    candidates int NOT NULL DEFAULT 0,
+    embedded int NOT NULL DEFAULT 0,
+    computed_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (day)
+);
+
+-- ---------------------------------------------------------------------------
 -- Roles & privileges (#14) — least-privilege split
 --
 -- Two roles share the app schema:
@@ -420,6 +442,7 @@ REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.global_feed_cache    FROM haf_fyp_u
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.user_profile_vectors FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.post_bridge_cache    FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.feed_metrics_daily   FROM haf_fyp_user;
+REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.embedding_coverage_daily FROM haf_fyp_user;
 REVOKE UPDATE               ON haf_fyp_app.feed_events_rollup_state FROM haf_fyp_user;
 REVOKE DELETE               ON haf_fyp_app.feed_events            FROM haf_fyp_user;
 REVOKE UPDATE               ON haf_fyp_app.active_users           FROM haf_fyp_user;

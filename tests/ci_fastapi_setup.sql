@@ -86,3 +86,31 @@ INSERT INTO haf_fyp_app.algorithm_versions (version, is_active) VALUES ('1.1.0',
 ON CONFLICT DO NOTHING;
 -- The rollup/prune FUNCTIONS are loaded by the maintenance test itself from
 -- db/feed_events_maintenance.sql (psql \i does not work through psycopg2).
+
+-- #15: embedding-coverage rollup target read by GET /metrics.
+CREATE TABLE IF NOT EXISTS haf_fyp_app.embedding_coverage_daily (
+    day DATE NOT NULL,
+    candidates INT NOT NULL DEFAULT 0,
+    embedded INT NOT NULL DEFAULT 0,
+    computed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (day)
+);
+
+-- #15: minimal candidate + embedding tables so the pg-backed refresh test
+-- (tests/integration/test_embedding_coverage_db.py) can exercise the real
+-- refresh_embedding_coverage() from db/embedding_coverage_maintenance.sql. These
+-- mirror only the columns that function touches (the full definitions, with
+-- pgvector, live in db/create_tables.sql / the HiveSense app and are not loaded
+-- in this pgvector-less lane).
+CREATE TABLE IF NOT EXISTS haf_fyp_app.post_candidates (
+    post_id BIGINT PRIMARY KEY,
+    created_at TIMESTAMP NOT NULL,
+    hive_post_id INT
+);
+
+CREATE SCHEMA IF NOT EXISTS hivesense_app;
+CREATE TABLE IF NOT EXISTS hivesense_app.posts_vectors (
+    post_id INT NOT NULL,
+    chunk_number INT NOT NULL DEFAULT 0,
+    PRIMARY KEY (post_id, chunk_number)
+);
