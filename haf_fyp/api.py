@@ -93,7 +93,7 @@ class InterestsRequest(BaseModel):
         Field(
             min_length=1,
             max_length=16,
-            description="Hive account whose cold-start interests are being set; must match the account that signed the request.",
+            description="Hive account whose cold-start interests are being set; the request must be signed by its own posting key, or by the posting key of an account it has directly delegated posting authority to (one hop; see the endpoint description for what is not accepted).",
             examples=["alice"],
         ),
     ]
@@ -106,7 +106,7 @@ class InterestsRequest(BaseModel):
             examples=[[12, 34, 56]],
         ),
     ]
-    # Proof the caller controls `username`: a posting-key signature over the
+    # Proof the caller holds posting authority over `username`: a signature over the
     # canonical challenge (see the endpoint description / auth.build_message).
     timestamp: Annotated[
         int,
@@ -120,7 +120,7 @@ class InterestsRequest(BaseModel):
         Field(
             min_length=130,
             max_length=130,
-            description="Posting-key signature proving control of `username`: the 65-byte graphene compact signature as hex, produced by signing sha256 of the canonical challenge (see endpoint description) with the account's posting key (Hive Keychain requestSignBuffer / HiveAuth).",
+            description="Posting-key signature proving posting authority over `username` (its own posting key, or that of an account `username` has delegated posting authority to): the 65-byte graphene compact signature as hex, produced by signing sha256 of the canonical challenge (see endpoint description) with that posting key (Hive Keychain requestSignBuffer / HiveAuth).",
             examples=["1f" + "a1b2c3d4e5f6" * 10 + "a1b2c3d4"],
         ),
     ]
@@ -245,7 +245,8 @@ def post_interests(request: Request, req: InterestsRequest):
     ranker can bootstrap the user's interest vector immediately.
 
     Authenticated: the request must carry a posting-key signature proving the
-    caller controls `username`. The client signs the canonical UTF-8 challenge
+    caller holds posting authority over `username`. The client signs the
+    canonical UTF-8 challenge
 
         hivefy:interests:v1:<username>:<timestamp>:<ids>
 
@@ -260,6 +261,13 @@ def post_interests(request: Request, req: InterestsRequest):
     within INTERESTS_SIG_MAX_AGE (default 300s). Unsigned/malformed requests fail
     with 422, bad or stale signatures with 401, and an unreachable/unconfigured
     key-lookup node with 503.
+
+    A posting authority delegated to another account (posting.account_auths) is
+    honoured one hop deep. Three things consensus would accept are still
+    rejected here, all returning 401: a key reachable only through two or more
+    chained delegations; an authority satisfied only by summing weights across
+    several delegates (each path must meet the threshold on its own); and active
+    or owner keys, which are never accepted for this endpoint.
     """
     try:
         verify_interests(req.username, req.timestamp, req.communities, req.signature)
