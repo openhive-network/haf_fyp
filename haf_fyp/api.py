@@ -2,11 +2,12 @@
 FastAPI overlay for haf_fyp.
 
 Handles write operations and admin actions that PostgREST cannot serve:
-  POST /v1/fyp/interests           — cold-start interest picker (rate-limited)
-  POST /v1/fyp/events              — impression / engagement telemetry (batched)
-  POST /v1/fyp/admin/algorithm     — activate an algorithm version (API-key gated)
-  GET  /health                     — service health check
-  GET  /metrics                    — embedding-coverage health metric (#15)
+  POST   /v1/fyp/interests         — cold-start interest picker (rate-limited)
+  DELETE /v1/fyp/interests         — un-opt-in: clear declared interests (#10)
+  POST   /v1/fyp/events            — impression / engagement telemetry (batched)
+  POST   /v1/fyp/admin/algorithm   — activate an algorithm version (API-key gated)
+  GET    /health                   — service health check
+  GET    /metrics                  — embedding-coverage health metric (#15)
 
 PostgREST (port 3001) serves all read endpoints from haf_fyp_endpoints schema.
 Redis pub/sub signals the ranker for on-demand feed refresh after interest updates.
@@ -26,12 +27,12 @@ import psycopg2.extras
 import psycopg2.pool
 import redis as redis_lib
 from fastapi import FastAPI, Header, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from .auth import KeyLookupUnavailable, verify_interests
+from .auth import KeyLookupUnavailable, verify_interests, verify_interests_delete
 from .metrics import build_coverage_report, fetch_coverage_rows
 
 log = logging.getLogger(__name__)
@@ -93,6 +94,12 @@ class InterestsRequest(BaseModel):
         Field(
             min_length=1,
             max_length=16,
+            # Deliberately NOT given InterestsDeleteRequest's charset pattern. This is
+            # a deployed contract: adding it would turn 401 into 422 for input that
+            # cannot authenticate anyway, which is a live behaviour change bought for
+            # cosmetic symmetry and nothing else. #10 does not need it. The asymmetry
+            # is safe because auth._verify_signed rejects a ':' username on BOTH
+            # paths — auth is the boundary, not the model.
             description="Hive account whose cold-start interests are being set; the request must be signed by its own posting key, or by the posting key of an account it has directly delegated posting authority to (one hop; see the endpoint description for what is not accepted).",
             examples=["alice"],
         ),
@@ -129,6 +136,51 @@ class InterestsRequest(BaseModel):
 class InterestsResponse(BaseModel):
     username: str
     communities_saved: int
+
+
+class InterestsDeleteRequest(BaseModel):
+    """Un-opt-in request (#10).
+
+    No `communities` field: the delete is all-or-nothing, so there is nothing to
+    bind beyond the account. Extras are FORBIDDEN rather than ignored — a client
+    that sends `communities` believing it performs a partial delete is told so
+    with a 422 instead of silently clearing every declared interest. (This is
+    stricter than InterestsRequest, which is a deployed contract and must keep
+    accepting everything it accepts today.)"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    username: Annotated[
+        str,
+        Field(
+            min_length=3,
+            max_length=16,
+            pattern=r"^[a-z][a-z0-9.-]{2,15}$",
+            description="Hive account whose declared interests are being cleared; the request must be signed by its own posting key, or by the posting key of an account it has directly delegated posting authority to (one hop). The pattern is Hive's own account-name charset, which also keeps the challenge separator ':' out of the signed string.",
+            examples=["alice"],
+        ),
+    ]
+    timestamp: Annotated[
+        int,
+        Field(
+            description="Unix time (seconds) at which the challenge was signed. Must be within INTERESTS_SIG_MAX_AGE (default 300s) of server time, or the request is rejected (401).",
+            examples=[1751370000],
+        ),
+    ]
+    signature: Annotated[
+        str,
+        Field(
+            min_length=130,
+            max_length=130,
+            description="Posting-key signature over sha256 of the canonical challenge `hivefy:interests:delete:v1:<username>:<timestamp>` — a DIFFERENT challenge from the opt-in, so an interest-picker signature can never be replayed as a delete (or the reverse). The 65-byte graphene compact signature as hex (Hive Keychain requestSignBuffer / HiveAuth).",
+            examples=["1f" + "a1b2c3d4e5f6" * 10 + "a1b2c3d4"],
+        ),
+    ]
+
+
+class InterestsDeleteResponse(BaseModel):
+    username: str
+    communities_removed: int
 
 
 _MAX_MS = 24 * 60 * 60 * 1000  # clamp durations to 24h — anything larger is junk
@@ -269,6 +321,15 @@ def post_interests(request: Request, req: InterestsRequest):
     several delegates (each path must meet the threshold on its own); and active
     or owner keys, which are never accepted for this endpoint.
     """
+    # De-duplicate BEFORE any SQL or arithmetic. The signed challenge already uses
+    # sorted(set(...)) (auth.build_message), so this is what the user actually
+    # authorised — but the raw list went into one execute_values batch, and two
+    # identical (username, community_id) rows in a single ON CONFLICT statement make
+    # Postgres raise "cannot affect row a second time", surfacing as a 500 on a
+    # request the documented contract says is valid ("duplicates are ignored").
+    # It also stopped communities_saved counting duplicates it never stored.
+    communities = sorted(set(req.communities))
+
     try:
         verify_interests(req.username, req.timestamp, req.communities, req.signature)
     except PermissionError as exc:
@@ -291,7 +352,7 @@ def post_interests(request: Request, req: InterestsRequest):
                     weight      = EXCLUDED.weight,
                     declared_at = EXCLUDED.declared_at
                 """,
-                [(req.username, cid, 1.0) for cid in req.communities],
+                [(req.username, cid, 1.0) for cid in communities],
                 template="(%s, %s, %s, NOW())",
             )
             cur.execute(
@@ -300,7 +361,7 @@ def post_interests(request: Request, req: InterestsRequest):
                 WHERE username = %s
                   AND community_id <> ALL(%s)
                 """,
-                (req.username, req.communities),
+                (req.username, communities),
             )
             # Register the opt-in in the ranking rotation (same transaction as
             # the interests write, so membership is durable even if the Redis
@@ -326,7 +387,141 @@ def post_interests(request: Request, req: InterestsRequest):
         pool.putconn(conn)
 
     _publish_refresh(req.username)
-    return InterestsResponse(username=req.username, communities_saved=len(req.communities))
+    return InterestsResponse(username=req.username, communities_saved=len(communities))
+
+
+@app.delete("/v1/fyp/interests", response_model=InterestsDeleteResponse)
+@limiter.limit("5/minute")
+def delete_interests(request: Request, req: InterestsDeleteRequest):
+    """
+    Un-opt-in: clear a user's declared cold-start community interests (#10).
+
+    Deletes every haf_fyp_app.user_interests row for `username`. The picker's
+    opt-in is otherwise permanent — POST requires at least one community, so a
+    user who cleared or abandoned their interests stayed in the ranking rotation
+    forever with no way out. Publishes the same Redis refresh signal the opt-in
+    does; the ranker (as haf_fyp_owner) reconciles on it and, if the account now
+    has no declared interests and has never interacted on-chain, evicts its
+    haf_fyp_app.active_users row and drops its cached feed and profile vector.
+
+    This endpoint deliberately does NOT touch active_users. Doing so would
+    require granting DELETE on the rotation table to haf_fyp_user — the
+    anonymous-facing role PostgREST and this overlay share — re-widening exactly
+    what #14 narrowed. It also cannot clear feed_cache / user_profile_vectors,
+    which #14 revoked from that role, so the ranker is the only place the
+    un-opt-in can actually complete.
+
+    An account that HAS interacted on-chain stays in the rotation: its membership
+    comes from process_interactions, not from the picker. Its declared interests
+    are removed either way, so the community boost and the interest-based vector
+    bootstrap stop using them.
+
+    All-or-nothing by design: to keep some interests and drop others, POST the
+    remaining set (POST replaces the whole set). Sending a `communities` field
+    here is rejected with 422 rather than ignored, so no client can believe it
+    performed a partial delete.
+
+    Authenticated exactly like the opt-in but over a DIFFERENT canonical
+    challenge, so neither signature can be replayed as the other action inside
+    the freshness window. The client signs the canonical UTF-8 string
+
+        hivefy:interests:delete:v1:<username>:<timestamp>
+
+    for example
+
+        hivefy:interests:delete:v1:alice:1751370000
+
+    sha256-hashed and signed with the account's posting key (Hive Keychain
+    requestSignBuffer / HiveAuth); send the same unix `timestamp` and the 65-byte
+    compact signature as hex in `signature`. There is no community list in the
+    challenge because the request deletes all of them: within
+    INTERESTS_SIG_MAX_AGE (default 300s) a captured delete request can be
+    replayed verbatim, which is inert because the operation is idempotent — the
+    one live consequence is that a user who re-opts-in inside that same window
+    could have the new selection cleared again, so clients should not re-open the
+    picker within INTERESTS_SIG_MAX_AGE of a delete. Unsigned/malformed requests
+    fail with 422, bad or stale signatures with 401, and an
+    unreachable/unconfigured key-lookup node with 503.
+
+    A posting authority delegated to another account is honoured one hop deep,
+    with the same three deviations as the opt-in (no chained delegation, no
+    cross-path weight summing, posting keys only) — see post_interests.
+
+    Idempotent: clearing an account with no declared interests returns 200 with
+    communities_removed = 0, never 404. A retry after a lost response must not
+    report a different outcome, and — more importantly — the refresh signal still
+    has to fire: an account can sit in active_users with zero interest rows (the
+    pre-#9 backfill in create_tables.sql, or a feed the ranker built), and that
+    row is exactly what the refresh reconciles away. A 404 would abort before the
+    publish and make the stuck case permanently unfixable.
+
+    Rate-limited to 5/minute per IP, half the opt-in's 10/minute: un-opt-in is a
+    single deliberate click, never an iterated picker interaction, so the lower
+    ceiling costs a real user nothing while bounding both replay attempts and the
+    trusted-node posting-key lookups each attempt costs before any DB work.
+
+    TRANSPORT NOTE (weighed deliberately): this is a DELETE carrying a JSON body,
+    which RFC 9110 gives no defined semantics and which some clients and
+    intermediaries drop. It is safe in the reference stack because uvicorn serves
+    this app directly — docker/haf_fyp_nginx.conf.template fronts only PostgREST —
+    and it keeps the 130-char signature out of URLs and access logs, which a
+    query-string variant would not. CLIENT AUTHORS: send the body as a body, e.g.
+    axios.delete(url, {data: payload}) NOT axios.delete(url, payload), and fetch's
+    {method:'DELETE', body: ...}. An operator fronting this service with their own
+    proxy should confirm it forwards DELETE bodies; if that is a problem, adding a
+    POST /v1/fyp/interests/delete alias is a one-line change — the challenge is
+    transport-independent.
+    """
+    try:
+        verify_interests_delete(req.username, req.timestamp, req.signature)
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except KeyLookupUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    assert _pool is not None
+    pool = _pool
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            # NOTE: same-action replay inside INTERESTS_SIG_MAX_AGE is a KNOWN,
+            # DOCUMENTED limitation (see the docstring). A previous attempt to close
+            # it with `AND declared_at <= to_timestamp(timestamp)` was reverted after
+            # live probing: declared_at is DB NOW() with microseconds in a
+            # timezone-NAIVE column while the signed timestamp is client-supplied
+            # whole seconds legally skewed by up to +/-300s, so it rejected
+            # legitimate deletes (same-second un-opt-in, any client running slightly
+            # behind) while STILL permitting a future-skewed capture to erase a later
+            # opt-in — strictly worse than documenting the window. Closing it
+            # properly needs a persisted monotonic preference generation or a
+            # server-issued nonce bound into both signed actions, plus migrating
+            # declared_at to timestamptz.
+            cur.execute(
+                "DELETE FROM haf_fyp_app.user_interests WHERE username = %s",
+                (req.username,),
+            )
+            # rowcount is -1 where undefined; the response model would happily
+            # serialize that, so clamp.
+            removed = max(cur.rowcount, 0)
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        log.exception("failed to clear interests for %s", req.username)
+        raise HTTPException(status_code=500, detail="failed to clear interests") from exc
+    finally:
+        pool.putconn(conn)
+
+    # Post-commit side effect, outside the DB try (same shape as the opt-in).
+    # Sent even when nothing was deleted: the ranker's reconcile — not this
+    # DELETE — removes the active_users row, and that row outlives the last
+    # interest row. The payload is deliberately identical to the opt-in's
+    # {"username": ...}: the signal means "re-examine this user", never "this
+    # user unsubscribed". A reason flag would invite the daemon to act on the
+    # event instead of on current state, which is what makes the reconcile
+    # race-free (see ranker_daemon._evict_unsubscribed).
+    _publish_refresh(req.username)
+    log.info("interests cleared for %s (%d row(s))", req.username, removed)
+    return InterestsDeleteResponse(username=req.username, communities_removed=removed)
 
 
 @app.post("/v1/fyp/events", response_model=EventsResponse, status_code=202)

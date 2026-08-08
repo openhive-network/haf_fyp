@@ -34,6 +34,42 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.active_users (
     PRIMARY KEY (username)
 );
 
+-- #10: dormant-user eviction deletes the evicted user's cached feed in the same
+-- statement (leaving it behind keeps get_personalized_feed serving a frozen
+-- personalized feed — the #9 symptom). Mirrors only the columns the eviction test
+-- touches; the full definition lives in db/create_tables.sql.
+CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_cache (
+    username VARCHAR(16) NOT NULL,
+    post_id BIGINT NOT NULL,
+    final_score FLOAT NOT NULL DEFAULT 0,
+    rank INT NOT NULL DEFAULT 0,
+    PRIMARY KEY (username, post_id)
+);
+
+-- #10: both eviction paths test "has this account ever acted on-chain?" against
+-- user_interactions rather than trusting active_users.last_interaction_at, which is
+-- only a proxy and goes stale when an evicted voter re-opts-in. Mirrors only the
+-- columns those predicates touch.
+CREATE TABLE IF NOT EXISTS haf_fyp_app.user_interactions (
+    username VARCHAR(16) NOT NULL,
+    post_id BIGINT NOT NULL,
+    PRIMARY KEY (username, post_id)
+);
+
+-- #10: an explicit un-opt-in also drops the derived profile vector (unlike dormancy
+-- eviction, which keeps it). The real table needs pgvector, which this lane does not
+-- have — only the key column the delete uses is mirrored.
+CREATE TABLE IF NOT EXISTS haf_fyp_app.user_profile_vectors (
+    username VARCHAR(16) NOT NULL,
+    -- posts_sampled is the vector's PROVENANCE: 0 means bootstrapped from
+    -- communities/interests, >0 means derived from that many real interactions.
+    -- The un-opt-in cleanup deletes only bootstrapped vectors, so this column is
+    -- load-bearing — without it the statement errors and the daemon's best-effort
+    -- handler swallows it, leaving the cleanup silently dead.
+    posts_sampled INT NOT NULL DEFAULT 0,
+    PRIMARY KEY (username)
+);
+
 -- #12: the /v1/fyp/events endpoint appends telemetry, so FastAPI writes this too.
 CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_events (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

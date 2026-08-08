@@ -579,3 +579,130 @@ def test_no_eligible_delegates_is_401_not_503(monkeypatch):
     with pytest.raises(PermissionError):
         auth.verify_interests("alice", ts, comms, sig)
     assert len(calls) == 1
+
+
+# --------------------------------------------------------------------------
+# Un-opt-in challenge (#10) — a distinct action, non-replayable across actions
+# --------------------------------------------------------------------------
+
+
+def test_build_delete_message_is_canonical():
+    # No community segment: the delete is all-or-nothing, so there is no payload
+    # to bind. MUST match the client exactly (documented in api.delete_interests).
+    assert auth.build_delete_message("alice", 1750000000) == (
+        "hivefy:interests:delete:v1:alice:1750000000"
+    )
+
+
+def test_delete_challenge_never_equals_an_interests_challenge():
+    # The naive design — reusing the opt-in format with an empty id list — makes
+    # the delete challenge "hivefy:interests:v1:alice:1750000000:", which is
+    # exactly what signing an EMPTY community set produces: one string, one
+    # signature, both actions. Today those differ only because
+    # InterestsRequest.communities has min_length=1, i.e. an auth boundary resting
+    # on a validation constant. The separate prefix removes that coupling.
+    ts = 1750000000
+    delete = auth.build_delete_message("alice", ts)
+    for comms in ([], [0], [1], [1, 2], [146620]):
+        assert auth.build_message("alice", ts, comms) != delete
+
+
+def test_valid_delete_signature_accepted(keypair):
+    priv, _ = keypair
+    ts = int(time.time())
+    auth.verify_interests_delete("alice", ts, _sign(priv, auth.build_delete_message("alice", ts)))
+
+
+def test_interests_signature_is_not_a_delete_signature(keypair):
+    # Cross-replay: a signature captured from the interest picker must not
+    # authorize an un-opt-in inside the freshness window. Same account, same
+    # timestamp, same key — the challenge is the ONLY difference. The positive
+    # control stops this passing merely because verification is broken outright.
+    priv, _ = keypair
+    ts = int(time.time())
+    comms = [146620, 141359]
+    sig = _sign(priv, auth.build_message("alice", ts, comms))
+    auth.verify_interests("alice", ts, comms, sig)  # positive control
+    with pytest.raises(PermissionError):
+        auth.verify_interests_delete("alice", ts, sig)
+
+
+def test_delete_signature_is_not_an_interests_signature(keypair):
+    # The reverse direction, over every community set an attacker might pick —
+    # including the empty one, which is the collision the separate prefix exists
+    # to prevent.
+    priv, _ = keypair
+    ts = int(time.time())
+    sig = _sign(priv, auth.build_delete_message("alice", ts))
+    auth.verify_interests_delete("alice", ts, sig)  # positive control
+    for comms in ([], [1], [146620], [146620, 141359]):
+        with pytest.raises(PermissionError):
+            auth.verify_interests("alice", ts, comms, sig)
+
+
+def test_delete_tampered_username_rejected(keypair, chain):
+    priv, stm = keypair
+    ts = int(time.time())
+    sig = _sign(priv, auth.build_delete_message("alice", ts))
+    # bob holds the *same* key, so the username baked into the signed challenge is
+    # the only thing that can cause the rejection.
+    chain["bob"] = _pa(keys=[(stm, 1)], accounts=[], threshold=1)
+    with pytest.raises(PermissionError):
+        auth.verify_interests_delete("bob", ts, sig)
+
+
+def test_delete_stale_timestamp_rejected(keypair):
+    priv, _ = keypair
+    old = int(time.time()) - (auth.SIG_MAX_AGE + 60)
+    with pytest.raises(PermissionError):
+        auth.verify_interests_delete("alice", old, _sign(priv, auth.build_delete_message("alice", old)))
+
+
+def test_delete_malformed_signature_rejected(keypair):
+    with pytest.raises(PermissionError):
+        auth.verify_interests_delete("alice", int(time.time()), "00" * 65)
+
+
+def test_delete_honours_delegated_posting_authority(chain):
+    # The delete must run the SAME authority resolution as the opt-in: a
+    # hand-copied verifier that dropped the delegation hop would 401 every
+    # Keychain-delegated account with nothing else noticing. This is why both
+    # actions share _verify_signed rather than duplicating it.
+    priv, stm = _key()
+    ts = int(time.time())
+    sig = _sign(priv, auth.build_delete_message("alice", ts))
+    other = auth._encode_pubkey(coincurve.PrivateKey().public_key.format(compressed=True))
+    chain["alice"] = _pa(keys=[(other, 1)], accounts=[("bob", 1)], threshold=1)
+    chain["bob"] = _pa(keys=[(stm, 1)], accounts=[], threshold=1)
+    auth.verify_interests_delete("alice", ts, sig)
+    assert chain.calls == [["alice"], ["bob"]]
+
+
+def test_delete_key_lookup_unavailable_propagates(keypair, monkeypatch):
+    # Infra failure must surface as 503 on this path too, not a misleading 401.
+    priv, _ = keypair
+    ts = int(time.time())
+    sig = _sign(priv, auth.build_delete_message("alice", ts))
+
+    def _raise(_usernames, **_kwargs):
+        raise auth.KeyLookupUnavailable("node down")
+
+    monkeypatch.setattr(auth, "account_posting_authorities", _raise)
+    with pytest.raises(auth.KeyLookupUnavailable):
+        auth.verify_interests_delete("alice", ts, sig)
+
+
+def test_username_containing_the_challenge_separator_rejected(chain):
+    # ':' separates challenge segments and is never legal in a Hive account name.
+    # api.py rejects it with 422, but auth is the security boundary and must not
+    # depend on the caller having validated its input — a username carrying the
+    # separator is the only way a challenge could re-parse as a different
+    # (action, username, timestamp) triple.
+    priv, stm = _key()
+    ts = int(time.time())
+    chain["alice:1"] = _pa(keys=[(stm, 1)], accounts=[], threshold=1)
+    with pytest.raises(PermissionError):
+        auth.verify_interests_delete("alice:1", ts, _sign(priv, auth.build_delete_message("alice:1", ts)))
+    with pytest.raises(PermissionError):
+        auth.verify_interests("alice:1", ts, [1], _sign(priv, auth.build_message("alice:1", ts, [1])))
+    assert chain.calls == [], "rejected before any on-chain lookup"

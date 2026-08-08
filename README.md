@@ -118,8 +118,25 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Service health check |
-| POST | `/v1/fyp/interests` | Declare cold-start community interests (10 req/min) |
+| GET | `/metrics` | Embedding-coverage health metric (#15) |
+| POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10 req/min) |
+| DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5 req/min) |
+| POST | `/v1/fyp/events` | Impression / engagement telemetry batch (120 req/min) |
 | POST | `/v1/fyp/admin/algorithm` | Activate an algorithm version (`X-Admin-Key` required) |
+
+Both interest routes are authenticated with a Hive posting-key signature over a
+canonical challenge — `hivefy:interests:v1:<username>:<timestamp>:<ids>` to opt in
+and `hivefy:interests:delete:v1:<username>:<timestamp>` to opt out. The two are
+distinct strings on purpose, so a signature captured from one cannot be replayed
+as the other inside the 300s freshness window.
+
+`DELETE /v1/fyp/interests` removes every declared interest (all-or-nothing — POST
+the remaining set to drop only some). It returns 200 with the number of rows
+removed, including 0, and publishes the usual refresh signal; the ranker then
+reconciles rotation membership and, for an account with no interests and no
+on-chain interactions, evicts its `active_users` row and drops its cached feed and
+profile vector. Accounts that have interacted on-chain stay ranked — their
+membership comes from the chain, not the picker.
 
 Clean URL rewrites (via nginx `endpoints/rewrite_rules.conf`):
 

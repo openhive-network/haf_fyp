@@ -33,12 +33,30 @@ services:
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /create_tables.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /seed_data.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -c "SET custom.swagger_url = 'localhost';" -f /endpoint_schema.sql &&
-        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -c "GRANT SELECT ON ALL TABLES IN SCHEMA haf_fyp_app TO haf_fyp_user; GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA haf_fyp_endpoints TO haf_fyp_user;"
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /active_users_maintenance.sql &&
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -c "GRANT SELECT ON ALL TABLES IN SCHEMA haf_fyp_app TO haf_fyp_user; GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA haf_fyp_endpoints TO haf_fyp_user;" &&
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /create_tables.sql &&
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /active_users_maintenance.sql &&
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_privileges.sql
     volumes:
       - ../tests/ci_setup.sql:/ci_setup.sql:ro
       - ../db/create_tables.sql:/create_tables.sql:ro
       - ../db/seed_data.sql:/seed_data.sql:ro
       - ../endpoints/endpoint_schema.sql:/endpoint_schema.sql:ro
+      # #10: the only lane with the real NOLOGIN roles and a real superuser
+      # installer, so it is the only place the maintenance grants footer and the
+      # privilege assertions can actually be exercised.
+      #
+      # create_tables.sql and active_users_maintenance.sql are applied TWICE on
+      # purpose — a REINSTALL check, matching what haf_block_explorer covers in its
+      # setup-scripts-test job (this repo has no functional lane, and adding one just
+      # for this would be a new CI job for a single assertion). Both files are
+      # re-run-on-every-install by design, so a non-idempotent edit — a bare ALTER, a
+      # CREATE without IF NOT EXISTS, a one-time data fixup that fires twice — fails
+      # the pipeline here instead of the next production deploy. ci_privileges.sql
+      # runs LAST, after every GRANT/REVOKE and after the reinstall.
+      - ../db/active_users_maintenance.sql:/active_users_maintenance.sql:ro
+      - ../tests/ci_privileges.sql:/ci_privileges.sql:ro
     depends_on:
       postgres:
         condition: service_healthy
