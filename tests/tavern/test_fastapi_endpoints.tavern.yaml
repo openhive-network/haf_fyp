@@ -99,6 +99,114 @@ stages:
       status_code: 422
 
 ---
+test_name: DELETE /v1/fyp/interests requires a signature
+
+# Like the POST, the happy path needs a posting-key signature matching a real
+# on-chain account, which CI cannot produce; it is covered by
+# tests/unit/test_auth.py. Here we assert the rejection paths. Every case below is
+# decided by pydantic or by the staleness check that runs first in _verify_signed,
+# so none of them reaches the DB or the key-lookup RPC — no HIVE_RPC_URL needed.
+stages:
+  - name: DELETE without signature/timestamp returns 422
+    request:
+      url: "{fastapi_url}/v1/fyp/interests"
+      method: DELETE
+      json:
+        username: "testuser"
+    response:
+      status_code: 422
+
+---
+test_name: DELETE /v1/fyp/interests rejects a stale/invalid signature
+
+stages:
+  # timestamp MUST stay stale here: a fresh one would fall through to
+  # recover_pubkey and the RPC, making the assertion non-deterministic.
+  - name: well-formed body but stale timestamp returns 401
+    request:
+      url: "{fastapi_url}/v1/fyp/interests"
+      method: DELETE
+      json:
+        username: "testuser"
+        timestamp: 1
+        signature: "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    response:
+      status_code: 401
+
+---
+test_name: DELETE /v1/fyp/interests rejects missing body
+
+stages:
+  - name: DELETE without body returns 422
+    request:
+      url: "{fastapi_url}/v1/fyp/interests"
+      method: DELETE
+    response:
+      status_code: 422
+
+---
+test_name: DELETE /v1/fyp/interests validates the username
+
+stages:
+  - name: username longer than 16 chars returns 422
+    request:
+      url: "{fastapi_url}/v1/fyp/interests"
+      method: DELETE
+      json:
+        username: "this-name-is-toolong"
+        timestamp: 1
+        signature: "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    response:
+      status_code: 422
+
+  # ':' separates challenge segments. Rejected here so it never reaches auth —
+  # which rejects it again, since auth must not trust the caller's validation.
+  - name: username carrying the challenge separator returns 422
+    request:
+      url: "{fastapi_url}/v1/fyp/interests"
+      method: DELETE
+      json:
+        username: "al:ice"
+        timestamp: 1
+        signature: "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    response:
+      status_code: 422
+
+---
+test_name: DELETE /v1/fyp/interests validates the signature field
+
+stages:
+  - name: signature of the wrong length returns 422
+    request:
+      url: "{fastapi_url}/v1/fyp/interests"
+      method: DELETE
+      json:
+        username: "testuser"
+        timestamp: 1
+        signature: "deadbeef"
+    response:
+      status_code: 422
+
+---
+test_name: DELETE /v1/fyp/interests refuses a communities field
+
+# The delete is all-or-nothing. Ignoring `communities` would let a client believe
+# it removed one interest while every interest was cleared, so the model forbids
+# extras rather than dropping them.
+stages:
+  - name: body carrying communities returns 422, not a silent full delete
+    request:
+      url: "{fastapi_url}/v1/fyp/interests"
+      method: DELETE
+      json:
+        username: "testuser"
+        communities: [1234]
+        timestamp: 1
+        signature: "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    response:
+      status_code: 422
+
+---
 test_name: POST /v1/fyp/admin/algorithm requires X-Admin-Key header
 
 stages:

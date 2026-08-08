@@ -166,9 +166,15 @@ ALTER TABLE haf_fyp_app.active_users
 ALTER COLUMN last_interaction_at DROP NOT NULL,
 ALTER COLUMN last_block DROP NOT NULL;
 
--- (The matching backfill of pre-#9 opt-ins lives below the user_interests
--- definition — that table is created later in this file.)
-
+-- #10: rows LEAVE the rotation now. Until then a row could only ever be added, so a
+-- cleared or abandoned interest-picker opt-in held one of the shared
+-- MAX_USERS_PER_CYCLE slots forever. haf_fyp_app.evict_unproductive_users()
+-- (db/active_users_maintenance.sql) reaps only accounts with NOTHING to personalize
+-- from — no declared interests and no on-chain history — which is exactly the
+-- population issue #10 proposed removing, and whose membership re-establishes itself
+-- on the next opt-in. Accounts that still hold user_interests are NEVER evicted: they
+-- have no automatic way back, which would be #9 all over again.
+--
 -- ---------------------------------------------------------------------------
 -- Feed cache — precomputed ranked feeds (personalized)
 -- ---------------------------------------------------------------------------
@@ -422,14 +428,32 @@ GRANT SELECT ON ALL TABLES IN SCHEMA haf_fyp_app TO haf_fyp_user;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA haf_fyp_endpoints TO haf_fyp_user;
 
 -- Narrow API writes — exactly what the HTTP endpoints perform, nothing more:
---   POST /v1/fyp/events            -> INSERT feed_events
---   POST /v1/fyp/interests         -> INSERT/DELETE user_interests, INSERT active_users
---   POST /v1/fyp/admin/algorithm   -> UPDATE algorithm_versions (API-key gated)
--- (active_users: INSERT only — opt-in is ON CONFLICT DO NOTHING; the ranker's
---  last_scored_at UPSERT runs as owner. GENERATED-IDENTITY feed_events.id needs
---  no separate sequence grant.)
+--   POST   /v1/fyp/events          -> INSERT feed_events
+--   POST   /v1/fyp/interests       -> INSERT/UPDATE/DELETE user_interests, INSERT active_users
+--   DELETE /v1/fyp/interests       -> DELETE user_interests (#10)
+--   POST   /v1/fyp/admin/algorithm -> UPDATE algorithm_versions (API-key gated)
+-- (user_interests: UPDATE is REQUIRED, not decorative — the opt-in upserts with
+--  ON CONFLICT ... DO UPDATE, and PostgreSQL demands INSERT *and* UPDATE for the
+--  DO UPDATE arm. The check runs at executor start whether or not a row actually
+--  conflicts, so INSERT+DELETE alone made EVERY POST /v1/fyp/interests fail with
+--  "permission denied for table user_interests" -> HTTP 500. Column-scoped to the
+--  two columns the upsert actually sets: a table-wide UPDATE would additionally
+--  let the anon-facing role rewrite username/community_id, i.e. reassign another
+--  account's declared interests.
+--  NOTE: no CI job catches a regression here — the fastapi-tests lane runs
+--  Postgres with POSTGRES_USER=haf_fyp_user, which the official entrypoint creates
+--  as a SUPERUSER, so every GRANT/REVOKE in this file is bypassed there. The
+--  assertions in tests/ci_privileges.sql run in the postgrest-tests lane, which
+--  has the real NOLOGIN roles, and exist precisely to cover that blind spot.
+--  active_users: INSERT only. The un-opt-in deliberately does NOT delete this row
+--  — that would put DELETE on the rotation table back on the anon-facing role,
+--  re-widening what this block narrows. The ranker evicts it as owner (#10), along
+--  with the user's feed_cache / user_profile_vectors rows, which is also why those
+--  stay revoked below. The ranker's last_scored_at UPSERT runs as owner.
+--  GENERATED-IDENTITY feed_events.id needs no separate sequence grant.)
 GRANT INSERT ON haf_fyp_app.feed_events        TO haf_fyp_user;
 GRANT INSERT, DELETE ON haf_fyp_app.user_interests TO haf_fyp_user;
+GRANT UPDATE (weight, declared_at) ON haf_fyp_app.user_interests TO haf_fyp_user;
 GRANT INSERT ON haf_fyp_app.active_users       TO haf_fyp_user;
 GRANT UPDATE ON haf_fyp_app.algorithm_versions TO haf_fyp_user;
 
@@ -445,4 +469,8 @@ REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.feed_metrics_daily   FROM haf_fyp_u
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.embedding_coverage_daily FROM haf_fyp_user;
 REVOKE UPDATE               ON haf_fyp_app.feed_events_rollup_state FROM haf_fyp_user;
 REVOKE DELETE               ON haf_fyp_app.feed_events            FROM haf_fyp_user;
-REVOKE UPDATE               ON haf_fyp_app.active_users           FROM haf_fyp_user;
+-- active_users: UPDATE is the ranker's (last_scored_at, as owner);
+-- DELETE is the #10 rotation eviction, also owner-only. Both are REVOKEd rather
+-- than merely left ungranted, so an older deployment that ever received a blanket
+-- grant is narrowed too and the un-opt-in endpoint cannot quietly acquire them.
+REVOKE UPDATE, DELETE       ON haf_fyp_app.active_users           FROM haf_fyp_user;

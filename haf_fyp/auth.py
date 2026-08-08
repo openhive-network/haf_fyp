@@ -31,6 +31,29 @@ Signature format (Keychain requestSignBuffer / dhive Signature.toString):
   65 bytes hex = [recovery+31][r(32)][s(32)], signed over sha256(message).
 Public keys use Hive's "STM" + base58(compressed_pubkey || ripemd160(...)[:4]).
 
+Two actions are authenticated here, each with its OWN canonical challenge:
+
+  opt-in     hivefy:interests:v1:<username>:<timestamp>:<ids>
+  un-opt-in  hivefy:interests:delete:v1:<username>:<timestamp>          (#10)
+
+The action is a fixed LITERAL at a fixed segment position, never a value the
+caller supplies, so no request can produce the other action's challenge: the
+segment after "hivefy:interests:" is "v1" for the opt-in and "delete" for the
+un-opt-in, and neither a username (':' rejected in _verify_signed) nor an integer
+timestamp can bridge that difference. That is what stops a signature captured
+from the interest picker being replayed as a delete inside the SIG_MAX_AGE
+window, and the reverse.
+
+Note in particular that the delete challenge is NOT the opt-in challenge with an
+empty id list: that would be "hivefy:interests:v1:alice:123:", which is precisely
+what signing an EMPTY community set produces — one string, one signature, both
+actions. Today those cannot collide only because InterestsRequest.communities has
+min_length=1, i.e. an auth boundary resting on a validation constant. The
+separate prefix removes that coupling.
+
+The opt-in challenge is a published client contract (frontends already sign it,
+and api.post_interests documents it verbatim); it MUST NOT change.
+
 Delegated posting authority (posting.account_auths) is resolved one hop deep
 (#4). If the recovered key is not in the account's own key_auths, every delegate
 whose weight alone meets the threshold is resolved in a single batched RPC, and
@@ -261,24 +284,61 @@ def _delegated_signer(authority: PostingAuthority, pubkey: str, target: str) -> 
     return None
 
 
+# Challenge prefixes. Each action's token is a FIXED LITERAL at a fixed segment
+# position (see the module docstring) — that, not the payload, is what makes the
+# two challenges non-collidable.
+_INTERESTS_PREFIX = "hivefy:interests:v1"
+_INTERESTS_DELETE_PREFIX = "hivefy:interests:delete:v1"
+
+
 def build_message(username: str, timestamp: int, communities: list[int]) -> str:
-    """Canonical challenge — MUST match the client exactly. Binds the payload
-    (username + timestamp + exact community set) so it cannot be replayed with a
-    different body."""
+    """Canonical opt-in challenge — MUST match the client exactly. Binds the
+    payload (username + timestamp + exact community set) so it cannot be replayed
+    with a different body.
+
+    PUBLISHED CONTRACT: deployed frontends already sign this exact string and
+    api.post_interests documents it verbatim. Do not change the format, and do
+    not fold the un-opt-in into it by varying a segment value — see
+    build_delete_message."""
     ids = ",".join(str(c) for c in sorted(set(communities)))
-    return f"hivefy:interests:v1:{username}:{timestamp}:{ids}"
+    return f"{_INTERESTS_PREFIX}:{username}:{timestamp}:{ids}"
 
 
-def verify_interests(username: str, timestamp: int, communities: list[int], signature: str) -> None:
-    """Raise PermissionError unless the signature proves posting authority over
-    `username` for this exact request within the freshness window — directly, or
-    through one hop of delegated posting authority.
-    Raises KeyLookupUnavailable on RPC/config failure (caller maps to 503)."""
+def build_delete_message(username: str, timestamp: int) -> str:
+    """Canonical un-opt-in challenge (#10) — MUST match the client exactly.
+
+    There is no community list: the delete is all-or-nothing, so there is no
+    payload to bind beyond the account and the freshness window. Deliberately a
+    SEPARATE PREFIX rather than the opt-in format with an empty id list — that
+    would render "hivefy:interests:v1:alice:123:", identical to an opt-in over an
+    empty community set, making one signature authorize either action."""
+    return f"{_INTERESTS_DELETE_PREFIX}:{username}:{timestamp}"
+
+
+def _verify_signed(username: str, timestamp: int, message: str, signature: str) -> None:
+    """Shared verification core for every signed action.
+
+    `message` is the already-built canonical challenge and is the ONLY thing that
+    distinguishes one action from another — everything below (freshness, key
+    recovery, on-chain authority, the one-hop delegation, the 401/503 split) is
+    action-agnostic and must stay in one place, so a new action can never ship
+    with a verifier that quietly forgot the delegation hop.
+
+    Raises PermissionError (-> 401) or KeyLookupUnavailable (-> 503)."""
     now = int(time.time())
     if abs(now - int(timestamp)) > SIG_MAX_AGE:
         raise PermissionError("timestamp is stale or in the future")
 
-    message = build_message(username, timestamp, communities)
+    # ':' separates challenge segments and is not legal in a Hive account name.
+    # InterestsDeleteRequest rejects it with 422, but InterestsRequest (the older,
+    # deployed model) does not — and auth is the security boundary regardless, so
+    # this must not depend on a caller having validated its input. A username
+    # carrying the separator is the only way a challenge could be re-parsed as a
+    # different (action, username, timestamp) triple, so it is rejected here for
+    # BOTH actions.
+    if ":" in username:
+        raise PermissionError("invalid username")
+
     try:
         recovered = recover_pubkey(message, signature)
     except Exception as exc:  # malformed signature
@@ -302,3 +362,24 @@ def verify_interests(username: str, timestamp: int, communities: list[int], sign
     if direct > 0:
         raise PermissionError("posting key weight below the account's threshold (multisig not supported)")
     raise PermissionError("signature does not match the account's posting authority")
+
+
+def verify_interests(username: str, timestamp: int, communities: list[int], signature: str) -> None:
+    """Raise PermissionError unless the signature proves posting authority over
+    `username` for this exact interest declaration within the freshness window —
+    directly, or through one hop of delegated posting authority.
+    Raises KeyLookupUnavailable on RPC/config failure (caller maps to 503)."""
+    _verify_signed(
+        username, timestamp, build_message(username, timestamp, communities), signature
+    )
+
+
+def verify_interests_delete(username: str, timestamp: int, signature: str) -> None:
+    """Raise PermissionError unless the signature proves posting authority over
+    `username` for an un-opt-in within the freshness window (#10).
+
+    Identical authority rules to verify_interests — the challenge is the only
+    difference, which is exactly what makes an interest-picker signature unusable
+    here and a delete signature unusable there.
+    Raises KeyLookupUnavailable on RPC/config failure (caller maps to 503)."""
+    _verify_signed(username, timestamp, build_delete_message(username, timestamp), signature)

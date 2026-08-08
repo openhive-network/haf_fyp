@@ -483,6 +483,34 @@ def write_feed_cache(
         for rank, row in enumerate(top.itertuples(index=False))
     ]
     with conn.cursor() as cur:
+        # LOCK ORDER: active_users BEFORE feed_cache. This is a whole-system rule, not
+        # a local preference — haf_fyp_app.evict_unproductive_users takes the same order
+        # (SELECT ... FOR UPDATE on active_users, then DELETE feed_cache), and it MUST,
+        # because that FOR UPDATE is what makes an eviction pass wait out an in-flight
+        # write_feed_cache instead of deleting the rotation row while this transaction's
+        # freshly written cache rows survive — an orphaned personalized feed nothing can
+        # ever refresh again (#9's symptom, permanently). Writing feed_cache first here
+        # made the two paths acquire the same two tables in opposite orders: a textbook
+        # ABBA deadlock, reproduced against a live server. Postgres aborts one side, and
+        # when the victim is this one run_cycle logs it as "failed to rank user —
+        # skipping", so it reads as a transient blip while a feed silently goes stale.
+        # If you reorder either side, reorder both.
+        #
+        # Stamp scoring time on the active_users index so the scheduled cycle can pick
+        # stalest-scored users without scanning feed_cache. Upsert, not UPDATE: opted-in
+        # users who never interacted have no process_interactions row, and the old UPDATE
+        # silently no-opped for them — so they never entered the scheduled rotation and
+        # their feed froze at onboarding (#9). last_interaction_at / last_block stay NULL
+        # until a first interaction. Same transaction as the cache write below, so the
+        # stamp and the feed it describes still commit together.
+        cur.execute(
+            """
+            INSERT INTO haf_fyp_app.active_users (username, last_scored_at)
+            VALUES (%s, %s)
+            ON CONFLICT (username) DO UPDATE SET last_scored_at = EXCLUDED.last_scored_at
+            """,
+            (username, now),
+        )
         cur.execute(
             "DELETE FROM haf_fyp_app.feed_cache WHERE username = %s", (username,)
         )
@@ -496,20 +524,6 @@ def write_feed_cache(
             VALUES %s
             """,
             rows,
-        )
-        # Stamp scoring time on the active_users index so the scheduled cycle
-        # can pick stalest-scored users without scanning feed_cache. Upsert, not
-        # UPDATE: opted-in users who never interacted have no process_interactions
-        # row, and the old UPDATE silently no-opped for them — so they never
-        # entered the scheduled rotation and their feed froze at onboarding (#9).
-        # last_interaction_at / last_block stay NULL until a first interaction.
-        cur.execute(
-            """
-            INSERT INTO haf_fyp_app.active_users (username, last_scored_at)
-            VALUES (%s, %s)
-            ON CONFLICT (username) DO UPDATE SET last_scored_at = EXCLUDED.last_scored_at
-            """,
-            (username, now),
         )
     conn.commit()
     # Precompute the bridge JSON for this user's feed so the endpoint serves it
