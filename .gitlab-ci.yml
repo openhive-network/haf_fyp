@@ -109,7 +109,11 @@ fastapi-tests:
                            dbname=os.environ['POSTGRES_DB'], user=os.environ['POSTGRES_USER'],
                            password=os.environ.get('POSTGRES_PASSWORD',''))
       c.autocommit = True
+      c.cursor().execute(open('tests/haf_stub.sql').read())
       c.cursor().execute(open('tests/ci_fastapi_setup.sql').read())
+      # #16: the real SECURITY DEFINER reader GET /sync-status calls. Loaded from
+      # db/ (not restubbed) so the tavern check exercises the shipped function body.
+      c.cursor().execute(open('db/sync_status.sql').read())
       c.close()
       print('DB setup complete')
       "
