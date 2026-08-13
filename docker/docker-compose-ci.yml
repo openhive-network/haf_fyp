@@ -29,23 +29,40 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >-
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /haf_stub.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_setup.sql &&
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /builtin_roles.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /create_tables.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /seed_data.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -c "SET custom.swagger_url = 'localhost';" -f /endpoint_schema.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /active_users_maintenance.sql &&
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /sync_status.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -c "GRANT SELECT ON ALL TABLES IN SCHEMA haf_fyp_app TO haf_fyp_user; GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA haf_fyp_endpoints TO haf_fyp_user;" &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /create_tables.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /active_users_maintenance.sql &&
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /sync_status.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_privileges.sql
     volumes:
+      # #16: HAF core stand-in, shared with the fastapi-tests lane so the two
+      # cannot drift. Must load BEFORE ci_setup.sql, which adds the RLS policy and
+      # grants on top of these tables.
+      - ../tests/haf_stub.sql:/haf_stub.sql:ro
       - ../tests/ci_setup.sql:/ci_setup.sql:ro
+      # #16: the SHIPPED role file, run right after the fixture. ci_setup.sql
+      # creates the HAF group stand-ins but deliberately grants no memberships, so
+      # the group membership tests/ci_privileges.sql depends on comes from this
+      # product file. Without it that probe would only restate its own fixture.
+      - ../db/builtin_roles.sql:/builtin_roles.sql:ro
+      # #16: the SECURITY DEFINER reader tests/ci_privileges.sql probes. Applied in
+      # both install passes, like create_tables.sql, so a non-idempotent edit fails
+      # here rather than on the next deploy.
+      - ../db/sync_status.sql:/sync_status.sql:ro
       - ../db/create_tables.sql:/create_tables.sql:ro
       - ../db/seed_data.sql:/seed_data.sql:ro
       - ../endpoints/endpoint_schema.sql:/endpoint_schema.sql:ro
-      # #10: the only lane with the real NOLOGIN roles and a real superuser
-      # installer, so it is the only place the maintenance grants footer and the
-      # privilege assertions can actually be exercised.
+      # #10: the only lane with real restricted (non-superuser) roles and a real
+      # superuser installer, so it is the only place the maintenance grants footer
+      # and the privilege assertions can actually be exercised.
       #
       # create_tables.sql and active_users_maintenance.sql are applied TWICE on
       # purpose — a REINSTALL check, matching what haf_block_explorer covers in its

@@ -333,3 +333,29 @@ stages:
             ts: 1000000000000000000
     response:
       status_code: 422
+
+---
+test_name: FastAPI sync-status reports the haf_fyp HAF context (#16)
+
+# Asserts exact values, unlike the /metrics smoke test above: the fixture is
+# seeded deterministically by tests/ci_fastapi_setup.sql and nothing in this job
+# advances it. That makes this the one place the wire format is pinned against a
+# real PostgreSQL — a regression in the timestamp formatting (an offset suffix,
+# microseconds, a space instead of the literal T) fails here.
+#
+# NOT covered here: the privilege model. This lane's postgres role is a superuser
+# and hafd.contexts is a stub without RLS, so grants and policies are bypassed
+# entirely — see the header of tests/ci_fastapi_setup.sql. The real check is the
+# post-install assertion in scripts/install_app.sh.
+stages:
+  - name: GET /sync-status returns the context block and its UTC timestamp
+    request:
+      url: "{fastapi_url}/sync-status"
+      method: GET
+    response:
+      status_code: 200
+      headers:
+        cache-control: "public, max-age=0"
+      json:
+        last_block_num: 5000000
+        last_block_time: "2016-09-15T19:47:21"

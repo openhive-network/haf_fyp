@@ -7,7 +7,9 @@ CREATE SCHEMA IF NOT EXISTS haf_fyp_app;
 -- #14: the pg-backed maintenance test loads db/feed_events_maintenance.sql, which
 -- REVOKE/GRANTs EXECUTE to/from haf_fyp_owner and haf_fyp_user. haf_fyp_user is
 -- the container's own role; create haf_fyp_owner so those grants resolve here
--- (the full install creates it via builtin_roles.sql). NOLOGIN, no privileges.
+-- (the full install creates it via builtin_roles.sql, which since #16 makes it
+-- LOGIN INHERIT). Irrelevant in this lane: POSTGRES_USER=haf_fyp_user is the
+-- container superuser, so role attributes and privileges are not exercised here.
 DO $$ BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'haf_fyp_owner') THEN
         CREATE ROLE haf_fyp_owner NOLOGIN;
@@ -150,3 +152,25 @@ CREATE TABLE IF NOT EXISTS hivesense_app.posts_vectors (
     chunk_number INT NOT NULL DEFAULT 0,
     PRIMARY KEY (post_id, chunk_number)
 );
+
+-- #16: the hafd/hive stand-in for GET /sync-status lives in tests/haf_stub.sql,
+-- loaded by .gitlab-ci.yml alongside this file and shared with the postgrest lane
+-- so the two cannot drift. It is NOT inlined here.
+--
+-- This lane cannot check the privilege model at all: POSTGRES_USER=haf_fyp_user is
+-- created as a SUPERUSER by the postgres entrypoint, so every ACL, grant and RLS
+-- policy is bypassed for the uvicorn process. A privilege regression passes this
+-- lane green. That is covered by the post-install assertion in
+-- scripts/install_app.sh (a real HAF node) and, for the RLS semantics, by
+-- tests/ci_privileges.sql in the postgrest lane.
+
+-- #16: let haf_fyp_owner read the HAF stand-in, so the SECURITY DEFINER function
+-- in db/sync_status.sql actually works here. On a real node the definer reaches
+-- hafd through its hive_applications_group membership; this lane has no group
+-- model (and its haf_fyp_user is a superuser), so grant the reads directly. Without
+-- this the definer hop fails with "permission denied for table contexts" and every
+-- GET /sync-status returns 500 — which is how the first pipeline run failed.
+GRANT USAGE ON SCHEMA hafd, hive TO haf_fyp_owner;
+GRANT SELECT ON hafd.contexts, hafd.blocks TO haf_fyp_owner;
+GRANT SELECT ON hive.ci_instance_state TO haf_fyp_owner;
+GRANT EXECUTE ON FUNCTION hive.is_instance_ready() TO haf_fyp_owner;

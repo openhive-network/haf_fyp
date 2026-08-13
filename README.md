@@ -119,10 +119,26 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 |--------|------|-------------|
 | GET | `/health` | Service health check |
 | GET | `/metrics` | Embedding-coverage health metric (#15) |
+| GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
 | POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10 req/min) |
 | DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5 req/min) |
 | POST | `/v1/fyp/events` | Impression / engagement telemetry batch (120 req/min) |
 | POST | `/v1/fyp/admin/algorithm` | Activate an algorithm version (`X-Admin-Key` required) |
+
+`GET /sync-status` is the ecosystem-uniform freshness endpoint (same shape as
+haf_block_explorer's), returning `{"last_block_num": N, "last_block_time": "YYYY-MM-DDTHH:MM:SS"}`
+in UTC so a monitor computes staleness in one call. It reports HAF's authoritative
+pointer, `hafd.contexts.current_block_num`, rather than the app's own
+`app_status.last_processed_block` bookkeeping row that PostgREST's `/rpc/get_health`
+returns. The two normally agree — `main()` advances both in the same transaction — but
+they have different failure modes, and only this one carries a timestamp.
+`last_block_time` is null before the first block is processed, and the endpoint returns
+503 while HAF is in massive sync.
+
+It is served **only on the FastAPI overlay (port 3002)**, per #16. haf_api_node's stock
+agent checks probe `http://<app>-postgrest-rewriter:80/sync-status`, which haf_fyp does
+not serve, so a haf_api_node profile must point its `*_HEALTH_URL` at port 3002 — or
+#17 should add a PostgREST twin so the standard probe URL works.
 
 Both interest routes are authenticated with a Hive posting-key signature over a
 canonical challenge — `hivefy:interests:v1:<username>:<timestamp>:<ids>` to opt in

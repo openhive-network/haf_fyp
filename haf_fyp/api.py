@@ -8,6 +8,7 @@ Handles write operations and admin actions that PostgREST cannot serve:
   POST   /v1/fyp/admin/algorithm   — activate an algorithm version (API-key gated)
   GET    /health                   — service health check
   GET    /metrics                  — embedding-coverage health metric (#15)
+  GET    /sync-status              — uniform HAF-app sync freshness (#16)
 
 PostgREST (port 3001) serves all read endpoints from haf_fyp_endpoints schema.
 Redis pub/sub signals the ranker for on-demand feed refresh after interest updates.
@@ -18,7 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional
 
@@ -26,7 +27,7 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 import redis as redis_lib
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -34,6 +35,12 @@ from slowapi.util import get_remote_address
 
 from .auth import KeyLookupUnavailable, verify_interests, verify_interests_delete
 from .metrics import build_coverage_report, fetch_coverage_rows
+from .sync_status import (
+    ContextNotFound,
+    InstanceNotReady,
+    build_sync_status,
+    fetch_sync_status_row,
+)
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +68,31 @@ def _db_kwargs() -> dict:
         user=os.environ.get("POSTGRES_USER", "haf_fyp_user"),
         password=os.environ.get("POSTGRES_PASSWORD", ""),
     )
+
+
+@contextmanager
+def _db_conn():
+    """Borrow a pooled connection, always returning it.
+
+    Exists so pool.getconn() happens INSIDE the caller's guarded region. Spelled
+    out inline, every call site so far has `conn = pool.getconn()` on the line
+    above its `try:`, so a PoolError("connection pool exhausted") — reachable with
+    maxconn=5 and a monitor polling /sync-status — escapes the handler's
+    HTTPException path entirely and Starlette answers a bare text/plain 500 with
+    no JSON detail and no Cache-Control. Raising inside the `with` body instead
+    lets the caller map it like any other failure.
+
+    The existing endpoints still use the inline four-line prologue; converting
+    them is a separate change (it would touch five handlers this MR does not
+    otherwise alter).
+    """
+    assert _pool is not None
+    pool = _pool
+    conn = pool.getconn()
+    try:
+        yield conn
+    finally:
+        pool.putconn(conn)
 
 
 @asynccontextmanager
@@ -230,6 +262,32 @@ class AlgorithmActivateRequest(BaseModel):
     version: str
 
 
+class SyncStatusResponse(BaseModel):
+    last_block_num: Annotated[
+        int,
+        Field(
+            description=(
+                "Last block fully processed by haf_fyp "
+                "(hafd.contexts.current_block_num for the 'haf_fyp' context)."
+            ),
+            examples=[5000000],
+        ),
+    ]
+    # str, not datetime: pydantic would re-serialise a datetime with a "+00:00"
+    # offset and microseconds, breaking the fixed 19-char format every other HAF
+    # app emits. haf_fyp.sync_status.format_block_time owns the formatting.
+    last_block_time: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "UTC timestamp of that block, 'YYYY-MM-DDTHH:MM:SS'. Null before "
+                "the first block is processed."
+            ),
+            examples=["2016-09-15T19:47:21"],
+        ),
+    ] = None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -282,6 +340,92 @@ def metrics():
         pool.putconn(conn)
     today = datetime.now(tz=timezone.utc).date()
     return build_coverage_report(rows, today)
+
+
+# Sync status is real-time health data — never let a proxy or browser serve a
+# stale answer. Value matches haf_block_explorer's get_hafbe_sync_status.sql
+# byte for byte (verified live against the deployed btracker endpoint, which
+# emits the same literal); the issue text's "max-age=0" is satisfied by it.
+_SYNC_STATUS_HEADERS = {"Cache-Control": "public, max-age=0"}
+
+
+@app.get("/sync-status", response_model=SyncStatusResponse)
+def sync_status(response: Response):
+    """
+    Last block fully processed by the haf_fyp HAF context, with its UTC timestamp (#16).
+
+    The ecosystem-uniform HAF-app freshness endpoint, identical in shape to
+    haf_block_explorer's /sync-status: the timestamp lets a consumer compute
+    staleness in a single call (age = now() - last_block_time) with no separate
+    head-block reference.
+
+    Served ONLY on this FastAPI overlay (port 3002), as #16 specifies. Note that
+    haf_api_node's agent checks probe http://<app>-postgrest-rewriter:80/sync-status,
+    and haf_fyp's rewrite rules have no /sync-status entry — its catch-all maps it
+    to /rpc/sync-status, which does not exist. A haf_api_node profile must
+    therefore point its *_HEALTH_URL at this port, or #17 must add a PostgREST
+    twin (haf_fyp_endpoints.get_fyp_sync_status) so the standard probe URL works
+    and the rewriter -> postgrest -> postgres path is what gets exercised.
+
+    Read from hafd.contexts.current_block_num for the 'haf_fyp' context, LEFT
+    JOINed to hafd.blocks for that block's created_at. last_block_time is null
+    before the first block is processed — the context is registered at block 0
+    and there is no block 0.
+
+    Sourced from HAF's authoritative pointer rather than the app's own
+    haf_fyp_app.app_status.last_processed_block row that PostgREST's /rpc/get_health
+    returns. The two normally agree — main() advances both in one transaction — but
+    they have different failure modes, and only this one carries a timestamp.
+
+    Returns 503 while the HAF instance is still in massive sync (the join's
+    indexes are dropped for the duration, so this fails fast rather than starting
+    an unindexed scan of the largest table in the database), and 503 if the
+    haf_fyp context is missing or invisible to the reader (see db/sync_status.sql).
+    """
+    response.headers.update(_SYNC_STATUS_HEADERS)
+
+    # One try covering BOTH the connection checkout and the query, so pool
+    # exhaustion (PoolError, reachable with maxconn=5 under continuous monitor
+    # polling) maps to a 503 with the JSON body and the no-cache header, instead
+    # of escaping as a bare text/plain 500.
+    try:
+        with _db_conn() as conn:
+            row = fetch_sync_status_row(conn)
+        return build_sync_status(row)
+    except (InstanceNotReady, ContextNotFound) as exc:
+        # Both are "not ready yet, ask again" rather than "broken". Expected for
+        # the days a massive sync takes, and monitors poll this, so no
+        # log.exception — it would bury the log in a condition the body states.
+        # ContextNotFound is never reported as a 200 with a null block: an empty
+        # result is the signature of a privilege misconfiguration, and a 200
+        # would hide it. It gets a warning because, unlike massive sync, it is
+        # never expected in a healthy deployment.
+        if isinstance(exc, ContextNotFound):
+            log.warning("sync-status: %s", exc)
+        raise HTTPException(
+            status_code=503, detail=str(exc), headers=_SYNC_STATUS_HEADERS
+        ) from exc
+    except psycopg2.pool.PoolError as exc:
+        log.warning("sync-status: %s", exc)
+        raise HTTPException(
+            status_code=503, detail="database connection pool exhausted",
+            headers=_SYNC_STATUS_HEADERS,
+        ) from exc
+    except Exception as exc:
+        # Deliberately NO conn.rollback(). The common failure here is a dead
+        # backend (HAF restart, pg_terminate_backend, an idle timeout on the
+        # long-lived minconn=1 connection), and psycopg2 raises
+        # InterfaceError("connection already closed") from rollback() on a closed
+        # connection — which would escape this handler, replacing the JSON error
+        # and the log line with a bare text/plain 500 and a misleading traceback.
+        # It is also unnecessary: pool.putconn() closes an UNKNOWN-status
+        # connection and rolls back a non-IDLE one before re-pooling, so no dirty
+        # connection is ever reused. Matches /metrics, which also does not roll back.
+        log.exception("failed to read sync status")
+        raise HTTPException(
+            status_code=500, detail="failed to read sync status",
+            headers=_SYNC_STATUS_HEADERS,
+        ) from exc
 
 
 @app.post("/v1/fyp/interests", response_model=InterestsResponse)
