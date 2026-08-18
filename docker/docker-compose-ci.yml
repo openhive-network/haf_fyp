@@ -41,7 +41,8 @@ services:
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /create_tables.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /active_users_maintenance.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /sync_status.sql &&
-        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_privileges.sql
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_privileges.sql &&
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_invariants.sql
     volumes:
       # #16: HAF core stand-in, shared with the fastapi-tests lane so the two
       # cannot drift. Must load BEFORE ci_setup.sql, which adds the RLS policy and
@@ -74,6 +75,10 @@ services:
       # runs LAST, after every GRANT/REVOKE and after the reinstall.
       - ../db/active_users_maintenance.sql:/active_users_maintenance.sql:ro
       - ../tests/ci_privileges.sql:/ci_privileges.sql:ro
+      # Cross-cutting state invariants (context pointer vs app_status, app_status
+      # singleton). Runs after ci_privileges.sql, so it sees the fully installed,
+      # re-installed and re-granted database.
+      - ../tests/ci_invariants.sql:/ci_invariants.sql:ro
     depends_on:
       postgres:
         condition: service_healthy

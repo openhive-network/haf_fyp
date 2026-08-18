@@ -50,7 +50,19 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.app_status (
     continue_processing bool NOT NULL DEFAULT TRUE,
     last_processed_block int NOT NULL DEFAULT 0
 );
-INSERT INTO haf_fyp_app.app_status VALUES (TRUE, 0);
+
+-- Seeded to the SAME block as tests/haf_stub.sql's hafd.contexts row, not to 0. The
+-- context pointer and this column are one clock (see db/haf_fyp_app.sql), so a fixture
+-- with the context at the chain tip and app_status at 0 encodes a state that cannot
+-- legitimately exist -- and it is exactly the desync tests/ci_invariants.sql now forbids.
+INSERT INTO haf_fyp_app.app_status (continue_processing, last_processed_block)
+VALUES (TRUE, 5000000);
+
+-- Mirrors the singleton index in db/haf_fyp_app.sql. That file is not loaded in this
+-- lane (it calls the hive.* app API, which the stub does not provide), so this fixture
+-- restates its DDL and must be kept in step with it.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_app_status_singleton
+ON haf_fyp_app.app_status ((TRUE));
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.app_version (
     git_hash text NOT NULL

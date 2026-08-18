@@ -14,9 +14,13 @@
 --     has_schema_privilege('hive_applications_group','hafd','CREATE')           = t
 --     has_function_privilege(...,'hive.disable_indexes_of_irreversible()', ...) = t
 -- TRUNCATE is NOT gated by row-level security, so a member can wipe every HAF
--- app's context registration on the node regardless of the RLS policies. HAF's
--- default pg_hba is `host haf_block_log all 0.0.0.0/0 trust`, so any role with
--- LOGIN is reachable without a credential.
+-- app's context registration on the node regardless of the RLS policies. Whether
+-- that is reachable anonymously is the DEPLOYMENT's pg_hba, not HAF's image
+-- default (#19): haf/docker/docker_entrypoint.sh overwrites pg_hba.conf with the
+-- deployment's $PG_ACCESS. On the node measured here it does resolve to
+-- `host haf_block_log all 0.0.0.0/0 trust`, so any role with LOGIN is reachable
+-- without a credential -- but that is a property of the deployment, not a HAF
+-- default to assume. See db/builtin_roles.sql for the fuller accounting.
 --
 -- haf_fyp_user is the UNAUTHENTICATED role that PostgREST and the FastAPI overlay
 -- connect as, and this repo deliberately keeps privileges off it (see the #14

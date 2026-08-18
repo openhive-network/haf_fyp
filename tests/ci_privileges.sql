@@ -79,3 +79,49 @@ END
 $$;
 
 RESET ROLE;
+
+-- #19: the membership itself, asserted directly rather than inferred from the denial
+-- probe above.
+--
+-- Nothing enforced this before, and the denial probe cannot: grant the group to a
+-- NOINHERIT role and the probe still passes, because the privileges do not arrive by
+-- inheritance -- yet a real connection can `SET ROLE hive_applications_group` and take
+-- them anyway. Measured on PG14 with exactly that setup: pg_has_role(...,'USAGE') was
+-- false while a session connected as haf_fyp_user went from 0 to 1 visible rows in
+-- hafd.contexts after one SET ROLE. So the inherit flag is not a boundary here -- the
+-- membership is, and MEMBER is precisely "may SET ROLE to it".
+--
+-- #19 settled that this role stays out of that group: haf_api_node migrated every app's
+-- health check off the per-app psql query that needed the membership and onto an HTTP
+-- /sync-status probe, so the group-less API role is what the new checks are built for.
+-- This is the assertion that keeps that decision from being quietly undone.
+DO $$
+BEGIN
+    IF pg_has_role('haf_fyp_user', 'hive_applications_group', 'MEMBER') THEN
+        RAISE EXCEPTION
+            'haf_fyp_user is a member of hive_applications_group. Even NOINHERIT that is '
+            'one SET ROLE away from TRUNCATE on hafd.contexts (which RLS does not gate) '
+            'and from the SECURITY DEFINER path to superuser through '
+            'hive.app_restore_indexes() (see db/builtin_roles.sql, #19).';
+    END IF;
+
+    -- The other direction of the same hazard: a haf_fyp_user that could impersonate
+    -- haf_fyp_owner would satisfy HAF's hive.can_impersonate check on the hafd.contexts
+    -- UPDATE and DELETE policies, and could rewind or drop the haf_fyp context from an
+    -- unauthenticated connection.
+    --
+    -- HONEST NOTE: this branch is UNREACHABLE as the roles stand, and deliberately kept
+    -- anyway. db/builtin_roles.sql grants haf_fyp_user TO haf_fyp_owner, so PostgreSQL's
+    -- own loop prevention already refuses the reverse -- verified:
+    -- `GRANT haf_fyp_owner TO haf_fyp_user` fails with
+    -- 'role "haf_fyp_owner" is a member of role "haf_fyp_user"'. So do not read this as
+    -- active protection today; it is a guard for a future restructuring that drops the
+    -- forward grant, at which point the hazard becomes real and this becomes live.
+    IF pg_has_role('haf_fyp_user', 'haf_fyp_owner', 'MEMBER') THEN
+        RAISE EXCEPTION
+            'haf_fyp_user is a member of haf_fyp_owner; it could satisfy HAF''s '
+            'can_impersonate check and rewind the haf_fyp context '
+            '(see db/builtin_roles.sql).';
+    END IF;
+END
+$$;
