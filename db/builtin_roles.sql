@@ -22,27 +22,51 @@
 -- SELECT policy is granted TO that group, and PostgreSQL matches a policy's TO
 -- list against the *inherited* privilege set (has_privs_of_role), so a non-member
 -- -- or a NOINHERIT member, or a member holding a plain GRANT SELECT -- matches no
--- policy and reads ZERO ROWS with no error. (Verified live: haf_stats_user, which
--- has direct hafd grants but no membership, counts 0 rows in hafd.contexts while
--- hafbe_user, an INHERIT member, counts all 5.)
+-- policy and reads ZERO ROWS with no error.
+--
+-- CORRECTION (#19): an earlier version of this comment cited that shape as a fact
+-- about haf_stats -- "haf_stats_user, which has direct hafd grants but no
+-- membership, counts 0 rows in hafd.contexts". It is not a fact about the app. It
+-- is a fact about how a given NODE provisioned the role, and both of these
+-- measurements are real: on the node this file was first written against,
+-- haf_stats_user is NOINHERIT, holds no membership and counts 0 rows; on testapi
+-- the same role IS an inheriting member and reads its row. Every app's
+-- builtin_roles.sql creates roles IF NOT EXISTS, while HAF's
+-- scripts/create_haf_app_role.sh creates them `LOGIN INHERIT IN ROLE <base-group>`
+-- -- so whoever provisions the role first decides its memberships. Check the node
+-- in front of you rather than restating either measurement.
 --
 -- But that group is not a read grant. Verified on a live HAF node it also carries
 -- TRUNCATE on hafd.contexts -- which row-level security does NOT gate -- plus
 -- CREATE on schema hafd and EXECUTE on hive.disable_indexes_of_irreversible().
--- HAF's default pg_hba is `host haf_block_log all 0.0.0.0/0 trust`, so any LOGIN
--- role is reachable with no credential. Putting the unauthenticated API role in
--- that group would let anyone who can reach the port wipe every HAF app's context
--- registration, and would contradict the least-privilege split this repo
--- documents for haf_fyp_user (db/create_tables.sql, #14).
+-- Whether that is reachable anonymously is the DEPLOYMENT's pg_hba, not HAF's
+-- image default, which is narrower: haf/docker/docker_entrypoint.sh OVERWRITES
+-- pg_hba.conf with the deployment's $PG_ACCESS and only appends the image default
+-- as a trailing fallback. On the node measured here pg_hba_file_rules does resolve
+-- to `host haf_block_log all 0.0.0.0/0 trust`, so any LOGIN role is reachable with
+-- no credential -- but that is the deployment's choice to state, not HAF's default
+-- to assume. Putting the unauthenticated API role in that group would let anyone
+-- who can reach the port wipe every HAF app's context registration, and would
+-- contradict the least-privilege split this repo documents for haf_fyp_user
+-- (db/create_tables.sql, #14).
 --
 -- So the hafd read is done by haf_fyp_app.sync_status(), a SECURITY DEFINER
 -- function owned by haf_fyp_owner (db/sync_status.sql). haf_fyp_user gets EXECUTE
 -- on that one function and no HAF group at all.
 --
+-- AND THE ECOSYSTEM HAS SINCE CONFIRMED THAT SPLIT (#19). haf_api_node migrated
+-- every app's health check off the per-app `hive.get_app_current_block_age(<ctx>)`
+-- psql query -- the one consumer that required {app}_user to be in this group --
+-- and onto an HTTP probe of the app's own /sync-status
+-- (healthchecks/checks/check_http_sync_age.sh, consumed by hafah.sh, hafbe.sh,
+-- hivesense.sh and the rest, each with an overridable ${APP_HEALTH_URL}). The
+-- minimal group-less API role is what the new checks are built for. Do not add
+-- haf_fyp_user to hive_applications_group.
+--
 -- LOGIN on both roles closes hive/haf_fyp#17 blocker 3: docker-compose connects
 -- the sync, ranker and API containers as these roles, which NOLOGIN roles cannot
 -- do. Note both roles are created WITHOUT a password, so under a hardened pg_hba
--- (md5/scram) a deployment must set one; under HAF's default `trust` none is used.
+-- (md5/scram) a deployment must set one; under a `trust` line none is used.
 
 DO $$
 BEGIN

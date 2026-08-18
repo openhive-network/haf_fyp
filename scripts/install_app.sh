@@ -155,6 +155,56 @@ psql_cmd -v ON_ERROR_STOP=on -c "
     RESET ROLE;
 "
 
+# 14. Post-install assertion that the two clocks agree. The context pointer and
+#     app_status.last_processed_block are one clock (see db/haf_fyp_app.sql), and
+#     step 10 has just run create_context_if_not_exists(), which seeds or repairs the
+#     pointer. This is the only place that repair runs against the real hive.* API --
+#     the postgrest CI lane does not load db/haf_fyp_app.sql, because it calls the HAF
+#     application API and tests/haf_stub.sql does not implement it. tests/ci_invariants.sql
+#     asserts the same invariant against the stub.
+#
+#     A desynced pointer is silent by default: GET /sync-status answers HTTP 200 with
+#     {"last_block_num": 0, "last_block_time": null} because the context row exists, and
+#     haf_api_node's HTTP probe then reads that as a permanent false DOWN.
+psql_cmd -v ON_ERROR_STOP=on -c "
+DO \$\$
+DECLARE
+    __ctx int;
+    __app int;
+    __rows bigint;
+BEGIN
+    SELECT count(*) INTO __rows FROM haf_fyp_app.app_status;
+    IF __rows <> 1 THEN
+        RAISE EXCEPTION
+            'haf_fyp_app.app_status holds % rows, expected exactly 1. The LIMIT 1 readers '
+            'have no ORDER BY, so get_health and the ranker sync gate would pick an '
+            'arbitrary row. Re-running db/haf_fyp_app.sql de-duplicates them.', __rows;
+    END IF;
+
+    SELECT c.current_block_num INTO __ctx FROM hafd.contexts AS c WHERE c.name = 'haf_fyp';
+    SELECT max(s.last_processed_block) INTO __app FROM haf_fyp_app.app_status AS s;
+
+    IF __ctx IS NULL THEN
+        RAISE EXCEPTION 'no hafd.contexts row named haf_fyp after install';
+    END IF;
+
+    IF __app > 0 AND __ctx = 0 THEN
+        RAISE EXCEPTION
+            'HAF context is at block 0 while app_status reports % processed, and '
+            'create_context_if_not_exists() did not repair it. GET /sync-status would '
+            'report block 0 with a null timestamp on a synced node and the processor '
+            'would replay from genesis.', __app;
+    END IF;
+
+    IF abs(__ctx - __app) > 10000 THEN
+        RAISE WARNING
+            'HAF context (%) and app_status (%) differ by more than one 10000-block '
+            'batch. If the block processor is running this is an in-flight batch and '
+            'will settle; if it is not, the two clocks have drifted.', __ctx, __app;
+    END IF;
+END
+\$\$;"
+
 log "Installation complete."
 log "If any cross-schema NOTICEs appeared above, install the missing apps"
 log "then run: scripts/grant_cross_schema.sh"
