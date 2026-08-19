@@ -82,8 +82,23 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.post_commenters (
     FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates (post_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_post_commenters_pid
-ON haf_fyp_app.post_commenters (post_id);
+-- No separate (post_id) index (#18): PRIMARY KEY (post_id, commenter) already serves
+-- every post_id lookup through its leftmost prefix, so idx_post_commenters_pid was pure
+-- overhead — ~928 MB and 0 scans on mainnet since the 2026-07-16 stats reset (figures
+-- from issue #18; not reproducible from this repo), plus one index write per insert.
+-- Two post_id-keyed paths touch this table and the PK prefix covers both: the ON CONFLICT
+-- arbiter in process_comments() (db/process_engagement.sql), which uses the PK because the
+-- dropped index was never unique; and the FK check that runs when a post_candidates row is
+-- DELETEd or has its post_id UPDATEd, which scans this table for referencing rows. The
+-- insert-time direction needs no index here at all — it reads post_candidates' own PK and
+-- touches no post_commenters index.
+-- DROPped rather than merely un-CREATEd so an already-installed node reclaims the space on
+-- its next install run; this file is re-run on every deploy (scripts/install_app.sh). On a
+-- live node the plain DROP takes ACCESS EXCLUSIVE: queued behind the block processor's open
+-- transaction it also stalls every later reader of post_commenters until it clears. To avoid
+-- that, run DROP INDEX CONCURRENTLY haf_fyp_app.idx_post_commenters_pid; ahead of the deploy
+-- and this statement becomes a no-op. Do NOT re-add the index.
+DROP INDEX IF EXISTS haf_fyp_app.idx_post_commenters_pid;
 
 -- ---------------------------------------------------------------------------
 -- Engagement metrics — updated incrementally per block range
