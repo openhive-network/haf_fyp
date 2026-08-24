@@ -1,5 +1,13 @@
 [sqlfluff]
 dialect = postgres
+# 0 = never skip on size. sqlfluff's default is to SKIP any file over 20000 bytes and
+# say so with only a WARNING, so the job still exits 0 -- linting switches itself off
+# silently as a file grows. That had already happened to db/create_tables.sql, which
+# has never been linted and which nobody noticed; db/cross_schema_grants.sql crossed
+# the same threshold in #8. Raising the number just moves the cliff, so the gate is
+# removed and the single real exclusion is listed in .sqlfluffignore instead, where it
+# is visible and reviewed.
+large_file_skip_byte_limit = 0
 max_line_length = 120
 exclude_rules = references.keywords
 

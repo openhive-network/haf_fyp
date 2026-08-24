@@ -1,1 +1,8 @@
 endpoints/endpoint_schema.sql
+# Never linted -- it silently exceeded sqlfluff's default byte limit long before
+# anyone looked. Listed explicitly (#8) so the exclusion is a decision rather than a
+# side effect of file growth. It currently trips LT01 on the deliberately
+# column-aligned GRANT/REVOKE footer; un-aligning that block to satisfy the linter
+# would make it harder to read, so the exclusion stands until someone decides
+# otherwise. Removing this line is the way to revisit it.
+db/create_tables.sql

@@ -1,5 +1,5 @@
 """
-Embedding-coverage health metric (#15).
+Health metrics for the signals that fail soft (#15 embeddings, #8 credibility).
 
 Turns the precomputed haf_fyp_app.embedding_coverage_daily rollup (refreshed
 hourly by the ranker daemon via haf_fyp_app.refresh_embedding_coverage) into the
@@ -13,12 +13,30 @@ personalization without any error. A single day whose coverage collapses far
 below the ~80% steady state (short posts/comments legitimately have no embedding,
 so 100% is never expected) is the fingerprint of a HiveSense sync hole — exactly
 the undetected 2026-07-02 interruption that motivated this metric.
+
+The credibility section (#8) is the same idea applied to the other soft signal.
+Credibility reads four foreign schemas, and losing SELECT on one of them used to be
+indistinguishable from the app not being installed -- so the ranker scored on a
+partial signal and said nothing. This reports each source as readable / unreadable /
+absent, which separates a lost grant (repairable, "unreadable") from a deployment
+that simply has no balance tracker (fine, "absent").
+
+Unlike embedding coverage, this is NOT precomputed. That rollup is a table because
+the candidate scan behind it is multi-second; the credibility probe is a single
+indexed catalog read, and an inline answer cannot go stale -- which matters here
+because nothing in this app reports ranker liveness, so a persisted row written by a
+dead daemon would keep reporting the last known-good state indefinitely.
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 from statistics import median
+
+from haf_fyp.credibility import STATE_ABSENT, STATE_UNKNOWN, probe_credibility_sources
+
+log = logging.getLogger(__name__)
 
 # A settled day is flagged as a suspected hole when its coverage is below this
 # fraction of the window's median coverage. With a ~80% steady state the threshold
@@ -103,3 +121,91 @@ def fetch_coverage_rows(conn) -> list[tuple]:
             "FROM haf_fyp_app.embedding_coverage_daily ORDER BY day"
         )
         return cur.fetchall()
+
+
+def _source(relation: str, state: str) -> dict:
+    """One source's entry. An absent source has no relation name to report."""
+    return {
+        "relation": relation if relation and state != STATE_ABSENT else None,
+        "state": state,
+    }
+
+
+def build_credibility_sources_report(probe: dict | None) -> dict:
+    """
+    Shape a credibility.probe_credibility_sources() result for GET /metrics.
+
+    Deliberately a SEPARATE function merged in by the route rather than a fifth key
+    on build_coverage_report: that function's exact return shape is pinned by
+    tests/unit/test_metrics.py, and keeping them apart is what makes this addition
+    provably additive.
+
+    probe is None when the probe itself could not be run. That is reported as state
+    "unknown" AND degraded=true -- the one thing a health metric must never do is
+    answer "fine" when it does not know. degraded is null-free on purpose: a monitor
+    writing the natural `if body.credibility_sources.degraded` sees JSON null as
+    falsy, so reporting null here would make "I could not check" indistinguishable
+    from "nothing is wrong" to the automation this section exists to feed. Unknown
+    fails safe instead; the state string carries the distinction for a human.
+
+    "degraded" is narrower than "state": it means a relation EXISTS but is not
+    readable, i.e. a lost grant with a known remedy. A deployment with no balance
+    tracker at all reports state "reputation_only" and degraded false, because
+    nothing is broken there.
+    """
+    if probe is None:
+        # STATE_UNKNOWN, not a bare literal: every other value this endpoint can emit
+        # for these fields is a STATE_* constant in credibility.py, and one member
+        # defined here instead would leave the wire enum split across two modules --
+        # invisible to anything enumerating the constants to validate the contract,
+        # and silently inconsistent the first time the others are renamed.
+        return {
+            "state": STATE_UNKNOWN,
+            "degraded": True,
+            "reputation": _source("", STATE_UNKNOWN),
+            "vests": _source("", STATE_UNKNOWN),
+            "accounts": _source("", STATE_UNKNOWN),
+            "detail": "credibility source probe failed",
+        }
+    return {
+        "state": probe["state"],
+        "degraded": probe["degraded"],
+        "reputation": _source(probe["reputation_relation"], probe["reputation_state"]),
+        "vests": _source(probe["balance_relation"], probe["balance_state"]),
+        "accounts": _source(probe["accounts_relation"], probe["accounts_state"]),
+        "detail": probe["detail"],
+    }
+
+
+def fetch_credibility_sources(conn) -> dict | None:
+    """
+    Probe credibility source readability, or None if the probe itself failed.
+
+    Answers for the CALLING role. The endpoint runs as haf_fyp_user while the ranker
+    runs as haf_fyp_owner, and db/builtin_roles.sql grants haf_fyp_user TO
+    haf_fyp_owner -- so the owner's privileges are a superset of this role's and the
+    endpoint can only err conservatively (reporting unreadable where the daemon can
+    in fact read). Since db/cross_schema_grants.sql grants both roles in the same
+    statement, a divergence between them is itself a misconfiguration worth seeing.
+    """
+    try:
+        return probe_credibility_sources(conn)
+    except Exception as exc:
+        # Never let this take down the embedding-coverage metric it shares a route
+        # and a pooled connection with.
+        #
+        # Deliberately NO conn.rollback() here. When the probe failed because the
+        # connection itself died, rollback raises too -- and it would raise OUTSIDE
+        # this handler, replacing the JSON payload with a bare 500 and losing the
+        # coverage rows already read. It is also unnecessary: pool.putconn() closes
+        # an UNKNOWN-status connection and rolls back a non-IDLE one before
+        # re-pooling, so no dirty connection is ever reused, and /metrics issues no
+        # further statement after this. Same reasoning, verbatim, as the
+        # GET /sync-status handler in haf_fyp/api.py.
+        # No exc_info: monitors poll this endpoint, so a persistently dead backend
+        # would write a full traceback per scrape and bury the one line an operator
+        # needs. Same reasoning the /sync-status handler states for not using
+        # log.exception on its expected-condition path, and the same reasoning behind
+        # credibility's transition-only logging.
+        log.warning("credibility: source probe failed (%s) -- reporting state unknown", exc)
+        return None

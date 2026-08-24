@@ -37,10 +37,15 @@ services:
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -c "SET custom.swagger_url = 'localhost';" -f /endpoint_schema.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /active_users_maintenance.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /sync_status.sql &&
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /cross_schema_grants.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -c "GRANT SELECT ON ALL TABLES IN SCHEMA haf_fyp_app TO haf_fyp_user; GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA haf_fyp_endpoints TO haf_fyp_user;" &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /create_tables.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /active_users_maintenance.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /sync_status.sql &&
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /cross_schema_grants.sql &&
+        PGOPTIONS="-c role=ci_restricted_installer" PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /cross_schema_grants.sql > /tmp/restricted.log 2>&1; __rc=$$?; cat /tmp/restricted.log; [ "$$__rc" -eq 0 ] &&
+        grep -q "could not set default privileges for owner role" /tmp/restricted.log &&
+        grep -q "Self-healing incomplete" /tmp/restricted.log &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_privileges.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_invariants.sql
     volumes:
@@ -58,6 +63,18 @@ services:
       # both install passes, like create_tables.sql, so a non-idempotent edit fails
       # here rather than on the next deploy.
       - ../db/sync_status.sql:/sync_status.sql:ro
+      # #8: the self-healing cross-schema grant pass, as a real product file. It had
+      # never run in any lane -- so its ALTER DEFAULT PRIVILEGES loop, which exists to
+      # keep the Discover feed alive across a foreign app's upgrade, was untested.
+      # tests/ci_setup.sql stands up the foreign schemas it needs (reptracker_app owned
+      # by two non-installer roles, plus an unhealed_app negative control) and
+      # tests/haf_stub.sql supplies hafd.accounts, which this file grants on UNGUARDED
+      # and whose absence is why the file could not be loaded here before.
+      #
+      # Applied TWICE, like create_tables.sql and sync_status.sql: the file's header
+      # promises "Safe to re-run", and install_app.sh loads it on every install, so a
+      # non-idempotent edit should fail here rather than on the next deploy.
+      - ../db/cross_schema_grants.sql:/cross_schema_grants.sql:ro
       - ../db/create_tables.sql:/create_tables.sql:ro
       - ../db/seed_data.sql:/seed_data.sql:ro
       - ../endpoints/endpoint_schema.sql:/endpoint_schema.sql:ro

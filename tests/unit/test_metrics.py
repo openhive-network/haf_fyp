@@ -1,8 +1,13 @@
-"""Unit tests for the embedding-coverage report (#15, haf_fyp.metrics)."""
+"""Unit tests for the /metrics reports (#15 embedding coverage, #8 credibility)."""
 
 from datetime import date, datetime, timezone
+from unittest.mock import MagicMock
 
-from haf_fyp.metrics import build_coverage_report
+from haf_fyp.metrics import (
+    build_coverage_report,
+    build_credibility_sources_report,
+    fetch_credibility_sources,
+)
 
 TODAY = date(2026, 7, 27)
 
@@ -90,3 +95,112 @@ def test_computed_at_is_max_iso():
     ]
     report = build_coverage_report(rows, TODAY)
     assert report["computed_at"] == newer.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# #8: credibility source health section
+# ---------------------------------------------------------------------------
+
+
+def _probe(state="full", degraded=False, **overrides):
+    probe = {
+        "state": state,
+        "degraded": degraded,
+        "reputation_relation": "reptracker_app.account_reputations",
+        "reputation_state": "readable",
+        "balance_relation": "btracker_app.current_account_balances",
+        "balance_state": "readable",
+        "accounts_relation": "hafd.accounts",
+        "accounts_state": "readable",
+        "detail": "both sources readable",
+    }
+    probe.update(overrides)
+    return probe
+
+
+def test_coverage_report_keys_are_unchanged():
+    # The credibility section is merged in by the route, NOT added to
+    # build_coverage_report — this is what makes the addition provably additive.
+    assert set(build_coverage_report([], TODAY)) == {
+        "embedding_coverage",
+        "recent_window_pct",
+        "suspected_hole_days",
+        "computed_at",
+    }
+
+
+def test_credibility_sources_shape():
+    report = build_credibility_sources_report(_probe())
+    assert set(report) == {"state", "degraded", "reputation", "vests", "accounts", "detail"}
+    for key in ("reputation", "vests", "accounts"):
+        assert set(report[key]) == {"relation", "state"}
+    assert report["state"] == "full"
+    assert report["degraded"] is False
+    assert report["vests"]["relation"] == "btracker_app.current_account_balances"
+
+
+def test_absent_source_reports_no_relation_name():
+    # There is no name to report for something that is not installed, and
+    # inventing one would read as though it existed.
+    #
+    # Asserted on REPUTATION, not vests. _classify returns "" for a multi-candidate
+    # list, so balance_relation is ALWAYS "" when absent and would exercise only the
+    # `relation and ...` half of the guard -- the `state != STATE_ABSENT` half would
+    # go untested and `relation or None` would pass. Single-candidate sources have
+    # their name backfilled (credibility.py), so they are the only ones that reach it,
+    # and hafd.accounts is the case that matters: naming a relation that does not
+    # exist on this node is exactly the misreport this guard prevents.
+    report = build_credibility_sources_report(
+        _probe(state="vests_only", reputation_state="absent")
+    )
+    assert report["reputation"] == {"relation": None, "state": "absent"}
+    assert report["degraded"] is False
+
+
+def test_absent_accounts_does_not_name_a_relation_that_is_not_there():
+    report = build_credibility_sources_report(_probe(state="none", accounts_state="absent"))
+    assert report["accounts"] == {"relation": None, "state": "absent"}
+
+
+def test_unreadable_source_keeps_its_name_and_is_degraded():
+    # The name is the actionable part: it tells the operator what to re-grant.
+    report = build_credibility_sources_report(
+        _probe(state="reputation_only", degraded=True, balance_state="unreadable")
+    )
+    assert report["vests"] == {
+        "relation": "btracker_app.current_account_balances",
+        "state": "unreadable",
+    }
+    assert report["degraded"] is True
+
+
+def test_failed_probe_reports_unknown_and_fails_safe():
+    # The one thing a health metric must never do is answer "fine" when it does
+    # not know -- and `null` is not a safe way to say "unknown": every JSON consumer
+    # evaluates it as falsy, so a monitor writing `if degraded: alert()` would treat
+    # a failed probe exactly like a healthy node.
+    report = build_credibility_sources_report(None)
+    assert report["state"] == "unknown"
+    assert report["degraded"] is True
+    assert all(report[k]["state"] == "unknown" for k in ("reputation", "vests", "accounts"))
+
+
+def test_fetch_swallows_a_failed_probe():
+    # A broken probe must not take down the embedding-coverage metric it shares a
+    # route and a pooled connection with.
+    conn = MagicMock()
+    conn.cursor.side_effect = RuntimeError("boom")
+    assert fetch_credibility_sources(conn) is None
+
+
+def test_fetch_does_not_roll_back_a_dead_connection():
+    # The failure mode this guards: the probe failed BECAUSE the connection died, so
+    # conn.rollback() raises too -- and it would raise outside the handler, replacing
+    # the whole /metrics payload with a bare 500 and losing the coverage rows already
+    # read. pool.putconn() already closes an UNKNOWN-status connection and rolls back
+    # a non-IDLE one, so the rollback is unnecessary as well as unsafe.
+    conn = MagicMock()
+    conn.cursor.side_effect = RuntimeError("connection already closed")
+    conn.rollback.side_effect = AssertionError("must not roll back a dead connection")
+    assert fetch_credibility_sources(conn) is None
+    conn.rollback.assert_not_called()

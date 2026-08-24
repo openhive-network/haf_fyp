@@ -125,3 +125,168 @@ BEGIN
     END IF;
 END
 $$;
+
+-- ---------------------------------------------------------------------------
+-- #8: the self-healing cross-schema grant pass actually heals
+-- ---------------------------------------------------------------------------
+-- db/cross_schema_grants.sql's ALTER DEFAULT PRIVILEGES loop shipped in !27 with no
+-- test and no CI wiring, and had never run in any lane: the file was mounted nowhere,
+-- and it could not have been loaded anyway because it grants on hafd.accounts, which
+-- tests/haf_stub.sql did not define. #8 mounts the file and adds that stub, so this is
+-- the first assertion that the machinery works at all.
+--
+-- The claim under test is narrow and specific: a relation created AFTER the grant
+-- script ran, by a role the script never names explicitly, is readable by
+-- haf_fyp_user with no further GRANT. That is the whole point of default privileges,
+-- and it is what stops a foreign app's upgrade from silently 401-ing Discover.
+--
+-- The insufficient_privilege branch IS covered, by a separate pass. This file runs as
+-- the superuser postgres, for whom has_privs_of_role is unconditionally true, so the
+-- handler cannot fire here. docker-compose-ci.yml therefore runs the shipped
+-- db/cross_schema_grants.sql a third time under PGOPTIONS='-c role=
+-- ci_restricted_installer' -- a real NOSUPERUSER role, member of the btracker/hafbe
+-- owners but of neither reptracker_app owner -- and greps for the handler NOTICE and
+-- the partial-failure summary. That pass runs the file verbatim, so it is a behaviour
+-- test in the sense lines 12-16 of this file demand, not a copy of the loop.
+--
+-- It was briefly written off as untestable, on the reasoning that a role weak enough to
+-- trip the handler would fail on the plain GRANTs earlier in the file. That is wrong,
+-- and this MR is what made it wrong: those blocks gate on information_schema.schemata,
+-- which HIDES a schema the caller has no rights on, so they take their ELSE branch and
+-- issue nothing -- while the loop's guard, changed here to pg_catalog.pg_namespace, is
+-- not ACL-gated and sees the schema regardless. The weak role sails past and lands in
+-- the handler.
+--
+-- Worth knowing about the production shape, since it is not what it looks like:
+-- haf/scripts/create_haf_admin_role.sh creates the admin account WITH LOGIN SUPERUSER,
+-- so a compose-driven install never reaches this branch. But scripts/common.sh defaults
+-- POSTGRES_USER to haf_fyp_owner, and only docker-compose.yml's haf-fyp-setup service
+-- overrides it -- so every other invocation of scripts/grant_cross_schema.sh used to
+-- land here, heal nothing, and still print "Done.". That script now defaults to
+-- haf_admin and exits non-zero when nothing healed.
+
+BEGIN;
+
+-- Created by the SCHEMA/table owner, not by the installer: default privileges are
+-- keyed to the role that creates an object, so creating this as postgres would
+-- exercise a different pg_default_acl row than production's.
+SET ROLE "reptracker owner";
+CREATE TABLE reptracker_app.probe_after_grants (account_id INT PRIMARY KEY);
+RESET ROLE;
+
+-- And by the VIEW owner, the second owner of the same schema. Default privileges are
+-- recorded per (owner role, schema), so a loop that took only one owner -- the
+-- majority one, or the first -- would leave this unreadable while the assertion above
+-- still passed. hivemind_app and hivesense_app are both multi-owner on a live node.
+SET ROLE reptracker_view_owner;
+CREATE TABLE reptracker_app.probe_after_grants_second_owner (account_id INT PRIMARY KEY);
+RESET ROLE;
+
+SET ROLE haf_fyp_user;
+
+DO $$
+BEGIN
+    BEGIN
+        PERFORM 1 FROM reptracker_app.probe_after_grants;
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE EXCEPTION
+            'haf_fyp_user cannot read a table created in reptracker_app AFTER '
+            'db/cross_schema_grants.sql ran. Its ALTER DEFAULT PRIVILEGES pass did not '
+            'take effect for the schema/table owner -- check the _targets array and the '
+            'owner-discovery query, and note the owner name contains a space, so a %%I '
+            'changed to %%s in the format() call breaks exactly this.';
+    END;
+
+    BEGIN
+        PERFORM 1 FROM reptracker_app.probe_after_grants_second_owner;
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE EXCEPTION
+            'haf_fyp_user cannot read a table created in reptracker_app by its SECOND '
+            'owner role. The default-privilege pass covered one owner but not all of '
+            'them -- default privileges are recorded per (owner role, schema), and '
+            'hivemind_app / hivesense_app are multi-owner on a live node.';
+    END;
+END
+$$;
+
+RESET ROLE;
+
+-- The negative control. Same shape, same kind of owner, one difference: unhealed_app
+-- is NOT in _targets. haf_fyp_user holds USAGE on the schema (granted by
+-- tests/ci_setup.sql) so the denial can only come from the missing TABLE grant.
+--
+-- This is the assertion with the failure-detecting power. Without it, the two above
+-- pass just as happily if the loop were replaced by a blanket GRANT TO PUBLIC, or if
+-- this lane simply made everything readable -- they cannot, alone, distinguish "the
+-- default ACL fired" from "nothing was ever restricted".
+SET ROLE unhealed_owner;
+CREATE TABLE unhealed_app.probe_after_grants (account_id INT PRIMARY KEY);
+RESET ROLE;
+
+SET ROLE haf_fyp_user;
+
+DO $$
+BEGIN
+    BEGIN
+        PERFORM 1 FROM unhealed_app.probe_after_grants;
+        RAISE EXCEPTION
+            'haf_fyp_user can read a new table in unhealed_app, which is NOT in '
+            'db/cross_schema_grants.sql''s _targets. Either something grants far more '
+            'widely than intended, or this lane does not restrict at all -- in which '
+            'case the reptracker_app assertions above prove nothing.';
+    EXCEPTION WHEN insufficient_privilege THEN
+        NULL;  -- expected
+    END;
+END
+$$;
+
+RESET ROLE;
+
+-- The schema-owner half of owner discovery. Neither probe above reaches it: both of
+-- reptracker_app's owners own relations, so the pg_class scan finds them and the
+-- pg_namespace.nspowner UNION contributes nothing there. Delete that UNION and
+-- everything above still passes.
+--
+-- hafbe_bal is EMPTY, so nspowner is the only owner signal that exists for it -- this
+-- is the window an upgrade opens, where the schema has been recreated and the app has
+-- not repopulated it yet. btracker_app is non-empty but its relation belongs to a
+-- different role than the schema, so the scan finds btracker_rel_owner and stops.
+SET ROLE hafbe_owner;
+CREATE TABLE hafbe_bal.probe_after_grants (account INT PRIMARY KEY);
+RESET ROLE;
+
+SET ROLE btracker_schema_owner;
+CREATE TABLE btracker_app.probe_after_grants (account INT PRIMARY KEY);
+RESET ROLE;
+
+SET ROLE haf_fyp_user;
+
+DO $$
+BEGIN
+    BEGIN
+        PERFORM 1 FROM hafbe_bal.probe_after_grants;
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE EXCEPTION
+            'haf_fyp_user cannot read a table created in the EMPTY schema hafbe_bal. '
+            'An empty schema yields no pg_class.relowner rows, so the default-privilege '
+            'pass depends entirely on the pg_namespace.nspowner branch of its owner '
+            'discovery -- which is what an app upgrade hits, recreating the schema and '
+            'running this script before the app has repopulated it.';
+    END;
+
+    BEGIN
+        PERFORM 1 FROM btracker_app.probe_after_grants;
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE EXCEPTION
+            'haf_fyp_user cannot read a table created in btracker_app by the SCHEMA '
+            'owner. The schema holds a relation owned by a DIFFERENT role, so the '
+            'pg_class scan finds that one and stops; without the pg_namespace.nspowner '
+            'branch the schema owner is never covered.';
+    END;
+END
+$$;
+
+RESET ROLE;
+
+-- Nothing above is fixture the later files should see: this is a probe, not seed data.
+ROLLBACK;

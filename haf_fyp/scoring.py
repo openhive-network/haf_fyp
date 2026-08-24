@@ -22,6 +22,8 @@ import pandas as pd
 import psycopg2
 import psycopg2.extras
 
+from haf_fyp.credibility import DEFAULT_CREDIBILITY
+
 log = logging.getLogger(__name__)
 
 
@@ -55,9 +57,15 @@ def compute_engagement_quality(df: pd.DataFrame, params: dict) -> pd.Series:
 def compute_credibility(authors: pd.Series, author_credibility: dict) -> pd.Series:
     """
     Author credibility score in [0, 1] from btracker VESTS + reptracker reputation.
-    Falls back to 0.3 for authors absent from the pre-fetched credibility dict.
+
+    Falls back to credibility.DEFAULT_CREDIBILITY for authors absent from the
+    pre-fetched dict -- which is every author when no source is readable, because
+    fetch_author_credibility returns {} rather than issuing a query it knows will
+    fail. Imported rather than restated: this used to be a bare 0.3 literal here
+    while credibility._DEFAULT_CREDIBILITY sat unreferenced, two copies of one
+    number free to drift apart.
     """
-    return authors.map(lambda a: author_credibility.get(a, 0.3))
+    return authors.map(lambda a: author_credibility.get(a, DEFAULT_CREDIBILITY))
 
 
 def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:

@@ -55,14 +55,27 @@ hived ──► sql_serializer ──► HAF PostgreSQL
 
 ### External HAF Apps (for full scoring accuracy)
 
-The ranker degrades gracefully without these — relevance defaults to 0.5 and credibility to 0.3 — but full accuracy requires all three to be installed and synced on the same PostgreSQL server:
+The ranker degrades gracefully without these — relevance defaults to 0.5, and credibility is computed from whichever source is available with the weights renormalised — but full accuracy requires all of them installed and synced on the same PostgreSQL server:
 
 | App | Provides | Degrades to |
 |-----|----------|-------------|
 | [HiveSense](https://gitlab.syncad.com/hive/hivesense) | 1024-dim post embeddings (`hivesense_app.posts_vectors`, halfvec; keyed by hivemind post id) | relevance = 0.5 neutral |
 | [Hivemind](https://gitlab.syncad.com/hive/hivemind) | `(author, permlink)` → hivemind post id, the bridge to HiveSense embeddings (`hivemind_app.hive_posts`) | relevance = 0.5 neutral |
-| [reputation_tracker](https://gitlab.syncad.com/hive/reputation_tracker) | Per-account reputation scores (`reptracker_app.account_reputations`) | credibility = 0.3 neutral |
-| [balance_tracker](https://gitlab.syncad.com/hive/balance_tracker) | Per-account VESTS stake (`btracker_app.current_account_balances`) | credibility = 0.3 neutral |
+| [reputation_tracker](https://gitlab.syncad.com/hive/reputation_tracker) | Per-account reputation scores (`reptracker_app.account_reputations`) | credibility from VESTS alone, renormalised |
+| [balance_tracker](https://gitlab.syncad.com/hive/balance_tracker) | Per-account VESTS stake (`btracker_app.current_account_balances`, or `btracker_backend` / `hafbe_bal` under the block explorer) | credibility from reputation alone, renormalised |
+
+With NEITHER credibility source readable, every author scores the 0.3 default. A
+missing component is dropped from the weighted average rather than scored 0 at full
+weight (#8) — zeroing it compressed every author's credibility into `[0, 0.6]` and
+shifted the ranking, so a missing tracker changed the ORDER of the feed rather than
+just widening it.
+
+`GET /metrics` reports each source as `readable` / `unreadable` / `absent`.
+`unreadable` means the relation exists but this deployment has lost `SELECT` on it —
+a repairable misconfiguration, fixed by re-running `scripts/grant_cross_schema.sh`.
+`absent` just means the app is not installed here. The distinction matters: those two
+used to be indistinguishable, so a lost grant silently degraded ranking quality with
+nothing to notice.
 
 After installing each external app, run:
 ```bash
@@ -118,7 +131,7 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Service health check |
-| GET | `/metrics` | Embedding-coverage health metric (#15) |
+| GET | `/metrics` | Embedding coverage (#15) + credibility source health (#8) |
 | GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
 | POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10 req/min) |
 | DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5 req/min) |
