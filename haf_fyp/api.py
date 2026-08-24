@@ -7,7 +7,7 @@ Handles write operations and admin actions that PostgREST cannot serve:
   POST   /v1/fyp/events            — impression / engagement telemetry (batched)
   POST   /v1/fyp/admin/algorithm   — activate an algorithm version (API-key gated)
   GET    /health                   — service health check
-  GET    /metrics                  — embedding-coverage health metric (#15)
+  GET    /metrics                  — embedding coverage (#15) + credibility sources (#8)
   GET    /sync-status              — uniform HAF-app sync freshness (#16)
 
 PostgREST (port 3001) serves all read endpoints from haf_fyp_endpoints schema.
@@ -34,7 +34,12 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from .auth import KeyLookupUnavailable, verify_interests, verify_interests_delete
-from .metrics import build_coverage_report, fetch_coverage_rows
+from .metrics import (
+    build_coverage_report,
+    build_credibility_sources_report,
+    fetch_coverage_rows,
+    fetch_credibility_sources,
+)
 from .sync_status import (
     ContextNotFound,
     InstanceNotReady,
@@ -317,36 +322,85 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/metrics")
-def metrics():
-    """
-    Embedding-coverage health metric (#15).
-
-    Per-day share of ranking candidates that have a HiveSense embedding, read from
-    the precomputed haf_fyp_app.embedding_coverage_daily rollup (refreshed hourly by
-    the ranker daemon — the underlying candidate scan is multi-second, so it is
-    never run inline here). A settled day whose coverage falls far below the recent
-    steady state (~80%; short posts legitimately have no embedding) is listed in
-    suspected_hole_days, catching a HiveSense embedding gap proactively rather than
-    by sampling served feeds. The current UTC day is reported but never flagged —
-    mid-day it reads low simply because the latest posts are not embedded yet.
-    """
-    assert _pool is not None
-    pool = _pool
-    conn = pool.getconn()
-    try:
-        rows = fetch_coverage_rows(conn)
-    finally:
-        pool.putconn(conn)
-    today = datetime.now(tz=timezone.utc).date()
-    return build_coverage_report(rows, today)
-
+# Real-time health data — never let a proxy or browser serve a stale answer. The
+# credibility section of /metrics is a live privilege probe: cached, it would keep
+# reporting degraded=false after a grant is lost, or degraded=true after
+# grant_cross_schema.sh has repaired it, which defeats re-probing every request.
+_METRICS_HEADERS = {"Cache-Control": "public, max-age=0"}
 
 # Sync status is real-time health data — never let a proxy or browser serve a
 # stale answer. Value matches haf_block_explorer's get_hafbe_sync_status.sql
 # byte for byte (verified live against the deployed btracker endpoint, which
 # emits the same literal); the issue text's "max-age=0" is satisfied by it.
 _SYNC_STATUS_HEADERS = {"Cache-Control": "public, max-age=0"}
+
+
+@app.get("/metrics")
+def metrics(response: Response):
+    """
+    Health metrics for the two signals that fail soft.
+
+    embedding_coverage (#15): per-day share of ranking candidates that have a
+    HiveSense embedding, read from the precomputed
+    haf_fyp_app.embedding_coverage_daily rollup (refreshed hourly by the ranker
+    daemon — the underlying candidate scan is multi-second, so it is never run
+    inline here). A settled day whose coverage falls far below the recent steady
+    state (~80%; short posts legitimately have no embedding) is listed in
+    suspected_hole_days, catching a HiveSense embedding gap proactively rather than
+    by sampling served feeds. The current UTC day is reported but never flagged —
+    mid-day it reads low simply because the latest posts are not embedded yet.
+
+    credibility_sources (#8): whether each foreign relation the credibility signal
+    reads is readable, unreadable or absent. Probed inline — one indexed catalog
+    read, and unlike the coverage rollup it cannot go stale. "unreadable" means the
+    relation exists but this role has lost SELECT on it, which is a repairable
+    misconfiguration (scripts/grant_cross_schema.sh); "absent" just means the app is
+    not deployed here. This answers for haf_fyp_user, whose privileges are a subset
+    of the ranker's haf_fyp_owner, so it can only err on the conservative side.
+
+    A failed credibility probe reports state "unknown" (and degraded true, which fails
+    safe for a monitor) rather than taking the coverage metric down with it. The
+    reverse does not hold: the coverage read runs first and is not optional, so if the
+    rollup is unreadable the whole endpoint 503s rather than serving half a report.
+    """
+    # _db_conn, not the inline getconn prologue: it borrows INSIDE the guarded region,
+    # so a PoolError("connection pool exhausted") -- reachable with maxconn=5 and a
+    # monitor polling both this and /sync-status -- is mapped to JSON here instead of
+    # escaping as a bare text/plain 500. This route also now issues two queries while
+    # holding the connection, which raises the exhaustion pressure that makes it worth
+    # doing. The remaining handlers still use the inline prologue (#17).
+    # Headers first: the 503 below raises, and a raised HTTPException is rendered from
+    # a fresh JSONResponse, so anything set on the injected `response` after this point
+    # never reaches an error reply. The error path needs the no-cache header at least as
+    # much as the success path -- a proxy holding a 503 outlives the outage that caused
+    # it -- so it is also passed explicitly on the exception, exactly as /sync-status
+    # does on each of its three.
+    response.headers.update(_METRICS_HEADERS)
+    try:
+        with _db_conn() as conn:
+            rows = fetch_coverage_rows(conn)
+            probe = fetch_credibility_sources(conn)
+    except psycopg2.pool.PoolError as exc:
+        # Monitors poll this route, so a persistently exhausted pool must not write a
+        # traceback per scrape. Same treatment /sync-status gives the identical error,
+        # and the reason metrics.py's own probe handler omits exc_info.
+        log.warning("metrics: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="metrics temporarily unavailable",
+            headers=_METRICS_HEADERS,
+        ) from None
+    except Exception:
+        log.exception("failed to read metrics")
+        raise HTTPException(
+            status_code=503,
+            detail="metrics temporarily unavailable",
+            headers=_METRICS_HEADERS,
+        ) from None
+    today = datetime.now(tz=timezone.utc).date()
+    report = build_coverage_report(rows, today)
+    report["credibility_sources"] = build_credibility_sources_report(probe)
+    return report
 
 
 @app.get("/sync-status", response_model=SyncStatusResponse)

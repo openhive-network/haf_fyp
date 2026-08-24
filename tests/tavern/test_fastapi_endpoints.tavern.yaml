@@ -25,6 +25,13 @@ stages:
       method: GET
     response:
       status_code: 200
+      # credibility_sources is a LIVE privilege probe, so a cached answer would keep
+      # reporting degraded=false after a grant is lost (or true after it is repaired),
+      # defeating the point of re-probing every request. Pinned here for the same
+      # reason /sync-status pins it below: without this, deleting the header — or the
+      # `response: Response` parameter that carries it — leaves the suite green.
+      headers:
+        cache-control: "public, max-age=0"
 
 ---
 test_name: POST /v1/fyp/interests requires a signature

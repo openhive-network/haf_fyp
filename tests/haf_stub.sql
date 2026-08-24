@@ -32,6 +32,23 @@ CREATE TABLE IF NOT EXISTS hafd.blocks (
     created_at TIMESTAMP NOT NULL
 );
 
+-- The name -> id table haf_fyp/credibility.py joins FROM, and the only hafd object
+-- db/cross_schema_grants.sql grants on UNGUARDED (no schema-existence IF, unlike
+-- every foreign-app block in that file). Its absence is why cross_schema_grants.sql
+-- could not be loaded in any lane at all, and therefore why that file's self-healing
+-- default-privilege pass went completely unexercised until #8.
+--
+-- Columns mirror the real definition (haf/src/hive_fork_manager/irreversible_blocks
+-- .sql): id INTEGER PK, name VARCHAR(16) NOT NULL UNIQUE, block_num INTEGER nullable.
+-- The real table also carries an FK on block_num, omitted here because the stub has
+-- no ingestion path that would exercise it.
+CREATE TABLE IF NOT EXISTS hafd.accounts (
+    id INT PRIMARY KEY,
+    name VARCHAR(16) NOT NULL,
+    block_num INT,
+    CONSTRAINT uq_hive_accounts_name UNIQUE (name)
+);
+
 -- Readiness is driven by a ROW, not a session GUC. A GUC could only be set on the
 -- session issuing it, and the FastAPI app reads through a pooled connection no
 -- test holds a handle to — so the 503 massive-sync path was unreachable from any

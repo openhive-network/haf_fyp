@@ -128,7 +128,34 @@ psql_cmd -c "
 # 12. Cross-schema grants (hivesense_app, reptracker_app, btracker_app, hafd).
 #     Schemas that don't exist yet are skipped with a NOTICE — re-run
 #     scripts/grant_cross_schema.sh after installing each external app.
-run_sql_file "${SCRIPT_DIR}/../db/cross_schema_grants.sql"
+#
+#     The outcome is inspected here, not only in grant_cross_schema.sh. This is the
+#     PRIMARY path — docker-compose's haf-fyp-setup runs install_app.sh and never runs
+#     grant_cross_schema.sh — and "Self-healing FAILED" is a RAISE WARNING, which does
+#     not trip ON_ERROR_STOP. Without this check the installer prints success, every
+#     dependent service starts, and self-healing is silently off: the same
+#     warning-in-a-scrolling-log failure that cross_schema_grants.sql's own handler
+#     comment argues must reach ON_ERROR_STOP. set +e for the reason given in
+#     grant_cross_schema.sh: a failing command substitution under set -e kills the
+#     script before its output can be replayed.
+set +e
+_grants_output="$(run_sql_file "${SCRIPT_DIR}/../db/cross_schema_grants.sql" 2>&1)"
+_grants_status=$?
+set -e
+echo "${_grants_output}"
+
+if [ "${_grants_status}" -ne 0 ]; then
+    log "ERROR: cross_schema_grants.sql failed (psql exit ${_grants_status}) — see output above."
+    exit "${_grants_status}"
+fi
+
+if grep -q 'Self-healing FAILED' <<<"${_grants_output}"; then
+    log "ERROR: cross-schema self-healing set nothing while targets are installed."
+    log "       The credibility signal will silently lose its grants the next time a"
+    log "       foreign app is upgraded. Install as haf_admin, or as a member of the"
+    log "       foreign owner roles, then re-run."
+    exit 1
+fi
 
 # 13. Post-install assertion for GET /sync-status (#16). SET ROLE drops superuser,
 #     so this runs the endpoint's exact query as the exact role, exercising the

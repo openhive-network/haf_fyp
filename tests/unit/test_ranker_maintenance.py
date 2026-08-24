@@ -1,5 +1,6 @@
-"""Unit tests for the ranker daemon's feed_events maintenance (#12)."""
+"""Unit tests for the ranker daemon's maintenance passes (#12) and #8 reporting."""
 
+import logging
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -314,3 +315,59 @@ def test_cycle_is_topped_up_after_eviction_rather_than_running_short(monkeypatch
     )
     assert len(ranked) == len(set(ranked)), "no user may be ranked twice across refills"
     assert not set(ranked) & gone, "an evicted user must never be ranked"
+
+
+# ---------------------------------------------------------------------------
+# #8: how a lost credibility grant is reported
+# ---------------------------------------------------------------------------
+
+
+class _FakePgError(Exception):
+    """Carries a settable pgcode; see tests/unit/test_sync_status.py."""
+
+    def __init__(self, pgcode, message):
+        super().__init__(message)
+        self.pgcode = pgcode
+
+
+def test_lost_grant_logs_one_actionable_warning_not_a_traceback(monkeypatch, caplog):
+    # A misconfiguration with a known remedy repeats every cycle until someone
+    # acts on it. A stack trace each time buries the one line that says what to do.
+    conn = MagicMock()
+    monkeypatch.setattr(
+        rd,
+        "fetch_author_credibility",
+        MagicMock(side_effect=_FakePgError("42501", "permission denied for table x")),
+    )
+    with caplog.at_level(logging.INFO, logger="haf_fyp.ranker_daemon"):
+        assert rd._fetch_author_credibility_safe(conn, ["a"]) == {}
+
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+    assert "grant_cross_schema.sh" in caplog.records[0].getMessage()
+    assert caplog.records[0].exc_info is None
+    conn.rollback.assert_called_once()
+
+
+def test_other_failures_keep_their_traceback(monkeypatch, caplog):
+    conn = MagicMock()
+    monkeypatch.setattr(
+        rd, "fetch_author_credibility", MagicMock(side_effect=RuntimeError("boom"))
+    )
+    with caplog.at_level(logging.INFO, logger="haf_fyp.ranker_daemon"):
+        assert rd._fetch_author_credibility_safe(conn, ["a"]) == {}
+
+    assert [r.levelno for r in caplog.records] == [logging.ERROR]
+    assert caplog.records[0].exc_info is not None
+    conn.rollback.assert_called_once()
+
+
+def test_connection_loss_still_propagates_to_the_reconnect_path(monkeypatch):
+    conn = MagicMock()
+    monkeypatch.setattr(
+        rd,
+        "fetch_author_credibility",
+        MagicMock(side_effect=psycopg2.OperationalError("gone")),
+    )
+    with pytest.raises(psycopg2.OperationalError):
+        rd._fetch_author_credibility_safe(conn, ["a"])
+    conn.rollback.assert_not_called()

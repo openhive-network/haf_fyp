@@ -22,11 +22,14 @@
 -- auto-grants to haf_fyp. See hive/haf_fyp#6.
 --
 -- Schemas granted:
---   hivesense_app  — post embedding vectors (semantic relevance signal)
---   hivemind_app   — author/permlink → hivemind post id (bridge to HiveSense embeddings)
---   reptracker_app — account reputation scores (credibility signal)
---   btracker_app   — account VESTS balances (credibility signal)
---   hafd           — core HAF accounts table (name → id resolution)
+--   hivesense_app    — post embedding vectors (semantic relevance signal)
+--   hivemind_app     — author/permlink → hivemind post id (bridge to HiveSense embeddings)
+--   hivemind_postgrest_utilities — the bridge post builders + nai_currency_map
+--   reptracker_app   — account reputation scores (credibility signal)
+--   btracker_app     — account VESTS balances (credibility signal)
+--   btracker_backend — same balances, block-explorer layout (a VIEW)
+--   hafbe_bal        — same balances, block-explorer layout
+--   hafd             — core HAF accounts table (name → id resolution)
 
 DO $$
 BEGIN
@@ -146,6 +149,8 @@ $$;
 -- hafbe_bal schema instead of btracker_app. fetch_author_credibility auto-detects
 -- whichever of these is readable, so grant access to any that are present.
 DO $$
+DECLARE
+    _found int := 0;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata WHERE schema_name = 'btracker_backend'
@@ -153,6 +158,7 @@ BEGIN
         GRANT USAGE ON SCHEMA btracker_backend TO haf_fyp_user, haf_fyp_owner;
         GRANT SELECT ON ALL TABLES IN SCHEMA btracker_backend TO haf_fyp_user, haf_fyp_owner;
         RAISE NOTICE 'btracker_backend: granted SELECT to haf_fyp_user, haf_fyp_owner';
+        _found := _found + 1;
     END IF;
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata WHERE schema_name = 'hafbe_bal'
@@ -160,6 +166,15 @@ BEGIN
         GRANT USAGE ON SCHEMA hafbe_bal TO haf_fyp_user, haf_fyp_owner;
         GRANT SELECT ON ALL TABLES IN SCHEMA hafbe_bal TO haf_fyp_user, haf_fyp_owner;
         RAISE NOTICE 'hafbe_bal: granted SELECT to haf_fyp_user, haf_fyp_owner';
+        _found := _found + 1;
+    END IF;
+    -- Said out loud because this block alone had no ELSE: on a deployment where
+    -- balance_tracker lives ONLY here, the operator saw nothing at all and could not
+    -- tell "granted" from "did nothing". Not an error and usually not even a problem
+    -- — these two are the block-explorer layout and btracker_app above is the
+    -- standalone one, so exactly one of the three is normally present.
+    IF _found = 0 THEN
+        RAISE NOTICE 'btracker_backend / hafbe_bal not found — expected unless balance_tracker is deployed under the block explorer (btracker_app above is the standalone location)';
     END IF;
 END
 $$;
@@ -201,54 +216,133 @@ GRANT SELECT ON hafd.accounts TO haf_fyp_user;
 -- revoke it, so a recreated function stays executable by haf_fyp_user with no grant
 -- at all. Schema-level USAGE likewise does not lapse when objects are recreated.
 --
--- Scope — only the schemas whose loss is a hard failure are self-healed:
+-- Scope — every foreign APP schema haf_fyp reads is now self-healed (#8):
 --   * hivemind_app / hivemind_postgrest_utilities — the feed endpoints read these
 --     as haf_fyp_user; losing SELECT 401s Discover outright.
 --   * hivesense_app — the Python ranker reads posts_vectors directly; losing SELECT
 --     makes every ranking attempt throw, users get skipped, and feeds silently go
 --     stale with no HTTP error to notice. hivesense is also rebuilt most often.
+--   * reptracker_app / btracker_app / btracker_backend / hafbe_bal — the author
+--     credibility signal.
 --
--- reptracker_app / btracker_app / btracker_backend / hafbe_bal are deliberately NOT
--- included. They feed the credibility signal, which is designed to fail soft:
--- ranker_daemon._fetch_author_credibility_safe() catches the error, rolls back and
--- continues with neutral credibility. Losing those grants degrades ranking quality
--- until this script is re-run, but never breaks a request or a cycle — so they do
--- not warrant writing default-privilege policy into other apps' owner roles. Tracked
--- separately.
+-- hafd is the deliberate exception, and it is worth being explicit because
+-- credibility.py probes hafd.accounts precisely BECAUSE losing it is total rather
+-- than partial. It is not in _targets because it is not a peer app: it is HAF core,
+-- owned by hived_group, and writing default-privilege policy into the extension's own
+-- role reaches further than anything else here does. Its recreation also implies the
+-- HAF instance itself was reinstalled, after which install_app.sh runs this file again
+-- anyway. The probe reports an unreadable hafd.accounts at WARNING, so the state is
+-- visible even though it is not repaired automatically.
+--
+-- #8 REVERSES the earlier decision to leave the credibility schemas out. It rested on
+-- "the signal fails soft, so it never breaks a request or a cycle". Three parts of
+-- that did not hold up:
+--
+--   * Failing SOFT is not failing VISIBLY. credibility.py resolved the VESTS relation
+--     through information_schema.tables, which lists only relations the caller holds a
+--     privilege on — so a REVOKED grant and an UNINSTALLED app were byte-identical.
+--     The daemon logged a healthy "credibility scores for N / N authors" regardless.
+--   * Nor was it NEUTRAL. Dropping the VESTS term scored it 0 at weight 0.4 instead of
+--     renormalising, compressing every author into [0, 0.6] — a lost grant changed the
+--     ORDER of the feed, not just its scale.
+--   * reptracker_app was never soft at all: its join was UNCONDITIONAL, so losing that
+--     grant threw 42501 for the whole batch and every author, reputation included,
+--     collapsed to the default until someone re-ran this script.
+--
+-- The cost is the one already paid for hivemind/hivesense: one pg_default_acl row per
+-- (owner role, schema), SELECT only, to two roles.
+--
+-- HONEST LIMIT on two of the four, so nobody over-trusts this. hive.app_reset_data()
+-- does DROP SCHEMA IF EXISTS <context name> CASCADE, and for btracker_app and
+-- hafbe_bal the context name EQUALS the schema name (unlike haf_fyp: context 'haf_fyp',
+-- schema 'haf_fyp_app' — see db/haf_fyp_app.sql). A live node's hafd.contexts_log
+-- records exactly that reset for both, and a dropped schema takes its pg_default_acl
+-- rows with it — so for those two the OBSERVED recreation path still needs a re-run.
+-- btracker_backend is weaker again: CREATE OR REPLACE VIEW keeps the relation's OID
+-- and ACL, so nothing is lost there to heal. reptracker_app is the clear win. All four
+-- are included because the cost is a couple of catalog rows and relation-level rebuilds
+-- do happen — not because all four are equally covered.
 --
 -- Still requires re-running this script:
 --   * A full DROP/CREATE of a schema itself — default privileges are recorded
 --     against the schema and are discarded along with it.
+--   * An installer that is neither a superuser nor a member of the owner role. The
+--     loop below NOTICEs and leaves that schema's grants one-shot.
 --   * A foreign app that starts revoking PUBLIC EXECUTE on its functions.
 --
--- See hive/haf_fyp#6.
+-- NOT COVERED EVEN WHEN THIS WORKS: a VIEW that stays readable to us while its owner
+-- loses SELECT on the base table behind it. has_table_privilege on the view is still
+-- true and the SELECT still fails 42501. No catalog probe can see that; the ranker
+-- reports it at WARNING when the query actually fails.
+--
+-- So the degradation is SURFACED as well as repaired. haf_fyp/credibility.py probes
+-- ACL-BLIND catalogs (pg_class / pg_namespace plus has_schema_privilege /
+-- has_table_privilege on OIDs — never information_schema, never to_regclass, both of
+-- which hide or throw in the very state being measured), which makes "absent" and
+-- "present but unreadable" distinguishable. It re-probes every cycle rather than
+-- caching for the process lifetime, logs only on state TRANSITIONS, and GET /metrics
+-- reports it under "credibility_sources".
+--
+-- See hive/haf_fyp#6 and hive/haf_fyp#8.
 DO $$
 DECLARE
     -- schema name -> roles that need SELECT on it (mirrors the grants above).
     _targets CONSTANT text[][] := ARRAY[
+        -- Hard failures: an HTTP 401, or a ranking cycle that throws (#6).
         ['hivemind_app',                 'haf_fyp_user, haf_fyp_owner'],
         ['hivemind_postgrest_utilities', 'haf_fyp_user, haf_fyp_owner'],
-        ['hivesense_app',                'haf_fyp_user, haf_fyp_owner']
+        ['hivesense_app',                'haf_fyp_user, haf_fyp_owner'],
+        -- Credibility (#8). Soft failures, but silent ones that shifted the
+        -- ranking rather than merely narrowing it — see the scope note above.
+        ['reptracker_app',               'haf_fyp_user, haf_fyp_owner'],
+        ['btracker_app',                 'haf_fyp_user, haf_fyp_owner'],
+        ['btracker_backend',             'haf_fyp_user, haf_fyp_owner'],
+        ['hafbe_bal',                    'haf_fyp_user, haf_fyp_owner']
     ];
     _schema   text;
     _grantees text;
     _owner    text;
     _healed   int := 0;
+    _skipped  int := 0;
 BEGIN
     FOR _i IN 1 .. array_length(_targets, 1) LOOP
         _schema   := _targets[_i][1];
         _grantees := _targets[_i][2];
 
+        -- pg_namespace, NOT information_schema.schemata. That view is gated on
+        -- pg_has_role(nspowner,'USAGE') OR has_schema_privilege(oid,'CREATE, USAGE'),
+        -- so an installer without rights on a foreign schema reads "not found" for a
+        -- schema that plainly exists — the same existence-vs-visibility conflation
+        -- this file's scope note describes in credibility.py, one layer up. Gating on
+        -- it would silently drop a real target instead of reaching the handler below.
         CONTINUE WHEN NOT EXISTS (
-            SELECT 1 FROM information_schema.schemata WHERE schema_name = _schema
+            SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = _schema
         );
 
         FOR _owner IN
-            SELECT DISTINCT pg_get_userbyid(c.relowner)
+            -- The schema OWNER, even when the schema currently holds nothing. An
+            -- empty schema yields no relowner rows at all, so this pass used to set
+            -- nothing and the FIRST relation the app created would be unreadable —
+            -- the exact failure this block exists to prevent, in the exact window
+            -- where it is most likely (a schema recreated by an upgrade and probed
+            -- before the app has repopulated it).
+            SELECT pg_get_userbyid(n.nspowner)
+              FROM pg_namespace n
+             WHERE n.nspname = _schema
+            UNION
+            -- Plus every role owning a relation there today. Multi-owner is real:
+            -- hivemind_app and hivesense_app both are, and default privileges are
+            -- recorded per (owner role, schema), so taking one would under-cover.
+            --
+            -- relkind r/p/v/m/f is exactly the set ALTER DEFAULT PRIVILEGES ... ON
+            -- TABLES covers. 'v' is load-bearing rather than decorative:
+            -- btracker_backend exposes current_account_balances_view, one of the
+            -- three relations haf_fyp/credibility.py will accept for the VESTS join.
+            SELECT pg_get_userbyid(c.relowner)
               FROM pg_class c
               JOIN pg_namespace n ON n.oid = c.relnamespace
              WHERE n.nspname = _schema
-               AND c.relkind IN ('r', 'v', 'm')
+               AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
         LOOP
             BEGIN
                 EXECUTE format(
@@ -260,17 +354,42 @@ BEGIN
                 RAISE NOTICE '%: default SELECT set for owner role % -> % (auto re-grant on recreation)',
                     _schema, _owner, _grantees;
             EXCEPTION WHEN insufficient_privilege THEN
-                -- Needs superuser, or membership in the owner role. Fall back to the
-                -- previous behaviour: grants stay one-shot and the script must be
-                -- re-run after that app is upgraded.
-                RAISE NOTICE '%: could not set default privileges for owner role % (needs superuser or membership) — re-run grant_cross_schema.sh after % upgrades',
-                    _schema, _owner, _schema;
+                -- The ONE expected failure: ALTER DEFAULT PRIVILEGES FOR ROLE x needs
+                -- superuser or membership in x. Fall back to the previous behaviour —
+                -- grants stay one-shot and the script must be re-run after that app is
+                -- upgraded.
+                --
+                -- Deliberately NOT `WHEN OTHERS`. Widening it swallows defects in THIS
+                -- file: a typo in a _targets grantee list raises 42704 ("role does not
+                -- exist") for every owner, and under WHEN OTHERS that becomes a NOTICE
+                -- in a scrolling installer log while install_app.sh still reports
+                -- success — with self-healing silently switched off. A broken format()
+                -- call behaves the same way. Those are defects in this file, not
+                -- conditions to degrade around, so they must reach ON_ERROR_STOP.
+                _skipped := _skipped + 1;
+                RAISE NOTICE '%: could not set default privileges for owner role % (needs superuser or membership in %) — re-run grant_cross_schema.sh after % upgrades',
+                    _schema, _owner, _owner, _schema;
             END;
         END LOOP;
     END LOOP;
 
-    IF _healed = 0 THEN
-        RAISE NOTICE 'No default privileges were set — cross-schema grants will need a re-run after any foreign app is upgraded';
+    IF _healed = 0 AND _skipped = 0 THEN
+        -- Benign: no target schema is installed yet. Normal on a fresh node before
+        -- HiveSense/btracker/reptracker land.
+        RAISE NOTICE 'No self-healing targets are installed yet — re-run grant_cross_schema.sh after installing each foreign app';
+    ELSIF _healed = 0 THEN
+        -- NOT benign, and previously indistinguishable from the line above: targets
+        -- exist and NONE could be healed. The usual cause is running as a role that is
+        -- neither a superuser nor a member of the owner roles, which otherwise exits 0
+        -- and looks like a clean run.
+        RAISE WARNING 'Self-healing FAILED: 0 set, % skipped. Every target kept one-shot grants. Re-run as haf_admin (or a member of the owner roles).',
+            _skipped;
+    ELSIF _skipped > 0 THEN
+        -- A PARTIAL failure used to be silent: this summary only spoke when NOTHING
+        -- healed, so six schemas succeeding and one failing produced no closing line
+        -- and the per-owner NOTICE scrolled away in the install log.
+        RAISE WARNING 'Self-healing incomplete: % owner/schema pair(s) set, % skipped. Those schemas keep one-shot grants — re-run grant_cross_schema.sh after they are upgraded.',
+            _healed, _skipped;
     END IF;
 END
 $$;

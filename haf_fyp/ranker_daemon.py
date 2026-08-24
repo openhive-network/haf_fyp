@@ -39,7 +39,7 @@ import psycopg2
 import psycopg2.extras
 import redis as redis_lib
 
-from haf_fyp.credibility import fetch_author_credibility
+from haf_fyp.credibility import credibility_failure_message, fetch_author_credibility
 from haf_fyp.embeddings import fetch_post_vectors, register_vector_type
 from haf_fyp.scoring import (
     bootstrap_vector_from_communities,
@@ -237,13 +237,24 @@ def _fetch_author_credibility_safe(conn, authors: list[str]) -> dict:
     defaults missing authors to a neutral value, so a query failure must not
     abort the cycle. Roll back the poisoned transaction and return {} on any
     non-connection error; let OperationalError propagate to the reconnect path.
+
+    #8: a lost cross-schema grant is reported as one actionable WARNING rather than
+    a stack trace. It is a misconfiguration with a known remedy, not a bug, and it
+    repeats every cycle until someone acts on it -- a traceback each time buries the
+    one line that says what to do. Everything else keeps its traceback. The
+    predicate and the message live in credibility.py because .coveragerc omits this
+    module, so a test written here would not count (see haf_fyp/sync_status.py:15).
     """
     try:
         return fetch_author_credibility(conn, authors)
     except psycopg2.OperationalError:
         raise
-    except Exception:
-        log.exception("credibility fetch failed — continuing with neutral credibility")
+    except Exception as exc:
+        message = credibility_failure_message(exc)
+        if message:
+            log.warning("%s", message)
+        else:
+            log.exception("credibility fetch failed — continuing with neutral credibility")
         conn.rollback()
         return {}
 
