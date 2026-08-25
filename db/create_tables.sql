@@ -224,9 +224,17 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.global_feed_cache (
     score_recency float,
     score_credibility float,
     rank int NOT NULL,
+    algorithm_version varchar(16),
     computed_at timestamp,
     PRIMARY KEY (post_id)
 );
+
+-- Added via ALTER as well so in-place upgrades pick up the column (the CREATE
+-- above is IF NOT EXISTS and is a no-op on an already-installed table).
+-- Mirrors feed_cache.algorithm_version: without it every Discover impression is
+-- unattributable in feed_metrics_daily (#23).
+ALTER TABLE haf_fyp_app.global_feed_cache
+ADD COLUMN IF NOT EXISTS algorithm_version varchar(16);
 
 CREATE INDEX IF NOT EXISTS idx_global_feed_rank
 ON haf_fyp_app.global_feed_cache (rank ASC);

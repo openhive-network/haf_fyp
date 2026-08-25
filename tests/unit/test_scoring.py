@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 import haf_fyp.embeddings as embeddings
+import haf_fyp.scoring as scoring
 from haf_fyp.scoring import (
     _apply_diversity_cap,
     bootstrap_vector_from_communities,
@@ -329,3 +330,88 @@ class TestDiversityCap:
         assert out["community_id"].tolist()[:3].count(500) <= 2
         # every post still present
         assert sorted(out["post_id"]) == [0, 1, 2, 3, 4, 5]
+
+
+class _CapturingCursor:
+    """Captures execute_values' rows via the module-level psycopg2 shim."""
+
+    def __init__(self, sink):
+        self._sink = sink
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self._sink["deleted"] = "DELETE FROM haf_fyp_app.global_feed_cache" in sql
+
+
+class _CapturingConn:
+    def __init__(self, sink):
+        self._sink = sink
+
+    def cursor(self):
+        return _CapturingCursor(self._sink)
+
+    def commit(self):
+        self._sink["committed"] = True
+
+
+class TestWriteGlobalFeedCacheStampsAlgorithmVersion:
+    """#23: algo_version was accepted by write_global_feed_cache and then dropped.
+
+    Every global-sourced impression — /v1/fyp/global AND the cold-start fallback
+    inside get_personalized_feed — was therefore unattributable in
+    feed_metrics_daily. A test that only asserted "the row was written" would not
+    have caught it, so this asserts the value reaches the INSERT.
+    """
+
+    def _run(self, monkeypatch, algo_version):
+        sink = {}
+        captured = {}
+
+        def fake_execute_values(cur, sql, rows):
+            captured["sql"] = sql
+            captured["rows"] = rows
+
+        monkeypatch.setattr(
+            scoring.psycopg2.extras, "execute_values", fake_execute_values
+        )
+        monkeypatch.setattr(scoring, "render_bridge_for_posts", lambda *a, **k: None)
+
+        df = pd.DataFrame(
+            [
+                {
+                    "post_id": 11,
+                    "final_score": 0.9,
+                    "score_engagement": 0.5,
+                    "score_recency": 0.4,
+                    "score_credibility": 0.3,
+                },
+                {
+                    "post_id": 22,
+                    "final_score": 0.8,
+                    "score_engagement": 0.5,
+                    "score_recency": 0.4,
+                    "score_credibility": 0.3,
+                },
+            ]
+        )
+        scoring.write_global_feed_cache(_CapturingConn(sink), df, algo_version)
+        return captured
+
+    def test_algorithm_version_is_in_the_insert_columns(self, monkeypatch):
+        captured = self._run(monkeypatch, "1.2.0")
+        assert "algorithm_version" in captured["sql"]
+
+    def test_every_row_carries_the_version(self, monkeypatch):
+        captured = self._run(monkeypatch, "1.2.0")
+        # (post_id, final_score, engagement, recency, credibility, rank, algo, now)
+        assert [r[6] for r in captured["rows"]] == ["1.2.0", "1.2.0"]
+
+    def test_rank_is_still_positional_after_the_added_column(self, monkeypatch):
+        # Guards the off-by-one the new tuple element could introduce.
+        captured = self._run(monkeypatch, "1.2.0")
+        assert [r[5] for r in captured["rows"]] == [1, 2]
