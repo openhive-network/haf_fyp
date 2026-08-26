@@ -868,7 +868,7 @@ DECLARE
           "Feed"
         ],
         "summary": "Feed quality metrics",
-        "description": "Aggregated feed-quality metrics from the telemetry rollup (feed_metrics_daily, #12), summed over a date range and grouped by algorithm_version / source / rank. Enables engagement-rate@rank, open rate, and average dwell/watch \u2014 and A/B comparison across algorithm_version. NON-AUTHORITATIVE: derived from the unauthenticated /v1/fyp/events log (username is client-claimed), so treat figures as directional and corroborate against on-chain engagement. Global-sourced rows carry the algorithm_version that produced them (#23), but the global feed is identical for every viewer, so it supports longitudinal before/after comparison rather than concurrent A/B arms. Rows recorded before that change remain keyed under algorithm_version '' (the column is NOT NULL DEFAULT ''), so historical global-feed metrics live in the '' bucket and are not backfilled.",
+        "description": "Aggregated feed-quality metrics from the telemetry rollup (feed_metrics_daily, #12), summed over a date range and grouped by algorithm_version / source / rank. Enables engagement-rate@rank, open rate, and average dwell/watch \u2014 and A/B comparison across algorithm_version. NON-AUTHORITATIVE: derived from the unauthenticated /v1/fyp/events log (username is client-claimed), so treat figures as directional and corroborate against on-chain engagement. Global-feed responses now carry the algorithm_version that produced them (#23), so clients that echo it back yield attributed global rows; the server never derives this column, so anything a client omits still lands in the '' bucket (feed_metrics_daily.algorithm_version is NOT NULL DEFAULT ''). Rows recorded before #23 sit in '' for the same reason and are not backfilled. The global feed is identical for every viewer, so global-source attribution supports longitudinal before/after comparison rather than concurrent A/B arms.",
         "operationId": "haf_fyp_endpoints.get_feed_metrics",
         "parameters": [
           {
@@ -1564,8 +1564,7 @@ BEGIN
                         'post_id', gfc.post_id::text,
                         -- Stamped by the ranker (#23); was hardcoded NULL, which left
                         -- every global-sourced impression unattributable in
-                        -- feed_metrics_daily -- including the cold-start fallback this
-                        -- endpoint serves to users who have no personalized feed yet.
+                        -- feed_metrics_daily.
                         -- The global feed is identical for every viewer, so only one
                         -- version produces it at a time: this buys LONGITUDINAL
                         -- attribution across a version change, not concurrent A/B arms.
@@ -1780,17 +1779,19 @@ $$;
     description: >-
       Aggregated feed-quality metrics from the telemetry rollup
       (feed_metrics_daily, #12), summed over a date range and grouped by
-      algorithm_version / source / rank. Enables engagement-rate@rank, open rate,
-      and average dwell/watch — and A/B comparison across algorithm_version.
-      NON-AUTHORITATIVE: derived from the unauthenticated /v1/fyp/events log
-      (username is client-claimed), so treat figures as directional and
-      corroborate against on-chain engagement. Global-sourced rows carry
-      the algorithm_version that produced them (#23), but the global feed is
-      identical for every viewer, so it supports longitudinal before/after
-      comparison rather than concurrent A/B arms. Rows recorded before that
-      change remain keyed under algorithm_version '' (the column is NOT NULL
-      DEFAULT ''), so historical global-feed metrics live in the '' bucket and
-      are not backfilled.
+      algorithm_version / source / rank. Enables engagement-rate@rank, open
+      rate, and average dwell/watch — and A/B comparison across
+      algorithm_version. NON-AUTHORITATIVE: derived from the unauthenticated
+      /v1/fyp/events log (username is client-claimed), so treat figures as
+      directional and corroborate against on-chain engagement. Global-feed
+      responses now carry the algorithm_version that produced them (#23), so
+      clients that echo it back yield attributed global rows; the server never
+      derives this column, so anything a client omits still lands in the ''
+      bucket (feed_metrics_daily.algorithm_version is NOT NULL DEFAULT '').
+      Rows recorded before #23 sit in '' for the same reason and are not
+      backfilled. The global feed is identical for every viewer, so
+      global-source attribution supports longitudinal before/after comparison
+      rather than concurrent A/B arms.
     operationId: haf_fyp_endpoints.get_feed_metrics
     parameters:
       - in: query
