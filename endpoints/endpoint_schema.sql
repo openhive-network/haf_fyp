@@ -74,7 +74,7 @@ schemas:
       algorithm_version:
         type: string
         nullable: true
-        description: Ranking algorithm version that produced this entry, for A/B analysis (null in the global feed).
+        description: Ranking algorithm version that produced this entry, for A/B analysis. Global-sourced entries carry it too (#23); null only for entries written before that change.
  */
 
 /** openapi:components
@@ -288,7 +288,7 @@ DECLARE
           "algorithm_version": {
             "type": "string",
             "nullable": true,
-            "description": "Ranking algorithm version that produced this entry, for A/B analysis (null in the global feed)."
+            "description": "Ranking algorithm version that produced this entry, for A/B analysis. Global-sourced entries carry it too (#23); null only for entries written before that change."
           }
         }
       },
@@ -1784,8 +1784,8 @@ $$;
       and average dwell/watch — and A/B comparison across algorithm_version.
       NON-AUTHORITATIVE: derived from the unauthenticated /v1/fyp/events log
       (username is client-claimed), so treat figures as directional and
-      corroborate against on-chain engagement. Global-feed rows carry
-      the algorithm_version that produced them (#23); the global feed is
+      corroborate against on-chain engagement. Global-sourced rows carry
+      the algorithm_version that produced them (#23), but the global feed is
       identical for every viewer, so it supports longitudinal before/after
       comparison rather than concurrent A/B arms.
     operationId: haf_fyp_endpoints.get_feed_metrics

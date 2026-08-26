@@ -368,8 +368,8 @@ class TestWriteGlobalFeedCacheStampsAlgorithmVersion:
     have caught it, so this asserts the value reaches the INSERT.
     """
 
-    def _run(self, monkeypatch, algo_version):
-        sink = {}
+    def _run(self, monkeypatch, algo_version, sink=None):
+        sink = {} if sink is None else sink
         captured = {}
 
         def fake_execute_values(cur, sql, rows):
@@ -415,3 +415,12 @@ class TestWriteGlobalFeedCacheStampsAlgorithmVersion:
         # Guards the off-by-one the new tuple element could introduce.
         captured = self._run(monkeypatch, "1.2.0")
         assert [r[5] for r in captured["rows"]] == [1, 2]
+
+    def test_the_table_is_replaced_not_appended(self, monkeypatch):
+        # The DELETE-then-INSERT is load-bearing: global_feed_cache is a full
+        # replacement each cycle, which is why no migration is needed for the
+        # added column. The sink was previously captured and never asserted on.
+        sink = {}
+        self._run(monkeypatch, "1.2.0", sink=sink)
+        assert sink.get("deleted") is True
+        assert sink.get("committed") is True
