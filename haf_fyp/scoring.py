@@ -540,7 +540,12 @@ def write_feed_cache(
 
 
 def write_global_feed_cache(conn, scored_df: pd.DataFrame, algo_version: str) -> None:
-    """Replace global_feed_cache with the top 200 posts by base score."""
+    """Replace global_feed_cache with the top 200 posts by base score.
+
+    algo_version is stamped on every row (#23). It used to be accepted here and
+    then dropped, which left every global-sourced impression unattributable --
+    both /v1/fyp/global and the cold-start fallback inside get_personalized_feed.
+    """
     top = scored_df.head(200)
     now = datetime.utcnow()
     rows = [
@@ -551,6 +556,7 @@ def write_global_feed_cache(conn, scored_df: pd.DataFrame, algo_version: str) ->
             float(row.score_recency),
             float(row.score_credibility),
             rank + 1,
+            algo_version,
             now,
         )
         for rank, row in enumerate(top.itertuples(index=False))
@@ -562,7 +568,7 @@ def write_global_feed_cache(conn, scored_df: pd.DataFrame, algo_version: str) ->
             """
             INSERT INTO haf_fyp_app.global_feed_cache
                 (post_id, final_score, score_engagement, score_recency,
-                 score_credibility, rank, computed_at)
+                 score_credibility, rank, algorithm_version, computed_at)
             VALUES %s
             """,
             rows,

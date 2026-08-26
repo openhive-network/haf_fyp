@@ -74,7 +74,7 @@ schemas:
       algorithm_version:
         type: string
         nullable: true
-        description: Ranking algorithm version that produced this entry, for A/B analysis (null in the global feed).
+        description: Ranking algorithm version that produced this entry, for A/B analysis. Global-sourced entries carry it too (#23); null only for entries written before that change.
  */
 
 /** openapi:components
@@ -288,7 +288,7 @@ DECLARE
           "algorithm_version": {
             "type": "string",
             "nullable": true,
-            "description": "Ranking algorithm version that produced this entry, for A/B analysis (null in the global feed)."
+            "description": "Ranking algorithm version that produced this entry, for A/B analysis. Global-sourced entries carry it too (#23); null only for entries written before that change."
           }
         }
       },
@@ -868,7 +868,7 @@ DECLARE
           "Feed"
         ],
         "summary": "Feed quality metrics",
-        "description": "Aggregated feed-quality metrics from the telemetry rollup (feed_metrics_daily, #12), summed over a date range and grouped by algorithm_version / source / rank. Enables engagement-rate@rank, open rate, and average dwell/watch \u2014 and A/B comparison across algorithm_version. NON-AUTHORITATIVE: derived from the unauthenticated /v1/fyp/events log (username is client-claimed), so treat figures as directional and corroborate against on-chain engagement. Global-feed rows carry algorithm_version '' (no per-version A/B on the global feed).",
+        "description": "Aggregated feed-quality metrics from the telemetry rollup (feed_metrics_daily, #12), summed over a date range and grouped by algorithm_version / source / rank. Enables engagement-rate@rank, open rate, and average dwell/watch \u2014 and A/B comparison across algorithm_version. NON-AUTHORITATIVE: derived from the unauthenticated /v1/fyp/events log (username is client-claimed), so treat figures as directional and corroborate against on-chain engagement. Global-feed responses now carry the algorithm_version that produced them (#23), so clients that echo it back yield attributed global rows; the server never derives this column, so anything a client omits still lands in the '' bucket (feed_metrics_daily.algorithm_version is NOT NULL DEFAULT ''). Rows recorded before #23 sit in '' for the same reason and are not backfilled. The global feed is identical for every viewer, so global-source attribution supports longitudinal before/after comparison rather than concurrent A/B arms.",
         "operationId": "haf_fyp_endpoints.get_feed_metrics",
         "parameters": [
           {
@@ -1413,10 +1413,16 @@ BEGIN
                         'score_credibility', gfc.score_credibility,
                         'community_boost_applied', FALSE,
                         'boost_source', NULL::text,
-                        -- #12: joinable key for client telemetry. The global
-                        -- cache carries no algorithm_version, so it's null here.
+                        -- #12: joinable key for client telemetry.
                         'post_id', gfc.post_id::text,
-                        'algorithm_version', NULL::varchar
+                        -- Stamped by the ranker (#23); was hardcoded NULL, which left
+                        -- every global-sourced impression unattributable in
+                        -- feed_metrics_daily -- including the cold-start fallback this
+                        -- endpoint serves to users who have no personalized feed yet.
+                        -- The global feed is identical for every viewer, so only one
+                        -- version produces it at a time: this buys LONGITUDINAL
+                        -- attribution across a version change, not concurrent A/B arms.
+                        'algorithm_version', gfc.algorithm_version
                     ) AS fyp
                 -- See get_personalized_feed: hive_post_id is precomputed, so no
                 -- per-request Hivemind join (single PK join to post_candidates).
@@ -1554,10 +1560,15 @@ BEGIN
                         'score_credibility', gfc.score_credibility,
                         'community_boost_applied', FALSE,
                         'boost_source', NULL::text,
-                        -- #12: joinable key for client telemetry. The global
-                        -- cache carries no algorithm_version, so it's null here.
+                        -- #12: joinable key for client telemetry.
                         'post_id', gfc.post_id::text,
-                        'algorithm_version', NULL::varchar
+                        -- Stamped by the ranker (#23); was hardcoded NULL, which left
+                        -- every global-sourced impression unattributable in
+                        -- feed_metrics_daily.
+                        -- The global feed is identical for every viewer, so only one
+                        -- version produces it at a time: this buys LONGITUDINAL
+                        -- attribution across a version change, not concurrent A/B arms.
+                        'algorithm_version', gfc.algorithm_version
                     ) AS fyp
                 -- See get_personalized_feed: hive_post_id is precomputed, so no
                 -- per-request Hivemind join. The community filter stays on
@@ -1768,12 +1779,19 @@ $$;
     description: >-
       Aggregated feed-quality metrics from the telemetry rollup
       (feed_metrics_daily, #12), summed over a date range and grouped by
-      algorithm_version / source / rank. Enables engagement-rate@rank, open rate,
-      and average dwell/watch — and A/B comparison across algorithm_version.
-      NON-AUTHORITATIVE: derived from the unauthenticated /v1/fyp/events log
-      (username is client-claimed), so treat figures as directional and
-      corroborate against on-chain engagement. Global-feed rows carry
-      algorithm_version '' (no per-version A/B on the global feed).
+      algorithm_version / source / rank. Enables engagement-rate@rank, open
+      rate, and average dwell/watch — and A/B comparison across
+      algorithm_version. NON-AUTHORITATIVE: derived from the unauthenticated
+      /v1/fyp/events log (username is client-claimed), so treat figures as
+      directional and corroborate against on-chain engagement. Global-feed
+      responses now carry the algorithm_version that produced them (#23), so
+      clients that echo it back yield attributed global rows; the server never
+      derives this column, so anything a client omits still lands in the ''
+      bucket (feed_metrics_daily.algorithm_version is NOT NULL DEFAULT '').
+      Rows recorded before #23 sit in '' for the same reason and are not
+      backfilled. The global feed is identical for every viewer, so
+      global-source attribution supports longitudinal before/after comparison
+      rather than concurrent A/B arms.
     operationId: haf_fyp_endpoints.get_feed_metrics
     parameters:
       - in: query
