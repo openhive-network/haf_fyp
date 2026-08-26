@@ -868,7 +868,7 @@ DECLARE
           "Feed"
         ],
         "summary": "Feed quality metrics",
-        "description": "Aggregated feed-quality metrics from the telemetry rollup (feed_metrics_daily, #12), summed over a date range and grouped by algorithm_version / source / rank. Enables engagement-rate@rank, open rate, and average dwell/watch \u2014 and A/B comparison across algorithm_version. NON-AUTHORITATIVE: derived from the unauthenticated /v1/fyp/events log (username is client-claimed), so treat figures as directional and corroborate against on-chain engagement. Global-sourced rows carry the algorithm_version that produced them (#23), but the global feed is identical for every viewer, so it supports longitudinal before/after comparison rather than concurrent A/B arms.",
+        "description": "Aggregated feed-quality metrics from the telemetry rollup (feed_metrics_daily, #12), summed over a date range and grouped by algorithm_version / source / rank. Enables engagement-rate@rank, open rate, and average dwell/watch \u2014 and A/B comparison across algorithm_version. NON-AUTHORITATIVE: derived from the unauthenticated /v1/fyp/events log (username is client-claimed), so treat figures as directional and corroborate against on-chain engagement. Global-sourced rows carry the algorithm_version that produced them (#23), but the global feed is identical for every viewer, so it supports longitudinal before/after comparison rather than concurrent A/B arms. Rows recorded before that change remain keyed under algorithm_version '' (the column is NOT NULL DEFAULT ''), so historical global-feed metrics live in the '' bucket and are not backfilled.",
         "operationId": "haf_fyp_endpoints.get_feed_metrics",
         "parameters": [
           {
@@ -1787,7 +1787,10 @@ $$;
       corroborate against on-chain engagement. Global-sourced rows carry
       the algorithm_version that produced them (#23), but the global feed is
       identical for every viewer, so it supports longitudinal before/after
-      comparison rather than concurrent A/B arms.
+      comparison rather than concurrent A/B arms. Rows recorded before that
+      change remain keyed under algorithm_version '' (the column is NOT NULL
+      DEFAULT ''), so historical global-feed metrics live in the '' bucket and
+      are not backfilled.
     operationId: haf_fyp_endpoints.get_feed_metrics
     parameters:
       - in: query

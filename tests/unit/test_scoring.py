@@ -403,8 +403,12 @@ class TestWriteGlobalFeedCacheStampsAlgorithmVersion:
         return captured
 
     def test_algorithm_version_is_in_the_insert_columns(self, monkeypatch):
+        # Asserts the ORDERED substring, not mere presence. Presence alone lets a
+        # swap of algorithm_version and computed_at in the column list slip past
+        # every test in this class, even though the row tuple still pairs them the
+        # other way round -- it only fails later, at the database.
         captured = self._run(monkeypatch, "1.2.0")
-        assert "algorithm_version" in captured["sql"]
+        assert "rank, algorithm_version, computed_at" in " ".join(captured["sql"].split())
 
     def test_every_row_carries_the_version(self, monkeypatch):
         captured = self._run(monkeypatch, "1.2.0")
