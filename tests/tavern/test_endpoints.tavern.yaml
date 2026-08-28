@@ -14,7 +14,8 @@ stages:
       json:
         - status: "ok"
           last_processed_block: !anything
-          version: !anything
+          # Not !anything: that matches null, which is what #20 reported here.
+          version: "ci-test"
 
 ---
 test_name: Algorithm version endpoint
@@ -69,12 +70,16 @@ includes:
   - !include common.yaml
 
 stages:
-  - name: GET /rpc/get_version returns 200
+  - name: GET /rpc/get_version returns the installed hash, not null
     request:
       url: "{api_url}/rpc/get_version"
       method: GET
     response:
       status_code: 200
+      # Assert the value, not just the status. #20 shipped null through this endpoint for
+      # the life of the app while a status_code-only check stayed green. 'ci-test' is what
+      # tests/set_version.sql writes -- the statement install_app.sh step 15 runs.
+      json: "ci-test"
 
 ---
 test_name: User profile returns empty for unknown user

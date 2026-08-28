@@ -65,6 +65,58 @@ $$;
 ROLLBACK;
 
 -- ---------------------------------------------------------------------------
+-- 1b. app_version is a singleton, and it is never empty
+-- ---------------------------------------------------------------------------
+-- Same shape as app_status above, and the same silent failure. Nothing ever wrote to
+-- this table, so get_version() and get_health().version -- `SELECT git_hash ... LIMIT 1`
+-- with no ORDER BY -- returned null on every deployment (#20), and CI stayed green
+-- because the tavern check asserted only status_code: 200. db/app_version.sql now seeds a
+-- placeholder and bounds the row count; scripts/install_app.sh step 15 replaces the
+-- placeholder with the real commit. This asserts the invariant those depend on. The lane
+-- loads the shipped db/app_version.sql, so what is probed here is the product DDL.
+DO $$
+DECLARE
+    __rows bigint;
+    __hash text;
+BEGIN
+    SELECT count(*) INTO __rows FROM haf_fyp_app.app_version;
+    IF __rows <> 1 THEN
+        RAISE EXCEPTION
+            'haf_fyp_app.app_version holds % rows, expected exactly 1. get_version() and '
+            'get_health() take LIMIT 1 with no ORDER BY, so they would report an arbitrary '
+            'hash -- or, at 0 rows, the null this table shipped with (#20).', __rows;
+    END IF;
+
+    -- Not just present: usable. git_hash is NOT NULL, but '' satisfies that, and an empty
+    -- /version body is as unreadable as the null #20 reported. This mirrors the same check
+    -- in scripts/install_app.sh step 16, which no CI lane runs.
+    SELECT v.git_hash INTO __hash FROM haf_fyp_app.app_version AS v;
+    IF __hash IS NULL OR btrim(__hash) = '' THEN
+        RAISE EXCEPTION
+            'haf_fyp_app.app_version.git_hash is empty; GET /version would answer with an '
+            'empty string.';
+    END IF;
+END
+$$;
+
+-- And ENFORCED, not merely true right now. Rolled back, so the fixture the rest of the
+-- lane sees is untouched.
+BEGIN;
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO haf_fyp_app.app_version (git_hash) VALUES ('second-row');
+        RAISE EXCEPTION
+            'a second haf_fyp_app.app_version row was accepted -- the uq_app_version_singleton '
+            'unique index is missing, so a re-install can duplicate the row again';
+    EXCEPTION WHEN unique_violation THEN
+        NULL;  -- expected
+    END;
+END
+$$;
+ROLLBACK;
+
+-- ---------------------------------------------------------------------------
 -- 2. The context pointer and app_status agree
 -- ---------------------------------------------------------------------------
 DO $$

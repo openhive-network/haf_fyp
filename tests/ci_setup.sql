@@ -55,8 +55,12 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.app_status (
 -- context pointer and this column are one clock (see db/haf_fyp_app.sql), so a fixture
 -- with the context at the chain tip and app_status at 0 encodes a state that cannot
 -- legitimately exist -- and it is exactly the desync tests/ci_invariants.sql now forbids.
+-- Conditional so this fixture is re-runnable, matching the guarded seed in
+-- db/haf_fyp_app.sql. A plain INSERT would abort with unique_violation against the
+-- singleton index below the second time this file is applied.
 INSERT INTO haf_fyp_app.app_status (continue_processing, last_processed_block)
-VALUES (TRUE, 5000000);
+SELECT TRUE, 5000000
+WHERE NOT EXISTS (SELECT 1 FROM haf_fyp_app.app_status);
 
 -- Mirrors the singleton index in db/haf_fyp_app.sql. That file is not loaded in this
 -- lane (it calls the hive.* app API, which the stub does not provide), so this fixture
@@ -64,10 +68,9 @@ VALUES (TRUE, 5000000);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_app_status_singleton
 ON haf_fyp_app.app_status ((TRUE));
 
-CREATE TABLE IF NOT EXISTS haf_fyp_app.app_version (
-    git_hash text NOT NULL
-);
-INSERT INTO haf_fyp_app.app_version (git_hash) VALUES ('ci-test');
+-- app_version is NOT restated here. docker/docker-compose-ci.yml loads the shipped
+-- db/app_version.sql instead, so tests/ci_invariants.sql probes the real DDL rather than a
+-- copy of it -- the same rule this file states for the group memberships below.
 
 RESET ROLE;
 

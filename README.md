@@ -91,12 +91,24 @@ cp docker/.env docker/.env.local
 # Edit .env.local:
 #   - Set HAF_VERSION to a pinned release tag (not "latest") for production
 #   - Set FYP_ADMIN_API_KEY to a strong random secret
+#
+# Every command below passes --env-file docker/.env.local. Without it Compose reads
+# docker/.env (the project-directory default) and the edits above are silently ignored,
+# leaving FYP_ADMIN_API_KEY at its shipped placeholder.
 
 # 2. Install schema (one-time)
-docker compose -f docker/docker-compose.yml up haf-fyp-setup
+#    GIT_HASH is what GET /version reports. --short=8 matches CI's CI_COMMIT_SHORT_SHA,
+#    so the hash is the same width however the node was installed. Omit it and /version
+#    reports a placeholder rather than a commit.
+#    --build is required: GIT_HASH is a build argument baked into the image, so a plain
+#    `up` (or `run`) reuses the existing image and silently ignores a changed export.
+#    It is baked rather than passed at runtime on purpose -- the image carries the SQL,
+#    so the hash must describe the code inside it. See Dockerfile.sql.
+export GIT_HASH="$(git rev-parse --short=8 HEAD)"
+docker compose --env-file docker/.env.local -f docker/docker-compose.yml up --build haf-fyp-setup
 
 # 3. Start the full stack
-docker compose -f docker/docker-compose.yml up \
+docker compose --env-file docker/.env.local -f docker/docker-compose.yml up \
   haf-fyp-sync haf-fyp-ranker haf-fyp-api postgrest redis
 
 # 4. Smoke test
@@ -104,7 +116,7 @@ curl http://localhost:3001/rpc/get_health
 curl http://localhost:3001/rpc/get_algorithm
 
 # 5. After installing HiveSense / btracker / reptracker — grant cross-schema access
-docker compose -f docker/docker-compose.yml run --rm haf-fyp-setup \
+docker compose --env-file docker/.env.local -f docker/docker-compose.yml run --rm haf-fyp-setup \
   /app/scripts/grant_cross_schema.sh
 ```
 
