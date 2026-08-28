@@ -54,9 +54,17 @@ WHERE a.ctid <> k.keep_ctid;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_app_status_singleton
 ON haf_fyp_app.app_status ((TRUE));
 
-CREATE TABLE IF NOT EXISTS haf_fyp_app.app_version (
-    git_hash text NOT NULL
-);
+-- Read access for the API/PostgREST role, explicit and adjacent rather than relying on
+-- the blanket GRANT SELECT ON ALL TABLES in db/create_tables.sql that runs a step later.
+-- Matches haf_stats (db/haf_stats_app.sql:74-75). get_health() reads this table, so a
+-- path that loads this file without reaching create_tables.sql would otherwise serve
+-- /version while /health failed on "permission denied for table app_status".
+GRANT SELECT ON haf_fyp_app.app_status TO haf_fyp_user;
+
+-- app_version and its singleton machinery live in db/app_version.sql, loaded next by
+-- scripts/install_app.sh (step 2b). Split out so the postgrest CI lane -- which cannot
+-- load this file, because it calls the hive.* API the stub does not implement -- can
+-- execute the shipped DDL instead of a copy of it.
 
 -- ---------------------------------------------------------------------------
 -- Lifecycle control functions

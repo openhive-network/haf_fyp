@@ -28,6 +28,12 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile.sql
+      args:
+        # Baked into the image as ENV GIT_HASH; install_app.sh step 15 writes it into
+        # haf_fyp_app.app_version so GET /version names the running commit (#20). Unset
+        # makes that step record the placeholder from db/app_version.sql instead. `:-`
+        # rather than `-` so compose-validate, which sets no GIT_HASH, interpolates cleanly.
+        GIT_HASH: ${GIT_HASH:-}
     command: ["/app/scripts/install_app.sh"]
     environment:
       POSTGRES_HOST: haf
@@ -42,6 +48,10 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile.sql
+      args:
+        # Same Dockerfile as haf-fyp-setup; passed here too so the two images stay
+        # identical rather than differing only in a baked ENV.
+        GIT_HASH: ${GIT_HASH:-}
     command: ["/app/scripts/process_blocks.sh"]
     environment:
       POSTGRES_HOST: haf

@@ -67,6 +67,11 @@ run_sql_file "${SCRIPT_DIR}/../db/builtin_roles.sql"
 # 2. Schemas, control tables, lifecycle functions, main loop
 run_sql_file "${SCRIPT_DIR}/../db/haf_fyp_app.sql"
 
+# 2b. Application version table + singleton machinery (#20). Split out of haf_fyp_app.sql
+#     so the postgrest CI lane can load the shipped DDL instead of a copy; see the header
+#     of db/app_version.sql. Must follow step 2, which creates the schema.
+run_sql_file "${SCRIPT_DIR}/../db/app_version.sql"
+
 # 3. Application tables and composite type
 run_sql_file "${SCRIPT_DIR}/../db/create_tables.sql"
 
@@ -228,6 +233,102 @@ BEGIN
             'HAF context (%) and app_status (%) differ by more than one 10000-block '
             'batch. If the block processor is running this is an in-flight batch and '
             'will settle; if it is not, the two clocks have drifted.', __ctx, __app;
+    END IF;
+END
+\$\$;"
+
+# 15. Application version (#20). GIT_HASH arrives from Dockerfile.sql's ARG/ENV pair,
+#     which docker-compose bakes at build time, or straight from the environment on a
+#     source-tree install. Unset means nobody told us which commit this is, so we record
+#     the placeholder EXPLICITLY rather than leave whatever is already there.
+#
+#     That unconditional rewrite is the point, not a detail. app_version must describe the
+#     install that just ran. An earlier version of this step wrote nothing when GIT_HASH
+#     was unset, on the reasoning that db/app_version.sql's seed would still be in place --
+#     but that seed is guarded (ON CONFLICT DO NOTHING) and cannot refresh a table that
+#     already holds a row. Re-installing a node that had been installed WITH a hash
+#     therefore left the PREVIOUS commit's hash in the table, step 16 passed it, and GET
+#     /version confidently named a commit the node was no longer running. That is strictly
+#     worse than the null in #20: a null is obviously broken, a plausible-looking short SHA
+#     is not. A wrong hash is undetectable; a placeholder explains itself.
+#
+#     RUNS LAST, after every assertion above, because a version row is a claim about what
+#     is installed and must not be written until the install has actually succeeded. Steps
+#     13 and 14 can still RAISE EXCEPTION; stamping the new commit ahead of them would
+#     leave haf-fyp-setup crash-looping under restart: on-failure while /version reported a
+#     deploy that never finished -- the same undetectable-wrong-hash failure in a different
+#     costume. It is also the cheapest step to fail: by here the node is fully installed, so
+#     a redeploy that trips only on this leaves a serving stack alone.
+#
+#     SET LOCAL ROLE is correct here because ownership is uniform from step 3 onward:
+#     db/create_tables.sql reassigns every haf_fyp_app table to haf_fyp_owner. Run next to
+#     the table at step 2b instead, on a FRESH install, and the table is still owned by
+#     whoever connected, so SET ROLE would fail. Here it holds under both installer
+#     identities -- haf_admin, and the haf_fyp_owner default from scripts/common.sh.
+#
+#     DELETE + INSERT + UPDATE wrapped in one transaction, not haf_stats' TRUNCATE; INSERT.
+#     psql autocommits per statement, so top-level statements would be separate
+#     transactions with a window in between where the table is empty and a live node
+#     answers /version with null -- permanently, if a later statement failed. DELETE also
+#     needs only the DELETE privilege where TRUNCATE needs ownership.
+#
+#     The INSERT takes VALUES (DEFAULT), so the placeholder string has exactly one
+#     definition -- the column default in db/app_version.sql -- and cannot drift between
+#     "installed without a hash" and "install died before this step", the two states it
+#     exists to tell apart. The UPDATE then overwrites it only when a hash was supplied,
+#     which keeps both cases on one code path.
+#
+#     The statement lives in scripts/set_version.sql because the postgrest CI lane runs it
+#     too; keeping one file means the lane exercises this step rather than a copy of it.
+#
+#     -f, not -c: psql performs variable substitution only when reading a file or stdin.
+#     Passed to -c the string goes to the server verbatim and dies with
+#     `syntax error at or near ":"`. run_sql_file cannot be used either -- it forwards no
+#     -v (scripts/common.sh) -- so this reaches for psql_cmd directly, as step 9 does.
+#     :'git_hash' is psql's quote-and-escape substitution, so a hash carrying a quote
+#     cannot break out of the literal into SQL that runs with the installer's rights.
+#
+#     Ordering can still leave a stale hash in one direction nothing can fix: an in-place
+#     re-install that aborts at step 12, 13 or 14 has already applied the new SQL in steps
+#     1-11 while this step never runs, so /version keeps naming the previous commit on a
+#     partially upgraded schema. Running last is the least-bad choice, not a guarantee.
+if [ -n "${GIT_HASH:-}" ]; then
+    log "Recording application version: ${GIT_HASH}"
+else
+    log "WARNING: GIT_HASH is unset — recording the db/app_version.sql placeholder."
+    log "         GET /version will not name a commit. GIT_HASH is baked into the image"
+    log "         at build time, so exporting it and re-running is NOT enough -- a plain"
+    log "         'up' reuses the existing image. Rebuild:"
+    log "         GIT_HASH=\$(git rev-parse --short=8 HEAD) docker compose \\"
+    log "             -f docker/docker-compose.yml up --build haf-fyp-setup"
+fi
+
+psql_cmd -v git_hash="${GIT_HASH:-}" -f "${SCRIPT_DIR}/../scripts/set_version.sql"
+
+# 16. Assert the version row is a usable singleton. No CI lane runs this script, so this is
+#     the only place the #20 fix is checked against a real node. It asserts a usable row,
+#     not a real commit, so the GIT_HASH-unset path above still passes.
+psql_cmd -c "
+DO \$\$
+DECLARE
+    __rows bigint;
+    __hash text;
+BEGIN
+    SELECT count(*) INTO __rows FROM haf_fyp_app.app_version;
+    IF __rows <> 1 THEN
+        RAISE EXCEPTION
+            'haf_fyp_app.app_version holds % rows, expected exactly 1. get_version() and '
+            'get_health() take LIMIT 1 with no ORDER BY, so they would return an arbitrary '
+            'hash. Re-run db/app_version.sql to de-duplicate, then re-run this installer so '
+            'step 15 rewrites the survivor -- the collapse keeps an arbitrary row, not the '
+            'newest one.', __rows;
+    END IF;
+
+    SELECT v.git_hash INTO __hash FROM haf_fyp_app.app_version AS v;
+    IF __hash IS NULL OR btrim(__hash) = '' THEN
+        RAISE EXCEPTION
+            'haf_fyp_app.app_version.git_hash is empty; GET /version would answer with an '
+            'empty string, as unreadable as the null in #20.';
     END IF;
 END
 \$\$;"

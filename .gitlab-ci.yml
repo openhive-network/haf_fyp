@@ -164,7 +164,14 @@ postgrest-tests:
 docker-build-sql:
   extends: .docker-build
   script:
-    - docker build -f Dockerfile.sql -t $CI_REGISTRY_IMAGE/sql:$CI_COMMIT_SHORT_SHA .
+    # Stamps the image with the commit it was built from: GIT_HASH -> ENV -> written to
+    # haf_fyp_app.app_version by install_app.sh step 15, so GET /version can name it (#20).
+    # Short SHA to match the tag. Note this job builds and tags but does not push, and no
+    # compose service consumes a registry SQL image -- both Dockerfile.sql services use
+    # `build:`. So today this only stamps the image CI itself produces; the deployment path
+    # is the build arg in docker/docker-compose.yml. Kept here so the stamp is already
+    # correct whenever a push/consume step is added, rather than being remembered then.
+    - docker build -f Dockerfile.sql --build-arg GIT_HASH="$CI_COMMIT_SHORT_SHA" -t $CI_REGISTRY_IMAGE/sql:$CI_COMMIT_SHORT_SHA .
 
 docker-build-python:
   extends: .docker-build
