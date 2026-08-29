@@ -133,22 +133,32 @@ All read endpoints are served by PostgREST on port 3001. The FastAPI overlay on 
 | GET | `/rpc/list_algorithm_versions` | All registered algorithm versions |
 | GET | `/rpc/get_personalized_feed?username=alice&limit=20` | Ranked feed for a user |
 | GET | `/rpc/get_global_feed?limit=20` | Unauthenticated global feed |
-
-Every feed entry carries a nested `fyp.source` field — `personalized` when the user has a precomputed personalized feed, or `global` when `get_personalized_feed` serves the cold-start global fallback (it is uniform across all entries in one response). A client can therefore tell directly from a feed call whether the user is getting their own ranked feed or the global fallback, without a separate `get_user_profile` lookup (`has_feed`).
 | GET | `/rpc/get_user_profile?username=alice` | User vector status and top communities |
 | GET | `/rpc/get_score_explanation?username=alice&post_id=123` | Per-signal score breakdown |
+| GET | `/rpc/get_feed_metrics` | Feed performance analytics per algorithm version (#13) — product metrics, not service health |
+
+Every feed entry carries a nested `fyp.source` field — `personalized` when the user has a precomputed personalized feed, or `global` when `get_personalized_feed` serves the cold-start global fallback (it is uniform across all entries in one response). A client can therefore tell directly from a feed call whether the user is getting their own ranked feed or the global fallback, without a separate `get_user_profile` lookup (`has_feed`).
 
 ### FastAPI overlay (port 3002)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Service health check |
-| GET | `/metrics` | Embedding coverage (#15) + credibility source health (#8) |
+| GET | `/metrics` | Operational health: embedding coverage (#15) + credibility source health (#8) — not feed analytics |
 | GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
 | POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10 req/min) |
 | DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5 req/min) |
 | POST | `/v1/fyp/events` | Impression / engagement telemetry batch (120 req/min) |
 | POST | `/v1/fyp/admin/algorithm` | Activate an algorithm version (`X-Admin-Key` required) |
+
+The two metrics endpoints are unrelated and answer different questions. This one, on the
+FastAPI overlay, is the *operational* read — embedding coverage and credibility source
+health — and is what an embedding-gap or lost-grant alert should watch. It carries no block
+height, so it is not a freshness check: for that, watch `GET /sync-status` below. Feed
+*performance* analytics are a separate, product-facing read, served by PostgREST itself as
+`/rpc/get_feed_metrics` and as the clean URL `/v1/fyp/feed-metrics` through the nginx
+rewriter. That clean URL was `/v1/fyp/metrics` until the two were disambiguated; the old
+path no longer resolves.
 
 `GET /sync-status` is the ecosystem-uniform freshness endpoint (same shape as
 haf_block_explorer's), returning `{"last_block_num": N, "last_block_time": "YYYY-MM-DDTHH:MM:SS"}`
@@ -188,7 +198,19 @@ Clean URL rewrites (via nginx `endpoints/rewrite_rules.conf`):
 /v1/fyp/algorithm                    →  /rpc/get_algorithm
 /v1/fyp/algorithms                   →  /rpc/list_algorithm_versions
 /v1/fyp/explain/{username}/{post_id} →  /rpc/get_score_explanation
+/v1/fyp/feed-metrics                 →  /rpc/get_feed_metrics
+/health                              →  /rpc/get_health
+/version                             →  /rpc/get_version
+<anything else>                      →  /rpc/<anything else>      (catch-all)
 ```
+
+The rewriter fronts the **PostgREST surface only** — `docker/haf_fyp_nginx.conf.template`
+proxies to PostgREST and deliberately does not proxy the FastAPI overlay. So `/health` in
+this list is PostgREST's `get_health` (an array), which is a different endpoint from the
+FastAPI `/health` in the table above (an object), and different again from the rewriter's
+own container-liveness `/health` on port 81 (a bare 204). The catch-all is why any path
+matching no rule above — including the retired `/v1/fyp/metrics` — is rewritten to
+`/rpc/<path>` and comes back 404 rather than as a routing error.
 
 ## Ranking Algorithm
 

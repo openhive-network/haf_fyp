@@ -11,7 +11,7 @@ info:
   license:
     name: MIT License
     url: https://opensource.org/license/mit
-  version: 2.0.0
+  version: 3.0.0
 externalDocs:
   description: HAF FYP GitLab repository
   url: https://gitlab.syncad.com/hive/haf_fyp
@@ -207,7 +207,7 @@ DECLARE
       "name": "MIT License",
       "url": "https://opensource.org/license/mit"
     },
-    "version": "2.0.0"
+    "version": "3.0.0"
   },
   "externalDocs": {
     "description": "HAF FYP GitLab repository",
@@ -464,17 +464,20 @@ DECLARE
               "application/json": {
                 "schema": {
                   "x-sql-datatype": "TABLE(status text, last_processed_block int, version text)",
-                  "type": "object",
-                  "properties": {
-                    "status": {
-                      "type": "string",
-                      "example": "ok"
-                    },
-                    "last_processed_block": {
-                      "type": "integer"
-                    },
-                    "version": {
-                      "type": "string"
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "status": {
+                        "type": "string",
+                        "example": "ok"
+                      },
+                      "last_processed_block": {
+                        "type": "integer"
+                      },
+                      "version": {
+                        "type": "string"
+                      }
                     }
                   }
                 }
@@ -499,29 +502,32 @@ DECLARE
               "application/json": {
                 "schema": {
                   "x-sql-datatype": "TABLE(version text, description text, weights jsonb, deployed_at timestamp)",
-                  "type": "object",
-                  "properties": {
-                    "version": {
-                      "type": "string",
-                      "example": "1.0.0"
-                    },
-                    "description": {
-                      "type": "string"
-                    },
-                    "weights": {
-                      "type": "object",
-                      "additionalProperties": true,
-                      "example": {
-                        "relevance": 0.4,
-                        "recency": 0.3,
-                        "engagement": 0.2,
-                        "credibility": 0.1,
-                        "community_boost": 0.2
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "version": {
+                        "type": "string",
+                        "example": "1.0.0"
+                      },
+                      "description": {
+                        "type": "string"
+                      },
+                      "weights": {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "example": {
+                          "relevance": 0.4,
+                          "recency": 0.3,
+                          "engagement": 0.2,
+                          "credibility": 0.1,
+                          "community_boost": 0.2
+                        }
+                      },
+                      "deployed_at": {
+                        "type": "string",
+                        "format": "date-time"
                       }
-                    },
-                    "deployed_at": {
-                      "type": "string",
-                      "format": "date-time"
                     }
                   }
                 }
@@ -737,27 +743,30 @@ DECLARE
               "application/json": {
                 "schema": {
                   "x-sql-datatype": "TABLE(has_feed boolean, has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp)",
-                  "type": "object",
-                  "properties": {
-                    "has_feed": {
-                      "type": "boolean",
-                      "description": "True if the user has a precomputed personalized feed (vs the global fallback)"
-                    },
-                    "has_vector": {
-                      "type": "boolean"
-                    },
-                    "posts_sampled": {
-                      "type": "integer"
-                    },
-                    "top_communities": {
-                      "type": "array",
-                      "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "has_feed": {
+                        "type": "boolean",
+                        "description": "True if the user has a precomputed personalized feed (vs the global fallback)"
+                      },
+                      "has_vector": {
+                        "type": "boolean"
+                      },
+                      "posts_sampled": {
                         "type": "integer"
+                      },
+                      "top_communities": {
+                        "type": "array",
+                        "items": {
+                          "type": "integer"
+                        }
+                      },
+                      "updated_at": {
+                        "type": "string",
+                        "format": "date-time"
                       }
-                    },
-                    "updated_at": {
-                      "type": "string",
-                      "format": "date-time"
                     }
                   }
                 }
@@ -803,56 +812,59 @@ DECLARE
               "application/json": {
                 "schema": {
                   "x-sql-datatype": "TABLE(post_id bigint, author varchar(16), permlink varchar(256), title text, final_score float, score_relevance float, score_recency float, score_engagement float, score_credibility float, community_boost_applied boolean, boost_source varchar(16), rank int, algorithm_version varchar(16), algorithm_weights jsonb, computed_at timestamp)",
-                  "type": "object",
-                  "properties": {
-                    "post_id": {
-                      "type": "integer"
-                    },
-                    "author": {
-                      "type": "string"
-                    },
-                    "permlink": {
-                      "type": "string"
-                    },
-                    "title": {
-                      "type": "string"
-                    },
-                    "final_score": {
-                      "type": "number"
-                    },
-                    "score_relevance": {
-                      "type": "number"
-                    },
-                    "score_recency": {
-                      "type": "number"
-                    },
-                    "score_engagement": {
-                      "type": "number"
-                    },
-                    "score_credibility": {
-                      "type": "number"
-                    },
-                    "community_boost_applied": {
-                      "type": "boolean"
-                    },
-                    "boost_source": {
-                      "type": "string",
-                      "nullable": true,
-                      "description": "Which tier applied the community boost - 'subscribed', 'engaged', or null"
-                    },
-                    "rank": {
-                      "type": "integer"
-                    },
-                    "algorithm_version": {
-                      "type": "string"
-                    },
-                    "algorithm_weights": {
-                      "type": "object",
-                      "additionalProperties": true
-                    },
-                    "computed_at": {
-                      "type": "string",
-                      "format": "date-time"
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "post_id": {
+                        "type": "integer"
+                      },
+                      "author": {
+                        "type": "string"
+                      },
+                      "permlink": {
+                        "type": "string"
+                      },
+                      "title": {
+                        "type": "string"
+                      },
+                      "final_score": {
+                        "type": "number"
+                      },
+                      "score_relevance": {
+                        "type": "number"
+                      },
+                      "score_recency": {
+                        "type": "number"
+                      },
+                      "score_engagement": {
+                        "type": "number"
+                      },
+                      "score_credibility": {
+                        "type": "number"
+                      },
+                      "community_boost_applied": {
+                        "type": "boolean"
+                      },
+                      "boost_source": {
+                        "type": "string",
+                        "nullable": true,
+                        "description": "Which tier applied the community boost - 'subscribed', 'engaged', or null"
+                      },
+                      "rank": {
+                        "type": "integer"
+                      },
+                      "algorithm_version": {
+                        "type": "string"
+                      },
+                      "algorithm_weights": {
+                        "type": "object",
+                        "additionalProperties": true
+                      },
+                      "computed_at": {
+                        "type": "string",
+                        "format": "date-time"
+                      }
                     }
                   }
                 }
@@ -862,7 +874,7 @@ DECLARE
         }
       }
     },
-    "/v1/fyp/metrics": {
+    "/v1/fyp/feed-metrics": {
       "get": {
         "tags": [
           "Feed"
@@ -1007,7 +1019,7 @@ $func$;
 -- openapi-generated-code-begin
 DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_version;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_version()
-RETURNS TEXT 
+RETURNS TEXT
 -- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
@@ -1029,20 +1041,22 @@ $$;
           application/json:
             schema:
               x-sql-datatype: "TABLE(status text, last_processed_block int, version text)"
-              type: object
-              properties:
-                status:
-                  type: string
-                  example: ok
-                last_processed_block:
-                  type: integer
-                version:
-                  type: string
+              type: array
+              items:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  last_processed_block:
+                    type: integer
+                  version:
+                    type: string
  */
 -- openapi-generated-code-begin
 DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_health;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_health()
-RETURNS TABLE(status text, last_processed_block int, version text) 
+RETURNS TABLE(status text, last_processed_block int, version text)
 -- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
@@ -1073,30 +1087,32 @@ $$;
           application/json:
             schema:
               x-sql-datatype: "TABLE(version text, description text, weights jsonb, deployed_at timestamp)"
-              type: object
-              properties:
-                version:
-                  type: string
-                  example: "1.0.0"
-                description:
-                  type: string
-                weights:
-                  type: object
-                  additionalProperties: true
-                  example:
-                    relevance: 0.40
-                    recency: 0.30
-                    engagement: 0.20
-                    credibility: 0.10
-                    community_boost: 0.20
-                deployed_at:
-                  type: string
-                  format: date-time
+              type: array
+              items:
+                type: object
+                properties:
+                  version:
+                    type: string
+                    example: "1.0.0"
+                  description:
+                    type: string
+                  weights:
+                    type: object
+                    additionalProperties: true
+                    example:
+                      relevance: 0.40
+                      recency: 0.30
+                      engagement: 0.20
+                      credibility: 0.10
+                      community_boost: 0.20
+                  deployed_at:
+                    type: string
+                    format: date-time
  */
 -- openapi-generated-code-begin
 DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_algorithm;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_algorithm()
-RETURNS TABLE(version text, description text, weights jsonb, deployed_at timestamp) 
+RETURNS TABLE(version text, description text, weights jsonb, deployed_at timestamp)
 -- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
@@ -1141,7 +1157,7 @@ $$;
 -- openapi-generated-code-begin
 DROP FUNCTION IF EXISTS haf_fyp_endpoints.list_algorithm_versions;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.list_algorithm_versions()
-RETURNS TABLE(version text, description text, weights jsonb, deployed_at timestamp, is_active boolean) 
+RETURNS TABLE(version text, description text, weights jsonb, deployed_at timestamp, is_active boolean)
 -- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
@@ -1269,7 +1285,7 @@ CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_personalized_feed(
     "page-size" INT = 20,
     "truncate_body" INT = 0
 )
-RETURNS jsonb 
+RETURNS jsonb
 -- openapi-generated-code-end
 LANGUAGE plpgsql STABLE
 AS $$
@@ -1506,7 +1522,7 @@ CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_global_feed(
     "community_id" INT = NULL,
     "truncate_body" INT = 0
 )
-RETURNS jsonb 
+RETURNS jsonb
 -- openapi-generated-code-end
 LANGUAGE plpgsql STABLE
 AS $$
@@ -1622,29 +1638,31 @@ $$;
           application/json:
             schema:
               x-sql-datatype: "TABLE(has_feed boolean, has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp)"
-              type: object
-              properties:
-                has_feed:
-                  type: boolean
-                  description: True if the user has a precomputed personalized feed (vs the global fallback)
-                has_vector:
-                  type: boolean
-                posts_sampled:
-                  type: integer
-                top_communities:
-                  type: array
-                  items:
+              type: array
+              items:
+                type: object
+                properties:
+                  has_feed:
+                    type: boolean
+                    description: True if the user has a precomputed personalized feed (vs the global fallback)
+                  has_vector:
+                    type: boolean
+                  posts_sampled:
                     type: integer
-                updated_at:
-                  type: string
-                  format: date-time
+                  top_communities:
+                    type: array
+                    items:
+                      type: integer
+                  updated_at:
+                    type: string
+                    format: date-time
  */
 -- openapi-generated-code-begin
 DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_user_profile;
 CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_user_profile(
     "username" TEXT
 )
-RETURNS TABLE(has_feed boolean, has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp) 
+RETURNS TABLE(has_feed boolean, has_vector boolean, posts_sampled int, top_communities int[], updated_at timestamp)
 -- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
@@ -1700,42 +1718,44 @@ $$;
           application/json:
             schema:
               x-sql-datatype: "TABLE(post_id bigint, author varchar(16), permlink varchar(256), title text, final_score float, score_relevance float, score_recency float, score_engagement float, score_credibility float, community_boost_applied boolean, boost_source varchar(16), rank int, algorithm_version varchar(16), algorithm_weights jsonb, computed_at timestamp)"
-              type: object
-              properties:
-                post_id:
-                  type: integer
-                author:
-                  type: string
-                permlink:
-                  type: string
-                title:
-                  type: string
-                final_score:
-                  type: number
-                score_relevance:
-                  type: number
-                score_recency:
-                  type: number
-                score_engagement:
-                  type: number
-                score_credibility:
-                  type: number
-                community_boost_applied:
-                  type: boolean
-                boost_source:
-                  type: string
-                  nullable: true
-                  description: Which tier applied the community boost - 'subscribed', 'engaged', or null
-                rank:
-                  type: integer
-                algorithm_version:
-                  type: string
-                algorithm_weights:
-                  type: object
-                  additionalProperties: true
-                computed_at:
-                  type: string
-                  format: date-time
+              type: array
+              items:
+                type: object
+                properties:
+                  post_id:
+                    type: integer
+                  author:
+                    type: string
+                  permlink:
+                    type: string
+                  title:
+                    type: string
+                  final_score:
+                    type: number
+                  score_relevance:
+                    type: number
+                  score_recency:
+                    type: number
+                  score_engagement:
+                    type: number
+                  score_credibility:
+                    type: number
+                  community_boost_applied:
+                    type: boolean
+                  boost_source:
+                    type: string
+                    nullable: true
+                    description: Which tier applied the community boost - 'subscribed', 'engaged', or null
+                  rank:
+                    type: integer
+                  algorithm_version:
+                    type: string
+                  algorithm_weights:
+                    type: object
+                    additionalProperties: true
+                  computed_at:
+                    type: string
+                    format: date-time
  */
 -- openapi-generated-code-begin
 DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_score_explanation;
@@ -1743,7 +1763,7 @@ CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_score_explanation(
     "username" TEXT,
     "post_id" BIGINT
 )
-RETURNS TABLE(post_id bigint, author varchar(16), permlink varchar(256), title text, final_score float, score_relevance float, score_recency float, score_engagement float, score_credibility float, community_boost_applied boolean, boost_source varchar(16), rank int, algorithm_version varchar(16), algorithm_weights jsonb, computed_at timestamp) 
+RETURNS TABLE(post_id bigint, author varchar(16), permlink varchar(256), title text, final_score float, score_relevance float, score_recency float, score_engagement float, score_credibility float, community_boost_applied boolean, boost_source varchar(16), rank int, algorithm_version varchar(16), algorithm_weights jsonb, computed_at timestamp)
 -- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
@@ -1771,7 +1791,7 @@ AS $$
 $$;
 
 /** openapi:paths
-/v1/fyp/metrics:
+/v1/fyp/feed-metrics:
   get:
     tags:
       - Feed
@@ -1874,7 +1894,7 @@ CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_feed_metrics(
     "algorithm_version" TEXT = NULL,
     "source" TEXT = NULL
 )
-RETURNS jsonb 
+RETURNS jsonb
 -- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
