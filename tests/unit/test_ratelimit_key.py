@@ -140,8 +140,14 @@ class TestWiring:
         # while every test above stays green -- the function correct but unused.
         assert limiter._key_func is client_ip_key
 
-    def test_global_key_is_constant(self):
-        assert global_key(_req({})) == global_key(_req({}, peer="1.2.3.4")) == "global"
+    def test_global_key_takes_no_arguments_and_is_constant(self):
+        # slowapi invokes a per-decorator key_func as `lim.key_func()` with NO request.
+        # The first version of this took `_request` and 500'd all four endpoints; the
+        # unit test passed because it called it the way slowapi does not.
+        import inspect
+
+        assert list(inspect.signature(global_key).parameters) == []
+        assert global_key() == "global"
 
 
 class TestEndToEndThroughSlowapi:
@@ -201,3 +207,41 @@ class TestEndToEndThroughSlowapi:
         app = self._app(monkeypatch, client_ip_key)
         self._codes(app, "2001:db8:85a3:8d3::1", n=3)
         assert self._codes(app, "2001:db8:85a3:8d3::99", n=1) == [429]
+
+    def test_a_global_ceiling_decorator_actually_serves(self, monkeypatch):
+        """The regression that CI caught and the unit tests did not.
+
+        global_key originally took a `_request` parameter. Calling it directly (as the
+        old unit test did) worked fine; slowapi calls a per-decorator key_func with NO
+        arguments, so every request to all four limited endpoints raised TypeError
+        inside the limiter and returned 500. Only exercising a real decorated route
+        through the stack surfaces that.
+        """
+        from fastapi import FastAPI, Request
+        from fastapi.testclient import TestClient
+        from slowapi import Limiter, _rate_limit_exceeded_handler
+        from slowapi.errors import RateLimitExceeded
+        from slowapi.middleware import SlowAPIMiddleware
+
+        monkeypatch.setattr(api, "_TRUSTED_PROXIES", frozenset({"testclient"}))
+        lim = Limiter(key_func=client_ip_key, storage_uri="memory://")
+        app = FastAPI()
+        app.state.limiter = lim
+        app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+        app.add_middleware(SlowAPIMiddleware)
+
+        @app.get("/probe")
+        @lim.limit("100/minute")
+        @lim.limit("2/minute", key_func=global_key)
+        def probe(request: Request):  # noqa: ARG001
+            return {"ok": True}
+
+        with TestClient(app) as c:
+            # Different clients, so the per-IP limit is nowhere near exhausted --
+            # only the shared ceiling can produce the 429.
+            codes = [
+                c.get("/probe", headers={"X-Real-IP": ip}).status_code
+                for ip in (CLIENT_A, CLIENT_B, "192.0.2.9")
+            ]
+        assert 500 not in codes, "global_key signature is wrong for slowapi"
+        assert codes == [200, 200, 429], codes

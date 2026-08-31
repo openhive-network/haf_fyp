@@ -103,8 +103,15 @@ def client_ip_key(request: Request) -> str:
     return str(ip)
 
 
-def global_key(_request: Request) -> str:
-    """Single shared bucket, for limits that cap TOTAL cost rather than per-caller abuse."""
+def global_key() -> str:
+    """Single shared bucket, for limits that cap TOTAL cost rather than per-caller abuse.
+
+    TAKES NO ARGUMENTS ON PURPOSE. slowapi calls a Limiter-level key_func with the
+    request, but a per-decorator `key_func=` override is invoked as `lim.key_func()`
+    with none (slowapi/extension.py, __evaluate_limits). Giving this a request
+    parameter raises TypeError inside the limiter and 500s the endpoint -- on every
+    request, for all four limits at once.
+    """
     return "global"
 
 
