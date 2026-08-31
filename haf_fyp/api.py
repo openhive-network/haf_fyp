@@ -87,7 +87,10 @@ def _parse_trusted(raw: str) -> tuple[frozenset, tuple]:
     compare would silently not match it, the header would be ignored, and the app
     would degrade to peer keying -- which behind the edge is one global bucket for
     the whole internet, i.e. exactly the bug this fixes, with no failure signal.
-    Non-IP entries are kept as literals so hostnames and test peers still work.
+    Non-IP entries are kept as literals. Note this cannot make a HOSTNAME work: the
+    peer comes from request.client.host, which any real ASGI server fills from the
+    socket, so it is always numeric. Literals exist for synthetic peers such as
+    TestClient's "testclient"; configuring a hostname fails closed with no signal.
     """
     literals, nets = set(), []
     for entry in (e.strip() for e in raw.split(",")):
@@ -103,6 +106,23 @@ def _parse_trusted(raw: str) -> tuple[frozenset, tuple]:
 
 _TRUSTED_LITERALS, _TRUSTED_NETS = _parse_trusted(os.environ.get("TRUSTED_PROXY_IPS", ""))
 
+if not _TRUSTED_LITERALS:
+    # Behind a proxy this is not a smaller limit, it is NO per-client limit: every
+    # caller keys on the proxy's address, i.e. one bucket for the whole internet.
+    # That regression has shipped twice already and is invisible at runtime, so it
+    # gets the same treatment as HIVE_RPC_URL rather than a comment nobody reads.
+    log.warning(
+        "TRUSTED_PROXY_IPS is not set - rate limits will key on the socket peer. "
+        "Behind a reverse proxy that is ONE SHARED BUCKET for all callers. Set it "
+        "to the edge's address or CIDR."
+    )
+elif any(net.prefixlen == 0 for net in _TRUSTED_NETS):
+    # strict=False quietly widens a typo: 10.0.0.5/0 parses as 0.0.0.0/0.
+    log.warning(
+        "TRUSTED_PROXY_IPS contains a /0 network - every peer is trusted, so any "
+        "caller can set X-Real-IP and choose their own rate-limit bucket."
+    )
+
 
 def _peer_is_trusted(peer: str) -> bool:
     if peer in _TRUSTED_LITERALS:
@@ -113,6 +133,11 @@ def _peer_is_trusted(peer: str) -> bool:
         addr = ipaddress.ip_address(peer)
     except ValueError:
         return False
+    # A dual-stack listener presents an IPv4 edge as ::ffff:10.0.0.5, which is never
+    # `in` a v4 network -- the trust would silently never match and the app would
+    # degrade to peer keying. client_ip_key already unwraps; this must agree with it.
+    if addr.version == 6 and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
     return any(addr in net for net in _TRUSTED_NETS)
 
 
@@ -138,8 +163,13 @@ def client_ip_key(request: Request) -> str:
     # semantics) there is only one; if an edge ever used the appending form instead,
     # the FIRST value is the client-supplied one and keying on it would hand any
     # caller a forged bucket. The last is the one the nearest proxy wrote.
+    #
+    # Both spellings of "appended" have to be handled: repeated header lines, AND a
+    # single comma-joined value, which is what proxies emit and what an intermediary
+    # may collapse repeats into. Splitting only on the former left the latter
+    # unparseable, so it fell back to the peer -- one shared bucket, silently.
     values = request.headers.getlist("x-real-ip")
-    raw = (values[-1] if values else "").strip()
+    raw = (values[-1] if values else "").split(",")[-1].strip()
     if not raw:
         return peer
 
@@ -850,9 +880,14 @@ def delete_interests(request: Request, req: InterestsDeleteRequest):
 @app.post("/v1/fyp/events", response_model=EventsResponse, status_code=202)
 # 120/min per IP is deliberately generous -- a sendBeacon flush every few seconds is
 # ~20/min, and CGNAT means many real users can share one address. The global ceiling
-# is what bounds write volume: 600/min x 200 events/batch = 120k rows/min = 7.2M/hour,
+# bounds ACCEPTED write volume: 600/min x 200 events/batch = 120k rows/min = 7.2M/hour,
 # inside prune_feed_events' 20M cap given it only runs hourly. Without it, per-IP
 # keying removes the total bound the global bucket was accidentally providing.
+#
+# It does NOT bound total CPU. slowapi runs inside the endpoint wrapper, after
+# FastAPI validation, so a request that fails validation charges neither bucket -- a
+# 4MB malformed batch costs ~700ms and is unmetered. Closing that needs
+# SlowAPIMiddleware, which is a separate change (#28).
 @limiter.limit("600/minute", key_func=global_key)
 @limiter.limit("120/minute")
 def post_events(request: Request, req: EventsBatch):
@@ -928,8 +963,13 @@ def post_events(request: Request, req: EventsBatch):
 
 @app.post("/v1/fyp/admin/algorithm")
 # Global ceiling restores the brute-force bound on the API key that 5/min gave while
-# the bucket was (accidentally) shared.
-@limiter.limit("10/minute", key_func=global_key)
+# the bucket was (accidentally) shared. 30, not 10: at 10 the ratio to the per-IP
+# limit is 2:1, so two source IPs staying inside their own allowance consume the
+# whole ceiling and lock the real admin out indefinitely -- and rate limiting runs
+# BEFORE the API-key check, so that costs an attacker nothing. 6x headroom matches
+# the other three endpoints, and 30/min is still nowhere near brute-forcing a
+# 256-bit key.
+@limiter.limit("30/minute", key_func=global_key)
 @limiter.limit("5/minute")
 def activate_algorithm(
     request: Request,

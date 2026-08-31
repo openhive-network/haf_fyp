@@ -323,7 +323,7 @@ class TestLayeredCeilingsOnTheRealEndpoints:
         "post_interests": ("10 per 1 minute", "60 per 1 minute"),
         "delete_interests": ("5 per 1 minute", "30 per 1 minute"),
         "post_events": ("120 per 1 minute", "600 per 1 minute"),
-        "activate_algorithm": ("5 per 1 minute", "10 per 1 minute"),
+        "activate_algorithm": ("5 per 1 minute", "30 per 1 minute"),
     }
 
     @staticmethod
@@ -393,3 +393,54 @@ class TestThrottledAbuserDoesNotDrainTheGlobalBucket:
             "an innocent client was locked out by an abuser whose requests were "
             "already being rejected -- the global bucket was charged for them"
         )
+
+
+class TestAppendedHeaderSpellings:
+    """Both ways an appending edge can spell it must reach the same key."""
+
+    def test_comma_joined_value_takes_the_last_entry(self, trusted):
+        # A single header carrying "client, proxy" is what proxies actually emit and
+        # what an intermediary may collapse repeated lines into. Splitting only on
+        # repeated lines left this unparseable, so it fell back to the peer -- one
+        # shared bucket for everyone, silently.
+        r = _req({"x-real-ip": f"1.1.1.1, {CLIENT_A}"})
+        assert client_ip_key(r) == CLIENT_A
+
+    def test_repeated_lines_and_comma_joined_agree(self, trusted):
+        a = client_ip_key(_req_multi([("x-real-ip", "1.1.1.1"), ("x-real-ip", CLIENT_A)]))
+        b = client_ip_key(_req({"x-real-ip": f"1.1.1.1, {CLIENT_A}"}))
+        assert a == b == CLIENT_A
+
+    def test_a_lone_value_is_unaffected(self, trusted):
+        assert client_ip_key(_req({"x-real-ip": CLIENT_A})) == CLIENT_A
+
+
+class TestTrustGateMatchesClientIpKeyOnMappedAddresses:
+    def test_ipv4_mapped_peer_matches_an_ipv4_network(self, monkeypatch):
+        # A dual-stack listener presents an IPv4 edge as ::ffff:10.0.0.5. Without
+        # unwrapping, that is never `in` 10.0.0.0/8, the trust silently never matches,
+        # and every caller collapses to the peer bucket.
+        lits, nets = _parse_trusted("10.0.0.0/8")
+        monkeypatch.setattr(api, "_TRUSTED_LITERALS", lits)
+        monkeypatch.setattr(api, "_TRUSTED_NETS", nets)
+        r = _req({"x-real-ip": CLIENT_A}, peer="::ffff:10.0.0.5")
+        assert client_ip_key(r) == CLIENT_A
+
+    def test_a_mapped_peer_outside_the_range_is_still_untrusted(self, monkeypatch):
+        lits, nets = _parse_trusted("10.0.0.0/8")
+        monkeypatch.setattr(api, "_TRUSTED_LITERALS", lits)
+        monkeypatch.setattr(api, "_TRUSTED_NETS", nets)
+        r = _req({"x-real-ip": CLIENT_A}, peer="::ffff:45.9.148.99")
+        assert client_ip_key(r) == "::ffff:45.9.148.99"
+
+
+class TestParseTrustedWidening:
+    def test_a_typod_mask_is_detectable(self):
+        # strict=False turns 10.0.0.5/0 into 0.0.0.0/0 -- "trust the internet".
+        # api.py warns at import on this; the parse result is what makes it checkable.
+        _, nets = _parse_trusted("10.0.0.5/0")
+        assert any(n.prefixlen == 0 for n in nets)
+
+    def test_a_normal_mask_is_not_flagged(self):
+        _, nets = _parse_trusted("172.18.0.0/16")
+        assert not any(n.prefixlen == 0 for n in nets)
