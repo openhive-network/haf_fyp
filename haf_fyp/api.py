@@ -141,6 +141,9 @@ def _peer_is_trusted(peer: str) -> bool:
     return any(addr in net for net in _TRUSTED_NETS)
 
 
+_warned_untrusted_header = False
+
+
 def client_ip_key(request: Request) -> str:
     """Rate-limit bucket key: the real client IP when a trusted edge vouches for it.
 
@@ -157,6 +160,20 @@ def client_ip_key(request: Request) -> str:
     """
     peer = get_remote_address(request)
     if not _peer_is_trusted(peer):
+        # An untrusted peer presenting this header means one of two things, and both
+        # are worth a line: someone is forging it, or -- far more likely -- the edge
+        # was recreated with a new address and TRUSTED_PROXY_IPS is now stale. The
+        # stale case is otherwise SILENT: the app serves 200s and quietly returns to
+        # one shared bucket. Warn once per process so it cannot flood.
+        global _warned_untrusted_header
+        if not _warned_untrusted_header and request.headers.get("x-real-ip"):
+            _warned_untrusted_header = True
+            log.warning(
+                "X-Real-IP received from peer %s, which is not in TRUSTED_PROXY_IPS - "
+                "ignoring it and keying on the peer. If %s is the edge, the trust list "
+                "is stale and rate limits are now ONE SHARED BUCKET.",
+                peer, peer,
+            )
         return peer
 
     # Last value, not first. Under Caddy's `header_up X-Real-IP {remote_host}` (set
@@ -206,6 +223,7 @@ def global_key() -> str:
 limiter = Limiter(
     key_func=client_ip_key,
     storage_uri=os.environ.get("REDIS_URL", "memory://"),
+    key_style="url",
 )
 
 # ---------------------------------------------------------------------------
@@ -636,8 +654,12 @@ def sync_status(response: Response):
 # Per-IP bounds one abuser; the global ceiling bounds TOTAL cost -- each call does
 # signature verification plus a Hive RPC lookup, so this is cheap to send and
 # expensive to serve. The old global bucket supplied that ceiling by accident.
-@limiter.limit("60/minute", key_func=global_key)
-@limiter.limit("10/minute")
+# per_method: POST and DELETE share the /v1/fyp/interests path, and slowapi scopes a
+# bucket by path alone. Without it they are kept apart only by their limit AMOUNTS
+# differing (limits folds the amount into the key), so aligning the two numbers
+# later would silently merge them into one shared bucket.
+@limiter.limit("60/minute", key_func=global_key, per_method=True)
+@limiter.limit("10/minute", per_method=True)
 def post_interests(request: Request, req: InterestsRequest):
     """
     Declare or replace a user's cold-start community interests.
@@ -743,8 +765,8 @@ def post_interests(request: Request, req: InterestsRequest):
 
 
 @app.delete("/v1/fyp/interests", response_model=InterestsDeleteResponse)
-@limiter.limit("30/minute", key_func=global_key)
-@limiter.limit("5/minute")
+@limiter.limit("30/minute", key_func=global_key, per_method=True)
+@limiter.limit("5/minute", per_method=True)
 def delete_interests(request: Request, req: InterestsDeleteRequest):
     """
     Un-opt-in: clear a user's declared cold-start community interests (#10).

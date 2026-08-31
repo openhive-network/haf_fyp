@@ -280,6 +280,7 @@ Before going live:
 
 - [ ] `pgvector` extension installed by superuser on the HAF PostgreSQL server
 - [ ] `FYP_ADMIN_API_KEY` set to a strong random value in `docker/.env.local`
+- [ ] **`TRUSTED_PROXY_IPS` set to the reverse proxy's address or CIDR** if anything fronts this app. Rate limits key on `X-Real-IP` only from a trusted peer; unset, every caller keys on the proxy's address instead — one shared bucket for all of them, which is no per-client limit at all. The app logs a warning at startup when it is unset, and once more if a peer outside the list presents the header (which usually means the proxy was recreated with a new address and the list is now stale). Re-check it after anything that can renumber the proxy container.
 - [ ] `HAF_VERSION` pinned to a specific release tag (not `latest`)
 - [ ] HiveSense installed and synced → `grant_cross_schema.sh` re-run
 - [ ] Hivemind installed and synced (provides the (author, permlink) → hivemind post id bridge) → `grant_cross_schema.sh` re-run

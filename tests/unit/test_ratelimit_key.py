@@ -245,9 +245,12 @@ class TestEndToEndThroughSlowapi:
         app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
         app.add_middleware(SlowAPIMiddleware)
 
+        # Global ABOVE per-IP, mirroring the production endpoints. Stacked the other
+        # way this still passes (three distinct clients), which is exactly why it is
+        # worth pinning the right shape here.
         @app.get("/probe")
-        @lim.limit("100/minute")
         @lim.limit("2/minute", key_func=global_key)
+        @lim.limit("100/minute")
         def probe(request: Request):  # noqa: ARG001
             return {"ok": True}
 
@@ -444,3 +447,63 @@ class TestParseTrustedWidening:
     def test_a_normal_mask_is_not_flagged(self):
         _, nets = _parse_trusted("172.18.0.0/16")
         assert not any(n.prefixlen == 0 for n in nets)
+
+
+class TestStartupWarnings:
+    """The only deploy-time safety net in this change, and previously untested.
+
+    Deleting either branch left the whole suite green -- the same class of gap as an
+    unwired key_func: the code is correct and simply never runs.
+    """
+
+    @staticmethod
+    def _reload_with(monkeypatch, caplog, value):
+        import importlib
+        import logging
+
+        if value is None:
+            monkeypatch.delenv("TRUSTED_PROXY_IPS", raising=False)
+        else:
+            monkeypatch.setenv("TRUSTED_PROXY_IPS", value)
+        with caplog.at_level(logging.WARNING, logger="haf_fyp.api"):
+            importlib.reload(api)
+        return caplog.text
+
+    def test_unset_warns_that_limits_become_one_shared_bucket(self, monkeypatch, caplog):
+        text = self._reload_with(monkeypatch, caplog, None)
+        assert "TRUSTED_PROXY_IPS is not set" in text
+        assert "ONE SHARED BUCKET" in text
+
+    def test_a_zero_prefix_network_warns_that_every_peer_is_trusted(self, monkeypatch, caplog):
+        # strict=False turns a typo'd 10.0.0.5/0 into 0.0.0.0/0.
+        text = self._reload_with(monkeypatch, caplog, "10.0.0.5/0")
+        assert "/0 network" in text
+
+    def test_a_sane_value_warns_about_nothing(self, monkeypatch, caplog):
+        text = self._reload_with(monkeypatch, caplog, "172.18.0.0/16")
+        assert "TRUSTED_PROXY_IPS" not in text
+
+    def test_an_untrusted_peer_presenting_the_header_warns_once(self, monkeypatch, caplog):
+        """Covers the stale-trust case: the edge recreated with a new address.
+
+        Otherwise silent -- the app serves 200s and quietly reverts to one bucket.
+        """
+        import logging
+
+        monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset({EDGE}))
+        monkeypatch.setattr(api, "_TRUSTED_NETS", ())
+        monkeypatch.setattr(api, "_warned_untrusted_header", False)
+        with caplog.at_level(logging.WARNING, logger="haf_fyp.api"):
+            for _ in range(5):
+                client_ip_key(_req({"x-real-ip": CLIENT_A}, peer="10.9.9.9"))
+        assert caplog.text.count("not in TRUSTED_PROXY_IPS") == 1, "should warn once, not per request"
+
+    def test_no_warning_when_an_untrusted_peer_sends_no_header(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset({EDGE}))
+        monkeypatch.setattr(api, "_TRUSTED_NETS", ())
+        monkeypatch.setattr(api, "_warned_untrusted_header", False)
+        with caplog.at_level(logging.WARNING, logger="haf_fyp.api"):
+            client_ip_key(_req({}, peer="10.9.9.9"))
+        assert "not in TRUSTED_PROXY_IPS" not in caplog.text
