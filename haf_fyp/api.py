@@ -16,6 +16,7 @@ Redis pub/sub signals the ranker for on-demand feed refresh after interest updat
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -53,32 +54,58 @@ log = logging.getLogger(__name__)
 # Rate limiter — memory-backed by default; set REDIS_URL for multi-worker
 # ---------------------------------------------------------------------------
 
-# Every request reaches this app through Caddy -> Varnish -> HAProxy, so the socket
-# peer is always HAProxy's container address. get_remote_address() therefore returned
-# one constant for the entire internet, collapsing all four limits below into a single
-# GLOBAL bucket -- most damagingly POST /v1/fyp/interests, where 10/minute meant ten
-# opt-ins per minute across all users, i.e. real users 429ing each other.
+# Rate-limit bucket key.
 #
-# Caddy sets X-Real-IP to the true remote host on the @rest_apis route. `header_up`
-# with a value REPLACES, so a client-supplied X-Real-IP cannot survive, and port 3002
-# is not reachable from outside the host -- the edge is the only path in, which is what
-# makes this header trustworthy.
+# THE BUG THIS REPLACES: requests reach this app through Caddy -> Varnish -> HAProxy,
+# so the socket peer is always HAProxy's container address. get_remote_address()
+# returned that one constant for the entire internet, collapsing all four limits below
+# into a single GLOBAL bucket -- most damagingly POST /v1/fyp/interests, where 10/minute
+# meant ten opt-ins per minute across all users, i.e. real users 429ing each other.
 #
-# X-Forwarded-For is deliberately NOT used: three proxies append to it, and its leftmost
-# entry is whatever the client sent, so it is attacker-controlled. X-Real-IP is set by
-# exactly one hop and overwritten there.
+# WHY THE PEER GATE IS NOT OPTIONAL: an edge that overwrites X-Real-IP makes the header
+# trustworthy only for requests that came THROUGH that edge. This container publishes
+# port 3002 on the host (docker/docker-compose.yml), and the reference stack in this repo
+# has no edge at all -- so anyone reaching the port directly could set X-Real-IP freely
+# and mint a fresh bucket per request, making every limit a no-op. That is strictly worse
+# than the global bucket, and it is exactly why X-Forwarded-For is unsuitable generally.
+# So the header is honoured ONLY when the socket peer is a configured trusted proxy.
+# TRUSTED_PROXY_IPS is empty by default: unset means "no edge", which degrades to peer
+# keying rather than to a forgeable one.
 #
-# Falling back to the socket peer keeps local dev, CI and any direct call working; they
-# just share a bucket, as they did before.
-_MAX_IP_KEY = 64  # bounds the limiter's key space; an IP literal is at most 45 chars
+# Values are parsed with ipaddress rather than length-capped. A length cap bounds key
+# LENGTH, not key COUNT, and key count is what drives limiter memory -- the storage is a
+# shared, noeviction Redis, so unbounded key minting is an OOM path into a component the
+# ranker depends on.
+#
+# IPv6 is bucketed to /64: a residential customer is typically delegated a /64, so keying
+# on the full /128 would be free to evade and would mint a new key per rotation.
+_TRUSTED_PROXIES = frozenset(
+    p.strip() for p in os.environ.get("TRUSTED_PROXY_IPS", "").split(",") if p.strip()
+)
 
 
 def client_ip_key(request: Request) -> str:
-    """Rate-limit bucket key: the real client IP when the edge supplies it."""
-    real_ip = (request.headers.get("x-real-ip") or "").strip()
-    if real_ip and len(real_ip) <= _MAX_IP_KEY:
-        return real_ip
-    return get_remote_address(request)
+    """Rate-limit bucket key: the real client IP when a trusted edge vouches for it."""
+    peer = get_remote_address(request)
+    if peer not in _TRUSTED_PROXIES:
+        return peer
+
+    raw = (request.headers.get("x-real-ip") or "").strip()
+    if not raw:
+        return peer
+    try:
+        ip = ipaddress.ip_address(raw)
+    except ValueError:
+        return peer
+
+    if ip.version == 6:
+        return f"{ipaddress.ip_network(f'{ip}/64', strict=False).network_address}/64"
+    return str(ip)
+
+
+def global_key(_request: Request) -> str:
+    """Single shared bucket, for limits that cap TOTAL cost rather than per-caller abuse."""
+    return "global"
 
 
 limiter = Limiter(
@@ -511,7 +538,11 @@ def sync_status(response: Response):
 
 
 @app.post("/v1/fyp/interests", response_model=InterestsResponse)
+# Per-IP bounds one abuser; the global ceiling bounds TOTAL cost -- each call does
+# signature verification plus a Hive RPC lookup, so this is cheap to send and
+# expensive to serve. The old global bucket supplied that ceiling by accident.
 @limiter.limit("10/minute")
+@limiter.limit("60/minute", key_func=global_key)
 def post_interests(request: Request, req: InterestsRequest):
     """
     Declare or replace a user's cold-start community interests.
@@ -618,6 +649,7 @@ def post_interests(request: Request, req: InterestsRequest):
 
 @app.delete("/v1/fyp/interests", response_model=InterestsDeleteResponse)
 @limiter.limit("5/minute")
+@limiter.limit("30/minute", key_func=global_key)
 def delete_interests(request: Request, req: InterestsDeleteRequest):
     """
     Un-opt-in: clear a user's declared cold-start community interests (#10).
@@ -751,7 +783,13 @@ def delete_interests(request: Request, req: InterestsDeleteRequest):
 
 
 @app.post("/v1/fyp/events", response_model=EventsResponse, status_code=202)
+# 120/min per IP is deliberately generous -- a sendBeacon flush every few seconds is
+# ~20/min, and CGNAT means many real users can share one address. The global ceiling
+# is what bounds write volume: 600/min x 200 events/batch = 120k rows/min = 7.2M/hour,
+# inside prune_feed_events' 20M cap given it only runs hourly. Without it, per-IP
+# keying removes the total bound the global bucket was accidentally providing.
 @limiter.limit("120/minute")
+@limiter.limit("600/minute", key_func=global_key)
 def post_events(request: Request, req: EventsBatch):
     """
     Ingest a batch of feed telemetry events (impressions, opens, video
@@ -824,7 +862,10 @@ def post_events(request: Request, req: EventsBatch):
 
 
 @app.post("/v1/fyp/admin/algorithm")
+# Global ceiling restores the brute-force bound on the API key that 5/min gave while
+# the bucket was (accidentally) shared.
 @limiter.limit("5/minute")
+@limiter.limit("10/minute", key_func=global_key)
 def activate_algorithm(
     request: Request,
     req: AlgorithmActivateRequest,

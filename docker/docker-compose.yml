@@ -96,7 +96,12 @@ services:
       dockerfile: Dockerfile.python
     command: ["uvicorn", "haf_fyp.api:app", "--host", "0.0.0.0", "--port", "3002"]
     ports:
-      - "${FYP_API_PORT:-3002}:3002"
+      # Loopback-bound on purpose. Published on all interfaces this port bypasses the
+      # edge entirely, and the rate limiter's X-Real-IP would then be settable by any
+      # caller -- a fresh bucket per request, i.e. no limit at all. See client_ip_key
+      # in haf_fyp/api.py. Nothing needs the host mapping: other services reach this
+      # container by name on the compose network.
+      - "127.0.0.1:${FYP_API_PORT:-3002}:3002"
     environment:
       POSTGRES_HOST: haf
       POSTGRES_USER: haf_fyp_user
