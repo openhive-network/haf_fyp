@@ -76,7 +76,10 @@ python-tests:
   stage: test
   image: python:3.11-slim
   script:
-    - pip install -r requirements.txt pytest pytest-cov -q
+    # httpx: required by starlette.testclient, which tests/unit/test_ratelimit_key.py
+    # uses to assert rate-limit bucketing end-to-end through slowapi. Test-only, so
+    # it stays out of requirements.txt and off the runtime image.
+    - pip install -r requirements.txt pytest pytest-cov httpx -q
     - PYTHONPATH=. pytest tests/unit/ -v --cov=haf_fyp --cov-report=term-missing --cov-fail-under=40
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"

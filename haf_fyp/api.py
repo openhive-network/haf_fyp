@@ -16,6 +16,7 @@ Redis pub/sub signals the ranker for on-demand feed refresh after interest updat
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -53,9 +54,176 @@ log = logging.getLogger(__name__)
 # Rate limiter — memory-backed by default; set REDIS_URL for multi-worker
 # ---------------------------------------------------------------------------
 
+# Rate-limit bucket key.
+#
+# THE BUG THIS REPLACES: requests reach this app through Caddy -> Varnish -> HAProxy,
+# so the socket peer is always HAProxy's container address. get_remote_address()
+# returned that one constant for the entire internet, collapsing all four limits below
+# into a single GLOBAL bucket -- most damagingly POST /v1/fyp/interests, where 10/minute
+# meant ten opt-ins per minute across all users, i.e. real users 429ing each other.
+#
+# WHY THE PEER GATE IS NOT OPTIONAL: an edge that overwrites X-Real-IP makes the header
+# trustworthy only for requests that came THROUGH that edge. This container publishes
+# port 3002 on the host (docker/docker-compose.yml), and the reference stack in this repo
+# has no edge at all -- so anyone reaching the port directly could set X-Real-IP freely
+# and mint a fresh bucket per request, making every limit a no-op. That is strictly worse
+# than the global bucket, and it is exactly why X-Forwarded-For is unsuitable generally.
+# So the header is honoured ONLY when the socket peer is a configured trusted proxy.
+# TRUSTED_PROXY_IPS is empty by default: unset means "no edge", which degrades to peer
+# keying rather than to a forgeable one.
+#
+# Values are parsed with ipaddress rather than length-capped. A length cap bounds key
+# LENGTH, not key COUNT, and key count is what drives limiter memory -- the storage is a
+# shared, noeviction Redis, so unbounded key minting is an OOM path into a component the
+# ranker depends on.
+#
+# IPv6 is bucketed to /64: a residential customer is typically delegated a /64, so keying
+# on the full /128 would be free to evade and would mint a new key per rotation.
+def _parse_trusted(raw: str) -> tuple[frozenset, tuple]:
+    """Split TRUSTED_PROXY_IPS into literal strings and IP networks.
+
+    Accepting CIDR matters: Docker assigns the edge container a dynamic address on
+    the compose bridge, so a range is the natural thing to configure. A plain string
+    compare would silently not match it, the header would be ignored, and the app
+    would degrade to peer keying -- which behind the edge is one global bucket for
+    the whole internet, i.e. exactly the bug this fixes, with no failure signal.
+    Non-IP entries are kept as literals. Note this cannot make a HOSTNAME work: the
+    peer comes from request.client.host, which any real ASGI server fills from the
+    socket, so it is always numeric. Literals exist for synthetic peers such as
+    TestClient's "testclient"; configuring a hostname fails closed with no signal.
+    """
+    literals, nets = set(), []
+    for entry in (e.strip() for e in raw.split(",")):
+        if not entry:
+            continue
+        literals.add(entry)
+        try:
+            nets.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            pass
+    return frozenset(literals), tuple(nets)
+
+
+_TRUSTED_LITERALS, _TRUSTED_NETS = _parse_trusted(os.environ.get("TRUSTED_PROXY_IPS", ""))
+
+if not _TRUSTED_LITERALS:
+    # Behind a proxy this is not a smaller limit, it is NO per-client limit: every
+    # caller keys on the proxy's address, i.e. one bucket for the whole internet.
+    # That regression has shipped twice already and is invisible at runtime, so it
+    # gets the same treatment as HIVE_RPC_URL rather than a comment nobody reads.
+    log.warning(
+        "TRUSTED_PROXY_IPS is not set - rate limits will key on the socket peer. "
+        "Behind a reverse proxy that is ONE SHARED BUCKET for all callers. Set it "
+        "to the edge's address or CIDR."
+    )
+elif any(net.prefixlen == 0 for net in _TRUSTED_NETS):
+    # strict=False quietly widens a typo: 10.0.0.5/0 parses as 0.0.0.0/0.
+    log.warning(
+        "TRUSTED_PROXY_IPS contains a /0 network - every peer is trusted, so any "
+        "caller can set X-Real-IP and choose their own rate-limit bucket."
+    )
+
+
+def _peer_is_trusted(peer: str) -> bool:
+    if peer in _TRUSTED_LITERALS:
+        return True
+    if not _TRUSTED_NETS:
+        return False
+    try:
+        addr = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    # A dual-stack listener presents an IPv4 edge as ::ffff:10.0.0.5, which is never
+    # `in` a v4 network -- the trust would silently never match and the app would
+    # degrade to peer keying. client_ip_key already unwraps; this must agree with it.
+    if addr.version == 6 and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    return any(addr in net for net in _TRUSTED_NETS)
+
+
+_warned_untrusted_header = False
+
+
+def client_ip_key(request: Request) -> str:
+    """Rate-limit bucket key: the real client IP when a trusted edge vouches for it.
+
+    THE PARAMETER MUST BE NAMED `request`. slowapi dispatches on the name, not on
+    whether this is a Limiter-level key_func or a per-decorator override:
+
+        if "request" in inspect.signature(lim.key_func).parameters:
+            limit_key = lim.key_func(request)
+        else:
+            limit_key = lim.key_func()
+
+    Renaming it to `req` -- the name used elsewhere in this module -- makes slowapi
+    call it with no argument and 500s every request to all four limited endpoints.
+    """
+    peer = get_remote_address(request)
+    if not _peer_is_trusted(peer):
+        # An untrusted peer presenting this header means one of two things, and both
+        # are worth a line: someone is forging it, or -- far more likely -- the edge
+        # was recreated with a new address and TRUSTED_PROXY_IPS is now stale. The
+        # stale case is otherwise SILENT: the app serves 200s and quietly returns to
+        # one shared bucket. Warn once per process so it cannot flood.
+        global _warned_untrusted_header
+        if not _warned_untrusted_header and request.headers.get("x-real-ip"):
+            _warned_untrusted_header = True
+            log.warning(
+                "X-Real-IP received from peer %s, which is not in TRUSTED_PROXY_IPS - "
+                "ignoring it and keying on the peer. If %s is the edge, the trust list "
+                "is stale and rate limits are now ONE SHARED BUCKET.",
+                peer, peer,
+            )
+        return peer
+
+    # Last value, not first. Under Caddy's `header_up X-Real-IP {remote_host}` (set
+    # semantics) there is only one; if an edge ever used the appending form instead,
+    # the FIRST value is the client-supplied one and keying on it would hand any
+    # caller a forged bucket. The last is the one the nearest proxy wrote.
+    #
+    # Both spellings of "appended" have to be handled: repeated header lines, AND a
+    # single comma-joined value, which is what proxies emit and what an intermediary
+    # may collapse repeats into. Splitting only on the former left the latter
+    # unparseable, so it fell back to the peer -- one shared bucket, silently.
+    values = request.headers.getlist("x-real-ip")
+    raw = (values[-1] if values else "").split(",")[-1].strip()
+    if not raw:
+        return peer
+
+    try:
+        ip = ipaddress.ip_address(raw)
+        # ::ffff:203.0.113.7 is an IPv4 client in v6 clothing. Without this it takes
+        # the /64 branch below and masks to '::', collapsing EVERY mapped address
+        # into one bucket -- this MR's own bug, recreated in a corner.
+        if ip.version == 6 and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if ip.version == 6:
+            return f"{ipaddress.ip_network(f'{ip}/64', strict=False).network_address}/64"
+    except ValueError:
+        return peer
+    return str(ip)
+
+
+def global_key() -> str:
+    """Single shared bucket, capping TOTAL cost rather than per-caller abuse.
+
+    Takes no parameter, and specifically none named `request` -- see client_ip_key
+    for why the name is what slowapi dispatches on.
+
+    ORDER MATTERS WHERE THIS IS USED. slowapi evaluates limits in registration order
+    and breaks on the first failure, and stacked decorators register bottom-up. So
+    the global ceiling must be the OUTER decorator: if it is inner, it is hit()
+    before the per-IP limit is checked, and requests the per-IP limit is already
+    rejecting still spend global budget -- letting one throttled abuser 429 everyone
+    else, which is the harm this whole change exists to remove.
+    """
+    return "global"
+
+
 limiter = Limiter(
-    key_func=get_remote_address,
+    key_func=client_ip_key,
     storage_uri=os.environ.get("REDIS_URL", "memory://"),
+    key_style="url",
 )
 
 # ---------------------------------------------------------------------------
@@ -483,7 +651,15 @@ def sync_status(response: Response):
 
 
 @app.post("/v1/fyp/interests", response_model=InterestsResponse)
-@limiter.limit("10/minute")
+# Per-IP bounds one abuser; the global ceiling bounds TOTAL cost -- each call does
+# signature verification plus a Hive RPC lookup, so this is cheap to send and
+# expensive to serve. The old global bucket supplied that ceiling by accident.
+# per_method: POST and DELETE share the /v1/fyp/interests path, and slowapi scopes a
+# bucket by path alone. Without it they are kept apart only by their limit AMOUNTS
+# differing (limits folds the amount into the key), so aligning the two numbers
+# later would silently merge them into one shared bucket.
+@limiter.limit("60/minute", key_func=global_key, per_method=True)
+@limiter.limit("10/minute", per_method=True)
 def post_interests(request: Request, req: InterestsRequest):
     """
     Declare or replace a user's cold-start community interests.
@@ -589,7 +765,8 @@ def post_interests(request: Request, req: InterestsRequest):
 
 
 @app.delete("/v1/fyp/interests", response_model=InterestsDeleteResponse)
-@limiter.limit("5/minute")
+@limiter.limit("30/minute", key_func=global_key, per_method=True)
+@limiter.limit("5/minute", per_method=True)
 def delete_interests(request: Request, req: InterestsDeleteRequest):
     """
     Un-opt-in: clear a user's declared cold-start community interests (#10).
@@ -723,6 +900,17 @@ def delete_interests(request: Request, req: InterestsDeleteRequest):
 
 
 @app.post("/v1/fyp/events", response_model=EventsResponse, status_code=202)
+# 120/min per IP is deliberately generous -- a sendBeacon flush every few seconds is
+# ~20/min, and CGNAT means many real users can share one address. The global ceiling
+# bounds ACCEPTED write volume: 600/min x 200 events/batch = 120k rows/min = 7.2M/hour,
+# inside prune_feed_events' 20M cap given it only runs hourly. Without it, per-IP
+# keying removes the total bound the global bucket was accidentally providing.
+#
+# It does NOT bound total CPU. slowapi runs inside the endpoint wrapper, after
+# FastAPI validation, so a request that fails validation charges neither bucket -- a
+# 4MB malformed batch costs ~700ms and is unmetered. Closing that needs
+# SlowAPIMiddleware, which is a separate change (#28).
+@limiter.limit("600/minute", key_func=global_key)
 @limiter.limit("120/minute")
 def post_events(request: Request, req: EventsBatch):
     """
@@ -796,6 +984,14 @@ def post_events(request: Request, req: EventsBatch):
 
 
 @app.post("/v1/fyp/admin/algorithm")
+# Global ceiling restores the brute-force bound on the API key that 5/min gave while
+# the bucket was (accidentally) shared. 30, not 10: at 10 the ratio to the per-IP
+# limit is 2:1, so two source IPs staying inside their own allowance consume the
+# whole ceiling and lock the real admin out indefinitely -- and rate limiting runs
+# BEFORE the API-key check, so that costs an attacker nothing. 6x headroom matches
+# the other three endpoints, and 30/min is still nowhere near brute-forcing a
+# 256-bit key.
+@limiter.limit("30/minute", key_func=global_key)
 @limiter.limit("5/minute")
 def activate_algorithm(
     request: Request,

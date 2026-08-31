@@ -96,8 +96,20 @@ services:
       dockerfile: Dockerfile.python
     command: ["uvicorn", "haf_fyp.api:app", "--host", "0.0.0.0", "--port", "3002"]
     ports:
-      - "${FYP_API_PORT:-3002}:3002"
+      # Loopback-bound on purpose. Published on all interfaces this port bypasses the
+      # edge entirely, and the rate limiter's X-Real-IP would then be settable by any
+      # caller -- a fresh bucket per request, i.e. no limit at all. See client_ip_key
+      # in haf_fyp/api.py. Nothing needs the host mapping: other services reach this
+      # container by name on the compose network.
+      - "127.0.0.1:${FYP_API_PORT:-3002}:3002"
     environment:
+      # Peers whose X-Real-IP the rate limiter will trust -- the edge, and nothing
+      # else. Accepts addresses or CIDR (the edge container's address is usually
+      # assigned dynamically). EMPTY BY DEFAULT: unset means no edge, and limits
+      # degrade to keying on the socket peer rather than on a forgeable header.
+      # Leaving it unset behind a proxy silently restores the one-global-bucket bug
+      # this exists to fix, so set it wherever an edge is in front.
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-}
       POSTGRES_HOST: haf
       POSTGRES_USER: haf_fyp_user
       POSTGRES_DB:   haf_block_log
