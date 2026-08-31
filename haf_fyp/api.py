@@ -53,8 +53,36 @@ log = logging.getLogger(__name__)
 # Rate limiter — memory-backed by default; set REDIS_URL for multi-worker
 # ---------------------------------------------------------------------------
 
+# Every request reaches this app through Caddy -> Varnish -> HAProxy, so the socket
+# peer is always HAProxy's container address. get_remote_address() therefore returned
+# one constant for the entire internet, collapsing all four limits below into a single
+# GLOBAL bucket -- most damagingly POST /v1/fyp/interests, where 10/minute meant ten
+# opt-ins per minute across all users, i.e. real users 429ing each other.
+#
+# Caddy sets X-Real-IP to the true remote host on the @rest_apis route. `header_up`
+# with a value REPLACES, so a client-supplied X-Real-IP cannot survive, and port 3002
+# is not reachable from outside the host -- the edge is the only path in, which is what
+# makes this header trustworthy.
+#
+# X-Forwarded-For is deliberately NOT used: three proxies append to it, and its leftmost
+# entry is whatever the client sent, so it is attacker-controlled. X-Real-IP is set by
+# exactly one hop and overwritten there.
+#
+# Falling back to the socket peer keeps local dev, CI and any direct call working; they
+# just share a bucket, as they did before.
+_MAX_IP_KEY = 64  # bounds the limiter's key space; an IP literal is at most 45 chars
+
+
+def client_ip_key(request: Request) -> str:
+    """Rate-limit bucket key: the real client IP when the edge supplies it."""
+    real_ip = (request.headers.get("x-real-ip") or "").strip()
+    if real_ip and len(real_ip) <= _MAX_IP_KEY:
+        return real_ip
+    return get_remote_address(request)
+
+
 limiter = Limiter(
-    key_func=get_remote_address,
+    key_func=client_ip_key,
     storage_uri=os.environ.get("REDIS_URL", "memory://"),
 )
 
