@@ -79,38 +79,96 @@ log = logging.getLogger(__name__)
 #
 # IPv6 is bucketed to /64: a residential customer is typically delegated a /64, so keying
 # on the full /128 would be free to evade and would mint a new key per rotation.
-_TRUSTED_PROXIES = frozenset(
-    p.strip() for p in os.environ.get("TRUSTED_PROXY_IPS", "").split(",") if p.strip()
-)
+def _parse_trusted(raw: str) -> tuple[frozenset, tuple]:
+    """Split TRUSTED_PROXY_IPS into literal strings and IP networks.
+
+    Accepting CIDR matters: Docker assigns the edge container a dynamic address on
+    the compose bridge, so a range is the natural thing to configure. A plain string
+    compare would silently not match it, the header would be ignored, and the app
+    would degrade to peer keying -- which behind the edge is one global bucket for
+    the whole internet, i.e. exactly the bug this fixes, with no failure signal.
+    Non-IP entries are kept as literals so hostnames and test peers still work.
+    """
+    literals, nets = set(), []
+    for entry in (e.strip() for e in raw.split(",")):
+        if not entry:
+            continue
+        literals.add(entry)
+        try:
+            nets.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            pass
+    return frozenset(literals), tuple(nets)
+
+
+_TRUSTED_LITERALS, _TRUSTED_NETS = _parse_trusted(os.environ.get("TRUSTED_PROXY_IPS", ""))
+
+
+def _peer_is_trusted(peer: str) -> bool:
+    if peer in _TRUSTED_LITERALS:
+        return True
+    if not _TRUSTED_NETS:
+        return False
+    try:
+        addr = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    return any(addr in net for net in _TRUSTED_NETS)
 
 
 def client_ip_key(request: Request) -> str:
-    """Rate-limit bucket key: the real client IP when a trusted edge vouches for it."""
+    """Rate-limit bucket key: the real client IP when a trusted edge vouches for it.
+
+    THE PARAMETER MUST BE NAMED `request`. slowapi dispatches on the name, not on
+    whether this is a Limiter-level key_func or a per-decorator override:
+
+        if "request" in inspect.signature(lim.key_func).parameters:
+            limit_key = lim.key_func(request)
+        else:
+            limit_key = lim.key_func()
+
+    Renaming it to `req` -- the name used elsewhere in this module -- makes slowapi
+    call it with no argument and 500s every request to all four limited endpoints.
+    """
     peer = get_remote_address(request)
-    if peer not in _TRUSTED_PROXIES:
+    if not _peer_is_trusted(peer):
         return peer
 
-    raw = (request.headers.get("x-real-ip") or "").strip()
+    # Last value, not first. Under Caddy's `header_up X-Real-IP {remote_host}` (set
+    # semantics) there is only one; if an edge ever used the appending form instead,
+    # the FIRST value is the client-supplied one and keying on it would hand any
+    # caller a forged bucket. The last is the one the nearest proxy wrote.
+    values = request.headers.getlist("x-real-ip")
+    raw = (values[-1] if values else "").strip()
     if not raw:
         return peer
+
     try:
         ip = ipaddress.ip_address(raw)
+        # ::ffff:203.0.113.7 is an IPv4 client in v6 clothing. Without this it takes
+        # the /64 branch below and masks to '::', collapsing EVERY mapped address
+        # into one bucket -- this MR's own bug, recreated in a corner.
+        if ip.version == 6 and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if ip.version == 6:
+            return f"{ipaddress.ip_network(f'{ip}/64', strict=False).network_address}/64"
     except ValueError:
         return peer
-
-    if ip.version == 6:
-        return f"{ipaddress.ip_network(f'{ip}/64', strict=False).network_address}/64"
     return str(ip)
 
 
 def global_key() -> str:
-    """Single shared bucket, for limits that cap TOTAL cost rather than per-caller abuse.
+    """Single shared bucket, capping TOTAL cost rather than per-caller abuse.
 
-    TAKES NO ARGUMENTS ON PURPOSE. slowapi calls a Limiter-level key_func with the
-    request, but a per-decorator `key_func=` override is invoked as `lim.key_func()`
-    with none (slowapi/extension.py, __evaluate_limits). Giving this a request
-    parameter raises TypeError inside the limiter and 500s the endpoint -- on every
-    request, for all four limits at once.
+    Takes no parameter, and specifically none named `request` -- see client_ip_key
+    for why the name is what slowapi dispatches on.
+
+    ORDER MATTERS WHERE THIS IS USED. slowapi evaluates limits in registration order
+    and breaks on the first failure, and stacked decorators register bottom-up. So
+    the global ceiling must be the OUTER decorator: if it is inner, it is hit()
+    before the per-IP limit is checked, and requests the per-IP limit is already
+    rejecting still spend global budget -- letting one throttled abuser 429 everyone
+    else, which is the harm this whole change exists to remove.
     """
     return "global"
 
@@ -548,8 +606,8 @@ def sync_status(response: Response):
 # Per-IP bounds one abuser; the global ceiling bounds TOTAL cost -- each call does
 # signature verification plus a Hive RPC lookup, so this is cheap to send and
 # expensive to serve. The old global bucket supplied that ceiling by accident.
-@limiter.limit("10/minute")
 @limiter.limit("60/minute", key_func=global_key)
+@limiter.limit("10/minute")
 def post_interests(request: Request, req: InterestsRequest):
     """
     Declare or replace a user's cold-start community interests.
@@ -655,8 +713,8 @@ def post_interests(request: Request, req: InterestsRequest):
 
 
 @app.delete("/v1/fyp/interests", response_model=InterestsDeleteResponse)
-@limiter.limit("5/minute")
 @limiter.limit("30/minute", key_func=global_key)
+@limiter.limit("5/minute")
 def delete_interests(request: Request, req: InterestsDeleteRequest):
     """
     Un-opt-in: clear a user's declared cold-start community interests (#10).
@@ -795,8 +853,8 @@ def delete_interests(request: Request, req: InterestsDeleteRequest):
 # is what bounds write volume: 600/min x 200 events/batch = 120k rows/min = 7.2M/hour,
 # inside prune_feed_events' 20M cap given it only runs hourly. Without it, per-IP
 # keying removes the total bound the global bucket was accidentally providing.
-@limiter.limit("120/minute")
 @limiter.limit("600/minute", key_func=global_key)
+@limiter.limit("120/minute")
 def post_events(request: Request, req: EventsBatch):
     """
     Ingest a batch of feed telemetry events (impressions, opens, video
@@ -871,8 +929,8 @@ def post_events(request: Request, req: EventsBatch):
 @app.post("/v1/fyp/admin/algorithm")
 # Global ceiling restores the brute-force bound on the API key that 5/min gave while
 # the bucket was (accidentally) shared.
-@limiter.limit("5/minute")
 @limiter.limit("10/minute", key_func=global_key)
+@limiter.limit("5/minute")
 def activate_algorithm(
     request: Request,
     req: AlgorithmActivateRequest,

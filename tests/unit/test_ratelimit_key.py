@@ -17,7 +17,7 @@ import pytest
 from starlette.datastructures import Headers
 
 from haf_fyp import api
-from haf_fyp.api import client_ip_key, global_key, limiter
+from haf_fyp.api import _parse_trusted, client_ip_key, global_key, limiter
 
 EDGE = "172.18.0.23"  # HAProxy, the only peer real traffic ever arrives from
 CLIENT_A = "203.0.113.7"
@@ -41,7 +41,8 @@ def _req_multi(pairs, peer=EDGE):
 
 @pytest.fixture
 def trusted(monkeypatch):
-    monkeypatch.setattr(api, "_TRUSTED_PROXIES", frozenset({EDGE}))
+    monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset({EDGE}))
+    monkeypatch.setattr(api, "_TRUSTED_NETS", ())
 
 
 class TestTrustedPeerGate:
@@ -61,11 +62,13 @@ class TestTrustedPeerGate:
         }
         assert keys == {"45.9.148.99"}
 
-    def test_default_config_trusts_nobody(self):
-        # TRUSTED_PROXY_IPS unset => degrade to peer keying, never to a forgeable key.
-        assert api._TRUSTED_PROXIES == frozenset() or EDGE not in api._TRUSTED_PROXIES or True
-        r = _req({"x-real-ip": CLIENT_A}, peer="45.9.148.99")
-        assert client_ip_key(r) == "45.9.148.99"
+    def test_unset_config_trusts_nobody(self, monkeypatch):
+        # TRUSTED_PROXY_IPS unset => degrade to peer keying, never a forgeable key.
+        # The previous version of this test ended in `or True` and was a tautology:
+        # it passed even with a trust set containing everything.
+        monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset())
+        monkeypatch.setattr(api, "_TRUSTED_NETS", ())
+        assert client_ip_key(_req({"x-real-ip": CLIENT_A})) == EDGE
 
     def test_header_from_the_trusted_edge_is_honoured(self, trusted):
         assert client_ip_key(_req({"x-real-ip": CLIENT_A})) == CLIENT_A
@@ -96,11 +99,14 @@ class TestClientIpKey:
                            "client": type("C", (), {"host": EDGE})()})()
         assert client_ip_key(r) == CLIENT_A
 
-    def test_duplicate_headers_take_the_first(self, trusted):
-        # Only expressible with real Headers. If a config ever used the appending form
-        # (header_up +X-Real-IP), the leftmost would be client-supplied -- this pins
-        # which one we key on so that change is visible.
-        r = _req_multi([("x-real-ip", CLIENT_A), ("x-real-ip", CLIENT_B)])
+    def test_duplicate_headers_take_the_LAST(self, trusted):
+        # Only expressible with real Headers. Under an appending edge the FIRST value
+        # is the client-supplied one, so keying on it would hand any caller a forged
+        # bucket and defeat the peer gate entirely. The last is what the nearest proxy
+        # wrote. Caddy's `header_up X-Real-IP {remote_host}` sets rather than appends,
+        # so today there is only ever one -- this pins the safe choice for the day
+        # that stops being true.
+        r = _req_multi([("x-real-ip", "1.1.1.1"), ("x-real-ip", CLIENT_A)])
         assert client_ip_key(r) == CLIENT_A
 
     @pytest.mark.parametrize(
@@ -140,13 +146,20 @@ class TestWiring:
         # while every test above stays green -- the function correct but unused.
         assert limiter._key_func is client_ip_key
 
-    def test_global_key_takes_no_arguments_and_is_constant(self):
-        # slowapi invokes a per-decorator key_func as `lim.key_func()` with NO request.
-        # The first version of this took `_request` and 500'd all four endpoints; the
-        # unit test passed because it called it the way slowapi does not.
+    def test_key_funcs_use_the_parameter_name_slowapi_dispatches_on(self):
+        # slowapi picks how to call a key_func by whether a parameter is LITERALLY
+        # named "request" -- same code path for Limiter-level and per-decorator:
+        #     if "request" in inspect.signature(lim.key_func).parameters:
+        #         limit_key = lim.key_func(request)
+        #     else:
+        #         limit_key = lim.key_func()
+        # The earlier version of this asserted "global_key takes no parameters",
+        # which is the wrong invariant: renaming client_ip_key's parameter to `req`
+        # also 500s everything, and that assertion would not have noticed.
         import inspect
 
-        assert list(inspect.signature(global_key).parameters) == []
+        assert "request" in inspect.signature(client_ip_key).parameters
+        assert "request" not in inspect.signature(global_key).parameters
         assert global_key() == "global"
 
 
@@ -167,7 +180,8 @@ class TestEndToEndThroughSlowapi:
         from slowapi.errors import RateLimitExceeded
         from slowapi.middleware import SlowAPIMiddleware
 
-        monkeypatch.setattr(api, "_TRUSTED_PROXIES", frozenset({"testclient"}))
+        monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset({"testclient"}))
+        monkeypatch.setattr(api, "_TRUSTED_NETS", ())
         lim = Limiter(key_func=key_func, storage_uri="memory://")
         app = FastAPI()
         app.state.limiter = lim
@@ -223,7 +237,8 @@ class TestEndToEndThroughSlowapi:
         from slowapi.errors import RateLimitExceeded
         from slowapi.middleware import SlowAPIMiddleware
 
-        monkeypatch.setattr(api, "_TRUSTED_PROXIES", frozenset({"testclient"}))
+        monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset({"testclient"}))
+        monkeypatch.setattr(api, "_TRUSTED_NETS", ())
         lim = Limiter(key_func=client_ip_key, storage_uri="memory://")
         app = FastAPI()
         app.state.limiter = lim
@@ -245,3 +260,136 @@ class TestEndToEndThroughSlowapi:
             ]
         assert 500 not in codes, "global_key signature is wrong for slowapi"
         assert codes == [200, 200, 429], codes
+
+
+class TestTrustedProxyParsing:
+    """CIDR support matters: the edge container's address is assigned by Docker."""
+
+    def test_cidr_entry_matches_an_address_inside_it(self, monkeypatch):
+        lits, nets = _parse_trusted("172.18.0.0/16")
+        monkeypatch.setattr(api, "_TRUSTED_LITERALS", lits)
+        monkeypatch.setattr(api, "_TRUSTED_NETS", nets)
+        assert client_ip_key(_req({"x-real-ip": CLIENT_A}, peer="172.18.0.23")) == CLIENT_A
+
+    def test_cidr_entry_does_not_match_outside_it(self, monkeypatch):
+        lits, nets = _parse_trusted("172.18.0.0/16")
+        monkeypatch.setattr(api, "_TRUSTED_LITERALS", lits)
+        monkeypatch.setattr(api, "_TRUSTED_NETS", nets)
+        assert client_ip_key(_req({"x-real-ip": CLIENT_A}, peer="45.9.148.99")) == "45.9.148.99"
+
+    def test_bare_address_and_slash32_both_work(self, monkeypatch):
+        for entry in ("172.18.0.23", "172.18.0.23/32"):
+            lits, nets = _parse_trusted(entry)
+            monkeypatch.setattr(api, "_TRUSTED_LITERALS", lits)
+            monkeypatch.setattr(api, "_TRUSTED_NETS", nets)
+            assert client_ip_key(_req({"x-real-ip": CLIENT_A}, peer="172.18.0.23")) == CLIENT_A, entry
+
+    def test_ipv6_edge_matches_however_it_is_written(self, monkeypatch):
+        lits, nets = _parse_trusted("fd15:a999:7f72::17")
+        monkeypatch.setattr(api, "_TRUSTED_LITERALS", lits)
+        monkeypatch.setattr(api, "_TRUSTED_NETS", nets)
+        # Expanded form must still be recognised -- a raw string compare would not.
+        peer = "fd15:0a999:7f72:0000:0000:0000:0000:0017".replace("0a999", "a999")
+        assert client_ip_key(_req({"x-real-ip": CLIENT_A}, peer=peer)) == CLIENT_A
+
+    def test_non_ip_entries_survive_as_literals(self, monkeypatch):
+        lits, nets = _parse_trusted("testclient, haproxy")
+        monkeypatch.setattr(api, "_TRUSTED_LITERALS", lits)
+        monkeypatch.setattr(api, "_TRUSTED_NETS", nets)
+        assert client_ip_key(_req({"x-real-ip": CLIENT_A}, peer="haproxy")) == CLIENT_A
+
+    def test_empty_and_whitespace_parse_to_nothing(self):
+        assert _parse_trusted("") == (frozenset(), ())
+        assert _parse_trusted("  ,  , ") == (frozenset(), ())
+
+
+class TestIpv4MappedIsUnwrapped:
+    def test_mapped_addresses_do_not_all_collapse_to_one_bucket(self, trusted):
+        a = client_ip_key(_req({"x-real-ip": "::ffff:203.0.113.7"}))
+        b = client_ip_key(_req({"x-real-ip": "::ffff:198.51.100.4"}))
+        assert a != b, "every IPv4-mapped client shared one bucket"
+        assert a == "203.0.113.7"
+
+    def test_mapped_and_plain_forms_agree(self, trusted):
+        assert client_ip_key(_req({"x-real-ip": "::ffff:203.0.113.7"})) == client_ip_key(
+            _req({"x-real-ip": "203.0.113.7"})
+        ), "same client got two allowances depending on header format"
+
+
+class TestLayeredCeilingsOnTheRealEndpoints:
+    """Guards the two ways the ceilings can be wrong without any test noticing."""
+
+    EXPECTED = {
+        "post_interests": ("10 per 1 minute", "60 per 1 minute"),
+        "delete_interests": ("5 per 1 minute", "30 per 1 minute"),
+        "post_events": ("120 per 1 minute", "600 per 1 minute"),
+        "activate_algorithm": ("5 per 1 minute", "10 per 1 minute"),
+    }
+
+    @staticmethod
+    def _limits(func_name):
+        return limiter._route_limits[f"haf_fyp.api.{func_name}"]
+
+    @pytest.mark.parametrize("func_name", sorted(EXPECTED))
+    def test_endpoint_carries_both_a_per_ip_and_a_global_limit(self, func_name):
+        # Deleting a `key_func=global_key` decorator used to leave the whole suite
+        # green -- the ceilings are the point of the change and could vanish silently.
+        by_key = {lim.key_func.__name__: str(lim.limit) for lim in self._limits(func_name)}
+        per_ip, glob = self.EXPECTED[func_name]
+        assert by_key.get("client_ip_key") == per_ip, by_key
+        assert by_key.get("global_key") == glob, by_key
+
+    @pytest.mark.parametrize("func_name", sorted(EXPECTED))
+    def test_per_ip_limit_is_evaluated_before_the_global_ceiling(self, func_name):
+        """The ordering bug, pinned.
+
+        slowapi evaluates limits in REGISTRATION order and breaks on the first
+        failure; stacked decorators register bottom-up. If the global ceiling
+        registers first it is hit() before the per-IP limit is checked, so requests
+        the per-IP limit is already rejecting still spend global budget -- one
+        throttled abuser then 429s every other user, which is the exact harm this
+        change exists to remove. Registration order must be per-IP first, which
+        means the global decorator has to sit ABOVE it in the source.
+        """
+        order = [lim.key_func.__name__ for lim in self._limits(func_name)]
+        assert order == ["client_ip_key", "global_key"], (
+            f"{func_name}: per-IP must be evaluated first, got {order} -- "
+            "move the global_key decorator above the per-IP one"
+        )
+
+
+class TestThrottledAbuserDoesNotDrainTheGlobalBucket:
+    def test_a_rejected_request_does_not_spend_global_budget(self, monkeypatch):
+        from fastapi import FastAPI, Request
+        from fastapi.testclient import TestClient
+        from slowapi import Limiter, _rate_limit_exceeded_handler
+        from slowapi.errors import RateLimitExceeded
+        from slowapi.middleware import SlowAPIMiddleware
+
+        monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset({"testclient"}))
+        monkeypatch.setattr(api, "_TRUSTED_NETS", ())
+        lim = Limiter(key_func=client_ip_key, storage_uri="memory://")
+        app = FastAPI()
+        app.state.limiter = lim
+        app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+        app.add_middleware(SlowAPIMiddleware)
+
+        # Same stacking as the real endpoints: global ABOVE per-IP.
+        @app.get("/probe")
+        @lim.limit("5/minute", key_func=global_key)
+        @lim.limit("2/minute")
+        def probe(request: Request):  # noqa: ARG001
+            return {"ok": True}
+
+        with TestClient(app) as c:
+            abuser = [
+                c.get("/probe", headers={"X-Real-IP": "45.9.148.99"}).status_code
+                for _ in range(10)
+            ]
+            victim = c.get("/probe", headers={"X-Real-IP": CLIENT_A}).status_code
+
+        assert abuser.count(200) == 2, abuser
+        assert victim == 200, (
+            "an innocent client was locked out by an abuser whose requests were "
+            "already being rejected -- the global bucket was charged for them"
+        )
