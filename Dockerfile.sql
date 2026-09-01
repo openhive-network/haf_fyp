@@ -29,3 +29,15 @@ ARG GIT_HASH=""
 ENV GIT_HASH=${GIT_HASH}
 
 ENTRYPOINT ["/bin/bash"]
+
+# Provenance, matching Dockerfile.python and Dockerfile.rewriter. GIT_HASH above is
+# consumed by install_app.sh (#20) and ends up in haf_fyp_app.app_version, which is a
+# runtime lookup; these labels make the IMAGE itself traceable without a database.
+ARG BUILD_TIME
+ARG GIT_COMMIT_SHA
+ARG GIT_CURRENT_BRANCH
+LABEL org.opencontainers.image.created="$BUILD_TIME"
+LABEL org.opencontainers.image.source="https://gitlab.syncad.com/hive/haf_fyp"
+LABEL org.opencontainers.image.revision="$GIT_COMMIT_SHA"
+LABEL org.opencontainers.image.title="HAF FYP SQL (schema, endpoints, installer)"
+LABEL io.hive.image.branch="$GIT_CURRENT_BRANCH"
