@@ -6,3 +6,16 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY haf_fyp/ /app/haf_fyp/
+
+# Provenance. Without these an image pulled from the registry cannot be traced back
+# to a commit, which defeats the purpose of publishing it (#26). The sql image gets
+# this via GIT_HASH -> app_version (#20); the rewriter via its OCI block. This is the
+# python image's equivalent.
+ARG BUILD_TIME
+ARG GIT_COMMIT_SHA
+ARG GIT_CURRENT_BRANCH
+LABEL org.opencontainers.image.created="$BUILD_TIME"
+LABEL org.opencontainers.image.source="https://gitlab.syncad.com/hive/haf_fyp"
+LABEL org.opencontainers.image.revision="$GIT_COMMIT_SHA"
+LABEL org.opencontainers.image.title="HAF FYP Python services (ranker + admin API)"
+LABEL io.hive.image.branch="$GIT_CURRENT_BRANCH"

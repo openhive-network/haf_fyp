@@ -52,7 +52,7 @@ hadolint:
   stage: lint
   image: hadolint/hadolint:latest-alpine
   script:
-    - hadolint --ignore DL3006 Dockerfile.python Dockerfile.sql
+    - hadolint Dockerfile.python Dockerfile.sql Dockerfile.rewriter
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
@@ -154,6 +154,13 @@ postgrest-tests:
 .docker-build:
   stage: build
   image: docker:24
+  # Three jobs each push their own moving tag. Without a resource group two
+  # overlapping default-branch pipelines race per-image and can leave the three
+  # tags on DIFFERENT commits, which nothing detects. interruptible lets GitLab's
+  # auto-cancel actually fire -- it only cancels pipelines whose jobs are all
+  # interruptible, and the default is false, so today both run to completion.
+  resource_group: registry-$CI_COMMIT_REF_SLUG
+  interruptible: true
   services:
     - docker:24-dind
   variables:
@@ -164,19 +171,82 @@ postgrest-tests:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
+# Push only from the default branch. Merge-request pipelines still BUILD -- that is
+# what catches a broken Dockerfile before review -- but publishing every MR commit
+# would fill the registry with images nobody consumes and make the tag list useless
+# for finding a deployable build.
+#
+# Two tags on a push:
+#   :<short-sha>  immutable, what a deployment pins
+#   :<default-branch>  moving, what a downstream tracks. Named from
+#                     $CI_DEFAULT_BRANCH, slashes replaced -- docker tags cannot
+#                     contain "/", so a default branch like release/1.0 would
+#                     otherwise be an invalid reference and hard-fail the push.
+# haf_fyp has no releases, so the branch tag is the honest stand-in for the
+# ${..._VERSION} tag haf_api_node's compose files expect. Siblings differ here:
+# haf_stats is short-sha only (137/137), while balance_tracker and
+# reputation_tracker are mostly semver (50/132 and 5/71 sha) -- which is exactly
+# why ${APP_VERSION:-${HIVE_API_NODE_VERSION}} has nothing to resolve to for us.
+# Add a semver tag when releases start rather than pinning raw SHAs forever (#26).
+# A scalar, not a list: `- *anchor` then splices ONE string. Aliasing a list here
+# would nest an array inside script:, which GitLab flattens but which reads as a
+# mistake to anyone who does not know that.
+.push-if-default-branch: &push_if_default_branch |
+  if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+    BRANCH_TAG=$(echo "$CI_DEFAULT_BRANCH" | tr '/' '-')
+    docker push "$IMAGE:$CI_COMMIT_SHORT_SHA"
+    docker tag  "$IMAGE:$CI_COMMIT_SHORT_SHA" "$IMAGE:$BRANCH_TAG"
+    docker push "$IMAGE:$BRANCH_TAG"
+    echo "pushed $IMAGE:$CI_COMMIT_SHORT_SHA and :$BRANCH_TAG"
+  else
+    echo "not on $CI_DEFAULT_BRANCH - built only, not pushed"
+  fi
+
 docker-build-sql:
   extends: .docker-build
+  variables:
+    IMAGE: $CI_REGISTRY_IMAGE/sql
   script:
-    # Stamps the image with the commit it was built from: GIT_HASH -> ENV -> written to
-    # haf_fyp_app.app_version by install_app.sh step 15, so GET /version can name it (#20).
-    # Short SHA to match the tag. Note this job builds and tags but does not push, and no
-    # compose service consumes a registry SQL image -- both Dockerfile.sql services use
-    # `build:`. So today this only stamps the image CI itself produces; the deployment path
-    # is the build arg in docker/docker-compose.yml. Kept here so the stamp is already
-    # correct whenever a push/consume step is added, rather than being remembered then.
-    - docker build -f Dockerfile.sql --build-arg GIT_HASH="$CI_COMMIT_SHORT_SHA" -t $CI_REGISTRY_IMAGE/sql:$CI_COMMIT_SHORT_SHA .
+    # GIT_HASH -> ENV -> written to haf_fyp_app.app_version by install_app.sh step 15,
+    # so GET /version names the commit the image was built from (#20). Short SHA to
+    # match the tag.
+    - docker build -f Dockerfile.sql
+        --build-arg GIT_HASH="$CI_COMMIT_SHORT_SHA"
+        --build-arg GIT_COMMIT_SHA="$CI_COMMIT_SHA"
+        --build-arg GIT_CURRENT_BRANCH="$CI_COMMIT_REF_NAME"
+        --build-arg BUILD_TIME="$CI_JOB_STARTED_AT"
+        -t "$IMAGE:$CI_COMMIT_SHORT_SHA" .
+    - *push_if_default_branch
 
 docker-build-python:
   extends: .docker-build
+  variables:
+    IMAGE: $CI_REGISTRY_IMAGE/python
   script:
-    - docker build -f Dockerfile.python -t $CI_REGISTRY_IMAGE/python:$CI_COMMIT_SHORT_SHA .
+    - docker build -f Dockerfile.python
+        --build-arg GIT_COMMIT_SHA="$CI_COMMIT_SHA"
+        --build-arg GIT_CURRENT_BRANCH="$CI_COMMIT_REF_NAME"
+        --build-arg BUILD_TIME="$CI_JOB_STARTED_AT"
+        -t "$IMAGE:$CI_COMMIT_SHORT_SHA" .
+    - *push_if_default_branch
+
+# The URL rewriter that fronts PostgREST, serving the clean /v1/fyp/... paths instead
+# of raw /rpc/<function>. Dockerfile.rewriter and its inputs have existed all along but
+# nothing ever built them, so deployments borrowed balance_tracker's rewriter image and
+# bind-mounted endpoints/rewrite_rules.conf from the host. That is why a path change
+# (e.g. #21's /v1/fyp/metrics -> /v1/fyp/feed-metrics) needed a node-side file edit
+# rather than an image bump, and why host and repo could silently diverge.
+docker-build-rewriter:
+  extends: .docker-build
+  variables:
+    IMAGE: $CI_REGISTRY_IMAGE/postgrest-rewriter
+  script:
+    - docker build -f Dockerfile.rewriter
+        --build-arg GIT_COMMIT_SHA="$CI_COMMIT_SHA"
+        --build-arg GIT_CURRENT_BRANCH="$CI_COMMIT_REF_NAME"
+        --build-arg GIT_LAST_LOG_MESSAGE="$CI_COMMIT_TITLE"
+        --build-arg BUILD_TIME="$CI_JOB_STARTED_AT"
+        --build-arg GIT_LAST_COMMITTER="$CI_COMMIT_AUTHOR"
+        --build-arg GIT_LAST_COMMIT_DATE="$CI_COMMIT_TIMESTAMP"
+        -t "$IMAGE:$CI_COMMIT_SHORT_SHA" .
+    - *push_if_default_branch
