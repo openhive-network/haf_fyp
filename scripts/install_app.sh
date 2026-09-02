@@ -5,18 +5,103 @@
 # PREREQUISITE: pgvector must be installed on the PostgreSQL server:
 #   Run as superuser: CREATE EXTENSION IF NOT EXISTS vector;
 #
-# OPTIONS:
+# OPTIONS:                                                      # --- help-start ---
 #   --swagger-url=URL   Public hostname for Swagger UI example URLs (default: localhost)
+#   --host=VALUE        PostgreSQL host  (default: $POSTGRES_HOST, else haf)
+#   --port=NUMBER       PostgreSQL port  (default: $POSTGRES_PORT, else 5432)
+#   --user=VALUE        PostgreSQL user  (default: $POSTGRES_USER, else haf_fyp_owner)
+#                       --postgres-host=, --postgres-port= and --postgres-user= are
+#                       accepted as synonyms, because that is balance_tracker's
+#                       spelling and runbooks get copied
+#   --is_forking=FALSE  Accepted for compatibility with the upstream module template.
+#                       TRUE is warned about and ignored -- see below.
+#   --help,-h,-?        Show this and exit                       # --- help-end ---
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=common.sh
 source "${SCRIPT_DIR}/common.sh"
 
 SWAGGER_URL="localhost"
 
+print_help() {
+    # Delimited by the markers above rather than a hardcoded line range. A range
+    # (`sed -n '2,12p'`) silently truncates as soon as the header grows by a line,
+    # and a test asserting on one early flag never notices.
+    #
+    # The bracket in help-sta[r]t is not decoration: written literally, the pattern
+    # matches THIS LINE too, sed re-opens the range here and prints the rest of the
+    # file. The character class matches the marker above without matching itself.
+    sed -n '/--- help-sta[r]t ---/,/--- help-en[d] ---/p' "$0" | sed 's/#\( \|$\)//; s/ *# --- help-[a-z]* ---//'
+}
+
+# The connection flags are parsed AFTER common.sh has applied its defaults, and every
+# psql_cmd call expands them at call time -- so assigning here genuinely overrides the
+# environment rather than being overridden by it.
 for arg in "$@"; do
     case "$arg" in
         --swagger-url=*) SWAGGER_URL="${arg#*=}" ;;
+
+        # Matching balance_tracker, haf_block_explorer and hivesense, all of which
+        # accept these on install_app and uninstall_app and whose docker entrypoints
+        # forward them. Without them the documented upstream operator form,
+        # `run --rm <svc> install_app --host=haf`, fails on an app claiming to
+        # implement the same contract.
+        # --postgres-host is balance_tracker's spelling and the only connection flag
+        # its install_app.sh takes; --host is haf_block_explorer's and hivesense's.
+        # The trio does not agree, so both are accepted -- otherwise the new
+        # unknown-option error below turns a copied balance_tracker runbook into a
+        # hard install failure, which under haf-fyp-setup's restart: on-failure is
+        # the same crash-loop the --is_forking handling was softened to avoid.
+        --host=*|--postgres-host=*) POSTGRES_HOST="${arg#*=}" ;;
+        --port=*|--postgres-port=*) POSTGRES_PORT="${arg#*=}" ;;
+        --user=*|--postgres-user=*) POSTGRES_USER="${arg#*=}" ;;
+
+        # haf_api_node's module template passes --is_forking defaulted from a node-wide
+        # ${IS_FORKING:-TRUE}, so a haf_fyp module file copied from an upstream app
+        # carries TRUE without anyone choosing it for this app. It cannot be honoured:
+        # create_context_if_not_exists() calls hive.app_context_set_non_forking('haf_fyp')
+        # when it CREATES the context (db/haf_fyp_app.sql), so HAF does not rewind
+        # these tables on a fork.
+        #
+        # Note the limit of that, since an earlier revision of this comment said
+        # "unconditionally": the call sits inside the `IF NOT app_context_exists`
+        # branch. On a database whose context already exists -- created forking by an
+        # older build or by hand -- this warning is still correct that the flag is not
+        # honoured, but nothing here converts that context to non-forking either.
+        #
+        # WARN, do not fail. An earlier revision of this MR exited 2 here, which was
+        # wrong in a way worth recording: haf-fyp-setup carries `restart: on-failure`
+        # while every other service waits on `service_completed_successfully`, so a hard
+        # failure on an inherited node-wide default would crash-loop the installer and
+        # keep the whole stack from ever starting -- over a flag that is a no-op here.
+        --is_forking=*)
+            case "${arg#*=}" in
+                FALSE|false|False)
+                    log "--is_forking=FALSE matches this app's context; nothing to do."
+                    ;;
+                *)
+                    log "WARNING: --is_forking=${arg#*=} is ignored."
+                    log "         haf_fyp registers a NON-forking HAF context by design"
+                    log "         (hive.app_context_set_non_forking, db/haf_fyp_app.sql), so HAF"
+                    log "         does NOT rewind its tables on a fork. Continuing non-forking."
+                    log "         Pass --is_forking=FALSE to silence this."
+                    ;;
+            esac
+            ;;
+
+        --help|-h|-\?) print_help; exit 0 ;;
+
+        # Unknown arguments are an ERROR, matching upstream's option loops. This loop
+        # used to have no fallthrough at all, so a mistyped --swagger-url silently
+        # installed with the "localhost" default and baked wrong example URLs into the
+        # published Swagger page, with nothing in the log to say so.
+        *)
+            log "ERROR: '${arg}' is not a valid option"
+            print_help
+            exit 2
+            ;;
     esac
 done
 

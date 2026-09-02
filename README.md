@@ -266,13 +266,133 @@ haf_fyp_endpoints
 ## Services
 
 ```yaml
-haf-fyp-setup    # one-shot DDL install + cross-schema grants (Dockerfile.sql)
-haf-fyp-sync     # PL/pgSQL block loop via process_blocks.sh (Dockerfile.sql)
-haf-fyp-ranker   # Python ranking daemon, 5-minute cycles (Dockerfile.python)
-haf-fyp-api      # FastAPI overlay on port 3002 (Dockerfile.python)
-postgrest        # PostgREST on port 3001
-redis            # pub/sub for force-refresh signals
+haf-fyp-setup      # one-shot DDL install + cross-schema grants (Dockerfile.sql)
+haf-fyp-sync       # PL/pgSQL block loop (Dockerfile.sql)
+haf-fyp-uninstall  # removes the app from the database — profile "haf-fyp-uninstall",
+                   # starts on a plain `up` (Dockerfile.sql)
+haf-fyp-ranker     # Python ranking daemon, 5-minute cycles (Dockerfile.python)
+haf-fyp-api        # FastAPI overlay on port 3002 (Dockerfile.python)
+postgrest          # PostgREST on port 3001
+redis              # pub/sub for force-refresh signals
 ```
+
+### The SQL image's verbs
+
+`Dockerfile.sql` builds one image used by three services, dispatched by
+`docker/docker_entrypoint.sh`:
+
+| Verb | Runs | Notes |
+|------|------|-------|
+| `install_app [--swagger-url=HOST] [--host=] [--port=] [--user=] [--is_forking=FALSE]` | `scripts/install_app.sh` | idempotent; safe to re-run |
+| `process_blocks` | `scripts/process_blocks.sh` | infinite loop |
+| `uninstall_app [--force] [--host=] [--port=] [--user=]` | `scripts/uninstall_app.sh` | destructive |
+
+This is the trio every haf_api_node app image exposes, which is what lets a module file
+say `command: ["install_app"]` rather than reaching into the image for a script path.
+
+Connection settings default from the environment (`POSTGRES_HOST`, `POSTGRES_PORT`,
+`POSTGRES_DB`, `POSTGRES_USER`); `--host=` / `--port=` / `--user=` override them, and
+the entrypoint forwards them exactly as balance_tracker's does, so a runbook copied
+from an upstream app works here. An argument neither option loop recognises is now an
+error rather than being silently discarded — which also turns a mistyped
+`--swagger-url` from a silent fallback to `localhost` into a failed install.
+
+`--is_forking` is accepted, and **only `FALSE` is honoured**. haf_fyp registers a
+**non-forking** HAF context by design (`hive.app_context_set_non_forking`,
+`db/haf_fyp_app.sql`), so HAF does not rewind its tables on a fork. `TRUE` — which a
+module file copied from an upstream app carries by default, from a node-wide
+`${IS_FORKING:-TRUE}` nobody chose for this app — logs a warning and continues. It
+deliberately does not fail: `haf-fyp-setup` runs under `restart: on-failure` while
+every other service waits on `service_completed_successfully`, so failing there would
+crash-loop the installer over a flag that is a no-op here.
+
+Anything that is not a verb but *is* runnable is still executed, so
+`run --rm haf-fyp-setup /app/scripts/grant_cross_schema.sh` and
+`docker run --rm <image> bash` keep working. An argument starting with `-` goes to bash,
+preserving `docker run --rm <image> -c '...'` — except `--help`, `-h` and `-?`, which
+print the dispatcher's own usage.
+
+Moving these services from a script path to a verb needs `--build` on the first run
+after upgrading: they declare `build:` with no `image:`, so a plain `up -d` reuses a
+previously-built image, which has no `install_app` to run.
+
+### Block-processing healthcheck
+
+The image ships `/app/block-processing-healthcheck.sh` — the path
+`reputation_tracker.yaml` and its siblings hardcode — and `docker/docker-compose.yml`
+attaches it to `haf-fyp-sync`. It is **not** declared as a `HEALTHCHECK` in the
+Dockerfile: upstream does not, and an image-level check would also land on the one-shot
+install and uninstall containers, for which "is the block loop advancing" is
+meaningless.
+
+It replaces `psql -c 'SELECT 1'`, which proved PostgreSQL answers and nothing about
+whether `haf_fyp_app.main()` — an infinite loop — was still running.
+
+The signal is `hafd.contexts.last_active_at`, HAF's own column, written once per
+`hive.app_next_iteration` and committed immediately. Healthy when it is fresher than
+`HAF_FYP_HEALTHCHECK_MAX_AGE_SECONDS` (default 300) **and** later than this container's
+start, or when `hive.is_app_in_sync()`.
+
+Be precise about what that column is: it is **not** a sub-batch heartbeat, and it is
+written with a clock that is already one iteration old. `__now TIMESTAMP := NOW()` is a
+DECLARE initializer evaluated at procedure entry, and `NOW()` is
+`transaction_timestamp()` — the start of the caller's still-open transaction, i.e. the
+one that just did the *previous* batch. So the value committed at the end of iteration
+*k* carries iteration *k−1*'s start, and the age this check observes spans up to **two**
+iteration durations.
+
+What it adds over the block pointer is the other case: at the chain tip the loop keeps
+iterating while waiting for a block, so the heartbeat ticks even though nothing was
+processed, which separates "idle" from "wedged".
+
+The consequence, stated rather than hidden: on a long MASSIVE batch this check **can
+report unhealthy on a healthy replay**. The 300s default (upstream uses 60s) is a wide
+guess, not a measurement — and because of the one-iteration lag it tolerates iterations
+of roughly 150s, not 300s. It is explicitly *not* justified by this app's 360s HAProxy
+agent-check, which measures how old the last processed *block* is, a different quantity.
+
+`SET TIME ZONE 'UTC'` is deliberately absent, diverging from upstream.
+`last_active_at` is `timestamp without time zone` written in the *server's* zone, so
+forcing the reader to UTC does not convert it — it only assumes it, and on a server
+ahead of UTC the difference goes negative and a dead loop reports healthy forever.
+Comparing `now()::timestamp` keeps both sides in the server's own zone, and
+`scripts/process_blocks.sh` takes the startup timestamp from `SELECT now()::timestamp`
+for the same reason — the cast is the point, not an incidental.
+
+**The HAProxy agent-check is a separate mechanism and still lives outside the image**;
+see `deployment/healthchecks/UPSTREAM_INTEGRATION.md`.
+
+## Uninstalling
+
+**Destructive and irreversible.** Drops the HAF context, both schemas `CASCADE`, and
+both roles — including the ranker's entire accumulated history, which only a full
+reprocess rebuilds. There is no backup step.
+
+Everything that connects as a haf_fyp role must be stopped first — not just the block
+processor. `DROP SCHEMA ... CASCADE` needs an `AccessExclusiveLock`, so with the ranker
+or the API still holding sessions it would **block** rather than fail, after the HAF
+context had already been removed. The script refuses while any such session exists.
+
+```bash
+docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
+  stop haf-fyp-sync haf-fyp-ranker haf-fyp-api postgrest
+docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
+  run --rm haf-fyp-uninstall
+```
+
+The profile keeps it out of a plain `up`, and is namespaced `haf-fyp-uninstall` so
+`COMPOSE_PROFILES` cannot collide with another app's teardown on a shared node.
+
+For a confirmation prompt, run `scripts/uninstall_app.sh` directly without `--force`:
+it asks you to type the database name, and refuses outright if there is no TTY to ask
+on.
+
+It reports what it could not remove rather than stopping at the first error, so a
+partial teardown is visible instead of silent; re-running is safe.
+
+Not removed, because this app did not create them and they are shared: the `pgvector`
+extension, and grants held by other roles on `hivesense_app` / `reptracker_app` /
+`btracker_app`.
 
 ## Deployment Checklist
 

@@ -34,7 +34,21 @@ services:
         # makes that step record the placeholder from db/app_version.sql instead. `:-`
         # rather than `-` so compose-validate, which sets no GIT_HASH, interpolates cleanly.
         GIT_HASH: ${GIT_HASH:-}
-    command: ["/app/scripts/install_app.sh"]
+    # NOTE: these services have `build:` and no `image:`, so a plain `up -d` reuses the
+    # cached image from whatever was built last. Moving from a script path to a verb
+    # therefore needs `--build` on the first run after this change -- without it an
+    # image built from develop gets `install_app` as a command it cannot find, exits
+    # 127, and `restart: on-failure` loops while every other service waits forever on
+    # service_completed_successfully.
+    #
+    # A verb, not a path (#27) -- the image's entrypoint dispatches it. Spelled this
+    # way here, rather than only in a future module file, so the reference stack uses
+    # the same form a module would. Note what that does NOT buy: compose-validate only
+    # runs `docker compose config`, which parses YAML and never starts a container, and
+    # the postgrest lane builds nothing from Dockerfile.sql. Nothing in CI executes the
+    # dispatcher inside the image; tests/unit/test_docker_entrypoint.py is what covers
+    # it, by running the script directly against stub scripts.
+    command: ["install_app"]
     environment:
       POSTGRES_HOST: haf
       POSTGRES_USER: haf_admin   # install requires DDL privileges
@@ -52,7 +66,7 @@ services:
         # Same Dockerfile as haf-fyp-setup; passed here too so the two images stay
         # identical rather than differing only in a baked ENV.
         GIT_HASH: ${GIT_HASH:-}
-    command: ["/app/scripts/process_blocks.sh"]
+    command: ["process_blocks"]
     environment:
       POSTGRES_HOST: haf
       POSTGRES_USER: haf_fyp_owner
@@ -61,12 +75,80 @@ services:
       haf-fyp-setup:
         condition: service_completed_successfully
     restart: unless-stopped
+    # Declared here rather than in Dockerfile.sql -- see the note there. This is the
+    # only service the check describes; the other two built from the same image run
+    # once and exit.
+    #
+    # What it replaces: `psql ... -c 'SELECT 1'`, which proved PostgreSQL answers and
+    # said nothing about whether haf_fyp_app.main() was still advancing. The loop is
+    # infinite; when it wedged, that check kept reporting healthy.
+    #
+    # start_period covers a first run against a fresh HAF, which replays the whole
+    # chain in MASSIVE iterations of up to 10,000 blocks -- and the heartbeat does not
+    # move until an iteration finishes, so a long batch can exceed MAX_AGE on a replay
+    # that is perfectly healthy.
+    #
+    # 72h is inherited from the SELECT 1 check this replaces and is NOT a considered
+    # number for the new one. Docker >= 25 ends the start period at the first success,
+    # so it does not in fact cover a whole replay; on older Docker it means a restarted
+    # service can never report unhealthy for three days, which is the silent window
+    # #27 exists to close. It is left alone here because nothing yet consumes this
+    # service's health -- no depends_on keys on it, and the node's status page uses the
+    # HAProxy agent-check instead -- so tuning it without a measured MASSIVE batch
+    # duration would be guessing twice.
     healthcheck:
-      test: ["CMD-SHELL", "psql -h haf -U haf_fyp_user -d haf_block_log -c 'SELECT 1' -q"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
+      test: ["CMD", "/app/block-processing-healthcheck.sh"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
       start_period: 72h
+
+  # Removes haf_fyp from the database: HAF context, both schemas (CASCADE), both
+  # roles. Behind a profile, so `docker compose up` never starts it.
+  #
+  #     docker compose -f docker/docker-compose.yml   #         stop haf-fyp-sync haf-fyp-ranker haf-fyp-api postgrest
+  #     docker compose -f docker/docker-compose.yml run --rm haf-fyp-uninstall
+  #
+  # USE `run --rm`, NOT `--profile haf-fyp-uninstall up`. Upstream documents the `up`
+  # form and it is safe THERE because upstream puts every app service behind a profile
+  # too. In THIS file nothing else has `profiles:`, so `up` would also start
+  # haf-fyp-setup -- whose command is `install_app` -- concurrently with the teardown,
+  # racing DROP SCHEMA against CREATE SCHEMA, and restart the very services the operator
+  # was just told to stop. The session guard cannot see it either: haf-fyp-setup
+  # connects as haf_admin, and the guard counts only haf_fyp_owner/haf_fyp_user.
+  # `run` starts only this service and its depends_on.
+  #
+  # --force is passed so the run is non-interactive; `docker compose run` does allocate
+  # a TTY, so dropping it would make the script prompt. Run scripts/uninstall_app.sh
+  # directly without --force to get the type-the-database-name confirmation.
+  #
+  # Stopping the other services first is not optional: the script refuses while anything
+  # is connected as a haf_fyp role, because DROP SCHEMA CASCADE needs an
+  # AccessExclusiveLock and would otherwise block behind the ranker rather than fail.
+  #
+  # DESTRUCTIVE AND IRREVERSIBLE -- it drops the ranker's whole history, which only a
+  # full reprocess rebuilds.
+  haf-fyp-uninstall:
+    profiles: ["haf-fyp-uninstall"]
+    build:
+      context: ..
+      dockerfile: Dockerfile.sql
+      args:
+        # Same build args as the other two services from this Dockerfile, so compose
+        # reuses their image instead of building a third one that differs only in a
+        # baked ENV.
+        GIT_HASH: ${GIT_HASH:-}
+    command: ["uninstall_app", "--force"]
+    environment:
+      POSTGRES_HOST: haf
+      POSTGRES_USER: haf_admin   # dropping roles needs more than haf_fyp_owner
+      POSTGRES_DB:   haf_block_log
+    depends_on:
+      # Without this, `run --rm haf-fyp-uninstall` against a stopped stack does not
+      # start haf and sits in wait_for_postgres -- an unbounded `until pg_isready`
+      # loop -- forever, with no message.
+      haf:
+        condition: service_healthy
 
   haf-fyp-ranker:
     build:
