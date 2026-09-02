@@ -189,6 +189,17 @@ on-chain interactions, evicts its `active_users` row and drops its cached feed a
 profile vector. Accounts that have interacted on-chain stay ranked — their
 membership comes from the chain, not the picker.
 
+**Rate limits are charged before the request body is parsed (#28), so a rejected
+request costs the caller its allowance.** A malformed batch answered `422` counts
+against the same bucket a successful one would, and a caller already over the limit
+gets a `429` without the body being read at all. This is what bounds total cost on
+`POST /v1/fyp/events`, which is unauthenticated by design: previously a 4 MB
+malformed batch cost ~700 ms of CPU and returned a ~3.9 MB validation error while
+charging nothing, repeatable without bound. Integrators should note the consequence:
+a client with a serialisation bug now burns its own quota rather than retrying for
+free. Buckets are per-IP (see `TRUSTED_PROXY_IPS` in the deployment checklist), so
+one broken client cannot spend anyone else's allowance.
+
 Clean URL rewrites (via nginx `endpoints/rewrite_rules.conf`):
 
 ```

@@ -5,7 +5,13 @@ pandas>=2.1
 redis>=5.0
 fastapi>=0.111
 uvicorn[standard]>=0.29
-slowapi>=0.1.9
+# Upper bound, not a floor alone: the rate limiter is charged before the body is
+# parsed (#28) via _route_limits / _check_request_limit(..., in_middleware=False),
+# which are slowapi internals. Verified identical in 0.1.9 and 0.1.10; a minor bump
+# is free to move them, and an image rebuild resolves this fresh -- exactly how an
+# unpinned pgvector silently broke ranking in !29. Bump deliberately, with the
+# tests/unit/test_ratelimit_ordering.py suite green.
+slowapi>=0.1.9,<0.2
 coincurve>=19.0
 base58>=2.1
 tavern>=2.9

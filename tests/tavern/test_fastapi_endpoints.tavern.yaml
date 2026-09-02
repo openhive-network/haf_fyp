@@ -1,4 +1,18 @@
 ---
+# EVERY request to a rate-limited endpoint below carries its own X-Real-IP.
+#
+# Since #28 the limit is charged BEFORE the body is parsed, so the 422/401
+# rejection paths this file is mostly made of now spend the caller's allowance.
+# From one address the seven DELETE /v1/fyp/interests cases alone would exceed
+# that endpoint's 5/minute and start answering 429 instead of the status each
+# case is asserting -- so each stage presents itself as a distinct client, which
+# is also how these limits behave in production. The job sets TRUSTED_PROXY_IPS
+# to the loopback for the header to be honoured; without it the app correctly
+# ignores X-Real-IP and keys on the peer, and the DELETE cases go red.
+#
+# Addresses are from TEST-NET-2 (198.51.100.0/24, RFC 5737) and are per-stage,
+# not per-endpoint. Adding a stage means adding an unused address, not reusing one.
+
 test_name: FastAPI health returns ok
 
 stages:
@@ -44,6 +58,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/interests"
       method: POST
+      headers:
+        X-Real-IP: "198.51.100.10"
       json:
         username: "testuser"
         communities: [1234, 5678]
@@ -58,6 +74,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/interests"
       method: POST
+      headers:
+        X-Real-IP: "198.51.100.11"
       json:
         username: "testuser"
         communities: [1234, 5678]
@@ -74,6 +92,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/interests"
       method: POST
+      headers:
+        X-Real-IP: "198.51.100.12"
       json:
         username: "testuser"
         communities: []
@@ -88,6 +108,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/interests"
       method: POST
+      headers:
+        X-Real-IP: "198.51.100.13"
     response:
       status_code: 422
 
@@ -99,6 +121,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/interests"
       method: POST
+      headers:
+        X-Real-IP: "198.51.100.14"
       json:
         username: "this-name-is-toolong"
         communities: [1234]
@@ -118,6 +142,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/interests"
       method: DELETE
+      headers:
+        X-Real-IP: "198.51.100.15"
       json:
         username: "testuser"
     response:
@@ -133,6 +159,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/interests"
       method: DELETE
+      headers:
+        X-Real-IP: "198.51.100.16"
       json:
         username: "testuser"
         timestamp: 1
@@ -148,6 +176,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/interests"
       method: DELETE
+      headers:
+        X-Real-IP: "198.51.100.17"
     response:
       status_code: 422
 
@@ -159,6 +189,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/interests"
       method: DELETE
+      headers:
+        X-Real-IP: "198.51.100.18"
       json:
         username: "this-name-is-toolong"
         timestamp: 1
@@ -172,6 +204,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/interests"
       method: DELETE
+      headers:
+        X-Real-IP: "198.51.100.19"
       json:
         username: "al:ice"
         timestamp: 1
@@ -187,6 +221,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/interests"
       method: DELETE
+      headers:
+        X-Real-IP: "198.51.100.20"
       json:
         username: "testuser"
         timestamp: 1
@@ -205,6 +241,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/interests"
       method: DELETE
+      headers:
+        X-Real-IP: "198.51.100.21"
       json:
         username: "testuser"
         communities: [1234]
@@ -221,6 +259,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/admin/algorithm"
       method: POST
+      headers:
+        X-Real-IP: "198.51.100.22"
       json:
         version: "1.0.0"
     response:
@@ -235,6 +275,7 @@ stages:
       url: "{fastapi_url}/v1/fyp/admin/algorithm"
       method: POST
       headers:
+        X-Real-IP: "198.51.100.23"
         X-Admin-Key: "wrong-key"
       json:
         version: "1.0.0"
@@ -251,6 +292,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/events"
       method: POST
+      headers:
+        X-Real-IP: "198.51.100.24"
       json:
         session: "sess-abc-123"
         username: "alice"
@@ -279,6 +322,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/events"
       method: POST
+      headers:
+        X-Real-IP: "198.51.100.25"
       json:
         session: "anon-xyz"
         events:
@@ -299,6 +344,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/events"
       method: POST
+      headers:
+        X-Real-IP: "198.51.100.26"
       json:
         session: "s1"
         events: []
@@ -309,6 +356,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/events"
       method: POST
+      headers:
+        X-Real-IP: "198.51.100.27"
       json:
         session: "s1"
         events:
@@ -321,6 +370,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/events"
       method: POST
+      headers:
+        X-Real-IP: "198.51.100.28"
       json:
         events:
           - t: "impression"
@@ -332,6 +383,8 @@ stages:
     request:
       url: "{fastapi_url}/v1/fyp/events"
       method: POST
+      headers:
+        X-Real-IP: "198.51.100.29"
       json:
         session: "s1"
         events:
@@ -366,3 +419,48 @@ stages:
       json:
         last_block_num: 5000000
         last_block_time: "2016-09-15T19:47:21"
+
+---
+test_name: A rejected request spends the caller's allowance (#28)
+
+# The end-to-end assertion for #28, through uvicorn rather than TestClient: before
+# the fix these six malformed bodies were all answered 422 for free, because
+# slowapi only ran once FastAPI had already parsed and rejected the request. That
+# made every validation failure an unmetered amplifier -- worst on the
+# unauthenticated /v1/fyp/events, where a 4 MB batch cost ~700 ms and returned a
+# ~3.9 MB error while charging nothing.
+#
+# DELETE /v1/fyp/interests is the probe because its 5/minute is the smallest limit
+# in the app, so the boundary is reached in six requests rather than 121.
+# .60 is used by this test alone -- the stages above are all on distinct addresses,
+# so nothing else has spent this bucket.
+stages:
+  - &spend
+    name: malformed body 1 of 5 - 422, and charged
+    request:
+      url: "{fastapi_url}/v1/fyp/interests"
+      method: DELETE
+      headers:
+        X-Real-IP: "198.51.100.60"
+      json:
+        username: "testuser"
+    response:
+      status_code: 422
+  - <<: *spend
+    name: malformed body 2 of 5 - 422, and charged
+  - <<: *spend
+    name: malformed body 3 of 5 - 422, and charged
+  - <<: *spend
+    name: malformed body 4 of 5 - 422, and charged
+  - <<: *spend
+    name: malformed body 5 of 5 - 422, and charged
+  - name: the allowance is now gone, so the sixth is refused before it is parsed
+    request:
+      url: "{fastapi_url}/v1/fyp/interests"
+      method: DELETE
+      headers:
+        X-Real-IP: "198.51.100.60"
+      json:
+        username: "testuser"
+    response:
+      status_code: 429

@@ -16,6 +16,7 @@ Redis pub/sub signals the ranker for on-demand feed refresh after interest updat
 
 from __future__ import annotations
 
+import inspect
 import ipaddress
 import json
 import logging
@@ -32,6 +33,10 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+# Route matching only -- NOT SlowAPIMiddleware itself, which exempts every route
+# that carries a decorator and so cannot close #28. See the note above the
+# middleware class for the mechanics.
+from slowapi.middleware import _find_route_handler, _get_route_name
 from slowapi.util import get_remote_address
 
 from .auth import KeyLookupUnavailable, verify_interests, verify_interests_delete
@@ -226,6 +231,121 @@ limiter = Limiter(
     key_style="url",
 )
 
+
+# ---------------------------------------------------------------------------
+# Charging the limit BEFORE the body is parsed (#28)
+# ---------------------------------------------------------------------------
+#
+# THE HOLE: @limiter.limit runs INSIDE the endpoint wrapper, so slowapi only gets
+# to charge a bucket on requests that already passed FastAPI/pydantic validation.
+# A request that fails validation is answered 422 having charged NOTHING, so it is
+# repeatable without bound and invisible to every limit on the route. Measured on
+# /v1/fyp/events, which is unauthenticated by design and caps batches at 200:
+#
+#     200 events x 4 bad fields   -> 422   req 21,828 B  resp 169,352 B  x7.8   47 ms
+#     60k events (~4 MB, too_long)-> 422   req 4,260,028 B resp 3,900,204 B    704 ms
+#
+# 704 ms of CPU and a 3.9 MB response for one unauthenticated request, unmetered.
+# Secondary: a caller ALREADY being 429'd still paid full JSON + pydantic parse on
+# every rejected request (~7.8 ms per 16 KB body), because the limit was not
+# consulted until after that work was done.
+#
+# WHY NOT SlowAPIMiddleware, WHICH IS WHAT #28 PROPOSED: it does not fix this. Its
+# dispatch calls slowapi's own _should_exempt, which returns True for any route
+# carrying a decorator --
+#
+#     # there is a decorator for this route we let the decorator handle it
+#     if name in limiter._route_limits: return True
+#
+# -- so all four limited endpoints are skipped by it, and it goes straight to
+# call_next. Even reaching _check_request_limit would not help: the middleware path
+# passes in_middleware=True, and route limits are only loaded `if not in_middleware`
+# (extension.py:579), so it evaluates ONLY application/default limits, never the
+# per-route decorators. Adding it changes nothing measurable; verified against the
+# shipped app -- ten invalid bodies still charge zero buckets with it installed.
+#
+# WHAT THIS DOES INSTEAD: evaluates each route's OWN decorator limits at the ASGI
+# layer, before FastAPI reads or parses the body, then marks the request done so the
+# decorator does not charge a second time (slowapi's own wrappers already guard on
+# `request.state._rate_limiting_complete`, which is how it re-entry-protects itself).
+#
+# CONSEQUENCE, AND IT IS A DELIBERATE CHOICE: a request that 422s now spends the
+# caller's allowance. That is what removes the amplifier -- an unmetered failure is
+# the whole bug -- but it does mean a client with a genuine serialisation bug burns
+# its own budget rather than failing for free. That is the right trade for an
+# unauthenticated ingest, and it is per-IP, so one broken client cannot spend
+# anyone else's allowance.
+#
+# BLAST RADIUS IS DELIBERATELY NARROW: routes with no @limiter.limit decorator are
+# passed straight through, so /health, /metrics and /sync-status are untouched --
+# this moves WHEN the existing limits are evaluated, it does not add limits anywhere.
+#
+# PRIVATE-API DEPENDENCY: _route_limits and _check_request_limit(..., False) are
+# slowapi internals; requirements.txt pins slowapi for that reason, and the tests in
+# tests/unit/test_ratelimit_ordering.py assert the BEHAVIOUR (an invalid body spends
+# the allowance, a 429 short-circuits before parsing) so a version bump that moves
+# the internals turns the suite red instead of silently un-metering the endpoint.
+_REQUIRED_SLOWAPI_INTERNALS = ("_route_limits", "_check_request_limit")
+
+
+class RateLimitBeforeValidationMiddleware:
+    """Evaluate a route's own @limiter.limit rules before its body is parsed.
+
+    Pure ASGI rather than BaseHTTPMiddleware: the point of the change is to spend
+    less on requests that are going to be rejected, and BaseHTTPMiddleware puts an
+    anyio task group and a streaming-response bridge in front of every request.
+    """
+
+    def __init__(self, app, limiter=None):
+        self.app = app
+        # Defaults to this module's limiter, which is the one the real app installs;
+        # taking it as an argument is what lets a test drive a fresh, isolated one.
+        self.limiter = limiter if limiter is not None else globals()["limiter"]
+        missing = [a for a in _REQUIRED_SLOWAPI_INTERNALS if not hasattr(self.limiter, a)]
+        if missing:
+            # Fail at startup, loudly. Degrading quietly here would restore the exact
+            # hole this exists to close, and nothing at runtime would say so.
+            raise RuntimeError(
+                f"slowapi is missing {missing} - RateLimitBeforeValidationMiddleware "
+                "cannot evaluate route limits early; pin a compatible slowapi."
+            )
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not self.limiter.enabled:
+            return await self.app(scope, receive, send)
+
+        handler = _find_route_handler(scope["app"].routes, scope)
+        # No route match (404, or a method this path does not serve) and routes with
+        # no decorator of their own: nothing to charge, behave exactly as before.
+        if handler is None or _get_route_name(handler) not in self.limiter._route_limits:
+            return await self.app(scope, receive, send)
+
+        # Built for the key func and the handler only. Do NOT read the body here --
+        # `receive` is handed on to the app untouched, and consuming it (even to log
+        # a size) leaves the endpoint waiting on a stream that will never arrive.
+        request = Request(scope, receive=receive)
+        try:
+            # in_middleware=False is the load-bearing argument: it is what makes
+            # slowapi load this route's decorator limits rather than only the
+            # application/default ones. See the note above.
+            self.limiter._check_request_limit(request, handler, False)
+        except RateLimitExceeded as exc:
+            # Mirror slowapi's own lookup so a custom handler still wins.
+            handle = scope["app"].exception_handlers.get(
+                type(exc), _rate_limit_exceeded_handler
+            )
+            response = handle(request, exc)
+            if inspect.isawaitable(response):
+                response = await response
+            return await response(scope, receive, send)
+
+        # Shared with the Request the endpoint receives (both are built from this
+        # scope, and Starlette backs .state with scope["state"]), so slowapi's
+        # decorator sees it and skips its own check rather than charging twice.
+        request.state._rate_limiting_complete = True
+        return await self.app(scope, receive, send)
+
+
 # ---------------------------------------------------------------------------
 # DB connection pool
 # ---------------------------------------------------------------------------
@@ -286,6 +406,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="haf_fyp", version="1.0.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(RateLimitBeforeValidationMiddleware)
 
 
 # ---------------------------------------------------------------------------
@@ -906,10 +1027,10 @@ def delete_interests(request: Request, req: InterestsDeleteRequest):
 # inside prune_feed_events' 20M cap given it only runs hourly. Without it, per-IP
 # keying removes the total bound the global bucket was accidentally providing.
 #
-# It does NOT bound total CPU. slowapi runs inside the endpoint wrapper, after
-# FastAPI validation, so a request that fails validation charges neither bucket -- a
-# 4MB malformed batch costs ~700ms and is unmetered. Closing that needs
-# SlowAPIMiddleware, which is a separate change (#28).
+# Both buckets are now charged BEFORE the body is parsed, so a malformed batch spends
+# the caller's allowance instead of being answered 422 for free -- see
+# RateLimitBeforeValidationMiddleware. That is what bounds total CPU here; the batch
+# cap alone bounds accepted write volume only (#28).
 @limiter.limit("600/minute", key_func=global_key)
 @limiter.limit("120/minute")
 def post_events(request: Request, req: EventsBatch):
