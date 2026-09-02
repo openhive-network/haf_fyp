@@ -17,15 +17,38 @@ sql-lint:
   script:
     - pip install sqlfluff==3.3.0 -q
     - sqlfluff lint db/ endpoints/ --dialect postgres
+    # scripts/ and docker/ added with #27's two new .sql files. shell-lint's scope was
+    # widened for exactly this reason -- new files in a directory the linter did not
+    # read -- and sql-lint's was not; both new files failed on their first run.
+    #
+    # Three LAYOUT rules excluded here and only here, because every .sql in these two
+    # directories is fed to psql with -v and uses :'var' substitution, which sqlfluff
+    # cannot parse: it reads the colon as an operator, so each placeholder becomes a
+    # spacing or indent complaint. (scripts/set_version.sql has done this since #20.)
+    # Excluding the layout rules keeps the parse check and every rule about meaning --
+    # which is what would catch a broken predicate. db/ and endpoints/ stay strict.
+    - sqlfluff lint scripts/ docker/ --dialect postgres --exclude-rules LT01,LT02,LT14
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 shell-lint:
   stage: lint
-  image: koalaman/shellcheck-alpine:latest
+  # Pinned, for the reason python-lint pins ruff: this job's scope just doubled, and an
+  # unpinned linter means a drifting build can fail unchanged code. :latest was 0.11.0
+  # when this was widened.
+  image: koalaman/shellcheck-alpine:v0.11.0
   script:
-    - find scripts/ -name "*.sh" -exec shellcheck --severity=warning {} +
+    # docker/ was never linted, so docker/rewriter_entrypoint.sh -- which has shipped in
+    # the rewriter image since !49 -- had no coverage, and #27's new
+    # docker/block-processing-healthcheck.sh and docker_entrypoint.sh, which run on
+    # every container start, would have inherited that blind spot.
+    #
+    # It found nothing. Both files were already clean, and an earlier revision of this
+    # MR edited rewriter_entrypoint.sh claiming SC2154 forced it -- SC2154 does not fire
+    # on ALL-CAPS names, and that edit has been reverted. The scope widening is worth
+    # keeping on its own terms; it is future coverage, not a fix.
+    - find scripts/ docker/ -name "*.sh" -exec shellcheck --severity=warning {} +
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
@@ -50,7 +73,8 @@ python-lint:
 
 hadolint:
   stage: lint
-  image: hadolint/hadolint:latest-alpine
+  # Pinned for the same reason as shellcheck above.
+  image: hadolint/hadolint:v2.12.0-alpine
   script:
     - hadolint Dockerfile.python Dockerfile.sql Dockerfile.rewriter
   rules:
@@ -216,6 +240,64 @@ docker-build-sql:
         --build-arg GIT_CURRENT_BRANCH="$CI_COMMIT_REF_NAME"
         --build-arg BUILD_TIME="$CI_JOB_STARTED_AT"
         -t "$IMAGE:$CI_COMMIT_SHORT_SHA" .
+    # Smoke-run the image (#27). Until this existed, NOTHING in CI ever started a
+    # container from Dockerfile.sql -- compose-validate only parses YAML, the postgrest
+    # lane builds from docker-compose-ci.yml, and the unit tests run the scripts on the
+    # Debian runner. So a script that works on Debian and dies on the image's Alpine
+    # userland passed every job. That is not hypothetical: an earlier revision of this
+    # MR shipped `date --utc --iso-8601=seconds`, a GNU long option BusyBox does not
+    # have, in the first line of process_blocks.sh -- which under `set -e` would have
+    # crash-looped haf-fyp-sync on every deployment, forever.
+    #
+    # These run without a database on purpose, so they are fast and cannot flake: each
+    # exercises a path that resolves before the first connection. Note what that rules
+    # OUT -- `uninstall_app` with no --force calls wait_for_postgres BEFORE its no-TTY
+    # refusal, so smoke-testing that path here would hang in an unbounded
+    # `until pg_isready` loop rather than fail. It is covered by a unit test instead.
+    #
+    # `! cmd` rather than `cmd; test $? -ne 0`: under `set -e` the failing command
+    # aborts the block before the status can be inspected.
+    - |
+      set -e
+      IMG="$IMAGE:$CI_COMMIT_SHORT_SHA"
+      # `run` wrapper: every assertion greps for a message. A bare `! docker run ...`
+      # passes on ANY non-zero status, including 127 when the file is not in the image
+      # -- so it would have "verified" a healthcheck that had never been COPYed. And
+      # `timeout` because a job that hangs reports "job timeout" rather than a diff.
+      expect_ok()   { timeout 60 docker run --rm "$IMG" "$@"; }
+      expect_fail() { rc=0; timeout 60 docker run --rm "$IMG" "$@" >/tmp/o 2>&1 || rc=$?; cat /tmp/o; [ "$rc" -ne 0 ] && [ "$rc" -ne 127 ]; }
+
+      echo "--- entrypoint dispatches its own usage on stdout ---"
+      expect_ok --help | grep -q "install_app"
+      echo "--- unknown verb fails with the right message, not merely non-zero ---"
+      expect_fail install-app; grep -q "unknown verb: install-app" /tmp/o
+      echo "--- the scripts parse and render help under the image's BusyBox userland ---"
+      expect_ok install_app   --help | grep -q -- "--swagger-url"
+      expect_ok uninstall_app --help | grep -q -- "--force"
+      expect_ok process_blocks --help | grep -q -- "--host"
+      echo "--- an invalid option is rejected, not ignored ---"
+      expect_fail install_app --nope; grep -q "is not a valid option" /tmp/o
+      echo "--- the compat path the LIVE node uses still dispatches ---"
+      expect_ok /app/scripts/install_app.sh --help | grep -q -- "--swagger-url"
+      echo "--- the healthcheck is present at the path module files hardcode ---"
+      expect_ok test -r /app/block-processing-healthcheck.sql
+      timeout 60 docker run --rm --entrypoint /app/block-processing-healthcheck.sh "$IMG" >/tmp/h 2>&1 && exit 1
+      cat /tmp/h; grep -q "hasn.t started yet" /tmp/h
+      echo "--- and fails CLOSED when it has a startup time but no database ---"
+      # Greps, like every other assertion. Without it this passed on ANY non-zero --
+      # including 124 (a 60s hang), 127, or the script exiting 1 because the .sql was
+      # missing, which is precisely the case the assertion above it is meant to prove.
+      timeout 60 docker run --rm -e HAF_FYP_STARTUP_TIME_FILE=/etc/hostname         --entrypoint /app/block-processing-healthcheck.sh "$IMG" >/tmp/h2 2>&1 && exit 1
+      cat /tmp/h2
+      # `psql: error:` is psql's own prefix for any connection failure, so this does not
+      # depend on guessing the wording -- the first attempt matched four phrasings and
+      # the image emitted a fifth ("could not translate host name"). Pairing it with the
+      # negative assertion is what makes it precise: it proves the script reached psql
+      # and psql failed, rather than the script exiting 1 down the missing-SQL-file path
+      # that the assertion above it exists to rule out.
+      grep -q "psql: error:" /tmp/h2
+      ! grep -q "healthcheck SQL not found" /tmp/h2
+      echo "image smoke tests passed"
     - *push_if_default_branch
 
 docker-build-python:
