@@ -92,10 +92,21 @@ def capture_argv(tmp_path) -> Path:
     write_exec(
         tmp_path / "bin" / "psql",
         "#!/bin/sh\n"
-        f'printf \'%s\\n\' "$*" > "{captured.as_posix()}"\n'
+        # ONE ARGUMENT PER LINE, not "$*". Flattened, the stub cannot see quoting --
+        # dropping the quotes around -v startup_time="${STARTUP_TIME}" word-splits the
+        # timestamp into a stray file argument and renders identically -- and an
+        # assertion can only match a PREFIX, so `-v context=haf_fyp` is satisfied by
+        # `context=haf_fyp_app`: the schema-for-context swap this whole file guards.
+        f'for a in "$@"; do printf \'%s\\n\' "$a"; done > "{captured.as_posix()}"\n'
         "printf 't'\n",
     )
     return captured
+
+
+
+def args_of(recorded: str) -> list:
+    """psql's argv, one entry per argument, so an assertion can match a WHOLE argument."""
+    return [line for line in recorded.split("\n") if line]
 
 
 def run(bash, env) -> subprocess.CompletedProcess:
@@ -200,7 +211,7 @@ def test_the_default_window_is_wider_than_upstreams_one_minute(bash, tmp_path, e
     set_startup(env)
     captured = capture_argv(tmp_path)
     run(bash, env)
-    assert "-v max_age=300" in captured.read_text()
+    assert "max_age=300" in args_of(captured.read_text())
 
 
 # --- the predicate itself ------------------------------------------------------------
@@ -268,16 +279,19 @@ def test_the_script_passes_every_variable_the_predicate_needs(bash, tmp_path, en
     captured = capture_argv(tmp_path)
     env["HAF_FYP_HEALTHCHECK_MAX_AGE_SECONDS"] = "77"
     run(bash, env)
-    argv = captured.read_text()
-    assert "-v context=haf_fyp" in argv
-    assert "-v max_age=77" in argv
-    assert "-v startup_time=2026-05-05 05:05:05.5" in argv
+    argv = args_of(captured.read_text())
+    # WHOLE arguments. `"-v context=haf_fyp" in <flattened>` was also satisfied by
+    # `context=haf_fyp_app`, so repointing the healthcheck at the SCHEMA instead of the
+    # CONTEXT survived the entire suite.
+    assert "context=haf_fyp" in argv
+    assert "max_age=77" in argv
+    assert "startup_time=2026-05-05 05:05:05.5" in argv
     # WHICH file, not merely that some --file was passed. Asserting only "--file=" let
     # the SQL_FILE default be repointed at any other readable file in the image with all
     # 18 tests still green -- so the whole-expression comparison below was guarding a
     # file the script did not have to read.
-    assert "--file=" in argv
-    assert argv.strip().endswith("block-processing-healthcheck.sql")
+    assert any(a.startswith("--file=") for a in argv), argv
+    assert any(a.endswith("block-processing-healthcheck.sql") for a in argv), argv
 
 
 def test_the_script_asks_for_a_bare_value(bash, tmp_path, env):
@@ -287,7 +301,7 @@ def test_the_script_asks_for_a_bare_value(bash, tmp_path, env):
     set_startup(env)
     captured = capture_argv(tmp_path)
     run(bash, env)
-    argv = captured.read_text()
+    argv = args_of(captured.read_text())
     assert "--tuples-only" in argv
     assert "--no-align" in argv
 
@@ -322,7 +336,7 @@ def test_the_context_is_not_hardcoded(bash, tmp_path, env):
     captured = capture_argv(tmp_path)
     env["HAF_FYP_CONTEXT"] = "some_other_app"
     run(bash, env)
-    assert "-v context=some_other_app" in captured.read_text()
+    assert "context=some_other_app" in args_of(captured.read_text())
     assert normalised_predicate().count(":'context'") == 3
 
 
@@ -364,3 +378,42 @@ def test_the_application_name_is_set_on_the_connection(bash, tmp_path, env):
     captured = capture_argv(tmp_path)
     run(bash, env)
     assert "application_name=haf_fyp_health_check" in captured.read_text()
+
+
+# --- the three lines with no assertions at all (round three) -----------------------
+#
+# Mutation testing removed each of these and the whole suite stayed green. Each one is
+# the fix for a failure this file's own header describes, so losing one silently
+# reinstates a bug that has already happened once.
+
+
+def test_psql_is_asked_to_be_quiet_and_bare(bash, tmp_path, env):
+    """--quiet suppresses the connection notices; --no-align/--tuples-only make the
+    output a bare `t`/`f`. The `[ "$(...)" = t ]` comparison fails against anything
+    else, so dropping any of them makes a HEALTHY app report unhealthy forever."""
+    captured = capture_argv(tmp_path)
+    set_startup(env)
+    run(bash, env)
+    argv = args_of(captured.read_text())
+    for flag in ("--quiet", "--no-align", "--tuples-only"):
+        assert flag in argv, f"psql was not asked for {flag}: {argv}"
+
+
+def test_the_locale_is_forced_to_C():
+    """A container usually has no locale, and psql then warns on stderr. That warning
+    is captured by the command substitution, the comparison sees `WARNING...t` instead
+    of `t`, and the container is permanently unhealthy -- which this file's header
+    records as having actually happened. Asserted on the source because the harness
+    runs under a locale that would not reproduce it.
+    """
+    assert "export LC_ALL=C" in SCRIPT.read_text()
+
+
+def test_a_timed_out_check_kills_its_psql():
+    """Docker sends SIGTERM when a healthcheck exceeds its timeout. Without the trap the
+    psql waiting on the server survives the script, so every timed-out probe leaks a
+    backend -- once a minute, forever, on a node that is already struggling enough to
+    time the check out."""
+    body = SCRIPT.read_text()
+    assert "trap " in body, "no signal handler; a timed-out check leaks its psql backend"
+    assert "kill -- -$$" in body, "the handler must kill the process GROUP, not just $$"

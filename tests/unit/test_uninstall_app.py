@@ -22,6 +22,7 @@ Closing it needs a pty case, which only runs on POSIX.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -69,17 +70,25 @@ def make_psql(tmp_path, *, sessions: str = "0", remaining: str = "",
         '  prev="$a"\n'
         "done\n"
         f'printf "%s\\n---\\n" "$cmd" >> "{logfile.as_posix()}"\n'
-        f'printf "%s\\n" "$*" >> "{(tmp_path / "argv.log").as_posix()}"\n'
+        # ONE LINE PER INVOCATION. "$*" carries the statement's own newlines, so a raw
+        # printf wrote one log line per SQL LINE -- which makes a per-invocation
+        # assertion ("is -Atq on the call that counts sessions?") impossible to express.
+        f'printf "%s\\n" "$(printf \'%s\' "$*" | tr \'\\n\' \' \')" >> "{(tmp_path / "argv.log").as_posix()}"\n'
         'case "$cmd$files" in\n'
-        # BEFORE the others: this statement mentions neither to_regclass nor
-        # pg_stat_activity, but keeping the order explicit stops a later arm
-        # from swallowing it if the query text changes.
-        f'  *is_superuser*)         printf "%s" {can_remove!r} ;;\n'
+        # FIRST, and QUOTED. Last in the `case`, a fail_on naming a query that also
+        # had an answer arm never fired -- the test asked for a failure and silently got
+        # a successful answer. And an unquoted `case` pattern is a word, so any fail_on
+        # containing a space ("DROP SCHEMA", "hafd.contexts AS c") was a shell syntax
+        # error and the stub died instead of simulating anything.
+        + (f'  *"{fail_on}"*) echo "stub psql: simulated failure" >&2; exit 3 ;;\n' if fail_on else "")
+        # All three pre-flight probes mention is_superuser, so one arm answers them
+        # all; _guarded_psql below separates them where a test needs to. Kept ahead of
+        # *to_regclass* so a rewrite of the probe text cannot be swallowed by it.
+        + f'  *is_superuser*)         printf "%s" {can_remove!r} ;;\n'
         f'  *pg_stat_activity*)     printf "%s" {sessions!r} ;;\n'
         f'  *uninstall_verify.sql*) printf "%s" {remaining!r} ;;\n'
         '  *to_regclass*)          printf "t" ;;\n'
         f'  *"hafd.contexts AS c"*) printf "%s" {context_left!r} ;;\n'
-        + (f'  *{fail_on}*) echo "stub psql: simulated failure" >&2; exit 3 ;;\n' if fail_on else "")
         + "esac\n"
         "exit 0\n",
     )
@@ -663,3 +672,149 @@ def test_a_failing_verification_probe_does_not_report_success(bash, tmp_path):
     assert r.returncode != 0
     assert "haf_fyp removed" not in r.stdout
     assert "could not verify" in r.stdout
+
+
+# --- --schema must have NO EFFECT on the teardown (round three) ---------------------
+
+@pytest.mark.parametrize("value", ["btracker_app", "haf_fyp_endpoints", "haf_fyp", "public"],
+                         ids=["foreign", "our-other-schema", "the-context-name", "public"])
+def test_the_teardown_emits_identical_sql_with_and_without_schema(bash, tmp_path, value):
+    """The worst case this flag could cause, and the one the tests did not exclude.
+
+    A mutant that assigns HAF_FYP_SCHEMAS or HAF_FYP_CONTEXT from --schema prints the
+    exact "is ignored" warning the acceptance tests assert on, then emits
+    `DROP SCHEMA IF EXISTS public CASCADE` or removes ANOTHER HAF APP'S CONTEXT, and the
+    whole suite stays green. Comparing the emitted SQL is the only assertion that
+    excludes it.
+    """
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    base = make_psql(a)
+    run(bash, a, "--force")
+    flag = make_psql(b)
+    run(bash, b, "--force", f"--schema={value}")
+    assert sql_of(flag) == sql_of(base), f"--schema={value} changed the teardown's SQL"
+
+
+def test_the_refusal_is_logged_as_an_ERROR(bash, tmp_path):
+    """Operators and log scrapers key on the severity token; nothing pinned it, so it
+    was free to drift to `note:` while the exit code stayed 1."""
+    _guarded_psql(tmp_path, can_impersonate="f")
+    r = run(bash, tmp_path, "--force")
+    assert "ERROR:" in r.stdout
+
+
+# --- the pre-flight predicates, pinned WHOLE (round three) --------------------------
+#
+# Mutation testing: `... OR true` appended to either probe makes the guard a permanent
+# pass -- the #30/#57 refusal is dead and the destructive teardown runs for any role --
+# and the entire suite stays green. It survives because the psql stub dispatches on a
+# SUBSTRING of the statement (*can_impersonate*, *rolcreaterole*) and returns a canned
+# answer, so it can only confirm that SOME statement mentioning that token was issued.
+# The predicate around it is invisible to every behavioural test in this file.
+#
+# So compare the whole normalised expression, the way this file's docstring says the
+# queries whose MEANING matters are compared. This catches an added disjunct, an
+# inverted comparison, a swapped operand and a renamed column -- none of which the
+# earlier token greps could see.
+
+
+def _probe_sql(marker: str) -> str:
+    """The -c argument of the assignment beginning `marker`, whitespace-normalised."""
+    body = SCRIPT.read_text()
+    after = body.split(marker, 1)[1]
+    sql = after.split('-c "', 1)[1].split('")', 1)[0]
+    return " ".join(sql.split())
+
+
+EXPECTED_CAN_REMOVE = (
+    "SELECT current_setting('is_superuser') = 'on' "
+    "OR NOT EXISTS (SELECT 1 FROM hafd.contexts WHERE name = '${HAF_FYP_CONTEXT}') "
+    "OR EXISTS (SELECT 1 FROM hafd.contexts "
+    "WHERE name = '${HAF_FYP_CONTEXT}' "
+    "AND hive.can_impersonate(current_user, owner))"
+)
+
+EXPECTED_CAN_DROP_ROLES = (
+    "SELECT current_setting('is_superuser') = 'on' "
+    "OR COALESCE((SELECT rolcreaterole FROM pg_roles WHERE rolname = current_user), false)"
+)
+
+
+def test_the_impersonation_probe_is_exactly_the_policys_question():
+    """hafd.contexts' DELETE policy is USING (hive.can_impersonate(current_user, owner)).
+    Anything else -- an extra OR, a different column, a role literal -- is a different
+    question, and the stub cannot tell the difference."""
+    assert _probe_sql('_can_remove="$(psql_cmd') == EXPECTED_CAN_REMOVE
+
+
+def test_the_drop_roles_probe_is_exactly_what_step_5_needs():
+    """DROP ROLE needs CREATEROLE or superuser. COALESCE(..., false) matters: a
+    current_user with no pg_roles row must be a refusal, not NULL."""
+    assert _probe_sql('_can_drop_roles="$(psql_cmd') == EXPECTED_CAN_DROP_ROLES
+
+
+# --- survivors from the mutation pass (round three) --------------------------------
+
+def test_the_lock_timeout_shares_a_session_with_the_ddl(bash, tmp_path):
+    """SET lock_timeout is SESSION-LOCAL.
+
+    Issued in a separate psql invocation it has no effect on the DROP that follows --
+    the indefinite block it exists to prevent, restored, with the literal
+    `SET lock_timeout = '30s';` still in the log for the other tests to find. Presence
+    is not the property; co-location in the same -c batch is.
+    """
+    log = make_psql(tmp_path)
+    run(bash, tmp_path, "--force")
+    blocks = [b for b in sql_of(log).split("---") if "DROP SCHEMA" in b or "DROP ROLE" in b]
+    assert blocks, "no destructive statement was issued"
+    for block in blocks:
+        assert "SET lock_timeout = '30s';" in block, (
+            "a destructive statement ran in a session without the lock timeout"
+        )
+
+
+def test_a_failing_context_probe_does_not_report_a_clean_teardown(bash, tmp_path):
+    """Precisely the failure the surrounding comment describes.
+
+    The sibling test fails psql on *to_regclass*, which now trips the EARLIER
+    _has_contexts probe and short-circuits before this line is reached -- so the
+    surviving-context probe's own `|| _probe_failed=1` was left unpinned. This one
+    answers to_regclass normally and errors only on the survivor query.
+    """
+    make_psql(tmp_path, fail_on="hafd.contexts AS c")
+    r = run(bash, tmp_path, "--force")
+    assert r.returncode != 0
+    assert "haf_fyp removed" not in r.stdout
+    assert "could not verify" in r.stdout
+
+
+def test_the_session_probe_asks_for_a_bare_value(bash, tmp_path):
+    """Without -Atq real psql returns a header, a rule and `(1 row)`. The fail-closed
+    branch then refuses EVERY teardown permanently with "unexpected session count" --
+    not a fail-open, but an unrunnable script."""
+    make_psql(tmp_path)
+    run(bash, tmp_path, "--force")
+    argv = (tmp_path / "argv.log").read_text()
+    sessions = [ln for ln in argv.split("\n") if "pg_stat_activity" in ln]
+    assert sessions, "the session guard never ran"
+    for line in sessions:
+        assert "-Atq" in line, f"the session count must be a bare value: {line}"
+
+
+def test_the_confirmation_variable_names_every_role_the_script_drops():
+    """HAF_FYP_ROLES feeds the confirmation banner while step 5's DO block names both
+    roles as literals. Drop one from the variable and the operator consents to less than
+    the script actually does, with every test green because the behaviour is unchanged.
+
+    Asserted on the SOURCE: the banner is inside the `[ ! -t 0 ]` interactive branch,
+    which this module's docstring records as uncovered (no pty here, POSIX-only).
+    """
+    body = SCRIPT.read_text()
+    declared = set(body.split('HAF_FYP_ROLES="', 1)[1].split('"', 1)[0].split())
+    dropped = set(re.findall(r"DROP ROLE (\w+);", body))
+    assert dropped, "no DROP ROLE statements found; the parser needs updating"
+    assert dropped <= declared, (
+        f"dropped but not named in HAF_FYP_ROLES: {sorted(dropped - declared)}"
+    )

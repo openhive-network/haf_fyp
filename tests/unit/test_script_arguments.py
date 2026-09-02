@@ -131,6 +131,9 @@ def run_with_stub_db(bash, tmp_path, script, *args: str) -> str:
 def test_a_foreign_schema_warns_but_does_not_exit(bash, tmp_path, script):
     out = run_with_stub_db(bash, tmp_path, script, "--schema=btracker_app")
     assert "WARNING: --schema" in out
+    # The offending value is the one part an operator needs. Without this the message
+    # can decay to "WARNING: --schema flag seen" and still pass.
+    assert "btracker_app" in out
     # Got past the option loop rather than bailing out of it.
     assert "Waiting for PostgreSQL" in out
 
@@ -228,8 +231,14 @@ def test_is_forking_true_warns_and_continues(bash, tmp_path):
     assert "Waiting for PostgreSQL" in out
 
 
-def test_is_forking_false_is_accepted_quietly(bash, tmp_path):
-    out = run_install_with_stub_db(bash, tmp_path, "--is_forking=FALSE")
+@pytest.mark.parametrize(
+    "script", [INSTALL, UNINSTALL, PROCESS], ids=["install", "uninstall", "process_blocks"]
+)
+def test_is_forking_false_is_accepted_quietly(bash, tmp_path, script):
+    """Parametrized in round three. Pinned on install_app only, deleting the
+    FALSE|false|False arm from the other two made the flag's one CORRECT value emit a
+    warning telling the operator it was ignored."""
+    out = run_with_stub_db(bash, tmp_path, script, "--is_forking=FALSE")
     assert "WARNING: --is_forking" not in out
     assert "Waiting for PostgreSQL" in out
 
@@ -389,3 +398,56 @@ def test_a_password_in_the_url_is_not_logged(bash, tmp_path):
         bash, tmp_path, "--postgres-url=postgresql://u:hunter2@h:5432/db")
     assert "hunter2" not in out
     assert "postgresql://u:***@h:5432/db" in out
+
+
+# --- --schema must have NO EFFECT, not merely be tolerated (round three) ------------
+#
+# Mutation testing found the hole: every assertion above is about the LOG LINE and the
+# EXIT CODE. A mutant that adds `HAF_FYP_SCHEMAS="${arg#*=}"` to the --schema arm prints
+# the exact "is ignored" warning these tests demand and then emits
+# `DROP SCHEMA IF EXISTS public CASCADE`, or points app_remove_context at another HAF
+# app's context -- with the whole suite green. The code comment's justification is "the
+# flag cannot change behaviour here"; nothing tested that claim.
+#
+# So compare the EMITTED SQL with and without the flag. Byte-identical or it failed.
+
+
+@pytest.mark.parametrize("value", ["btracker_app", "haf_fyp_endpoints", "haf_fyp", "public"],
+                         ids=["foreign", "our-other-schema", "the-context-name", "public"])
+def test_install_emits_identical_sql_with_and_without_schema(bash, tmp_path, value):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    _, base_log, _ = run_install_full_stub(bash, a)
+    _, flag_log, _ = run_install_full_stub(bash, b, f"--schema={value}")
+    assert flag_log.read_text() == base_log.read_text(), (
+        f"--schema={value} changed the SQL the installer emits"
+    )
+
+
+@pytest.mark.parametrize("value", ["btracker_app", "haf_fyp_endpoints", "haf_fyp"],
+                         ids=["foreign", "our-other-schema", "the-context-name"])
+def test_process_blocks_always_calls_the_same_main(bash, tmp_path, value):
+    """CALL haf_fyp_app.main('haf_fyp') -- the schema-qualified callee AND the context
+    argument must both be immune to the flag."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    out_base = run_with_stub_db(bash, a, PROCESS)
+    out_flag = run_with_stub_db(bash, b, PROCESS, f"--schema={value}")
+    for out in (out_base, out_flag):
+        assert "Waiting for PostgreSQL" in out
+    # The stub psql refuses, so the CALL never reaches a log -- assert on the source
+    # instead, which is the only place the schema is bound.
+    body = PROCESS.read_text()
+    assert "haf_fyp_app.main('haf_fyp')" in body or 'haf_fyp_app.main(\'haf_fyp\')' in body
+
+
+@pytest.mark.parametrize("value", ["btracker_app", "haf_fyp_endpoints", "haf_fyp", "public"],
+                         ids=["foreign", "our-other-schema", "the-context-name", "public"])
+def test_the_apps_own_schema_name_is_matched_exactly(bash, tmp_path, value):
+    """Not as a prefix. `[[ "${arg#*=}" != haf_fyp* ]]` silently accepts
+    haf_fyp_endpoints, haf_fyp (the CONTEXT name) and haf_fyp_appXYZ -- the same
+    prefix-vs-equality bug this repo has hit before. Only haf_fyp_app is quiet."""
+    out = run_with_stub_db(bash, tmp_path, INSTALL, f"--schema={value}")
+    assert "WARNING: --schema" in out, f"--schema={value} was accepted silently"

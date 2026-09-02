@@ -103,7 +103,12 @@ python-tests:
     # httpx: required by starlette.testclient, which tests/unit/test_ratelimit_key.py
     # uses to assert rate-limit bucketing end-to-end through slowapi. Test-only, so
     # it stays out of requirements.txt and off the runtime image.
-    - pip install -r requirements.txt pytest pytest-cov httpx -q
+    # pyyaml: tests/unit/test_compose_contract.py parses docker-compose.yml. That
+    # module FAILS rather than skips when it is missing under CI, for the same reason
+    # the bash harness does -- a silent skip would put the compose file, and the
+    # profile that keeps the destructive teardown from running on `up`, back to
+    # uncovered.
+    - pip install -r requirements.txt pytest pytest-cov httpx pyyaml -q
     - PYTHONPATH=. pytest tests/unit/ -v --cov=haf_fyp --cov-report=term-missing --cov-fail-under=40
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
