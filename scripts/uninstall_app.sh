@@ -19,6 +19,9 @@
 #   --user=VALUE   PostgreSQL user (default: $POSTGRES_USER, else haf_admin)
 #                  --postgres-host=, --postgres-port= and --postgres-user= are
 #                  accepted as synonyms (balance_tracker's spelling)
+#   --schema=NAME  Accepted for haf_api_node module-file compatibility; ignored with
+#                  a warning unless it names haf_fyp_app
+#   --is_forking=  Accepted likewise; this app's context is always non-forking
 #   --help,-h,-?   Show this and exit                           # --- help-end ---
 
 set -euo pipefail
@@ -67,6 +70,47 @@ for arg in "$@"; do
         --host=*|--postgres-host=*) POSTGRES_HOST="${arg#*=}" ;;
         --port=*|--postgres-port=*) POSTGRES_PORT="${arg#*=}" ;;
         --user=*|--postgres-user=*) POSTGRES_USER="${arg#*=}" ;;
+        # haf_api_node's module template passes --schema= on EVERY verb. Verified
+        # against upstream rather than remembered: hive/balance_tracker's
+        # scripts/process_blocks.sh has a `--schema=*) BTRACKER_SCHEMA=...` case, and
+        # balance_tracker.yaml ships it on install_app and uninstall_app too.
+        #
+        # !50 gave all three of this app's option loops an `exit 2` fallthrough and no
+        # --schema case, so a haf_fyp module file copied from that template -- the whole
+        # point of #27 -- exited 2 on every verb. On install that is a crash-loop under
+        # haf-fyp-setup's `restart: on-failure` with every other service waiting on
+        # service_completed_successfully, i.e. the stack never starts. It is also a
+        # REGRESSION: before !50 install_app's loop had no fallthrough, so the flag was
+        # ignored and the install worked.
+        #
+        # WARN and continue, for the same reason --is_forking below does: the flag
+        # cannot change behaviour here (the schema names are fixed in the SQL), so
+        # refusing buys nothing and costs the deployment.
+        --schema=*)
+            if [ "${arg#*=}" != "haf_fyp_app" ]; then
+                log "WARNING: --schema=${arg#*=} is ignored."
+                log "         haf_fyp owns two fixed schemas, haf_fyp_app and"
+                log "         haf_fyp_endpoints, named in the SQL. Continuing."
+            fi
+            ;;
+
+        # haf_api_node's module template defaults --is_forking from a node-wide
+        # ${IS_FORKING:-TRUE}, so it arrives here without anyone choosing it for this
+        # app. It cannot be honoured -- db/haf_fyp_app.sql registers the context
+        # non-forking -- and it cannot be refused either, for the reason above.
+        # install_app.sh carries the long version of this note.
+        --is_forking=*)
+            case "${arg#*=}" in
+                FALSE|false|False)
+                    log "--is_forking=FALSE matches this app's context; nothing to do."
+                    ;;
+                *)
+                    log "WARNING: --is_forking=${arg#*=} is ignored; haf_fyp's HAF context"
+                    log "         is registered NON-forking by design. Continuing."
+                    ;;
+            esac
+            ;;
+
         --help|-h|-\?) print_help; exit 0 ;;
         # A typo in a flag to a script that drops schemas must not be shrugged off --
         # least of all a mistyped --force, which would then fall through to a prompt
@@ -243,15 +287,37 @@ _psql_destructive() {
 # is reachable by an operator following the help text. install_app.sh's step 10 documents the
 # same RLS trap on the creation side and works around it with SET ROLE.
 #
-# Step 6 catches the resulting orphan, but saying so up front beats explaining an
-# INCOMPLETE afterwards.
+# An earlier revision only WARNED here, on the stated grounds that "step 6 catches the
+# resulting orphan". It does not, and that was the whole error. Step 6's probe is
+#     SELECT 'context ' || c.name FROM hafd.contexts AS c WHERE c.name = 'haf_fyp'
+# run in the SAME session, as the SAME role, through the SAME RLS policy that made the
+# DELETE affect zero rows -- so it also sees zero rows, _context_left is empty, and the
+# script prints "haf_fyp removed" and exits 0 while the context survives and both
+# schemas and both roles are gone. Refusing before anything is dropped is the only
+# response that leaves the operator somewhere recoverable.
+#
+# to_regrole guard: pg_has_role RAISES 42704 on an unknown role, and this script
+# advertises itself as safe to re-run -- by which point haf_fyp_owner is gone. The
+# earlier version got away with the unguarded call only because `2>/dev/null || echo ""`
+# degraded the raise into the warning it was already going to print; now that the branch
+# refuses, an idempotent re-run would refuse spuriously without both the guard and the
+# "role already gone" arm.
+#
+# MEMBER, not USAGE: USAGE asks whether the privileges arrive by INHERITANCE, which is
+# false for a NOINHERIT member -- while hive.can_impersonate, which is what the RLS
+# policy actually calls, would still permit the delete. USAGE therefore refuses a
+# connection that would have worked.
 _can_remove="$(psql_cmd -Atq -c "
     SELECT current_setting('is_superuser') = 'on'
-        OR pg_has_role(current_user, 'haf_fyp_owner', 'USAGE')" 2>/dev/null || echo "")"
+        OR to_regrole('haf_fyp_owner') IS NULL
+        OR pg_has_role(current_user, 'haf_fyp_owner', 'MEMBER')" 2>/dev/null || echo "")"
 if [ "${_can_remove}" != "t" ]; then
-    log "WARNING: connected as '${POSTGRES_USER}', which is neither superuser nor a"
-    log "         member of haf_fyp_owner. RLS on hafd.contexts will silently delete no"
-    log "         rows, so the context would survive. Use --user=haf_admin."
+    log "ERROR: connected as '${POSTGRES_USER}', which is neither superuser nor a member"
+    log "       of haf_fyp_owner. RLS on hafd.contexts would silently delete zero rows,"
+    log "       so the context would survive a teardown that reports success -- and the"
+    log "       verification in step 6 reads through the same filter, so it could not"
+    log "       tell you. Re-run with --user=haf_admin. Nothing has been changed."
+    exit 1
 fi
 
 log "Removing HAF context '${HAF_FYP_CONTEXT}'..."

@@ -6,6 +6,9 @@
 #   --host=VALUE   PostgreSQL host (default: $POSTGRES_HOST, else haf)
 #   --port=NUMBER  PostgreSQL port (default: $POSTGRES_PORT, else 5432)
 #   --user=VALUE   PostgreSQL user (default: $POSTGRES_USER, else haf_fyp_owner)
+#   --schema=NAME  Accepted for haf_api_node module-file compatibility; ignored
+#                  with a warning unless it names haf_fyp_app
+#   --is_forking=  Accepted likewise; this app's context is always non-forking
 #   --help,-h,-?   Show this and exit                           # --- help-end ---
 
 set -euo pipefail
@@ -29,6 +32,48 @@ for arg in "$@"; do
         --host=*) POSTGRES_HOST="${arg#*=}" ;;
         --port=*) POSTGRES_PORT="${arg#*=}" ;;
         --user=*) POSTGRES_USER="${arg#*=}" ;;
+
+        # haf_api_node's module template passes --schema= on EVERY verb. Verified
+        # against upstream rather than remembered: hive/balance_tracker's
+        # scripts/process_blocks.sh has a `--schema=*) BTRACKER_SCHEMA=...` case, and
+        # balance_tracker.yaml ships it on install_app and uninstall_app too.
+        #
+        # !50 gave all three of this app's option loops an `exit 2` fallthrough and no
+        # --schema case, so a haf_fyp module file copied from that template -- the whole
+        # point of #27 -- exited 2 on every verb. On install that is a crash-loop under
+        # haf-fyp-setup's `restart: on-failure` with every other service waiting on
+        # service_completed_successfully, i.e. the stack never starts. It is also a
+        # REGRESSION: before !50 install_app's loop had no fallthrough, so the flag was
+        # ignored and the install worked.
+        #
+        # WARN and continue, for the same reason --is_forking below does: the flag
+        # cannot change behaviour here (the schema names are fixed in the SQL), so
+        # refusing buys nothing and costs the deployment.
+        --schema=*)
+            if [ "${arg#*=}" != "haf_fyp_app" ]; then
+                log "WARNING: --schema=${arg#*=} is ignored."
+                log "         haf_fyp owns two fixed schemas, haf_fyp_app and"
+                log "         haf_fyp_endpoints, named in the SQL. Continuing."
+            fi
+            ;;
+
+        # haf_api_node's module template defaults --is_forking from a node-wide
+        # ${IS_FORKING:-TRUE}, so it arrives here without anyone choosing it for this
+        # app. It cannot be honoured -- db/haf_fyp_app.sql registers the context
+        # non-forking -- and it cannot be refused either, for the reason above.
+        # install_app.sh carries the long version of this note.
+        --is_forking=*)
+            case "${arg#*=}" in
+                FALSE|false|False)
+                    log "--is_forking=FALSE matches this app's context; nothing to do."
+                    ;;
+                *)
+                    log "WARNING: --is_forking=${arg#*=} is ignored; haf_fyp's HAF context"
+                    log "         is registered NON-forking by design. Continuing."
+                    ;;
+            esac
+            ;;
+
         --help|-h|-\?) print_help; exit 0 ;;
         *) log "ERROR: '${arg}' is not a valid option"; print_help; exit 2 ;;
     esac

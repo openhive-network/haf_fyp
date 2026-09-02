@@ -15,6 +15,8 @@
 #                       spelling and runbooks get copied
 #   --is_forking=FALSE  Accepted for compatibility with the upstream module template.
 #                       TRUE is warned about and ignored -- see below.
+#   --schema=NAME       Accepted likewise. Anything but haf_fyp_app is warned about
+#                       and ignored; the schema names are fixed in the SQL.
 #   --help,-h,-?        Show this and exit                       # --- help-end ---
 
 set -euo pipefail
@@ -89,6 +91,30 @@ for arg in "$@"; do
                     log "         Pass --is_forking=FALSE to silence this."
                     ;;
             esac
+            ;;
+
+        # haf_api_node's module template passes --schema= on EVERY verb. Verified
+        # against upstream rather than remembered: hive/balance_tracker's
+        # scripts/process_blocks.sh has a `--schema=*) BTRACKER_SCHEMA=...` case, and
+        # balance_tracker.yaml ships it on install_app and uninstall_app too.
+        #
+        # !50 gave all three of this app's option loops an `exit 2` fallthrough and no
+        # --schema case, so a haf_fyp module file copied from that template -- the whole
+        # point of #27 -- exited 2 on every verb. On install that is a crash-loop under
+        # haf-fyp-setup's `restart: on-failure` with every other service waiting on
+        # service_completed_successfully, i.e. the stack never starts. It is also a
+        # REGRESSION: before !50 install_app's loop had no fallthrough, so the flag was
+        # ignored and the install worked.
+        #
+        # WARN and continue, for the same reason --is_forking below does: the flag
+        # cannot change behaviour here (the schema names are fixed in the SQL), so
+        # refusing buys nothing and costs the deployment.
+        --schema=*)
+            if [ "${arg#*=}" != "haf_fyp_app" ]; then
+                log "WARNING: --schema=${arg#*=} is ignored."
+                log "         haf_fyp owns two fixed schemas, haf_fyp_app and"
+                log "         haf_fyp_endpoints, named in the SQL. Continuing."
+            fi
             ;;
 
         --help|-h|-\?) print_help; exit 0 ;;

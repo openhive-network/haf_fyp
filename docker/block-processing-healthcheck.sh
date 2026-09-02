@@ -46,6 +46,17 @@
 # even though no block was processed. That distinguishes "idle, waiting for the chain"
 # from "wedged", which a block pointer cannot.
 #
+# But be honest about the converse, which an earlier revision of this comment was not.
+# This proves the loop is ITERATING, not ADVANCING. The heartbeat UPDATE and its COMMIT
+# sit BEFORE EVERY early return in app_next_iteration -- the app_is_paused and
+# NOT is_instance_ready branches both pg_sleep and RETURN afterwards -- so with hived
+# down, or the app paused by hive.app_pause, the loop spins twice a second writing a
+# fresh heartbeat and this check reports HEALTHY while zero blocks are processed.
+#
+# Chain staleness is a different quantity and belongs to the HAProxy agent-check
+# (hive.get_app_current_block_age), tracked in #29. The two are complementary; this one
+# does not subsume it, and nothing here is a reason to drop it.
+#
 # The consequence, stated rather than hidden: during a long MASSIVE batch this check
 # CAN report unhealthy on a perfectly healthy replay. See MAX_AGE.
 #

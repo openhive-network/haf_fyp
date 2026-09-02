@@ -28,6 +28,7 @@ from tests.unit.shell_harness import clean_env, require_bash, stub_bin, write_ex
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 INSTALL = SCRIPTS / "install_app.sh"
 UNINSTALL = SCRIPTS / "uninstall_app.sh"
+PROCESS = SCRIPTS / "process_blocks.sh"
 
 TIMEOUT = 10
 
@@ -97,6 +98,75 @@ def test_help_does_not_run_off_the_end_of_the_file(bash, tmp_path):
     out = run(bash, tmp_path, INSTALL, "--help").stdout
     assert "psql_cmd" not in out
     assert out.count("\n") < 20
+
+
+# --- --schema (#30) ---------------------------------------------------------------
+#
+# The crash-loop. haf_api_node's module template passes --schema= on EVERY verb --
+# verified in hive/balance_tracker's own scripts/process_blocks.sh, which has a
+# `--schema=*) BTRACKER_SCHEMA=...` case -- and !50 gave all three of this app's option
+# loops an `exit 2` fallthrough with no --schema case. On install that is a permanent
+# crash-loop under haf-fyp-setup's restart: on-failure, so the stack never starts; on
+# process_blocks it is the same under the module's own restart policy. It was also a
+# REGRESSION, since before !50 install_app's loop had no fallthrough at all and the
+# flag was simply ignored.
+
+
+def run_with_stub_db(bash, tmp_path, script, *args: str) -> str:
+    """Get past the option loop and wait_for_postgres, then die at the first statement."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    write_exec(bindir / "pg_isready", "#!/bin/sh\nexit 0\n")
+    write_exec(bindir / "psql", "#!/bin/sh\necho 'stub psql: refusing' >&2\nexit 1\n")
+    proc = subprocess.run(
+        [bash, str(script), *args], env=clean_env(bindir),
+        capture_output=True, text=True, timeout=TIMEOUT,
+    )
+    return proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize(
+    "script", [INSTALL, UNINSTALL, PROCESS], ids=["install", "uninstall", "process_blocks"]
+)
+def test_a_foreign_schema_warns_but_does_not_exit(bash, tmp_path, script):
+    out = run_with_stub_db(bash, tmp_path, script, "--schema=btracker_app")
+    assert "WARNING: --schema" in out
+    # Got past the option loop rather than bailing out of it.
+    assert "Waiting for PostgreSQL" in out
+
+
+@pytest.mark.parametrize(
+    "script", [INSTALL, UNINSTALL, PROCESS], ids=["install", "uninstall", "process_blocks"]
+)
+def test_the_apps_own_schema_is_accepted_quietly(bash, tmp_path, script):
+    """The one value the flag exists to carry. Asserting only that a FOREIGN schema is
+    tolerated leaves re-targeting the accepted name green."""
+    out = run_with_stub_db(bash, tmp_path, script, "--schema=haf_fyp_app")
+    assert "WARNING: --schema" not in out
+    assert "Waiting for PostgreSQL" in out
+
+
+@pytest.mark.parametrize(
+    "script", [UNINSTALL, PROCESS], ids=["uninstall", "process_blocks"]
+)
+def test_is_forking_is_accepted_on_the_other_two_verbs(bash, tmp_path, script):
+    """install_app alone accepted it; the module template passes it to all three."""
+    out = run_with_stub_db(bash, tmp_path, script, "--is_forking=TRUE")
+    assert "WARNING: --is_forking" in out
+    assert "Waiting for PostgreSQL" in out
+
+
+@pytest.mark.parametrize(
+    "script", [INSTALL, UNINSTALL, PROCESS], ids=["install", "uninstall", "process_blocks"]
+)
+def test_help_does_not_run_off_the_end_of_any_script(bash, tmp_path, script):
+    """The marker character class was pinned for install_app only. Without it the other
+    two print the rest of their own file -- 289 lines for uninstall_app, including its
+    DROP SCHEMA statements."""
+    out = run(bash, tmp_path, script, "--help").stdout
+    assert out.count("\n") < 25, f"--help ran past the marker: {out.count(chr(10))} lines"
+    for leak in ("psql_cmd", "DROP SCHEMA", "haf_fyp_app.main"):
+        assert leak not in out, f"--help leaked script body: {leak!r}"
 
 
 # --- rejections -------------------------------------------------------------------

@@ -296,7 +296,14 @@ docker-build-sql:
       # and psql failed, rather than the script exiting 1 down the missing-SQL-file path
       # that the assertion above it exists to rule out.
       grep -q "psql: error:" /tmp/h2
-      ! grep -q "healthcheck SQL not found" /tmp/h2
+      # NOT `! grep -q ...`: bash exempts a !-inverted pipeline from errexit, so that
+      # form passes whatever the file contains -- and it is the only thing separating
+      # "failed closed for the right reason" from "failed because the SQL was never
+      # COPYed into the image".
+      if grep -q "healthcheck SQL not found" /tmp/h2; then
+        echo "FAIL: healthcheck could not find its .sql -- COPY missing from Dockerfile"
+        exit 1
+      fi
       echo "image smoke tests passed"
     - *push_if_default_branch
 

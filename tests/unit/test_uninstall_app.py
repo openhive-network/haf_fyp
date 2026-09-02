@@ -41,7 +41,7 @@ def bash():
 
 def make_psql(tmp_path, *, sessions: str = "0", remaining: str = "",
               context_left: str = "", log: str = "sql.log",
-              fail_on: str | None = None) -> Path:
+              can_remove: str = "t", fail_on: str | None = None) -> Path:
     """A stub psql that records what it was asked and answers each of the script's reads.
 
     Dispatch is on the statement text AND on any -f file, because the verification is a
@@ -49,6 +49,12 @@ def make_psql(tmp_path, *, sessions: str = "0", remaining: str = "",
     reads: the session count, the to_regclass probe, the context-survivor query, and
     the verification file. Everything else is a destructive statement and just gets
     logged.
+
+    can_remove answers the RLS pre-flight, which now REFUSES rather than warns (#30).
+    Note that the default matters: with no arm at all the stub printed nothing, the
+    script read "" and every test in this file would stop at the refusal -- which is
+    the point of making it a refusal, and is why it is a parameter rather than a
+    hardcoded "t".
     """
     stub_bin(tmp_path)  # creates bin/ and the pg_isready stub; idempotent
     logfile = tmp_path / log
@@ -65,6 +71,10 @@ def make_psql(tmp_path, *, sessions: str = "0", remaining: str = "",
         f'printf "%s\\n---\\n" "$cmd" >> "{logfile.as_posix()}"\n'
         f'printf "%s\\n" "$*" >> "{(tmp_path / "argv.log").as_posix()}"\n'
         'case "$cmd$files" in\n'
+        # BEFORE the others: this statement mentions neither to_regclass nor
+        # pg_stat_activity, but keeping the order explicit stops a later arm
+        # from swallowing it if the query text changes.
+        f'  *is_superuser*)         printf "%s" {can_remove!r} ;;\n'
         f'  *pg_stat_activity*)     printf "%s" {sessions!r} ;;\n'
         f'  *uninstall_verify.sql*) printf "%s" {remaining!r} ;;\n'
         '  *to_regclass*)          printf "t" ;;\n'
@@ -89,6 +99,54 @@ def run(bash, tmp_path, *args: str, stdin: str | None = None) -> subprocess.Comp
 
 def sql_of(logfile: Path) -> str:
     return logfile.read_text() if logfile.exists() else ""
+
+
+# --- the RLS pre-flight (#30) -----------------------------------------------------
+
+def test_refuses_when_the_role_cannot_delete_the_context(bash, tmp_path):
+    """It must REFUSE, not warn.
+
+    hive.context_remove is not SECURITY DEFINER and hafd.contexts has an RLS DELETE
+    policy of USING (hive.can_impersonate(current_user, owner)), so a caller who is
+    neither superuser nor able to impersonate haf_fyp_owner deletes ZERO ROWS WITHOUT
+    ERROR. An earlier revision only warned, on the stated grounds that step 6 would
+    catch the orphan -- but step 6 queries hafd.contexts in the SAME session as the
+    SAME role through the SAME policy, so it sees zero rows too and reports success.
+    The observed outcome was: context survives, both schemas and both roles dropped,
+    script prints "haf_fyp removed" and exits 0.
+    """
+    log = make_psql(tmp_path, can_remove="f")
+    r = run(bash, tmp_path, "--force")
+    assert r.returncode == 1
+    assert "Nothing has been changed" in r.stdout
+    # And it really did stop BEFORE the destructive statements.
+    assert "DROP SCHEMA" not in sql_of(log)
+    assert "app_remove_context" not in sql_of(log)
+
+
+def test_the_role_probe_survives_the_role_being_gone(bash, tmp_path):
+    """pg_has_role RAISES 42704 on an unknown role, and this script advertises itself
+    as safe to re-run -- by which point haf_fyp_owner is dropped. Without the
+    `to_regrole(...) IS NULL` arm the second run refuses instead of finishing the
+    teardown, so the guard added for #30 would have broken idempotency."""
+    body = SCRIPT.read_text()
+    probe = body.split("_can_remove=", 1)[1].split('if [ "${_can_remove}"', 1)[0]
+    assert "to_regrole('haf_fyp_owner') IS NULL" in probe, (
+        "the probe must tolerate the role already being dropped"
+    )
+    assert "'MEMBER'" in probe, (
+        "USAGE asks whether privileges arrive by INHERITANCE, which is false for a "
+        "NOINHERIT member that hive.can_impersonate would still permit"
+    )
+
+
+def test_a_permitted_role_proceeds(bash, tmp_path):
+    """The positive half. Asserting only the refusal leaves inverting the comparison
+    green, which would refuse every connection including haf_admin's."""
+    log = make_psql(tmp_path, can_remove="t")
+    r = run(bash, tmp_path, "--force")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "app_remove_context" in sql_of(log)
 
 
 # --- the session guard ------------------------------------------------------------
@@ -340,6 +398,7 @@ def test_a_non_haf_database_completes_instead_of_aborting(bash, tmp_path):
         "done\n"
         f'printf "%s\\n---\\n" "$cmd" >> "{logfile.as_posix()}"\n'
         'case "$cmd" in\n'
+        '  *is_superuser*)     printf "t" ;;\n'
         # pg_stat_activity FIRST: the guard query mentions neither of the others.
         '  *pg_stat_activity*) printf "0" ;;\n'
         # The bare to_regclass probe is the ONLY statement that is just a probe; every
@@ -454,6 +513,7 @@ def test_a_failing_destructive_statement_does_not_abort_the_run(bash, tmp_path):
         "done\n"
         f'printf "%s\\n---\\n" "$cmd" >> "{logfile.as_posix()}"\n'
         'case "$cmd$files" in\n'
+        '  *is_superuser*)     printf "t" ;;\n'
         '  *pg_stat_activity*)     printf "0" ;;\n'
         '  *uninstall_verify.sql*) printf "" ;;\n'
         '  *to_regclass*)          printf "t" ;;\n'
@@ -490,6 +550,7 @@ def test_a_failing_verification_probe_does_not_report_success(bash, tmp_path):
         '  prev="$a"\n'
         "done\n"
         'case "$cmd" in\n'
+        '  *is_superuser*)     printf "t" ;;\n'
         '  *pg_stat_activity*) printf "0"; exit 0 ;;\n'
         '  *to_regclass*)      echo "ERROR: connection lost" >&2; exit 2 ;;\n'
         "esac\n"
