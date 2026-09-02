@@ -336,6 +336,9 @@ run_sql_file "${SCRIPT_DIR}/../db/sync_status.sql"
 #     live HAF node owns its own context row (hafbe_app -> hafbe_owner,
 #     haf_stats -> haf_stats_owner); haf_fyp must match.
 psql_cmd -c "SET ROLE haf_fyp_owner; SELECT haf_fyp_app.create_context_if_not_exists(); RESET ROLE;"
+# Registry registration must follow both the context creation above and
+# process_block_range.sql (hive.app_register verifies the entry procedure exists).
+psql_cmd -c "SET ROLE haf_fyp_owner;" -f "${SCRIPT_DIR}/../db/register_app.sql"
 
 # 11. Grant read access on current and future objects to haf_fyp_user
 psql_cmd -c "

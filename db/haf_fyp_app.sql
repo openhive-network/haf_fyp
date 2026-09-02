@@ -255,3 +255,21 @@ BEGIN
     END LOOP;
 END;
 $$;
+
+-- ---------------------------------------------------------------------------
+-- Per-range entry point for the generic HAF block-processing driver
+-- (haf_app_driver.py from the psql base image, haf#341). The driver owns the
+-- transaction: it calls hive.app_next_iteration(_wait => FALSE) itself, hands
+-- the returned range here, and commits range + context position atomically -
+-- so this must not COMMIT. Registered via db/register_app.sql.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE haf_fyp_app.process_blocks(
+    IN _block_range hive.blocks_range
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    PERFORM haf_fyp_app.process_block_range(_block_range.first_block, _block_range.last_block);
+    UPDATE haf_fyp_app.app_status SET last_processed_block = _block_range.last_block;
+END;
+$$;

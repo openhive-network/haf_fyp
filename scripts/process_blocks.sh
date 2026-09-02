@@ -161,6 +161,30 @@ log "Block processing start time recorded: $(cat "${STARTUP_TIME_FILE}")"
 
 log "Starting block processing loop..."
 
+# The generic HAF block-processing driver (haf#341; /usr/local/bin in the psql
+# base image) runs the registered haf_fyp_app.process_blocks per delivered
+# range and idles on its own connection between blocks: the backend shows idle
+# in pg_stat_activity, notifications are consumed, and no transaction spans a
+# wait. hive.app_next_iteration also withholds blocks that hivemind (and
+# hivesense, when present) has not committed - see db/register_app.sql.
+#
+# exec'd directly so it is PID 1 and receives SIGTERM itself; a bash parent
+# swallows the signal until docker's kill (learned on reputation_tracker!223).
+#
+# The startup timestamp above stays OURS (database clock - see the healthcheck
+# contract), so the driver's own container-clock marker is disabled with an
+# empty --startup-marker.
+#
+# HAF_FYP_USE_LEGACY_LOOP=true forces the eternal CALL main() loop (also used
+# automatically when the driver or the registry is unavailable).
+if command -v haf_app_driver.py >/dev/null 2>&1 \
+   && [ "${HAF_FYP_USE_LEGACY_LOOP:-false}" != "true" ]; then
+    exec haf_app_driver.py --app=haf_fyp \
+        --postgres-url="postgresql://${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}?application_name=haf_fyp_block_processing" \
+        --startup-marker=
+fi
+
+log "haf_app_driver.py not used, falling back to the legacy CALL main() loop"
 psql_cmd -c "CALL haf_fyp_app.main('haf_fyp');"
 
 log "Block processing loop exited."
