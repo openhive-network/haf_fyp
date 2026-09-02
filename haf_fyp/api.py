@@ -23,7 +23,7 @@ import logging
 import os
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
-from typing import Annotated, Literal, Optional
+from typing import TYPE_CHECKING, Annotated, Literal, Optional, cast
 
 import psycopg2
 import psycopg2.extras
@@ -38,6 +38,10 @@ from slowapi.errors import RateLimitExceeded
 # middleware class for the mechanics.
 from slowapi.middleware import _find_route_handler, _get_route_name
 from slowapi.util import get_remote_address
+from starlette.concurrency import run_in_threadpool
+
+from limits import RateLimitItem
+from limits import parse as parse_rate_limit
 
 from .auth import KeyLookupUnavailable, verify_interests, verify_interests_delete
 from .metrics import (
@@ -52,6 +56,9 @@ from .sync_status import (
     build_sync_status,
     fetch_sync_status_row,
 )
+
+if TYPE_CHECKING:  # typing only -- not imported at runtime
+    from slowapi.wrappers import Limit
 
 log = logging.getLogger(__name__)
 
@@ -280,12 +287,91 @@ limiter = Limiter(
 # passed straight through, so /health, /metrics and /sync-status are untouched --
 # this moves WHEN the existing limits are evaluated, it does not add limits anywhere.
 #
-# PRIVATE-API DEPENDENCY: _route_limits and _check_request_limit(..., False) are
-# slowapi internals; requirements.txt pins slowapi for that reason, and the tests in
+# ONLY THE PER-IP LIMIT IS CHARGED HERE. The shared ceilings moved into the endpoint
+# bodies -- see _charge_global_ceiling above for why charging them early was a
+# cross-caller denial of service rather than a stricter limit.
+#
+# PRIVATE-API DEPENDENCY: _route_limits, _dynamic_route_limits and
+# _check_request_limit(..., in_middleware=False) are slowapi internals.
+# requirements.txt bounds slowapi below 0.2 for that reason -- note that even the
+# 0.1.9 -> 0.1.10 PATCH bump moved a semantic (Limit.is_exempt went from a property
+# to a method taking a Request), so "patch releases are safe" is not an assumption
+# available here; the two names this depends on were checked and are unchanged.
+# __init__ rejects the drifts it can see, and the tests in
 # tests/unit/test_ratelimit_ordering.py assert the BEHAVIOUR (an invalid body spends
-# the allowance, a 429 short-circuits before parsing) so a version bump that moves
-# the internals turns the suite red instead of silently un-metering the endpoint.
+# the allowance, a 429 short-circuits before parsing, malformed traffic cannot drain
+# the shared ceiling) so a bump that moves the internals turns the suite red instead
+# of silently un-metering the endpoint.
 _REQUIRED_SLOWAPI_INTERNALS = ("_route_limits", "_check_request_limit")
+
+
+# ---------------------------------------------------------------------------
+# The global ceilings: charged AFTER validation, deliberately (#28)
+# ---------------------------------------------------------------------------
+#
+# These used to be a second @limiter.limit decorator alongside the per-IP one, so
+# once the middleware below started charging before the body was parsed, BOTH were
+# charged on a request that then 422'd. That handed anyone a new lever the per-IP
+# design specifically exists to deny: malformed traffic, spread over a handful of
+# addresses each staying comfortably inside its OWN allowance, drains the SHARED
+# bucket and locks every other caller out. Measured on the shipped app -- 8 IPs x 5
+# header-less POSTs to /v1/fyp/admin/algorithm (all 422, none of the attackers ever
+# throttled) left an innocent admin on a clean address holding a 429.
+#
+# So the two limits are charged in different places now, which is what their two
+# jobs actually want:
+#
+#   per-IP  -- before the body is parsed, by the middleware. Bounds what ONE caller
+#              can make us spend, which is the whole of #28.
+#   global  -- here, from inside the endpoint body, which only ever executes once
+#              FastAPI has accepted the request. Bounds ACCEPTED volume, which is
+#              what its comments always claimed it bounded.
+#
+# Charging from the body rather than a decorator is not a workaround: slowapi has no
+# per-limit granularity to ask for, and a FastAPI dependency is no good either --
+# dependencies are solved alongside body validation, not after it.
+
+
+class _Ceiling:
+    """The two attributes RateLimitExceeded reads off a slowapi Limit.
+
+    Constructing a real slowapi Limit would mean calling LimitGroup positionally,
+    and its argument list is exactly the kind of thing a release moves. This keeps
+    the 429 body byte-identical to the decorator's -- str(item), i.e.
+    {"error": "Rate limit exceeded: 600 per 1 minute"} -- with no such coupling.
+    """
+
+    __slots__ = ("limit", "error_message")
+
+    def __init__(self, item):
+        self.limit = item
+        self.error_message = None
+
+
+_GLOBAL_CEILINGS: dict[str, RateLimitItem] = {}
+
+
+def _charge_global_ceiling(request: Request, spec: str, per_method: bool = False) -> None:
+    """Spend one unit of this endpoint's shared ceiling, or raise 429.
+
+    Key and scope are built exactly as slowapi's __evaluate_limits builds them
+    under key_style="url" -- key "global", scope the request path plus ":METHOD"
+    when the endpoint's limits are per-method -- so the bucket identity is
+    unchanged from when this was a decorator.
+    """
+    item = _GLOBAL_CEILINGS.get(spec)
+    if item is None:
+        item = _GLOBAL_CEILINGS[spec] = parse_rate_limit(spec)
+    scope = request.scope["path"] + (f":{request.method}" if per_method else "")
+    args = [global_key(), scope]
+    if not limiter.limiter.hit(item, *args):
+        # Mirrors __evaluate_limits' failure path: record the limit that failed so
+        # _rate_limit_exceeded_handler can read it back off request.state.
+        request.state.view_rate_limit = (item, args)
+        log.warning("global ceiling %s exceeded at %s", spec, scope)
+        # cast, not a real Limit: see _Ceiling. RateLimitExceeded reads only the
+        # two attributes it carries.
+        raise RateLimitExceeded(cast("Limit", _Ceiling(item)))
 
 
 class RateLimitBeforeValidationMiddleware:
@@ -310,14 +396,53 @@ class RateLimitBeforeValidationMiddleware:
                 "cannot evaluate route limits early; pin a compatible slowapi."
             )
 
+        # Presence is not enough: a release can keep both names and change what they
+        # do, and because this middleware also stamps _rate_limiting_complete, a
+        # silent failure here leaves the route unmetered for VALID requests too --
+        # worse than before #28. Two drifts are cheap to catch, so they are:
+        # _check_request_limit becoming async (the call would never run) and its
+        # signature changing shape (we pass in_middleware by keyword, so its NAME is
+        # load-bearing). A re-keyed _route_limits is not detectable here; the honest
+        # guard against that is tests/unit/test_ratelimit_ordering.py, which asserts
+        # the behaviour rather than the internals.
+        check = type(self.limiter)._check_request_limit
+        params = list(inspect.signature(check).parameters)
+        if inspect.iscoroutinefunction(check) or params[:4] != [
+            "self", "request", "endpoint_func", "in_middleware",
+        ]:
+            raise RuntimeError(
+                "slowapi's _check_request_limit has changed shape "
+                f"(async={inspect.iscoroutinefunction(check)}, params={params[:4]}); "
+                "RateLimitBeforeValidationMiddleware would stop metering silently."
+            )
+
+    def _is_limited(self, handler) -> bool:
+        if handler is None:
+            return False
+        name = _get_route_name(handler)
+        # BOTH registries. slowapi files a callable limit value -- @limiter.limit(
+        # lambda: "5/minute") -- under _dynamic_route_limits and never under
+        # _route_limits, so consulting only the latter would hand any future
+        # runtime-configurable limit straight back to the pre-#28 behaviour with the
+        # whole suite still green. _check_request_limit(in_middleware=False) loads
+        # both, so nothing past this point needs to know the difference.
+        return (
+            name in self.limiter._route_limits
+            or name in self.limiter._dynamic_route_limits
+        )
+
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or not self.limiter.enabled:
             return await self.app(scope, receive, send)
 
+        # NOTE: _find_route_handler keeps the LAST full match while the router
+        # dispatches the FIRST. Identical while no two routes match one method+path
+        # -- TestWiring asserts that -- but a later-registered POST /v1/fyp/{x}
+        # would shadow post_events here and silently un-meter it.
         handler = _find_route_handler(scope["app"].routes, scope)
-        # No route match (404, or a method this path does not serve) and routes with
-        # no decorator of their own: nothing to charge, behave exactly as before.
-        if handler is None or _get_route_name(handler) not in self.limiter._route_limits:
+        # No route match (404, or a method this path does not serve), and routes
+        # with no decorator of their own: nothing to charge, behave as before.
+        if not self._is_limited(handler):
             return await self.app(scope, receive, send)
 
         # Built for the key func and the handler only. Do NOT read the body here --
@@ -325,25 +450,89 @@ class RateLimitBeforeValidationMiddleware:
         # a size) leaves the endpoint waiting on a stream that will never arrive.
         request = Request(scope, receive=receive)
         try:
-            # in_middleware=False is the load-bearing argument: it is what makes
-            # slowapi load this route's decorator limits rather than only the
-            # application/default ones. See the note above.
-            self.limiter._check_request_limit(request, handler, False)
-        except RateLimitExceeded as exc:
-            # Mirror slowapi's own lookup so a custom handler still wins.
-            handle = scope["app"].exception_handlers.get(
-                type(exc), _rate_limit_exceeded_handler
+            # OFF THE EVENT LOOP. With REDIS_URL set (docker/docker-compose.yml, the
+            # deployed config) the limiter storage is limits' SYNCHRONOUS
+            # RedisStorage, so this is a blocking socket round-trip. Before #28 it
+            # ran inside slowapi's endpoint wrapper, and every limited endpoint is a
+            # `def`, so FastAPI was already running it in a threadpool. Calling it
+            # inline from this coroutine would hand that blocking call to the single
+            # event loop instead: with Redis merely SLOW the whole process
+            # serialises behind it, and with Redis hung, three unauthenticated junk
+            # requests stop /health answering at all -- which is what the HAProxy
+            # agent-check gates this node on. The hop costs far less than parsing
+            # the 4 MB body this exists to refuse.
+            #
+            # in_middleware is passed BY KEYWORD: slowapi already carries a `cost`
+            # argument on limit(), and a future release inserting one positionally
+            # ahead of it would turn our False into a cost and stop metering.
+            await run_in_threadpool(
+                self.limiter._check_request_limit,
+                request,
+                handler,
+                in_middleware=False,
             )
-            response = handle(request, exc)
-            if inspect.isawaitable(response):
-                response = await response
-            return await response(scope, receive, send)
+        except RateLimitExceeded as exc:
+            return await self._reject(scope, receive, send, request, exc)
+        except Exception:
+            # Limiter storage unreachable (Redis down). Fall THROUGH rather than
+            # answering 500 here: the decorator inside the endpoint attempts the
+            # same check and fails the same way, which reproduces pre-#28 behaviour
+            # exactly -- an invalid body still gets its 422, a valid one still gets
+            # the 500 it always got. Answering from here instead would turn every
+            # malformed request into a bare text/plain 500 for the duration of the
+            # outage, because this middleware sits outside ExceptionMiddleware.
+            # Deliberately does NOT mark the request complete, so the retry happens.
+            log.exception("rate-limit storage failed; deferring to the endpoint")
+            return await self.app(scope, receive, send)
 
         # Shared with the Request the endpoint receives (both are built from this
         # scope, and Starlette backs .state with scope["state"]), so slowapi's
         # decorator sees it and skips its own check rather than charging twice.
         request.state._rate_limiting_complete = True
         return await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _reject(scope, receive, send, request, exc):
+        """Answer 429 the way ExceptionMiddleware would have.
+
+        Resolving by exact type alone -- which is what slowapi's own middleware does
+        -- silently ignores a handler registered against a base class or a status
+        code, both of which Starlette honours. Normalising 4xx envelopes with
+        @app.exception_handler(HTTPException) is a common thing to do, and it would
+        otherwise have covered every 4xx except the 429s produced here.
+
+        The ORDER mirrors starlette/_exception_handler.py: a status-code handler
+        wins over a class handler, and only then is the MRO walked. Getting that
+        backwards is not academic -- FastAPI pre-registers a handler for
+        HTTPException, which RateLimitExceeded subclasses, so an MRO-first lookup
+        matches that default for every app and a status-code registration could
+        never win. `app.exception_handlers` keeps both kinds in one dict (int keys
+        for status codes), which is why they are split here; the pre-split pair
+        Starlette puts in scope["starlette.exception_handlers"] is not available to
+        us, since ExceptionMiddleware runs INSIDE this one.
+        """
+        handlers = scope["app"].exception_handlers
+        handle = None
+        status = getattr(exc, "status_code", None)
+        if status is not None:
+            handle = handlers.get(status)
+        if handle is None:
+            for cls in type(exc).__mro__:
+                if cls in handlers:
+                    handle = handlers[cls]
+                    break
+        if handle is None:
+            handle = _rate_limit_exceeded_handler
+
+        # Starlette runs a sync handler in a threadpool; a user-supplied one is free
+        # to do blocking work, and this middleware is on the event loop.
+        if inspect.iscoroutinefunction(handle):
+            response = await handle(request, exc)
+        else:
+            response = await run_in_threadpool(handle, request, exc)
+            if inspect.isawaitable(response):  # async __call__ on a callable object
+                response = await response
+        return await response(scope, receive, send)
 
 
 # ---------------------------------------------------------------------------
@@ -772,14 +961,15 @@ def sync_status(response: Response):
 
 
 @app.post("/v1/fyp/interests", response_model=InterestsResponse)
-# Per-IP bounds one abuser; the global ceiling bounds TOTAL cost -- each call does
-# signature verification plus a Hive RPC lookup, so this is cheap to send and
-# expensive to serve. The old global bucket supplied that ceiling by accident.
+# Per-IP bounds one abuser and is charged before the body is parsed (#28). The
+# 60/min ceiling bounds TOTAL accepted cost -- each call does signature verification
+# plus a Hive RPC lookup, so this is cheap to send and expensive to serve -- and is
+# charged from inside the body (_charge_global_ceiling) so a request rejected by
+# pydantic never spends it.
 # per_method: POST and DELETE share the /v1/fyp/interests path, and slowapi scopes a
 # bucket by path alone. Without it they are kept apart only by their limit AMOUNTS
 # differing (limits folds the amount into the key), so aligning the two numbers
 # later would silently merge them into one shared bucket.
-@limiter.limit("60/minute", key_func=global_key, per_method=True)
 @limiter.limit("10/minute", per_method=True)
 def post_interests(request: Request, req: InterestsRequest):
     """
@@ -816,6 +1006,7 @@ def post_interests(request: Request, req: InterestsRequest):
     several delegates (each path must meet the threshold on its own); and active
     or owner keys, which are never accepted for this endpoint.
     """
+    _charge_global_ceiling(request, "60/minute", per_method=True)
     # De-duplicate BEFORE any SQL or arithmetic. The signed challenge already uses
     # sorted(set(...)) (auth.build_message), so this is what the user actually
     # authorised — but the raw list went into one execute_values batch, and two
@@ -886,7 +1077,6 @@ def post_interests(request: Request, req: InterestsRequest):
 
 
 @app.delete("/v1/fyp/interests", response_model=InterestsDeleteResponse)
-@limiter.limit("30/minute", key_func=global_key, per_method=True)
 @limiter.limit("5/minute", per_method=True)
 def delete_interests(request: Request, req: InterestsDeleteRequest):
     """
@@ -968,6 +1158,7 @@ def delete_interests(request: Request, req: InterestsDeleteRequest):
     POST /v1/fyp/interests/delete alias is a one-line change — the challenge is
     transport-independent.
     """
+    _charge_global_ceiling(request, "30/minute", per_method=True)
     try:
         verify_interests_delete(req.username, req.timestamp, req.signature)
     except PermissionError as exc:
@@ -1022,16 +1213,15 @@ def delete_interests(request: Request, req: InterestsDeleteRequest):
 
 @app.post("/v1/fyp/events", response_model=EventsResponse, status_code=202)
 # 120/min per IP is deliberately generous -- a sendBeacon flush every few seconds is
-# ~20/min, and CGNAT means many real users can share one address. The global ceiling
-# bounds ACCEPTED write volume: 600/min x 200 events/batch = 120k rows/min = 7.2M/hour,
-# inside prune_feed_events' 20M cap given it only runs hourly. Without it, per-IP
-# keying removes the total bound the global bucket was accidentally providing.
+# ~20/min, and CGNAT means many real users can share one address. It is charged BEFORE
+# the body is parsed (#28), so a malformed batch spends the sender's own allowance
+# instead of being answered 422 for free. That is what bounds total CPU here.
 #
-# Both buckets are now charged BEFORE the body is parsed, so a malformed batch spends
-# the caller's allowance instead of being answered 422 for free -- see
-# RateLimitBeforeValidationMiddleware. That is what bounds total CPU here; the batch
-# cap alone bounds accepted write volume only (#28).
-@limiter.limit("600/minute", key_func=global_key)
+# The 600/min ceiling is charged from inside the body instead (_charge_global_ceiling),
+# so only ACCEPTED batches spend it: 600/min x 200 events = 120k rows/min = 7.2M/hour,
+# inside prune_feed_events' 20M cap given it only runs hourly. Charging it early too
+# would let malformed traffic from a few addresses drain the shared bucket and 429
+# everyone else -- see the note above _charge_global_ceiling.
 @limiter.limit("120/minute")
 def post_events(request: Request, req: EventsBatch):
     """
@@ -1054,6 +1244,7 @@ def post_events(request: Request, req: EventsBatch):
     Rate-limited per IP; batches are capped at 200 events. Send it fire-and-forget
     (e.g. navigator.sendBeacon on visibilitychange).
     """
+    _charge_global_ceiling(request, "600/minute")
     rows = []
     for ev in req.events:
         event_ts = (
@@ -1105,14 +1296,18 @@ def post_events(request: Request, req: EventsBatch):
 
 
 @app.post("/v1/fyp/admin/algorithm")
-# Global ceiling restores the brute-force bound on the API key that 5/min gave while
-# the bucket was (accidentally) shared. 30, not 10: at 10 the ratio to the per-IP
-# limit is 2:1, so two source IPs staying inside their own allowance consume the
-# whole ceiling and lock the real admin out indefinitely -- and rate limiting runs
-# BEFORE the API-key check, so that costs an attacker nothing. 6x headroom matches
-# the other three endpoints, and 30/min is still nowhere near brute-forcing a
+# The 30/min ceiling bounds brute-forcing the API key. 30, not 10: at 10 the ratio to
+# the per-IP limit is 2:1, so two source IPs staying inside their own allowance
+# consume the whole ceiling and lock the real admin out indefinitely. 6x headroom
+# matches the other three endpoints, and 30/min is nowhere near brute-forcing a
 # 256-bit key.
-@limiter.limit("30/minute", key_func=global_key)
+#
+# It is charged inside the body, ahead of the API-key check, so it still bounds
+# well-formed guessing -- but a request with no X-Admin-Key header at all is a 422
+# from FastAPI and never reaches it. That distinction is the point: while the ceiling
+# was a decorator charged before validation, 8 addresses sending header-less junk
+# (each inside its own 5/min, so never throttled) drained the shared 30 and locked
+# the real admin out. Only the per-IP limit is charged before the body is parsed.
 @limiter.limit("5/minute")
 def activate_algorithm(
     request: Request,
@@ -1126,6 +1321,7 @@ def activate_algorithm(
     Requires the X-Admin-Key header to match the ADMIN_API_KEY environment
     variable. The ranker will pick up the new weights on its next cycle.
     """
+    _charge_global_ceiling(request, "30/minute")
     admin_key = os.environ.get("ADMIN_API_KEY", "")
     if not admin_key or x_admin_key != admin_key:
         raise HTTPException(status_code=403, detail="invalid admin key")
