@@ -404,15 +404,10 @@ class TestLayeredCeilingsOnTheRealEndpoints:
             "/v1/fyp/interests path, so dropping it merges their ceilings"
         )
 
-    @pytest.mark.parametrize("func_name", sorted(EXPECTED))
+    # activate_algorithm is deliberately different -- see the class below.
+    @pytest.mark.parametrize("func_name", sorted(set(EXPECTED) - {"activate_algorithm"}))
     def test_the_ceiling_is_charged_before_anything_else_in_the_body(self, func_name):
-        """Nothing may run ahead of it -- least of all the admin key check.
-
-        activate_algorithm answers 403 to a wrong key. If the ceiling were charged
-        after that check, guessing keys would cost an attacker nothing at all and
-        the ceiling would stop bounding brute force, which is the whole reason it
-        is 30/minute rather than absent.
-        """
+        """Nothing may run ahead of it, so no work is done for free."""
         calls, fn = self._ceiling_calls(func_name)
         body = [n for n in fn.body if not (
             isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
@@ -423,6 +418,32 @@ class TestLayeredCeilingsOnTheRealEndpoints:
             f"{func_name}: the ceiling charge must be the first statement after the "
             f"docstring, found {ast.dump(first)[:80]}"
         )
+
+    def test_the_admin_ceiling_is_charged_only_when_the_key_is_wrong(self):
+        """The exception, and it is the point rather than an oversight.
+
+        An earlier revision charged this ceiling ahead of the key comparison, on the
+        reasoning that otherwise 'guessing keys would cost an attacker nothing'.
+        That conflates 'after the comparison' with 'after the 403': every guess IS a
+        failed comparison, so charging on the failure branch bounds brute force
+        identically -- while no longer letting six addresses of wrong guesses spend
+        the shared 30/minute and lock out the holder of the correct key.
+        """
+        calls, fn = self._ceiling_calls("activate_algorithm")
+        node = calls[0][2]
+        guard = next(n for n in fn.body if isinstance(n, ast.If))
+        assert any(n is node for n in ast.walk(guard)), (
+            "the admin ceiling charge is not inside the invalid-key branch, so a "
+            "correct key spends it too and guessers can lock the real admin out"
+        )
+        assert isinstance(guard.body[-1], ast.Raise), "the branch must still 403"
+
+    @pytest.mark.parametrize("func_name", sorted(EXPECTED))
+    def test_the_per_ip_decorator_keeps_its_per_method_flag(self, func_name):
+        # POST and DELETE share /v1/fyp/interests, and slowapi scopes by path alone.
+        want = self.EXPECTED[func_name][2]
+        got = {lim.per_method for lim in self._limits(func_name)}
+        assert got == {want}, f"{func_name}: per_method={got}, want {want}"
 
 
 class TestThrottledAbuserDoesNotDrainTheGlobalBucket:
@@ -441,7 +462,7 @@ class TestThrottledAbuserDoesNotDrainTheGlobalBucket:
         app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
         app.add_middleware(SlowAPIMiddleware)
 
-        # Same stacking as the real endpoints: global ABOVE per-IP.
+        # Stacked decorators: the shape slowapi sees, not the production split.
         @app.get("/probe")
         @lim.limit("5/minute", key_func=global_key)
         @lim.limit("2/minute")

@@ -146,10 +146,10 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 | GET | `/health` | Service health check |
 | GET | `/metrics` | Operational health: embedding coverage (#15) + credibility source health (#8) — not feed analytics |
 | GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
-| POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10 req/min) |
-| DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5 req/min) |
-| POST | `/v1/fyp/events` | Impression / engagement telemetry batch (120 req/min) |
-| POST | `/v1/fyp/admin/algorithm` | Activate an algorithm version (`X-Admin-Key` required) |
+| POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10/min per IP, 60/min total) |
+| DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5/min per IP, 30/min total) |
+| POST | `/v1/fyp/events` | Impression / engagement telemetry batch (120/min per IP, 600/min total) |
+| POST | `/v1/fyp/admin/algorithm` | Activate an algorithm version, `X-Admin-Key` required (5/min per IP; 30/min total, charged only on a wrong key) |
 
 The two metrics endpoints are unrelated and answer different questions. This one, on the
 FastAPI overlay, is the *operational* read — embedding coverage and credibility source
@@ -208,7 +208,9 @@ hour, inside `prune_feed_events`' cap). Charging the ceiling before validation t
 would let malformed traffic spread across a handful of addresses — each staying
 inside its own per-IP allowance, so never throttled — drain the shared bucket and
 `429` every other caller, which is a denial of service the per-IP design exists to
-prevent. Per-IP keying depends on `TRUSTED_PROXY_IPS` being set correctly; see the
+prevent. The admin route goes one step further and charges its ceiling only when
+the key is *wrong*, so guessing stays bounded at 30/min while the holder of the
+correct key can never be locked out by guessers. Per-IP keying depends on `TRUSTED_PROXY_IPS` being set correctly; see the
 deployment checklist.
 
 Clean URL rewrites (via nginx `endpoints/rewrite_rules.conf`):

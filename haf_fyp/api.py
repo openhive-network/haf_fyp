@@ -16,15 +16,19 @@ Redis pub/sub signals the ranker for on-demand feed refresh after interest updat
 
 from __future__ import annotations
 
+import functools
 import inspect
 import ipaddress
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Annotated, Literal, Optional, cast
 
+import anyio
+import anyio.to_thread
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
@@ -222,21 +226,50 @@ def global_key() -> str:
     Takes no parameter, and specifically none named `request` -- see client_ip_key
     for why the name is what slowapi dispatches on.
 
-    ORDER MATTERS WHERE THIS IS USED. slowapi evaluates limits in registration order
-    and breaks on the first failure, and stacked decorators register bottom-up. So
-    the global ceiling must be the OUTER decorator: if it is inner, it is hit()
-    before the per-IP limit is checked, and requests the per-IP limit is already
-    rejecting still spend global budget -- letting one throttled abuser 429 everyone
-    else, which is the harm this whole change exists to remove.
+    NO LONGER USED AS A DECORATOR key_func. The ceilings are charged from inside the
+    endpoint bodies by _charge_global_ceiling, which calls this for the bucket key;
+    test_the_per_ip_limit_is_the_only_decorator fails the build if a
+    `key_func=global_key` decorator comes back, because charging a shared bucket
+    before validation lets malformed traffic 429 everyone else.
     """
     return "global"
 
 
+_REDIS_URL = os.environ.get("REDIS_URL", "")
+
 limiter = Limiter(
     key_func=client_ip_key,
-    storage_uri=os.environ.get("REDIS_URL", "memory://"),
+    storage_uri=_REDIS_URL or "memory://",
     key_style="url",
+    # Bounded waits. limits' RedisStorage is synchronous, so an unresponsive Redis
+    # parks the calling worker thread for as long as the socket blocks -- and those
+    # threads are shared with every `def` endpoint in this app, /health included.
+    # Without a timeout the park is unbounded and the pool drains. Only passed for
+    # Redis: memory:// takes no socket options.
+    # cast: slowapi annotates storage_options as Dict[str, str], but the values go
+    # straight to redis-py as **kwargs, where these two are numeric. The annotation
+    # is wrong, not the values.
+    storage_options=cast(
+        "dict[str, str]",
+        {"socket_timeout": 2, "socket_connect_timeout": 2} if _REDIS_URL else {},
+    ),
 )
+
+# Middleware limiter checks get their OWN slice of the threadpool rather than the
+# default 40-token pool anyio shares with every sync endpoint. Without this the fix
+# for the event-loop stall only RAISES the bar: at ~41 concurrent junk requests the
+# checks take every slot and /health stops answering again, which is exactly the
+# HAProxy agent-check failure it was meant to close. Created lazily -- a
+# CapacityLimiter wants a running event loop.
+_LIMITER_THREAD_SLOTS = 8
+_limiter_threads: anyio.CapacityLimiter | None = None
+
+
+def _thread_limiter() -> anyio.CapacityLimiter:
+    global _limiter_threads
+    if _limiter_threads is None:
+        _limiter_threads = anyio.CapacityLimiter(_LIMITER_THREAD_SLOTS)
+    return _limiter_threads
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +335,11 @@ limiter = Limiter(
 # the allowance, a 429 short-circuits before parsing, malformed traffic cannot drain
 # the shared ceiling) so a bump that moves the internals turns the suite red instead
 # of silently un-metering the endpoint.
-_REQUIRED_SLOWAPI_INTERNALS = ("_route_limits", "_check_request_limit")
+_REQUIRED_SLOWAPI_INTERNALS = (
+    "_route_limits",
+    "_dynamic_route_limits",
+    "_check_request_limit",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -359,18 +396,44 @@ def _charge_global_ceiling(request: Request, spec: str, per_method: bool = False
     when the endpoint's limits are per-method -- so the bucket identity is
     unchanged from when this was a decorator.
     """
+    if not limiter.enabled:
+        # slowapi's documented kill-switch. The decorator honoured it for free; a
+        # hand-rolled charge has to, or "limiting off" still 429s callers from a
+        # bucket no per-IP allowance bounds.
+        return
+
     item = _GLOBAL_CEILINGS.get(spec)
     if item is None:
         item = _GLOBAL_CEILINGS[spec] = parse_rate_limit(spec)
     scope = request.scope["path"] + (f":{request.method}" if per_method else "")
     args = [global_key(), scope]
-    if not limiter.limiter.hit(item, *args):
+    if limiter._key_prefix:
+        # __evaluate_limits prepends it. Empty today, but the obvious day-one move
+        # when namespacing a shared Redis across haf_fyp and haf_stats is to set it
+        # -- and then the per-IP buckets would be namespaced while the ceilings
+        # collided across apps.
+        args = [limiter._key_prefix] + args
+
+    try:
+        allowed = limiter.limiter.hit(item, *args)
+    except Exception:
+        # Going through hit() directly means slowapi's own storage-error policy in
+        # _check_request_limit does not apply, so honour the part of it that is
+        # configurable. Default (unset) re-raises, which is what the ceiling did as
+        # a decorator: a storage outage surfaces rather than silently uncapping.
+        if getattr(limiter, "_swallow_errors", False):
+            log.warning("ceiling storage unreachable; allowing %s", scope)
+            return
+        raise
+
+    if not allowed:
         # Mirrors __evaluate_limits' failure path: record the limit that failed so
         # _rate_limit_exceeded_handler can read it back off request.state.
         request.state.view_rate_limit = (item, args)
         log.warning("global ceiling %s exceeded at %s", spec, scope)
         # cast, not a real Limit: see _Ceiling. RateLimitExceeded reads only the
-        # two attributes it carries.
+        # two attributes it carries -- and it must stay RateLimitExceeded, so the
+        # app's registered handler produces the same 429 body the decorator did.
         raise RateLimitExceeded(cast("Limit", _Ceiling(item)))
 
 
@@ -450,30 +513,37 @@ class RateLimitBeforeValidationMiddleware:
         # a size) leaves the endpoint waiting on a stream that will never arrive.
         request = Request(scope, receive=receive)
         try:
-            # OFF THE EVENT LOOP. With REDIS_URL set (docker/docker-compose.yml, the
-            # deployed config) the limiter storage is limits' SYNCHRONOUS
-            # RedisStorage, so this is a blocking socket round-trip. Before #28 it
-            # ran inside slowapi's endpoint wrapper, and every limited endpoint is a
-            # `def`, so FastAPI was already running it in a threadpool. Calling it
-            # inline from this coroutine would hand that blocking call to the single
-            # event loop instead: with Redis merely SLOW the whole process
-            # serialises behind it, and with Redis hung, three unauthenticated junk
-            # requests stop /health answering at all -- which is what the HAProxy
-            # agent-check gates this node on. The hop costs far less than parsing
-            # the 4 MB body this exists to refuse.
+            # OFF THE EVENT LOOP, AND OFF THE SHARED POOL. With REDIS_URL set
+            # (docker/docker-compose.yml, the deployed config) the limiter storage
+            # is limits' SYNCHRONOUS RedisStorage, so this is a blocking socket
+            # round-trip. Before #28 it ran inside slowapi's endpoint wrapper, and
+            # every limited endpoint is a `def`, so FastAPI was already running it
+            # in a threadpool; calling it inline from this coroutine handed that
+            # blocking call to the single event loop, where three unauthenticated
+            # junk requests against a hung Redis stopped /health answering at all.
+            #
+            # run_in_threadpool alone only RAISES that bar rather than removing it:
+            # it passes no limiter, so it draws on anyio's default 40-token pool --
+            # the same pool every `def` endpoint uses, /health included -- and at
+            # ~41 concurrent requests the identical starvation returns. Hence a
+            # dedicated slice, plus socket timeouts on the storage above, so a sick
+            # Redis is bounded twice over.
             #
             # in_middleware is passed BY KEYWORD: slowapi already carries a `cost`
             # argument on limit(), and a future release inserting one positionally
             # ahead of it would turn our False into a cost and stop metering.
-            await run_in_threadpool(
-                self.limiter._check_request_limit,
-                request,
-                handler,
-                in_middleware=False,
+            await anyio.to_thread.run_sync(
+                functools.partial(
+                    self.limiter._check_request_limit,
+                    request,
+                    handler,
+                    in_middleware=False,
+                ),
+                limiter=_thread_limiter(),
             )
         except RateLimitExceeded as exc:
             return await self._reject(scope, receive, send, request, exc)
-        except Exception:
+        except Exception as exc:
             # Limiter storage unreachable (Redis down). Fall THROUGH rather than
             # answering 500 here: the decorator inside the endpoint attempts the
             # same check and fails the same way, which reproduces pre-#28 behaviour
@@ -482,7 +552,20 @@ class RateLimitBeforeValidationMiddleware:
             # malformed request into a bare text/plain 500 for the duration of the
             # outage, because this middleware sits outside ExceptionMiddleware.
             # Deliberately does NOT mark the request complete, so the retry happens.
-            log.exception("rate-limit storage failed; deferring to the endpoint")
+            #
+            # NOTE the retry is only safe while a route carries a single Limit:
+            # __evaluate_limits restarts from the top, so if an earlier hit()
+            # succeeded and a later one raised, the earlier bucket is charged twice.
+            # One decorator per route today, and a multi-limit string
+            # ("10/minute;3/second") is enough to break that --
+            # test_every_limited_route_carries_exactly_one_limit pins it.
+            #
+            # THROTTLED, and warning rather than exception: this fires on the one
+            # path that by construction charges nothing, so a single client can
+            # drive it as fast as it can send. A full traceback per request measured
+            # ~2.3 KB -- roughly 19 GB/day from one sender -- and an unrotated log
+            # filling the pool is how this fleet has taken a node down before.
+            self._log_storage_failure(exc)
             return await self.app(scope, receive, send)
 
         # Shared with the Request the endpoint receives (both are built from this
@@ -490,6 +573,37 @@ class RateLimitBeforeValidationMiddleware:
         # decorator sees it and skips its own check rather than charging twice.
         request.state._rate_limiting_complete = True
         return await self.app(scope, receive, send)
+
+    _last_storage_failure_log = 0.0
+    _STORAGE_FAILURE_LOG_INTERVAL = 60.0
+
+    @classmethod
+    def _log_storage_failure(cls, exc) -> None:
+        now = time.monotonic()
+        if now - cls._last_storage_failure_log < cls._STORAGE_FAILURE_LOG_INTERVAL:
+            return
+        cls._last_storage_failure_log = now
+        log.warning(
+            "rate-limit storage failed (%s: %s); deferring to the endpoint. "
+            "Further occurrences suppressed for %.0fs.",
+            type(exc).__name__, exc, cls._STORAGE_FAILURE_LOG_INTERVAL,
+        )
+
+    @staticmethod
+    def _is_async_callable(obj) -> bool:
+        """What starlette._utils.is_async_callable does, without importing it.
+
+        inspect.iscoroutinefunction says False for an object with an async
+        __call__, which Starlette accepts as a handler. The isawaitable re-check
+        below would still return the right response, but only after spending a
+        threadpool slot to build the coroutine -- on the 429 path, during the
+        flood the 429 exists to shed.
+        """
+        while isinstance(obj, functools.partial):
+            obj = obj.func
+        return inspect.iscoroutinefunction(obj) or (
+            callable(obj) and inspect.iscoroutinefunction(getattr(obj, "__call__", None))
+        )
 
     @staticmethod
     async def _reject(scope, receive, send, request, exc):
@@ -526,12 +640,17 @@ class RateLimitBeforeValidationMiddleware:
 
         # Starlette runs a sync handler in a threadpool; a user-supplied one is free
         # to do blocking work, and this middleware is on the event loop.
-        if inspect.iscoroutinefunction(handle):
+        if RateLimitBeforeValidationMiddleware._is_async_callable(handle):
             response = await handle(request, exc)
         else:
             response = await run_in_threadpool(handle, request, exc)
-            if inspect.isawaitable(response):  # async __call__ on a callable object
+            if inspect.isawaitable(response):
                 response = await response
+        if response is None:
+            # Starlette's wrapped_app guards with `if response is not None`. A
+            # handler returning None is a caller bug either way, but this is the one
+            # line where "mirrors _exception_handler.py" would otherwise be untrue.
+            return
         return await response(scope, receive, send)
 
 
@@ -1321,9 +1440,15 @@ def activate_algorithm(
     Requires the X-Admin-Key header to match the ADMIN_API_KEY environment
     variable. The ranker will pick up the new weights on its next cycle.
     """
-    _charge_global_ceiling(request, "30/minute")
     admin_key = os.environ.get("ADMIN_API_KEY", "")
     if not admin_key or x_admin_key != admin_key:
+        # Charged on the FAILURE branch only. Every guess is a failed comparison, so
+        # the ceiling still bounds brute force at 30/minute -- but the holder of the
+        # correct key never spends it, which is what stops six addresses of wrong
+        # guesses (each inside its own 5/minute, so never throttled) from locking
+        # the real admin out. Charging ahead of the comparison instead priced that
+        # lockout at six IPs; it did not prevent it.
+        _charge_global_ceiling(request, "30/minute")
         raise HTTPException(status_code=403, detail="invalid admin key")
 
     assert _pool is not None
