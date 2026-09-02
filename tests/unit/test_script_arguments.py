@@ -306,14 +306,22 @@ def test_postgres_host_is_accepted_as_a_synonym(bash, tmp_path):
     assert "-h elsewhere" in argv_log.read_text()
 
 
-def test_help_covers_every_option_the_loop_accepts(bash, tmp_path):
+@pytest.mark.parametrize(
+    "script", [INSTALL, UNINSTALL, PROCESS], ids=["install", "uninstall", "process_blocks"]
+)
+def test_help_covers_every_option_the_loop_accepts(bash, tmp_path, script):
     """Drift guard keyed on the CODE, not on the comment header.
 
     The earlier version of this test grepped the header for a fixed list, so drift in
     the loop-to-help direction was invisible: adding or renaming a case went unnoticed.
     This reads the option loop itself and requires each long flag to appear in --help.
+
+    Parametrized in round two. It read install_app.sh only, so the --schema and
+    --is_forking help lines just added to the other two scripts were unguarded: deleting
+    them left the whole suite green -- exactly the drift this test exists to stop, on
+    the very cases the MR added.
     """
-    body = INSTALL.read_text()
+    body = script.read_text()
     loop = body.split("for arg in", 1)[1].split("\ndone", 1)[0]
     # Every long flag in every case label, including the FIRST alternative of an
     # `--a=*|--b=*)` pair. An earlier regex required a trailing ')' or a leading '|',
@@ -324,6 +332,60 @@ def test_help_covers_every_option_the_loop_accepts(bash, tmp_path):
     for label in labels:
         flags |= set(re.findall(r"(--[a-z0-9_-]+)", label))
     assert flags, "no options found in the loop; the parser above needs updating"
-    out = run(bash, tmp_path, INSTALL, "--help").stdout
+    out = run(bash, tmp_path, script, "--help").stdout
     missing = sorted(f for f in flags if f not in out)
-    assert not missing, f"accepted by the option loop but absent from --help: {missing}"
+    assert not missing, (
+        f"{script.name}: accepted by the option loop but absent from --help: {missing}"
+    )
+
+
+# --- --postgres-url (round two) ----------------------------------------------------
+#
+# The same defect class as --schema, left unfixed by the first pass: all three verbs
+# exited 2 on it. haf_api_node's hivemind.yaml ships
+# --postgres-url=postgresql://haf_admin@haf/haf_block_log on its uninstall service, and
+# all three of balance_tracker's scripts take the flag.
+
+
+@pytest.mark.parametrize(
+    "script", [INSTALL, UNINSTALL, PROCESS], ids=["install", "uninstall", "process_blocks"]
+)
+def test_postgres_url_is_accepted_on_every_verb(bash, tmp_path, script):
+    r = run(bash, tmp_path, script, "--postgres-url=postgresql://haf_admin@haf/db", "--help")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "is not a valid option" not in r.stdout
+
+
+@pytest.mark.parametrize(
+    "script", [INSTALL, UNINSTALL, PROCESS], ids=["install", "uninstall", "process_blocks"]
+)
+def test_url_is_accepted_as_a_synonym(bash, tmp_path, script):
+    """balance_tracker's --help documents `--url=URL` while its case label reads
+    `--postgres-url=*` -- an upstream inconsistency, so accept both spellings."""
+    r = run(bash, tmp_path, script, "--url=postgresql://haf_admin@haf/db", "--help")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_the_url_overrides_the_discrete_connection_flags(bash, tmp_path):
+    """It must reach psql, and it must WIN.
+
+    Accepting the flag and connecting to $POSTGRES_HOST anyway is the silent wrong-host
+    failure that makes ignoring a connection URI different in kind from ignoring
+    --schema. Passing -U alongside the URI is the same bug in miniature: the later -U
+    overrides the URI's own user.
+    """
+    _, _, argv_log = run_install_full_stub(
+        bash, tmp_path, "--postgres-url=postgresql://someone@elsewhere:6543/otherdb")
+    argv = argv_log.read_text()
+    assert "postgresql://someone@elsewhere:6543/otherdb" in argv
+    assert "-h haf" not in argv, "the discrete host was passed alongside the URI"
+    assert "-U haf_fyp_owner" not in argv, "the discrete user would override the URI's"
+
+
+def test_a_password_in_the_url_is_not_logged(bash, tmp_path):
+    """These scripts run in CI and under `docker compose logs`, and wait_for_postgres
+    prints the target it is waiting on."""
+    out = run_install_with_stub_db(
+        bash, tmp_path, "--postgres-url=postgresql://u:hunter2@h:5432/db")
+    assert "hunter2" not in out
+    assert "postgresql://u:***@h:5432/db" in out

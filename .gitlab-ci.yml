@@ -255,8 +255,10 @@ docker-build-sql:
     # refusal, so smoke-testing that path here would hang in an unbounded
     # `until pg_isready` loop rather than fail. It is covered by a unit test instead.
     #
-    # `! cmd` rather than `cmd; test $? -ne 0`: under `set -e` the failing command
-    # aborts the block before the status can be inspected.
+    # NOTE: do NOT reach for `! cmd` to assert a failure here. Bash exempts a
+    # !-inverted pipeline from errexit, so `! grep -q X file` passes whatever the file
+    # contains -- that is the bug fixed below. Capture the status instead, which is what
+    # expect_fail does.
     - |
       set -e
       IMG="$IMAGE:$CI_COMMIT_SHORT_SHA"
@@ -277,6 +279,16 @@ docker-build-sql:
       expect_ok process_blocks --help | grep -q -- "--host"
       echo "--- an invalid option is rejected, not ignored ---"
       expect_fail install_app --nope; grep -q "is not a valid option" /tmp/o
+      echo "--- the module-file flags are accepted, not rejected ---"
+      # --help AFTER them on purpose: the option loop processes every argument, so this
+      # proves acceptance and then exits 0 WITHOUT reaching wait_for_postgres. Asserting
+      # these with expect_fail instead hung the sibling app's docker-build for 58
+      # minutes -- with nothing to exit at, the script fell into an unbounded
+      # `until pg_isready` and `timeout` could not reap it through the container.
+      for verb in install_app uninstall_app process_blocks; do
+        expect_ok "$verb" --schema=btracker_app --is_forking=TRUE                   --postgres-url=postgresql://haf_admin@haf/haf_block_log --help >/tmp/f 2>&1
+        grep -q "WARNING: --schema" /tmp/f || { echo "FAIL: $verb did not warn on a foreign --schema"; cat /tmp/f; exit 1; }
+      done
       echo "--- the compat path the LIVE node uses still dispatches ---"
       expect_ok /app/scripts/install_app.sh --help | grep -q -- "--swagger-url"
       echo "--- the healthcheck is present at the path module files hardcode ---"

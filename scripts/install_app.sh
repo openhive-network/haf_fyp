@@ -17,6 +17,8 @@
 #                       TRUE is warned about and ignored -- see below.
 #   --schema=NAME       Accepted likewise. Anything but haf_fyp_app is warned about
 #                       and ignored; the schema names are fixed in the SQL.
+#   --postgres-url=URI  Full libpq connection URI. OVERRIDES --host/--port/--user.
+#                       --url= is accepted as a synonym.
 #   --help,-h,-?        Show this and exit                       # --- help-end ---
 
 set -euo pipefail
@@ -60,6 +62,14 @@ for arg in "$@"; do
         --port=*|--postgres-port=*) POSTGRES_PORT="${arg#*=}" ;;
         --user=*|--postgres-user=*) POSTGRES_USER="${arg#*=}" ;;
 
+        # haf_api_node's hivemind.yaml passes
+        #   --postgres-url=postgresql://haf_admin@haf/haf_block_log
+        # to its uninstall service, and all three of balance_tracker's scripts take the
+        # flag. It CANNOT be warn-and-ignored the way --schema is: ignoring a connection
+        # URI does not mean "no effect", it means connecting somewhere else than asked.
+        # common.sh gives it to psql and pg_isready as a conninfo.
+        --postgres-url=*|--url=*) POSTGRES_URL="${arg#*=}" ;;
+
         # haf_api_node's module template passes --is_forking defaulted from a node-wide
         # ${IS_FORKING:-TRUE}, so a haf_fyp module file copied from an upstream app
         # carries TRUE without anyone choosing it for this app. It cannot be honoured:
@@ -93,10 +103,13 @@ for arg in "$@"; do
             esac
             ;;
 
-        # haf_api_node's module template passes --schema= on EVERY verb. Verified
+        # balance_tracker's module file passes --schema= on ALL THREE verbs. Verified
         # against upstream rather than remembered: hive/balance_tracker's
         # scripts/process_blocks.sh has a `--schema=*) BTRACKER_SCHEMA=...` case, and
-        # balance_tracker.yaml ships it on install_app and uninstall_app too.
+        # balance_tracker.yaml ships it on install_app and uninstall_app too. Not
+        # "every module file" -- reputation_tracker.yaml and nft_tracker.yaml pass no
+        # --schema at all, and haf_block_explorer.yaml passes it only on its two
+        # balance-tracker services.
         #
         # !50 gave all three of this app's option loops an `exit 2` fallthrough and no
         # --schema case, so a haf_fyp module file copied from that template -- the whole

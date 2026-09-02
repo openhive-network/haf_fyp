@@ -107,13 +107,17 @@ def test_refuses_when_the_role_cannot_delete_the_context(bash, tmp_path):
     """It must REFUSE, not warn.
 
     hive.context_remove is not SECURITY DEFINER and hafd.contexts has an RLS DELETE
-    policy of USING (hive.can_impersonate(current_user, owner)), so a caller who is
-    neither superuser nor able to impersonate haf_fyp_owner deletes ZERO ROWS WITHOUT
-    ERROR. An earlier revision only warned, on the stated grounds that step 6 would
-    catch the orphan -- but step 6 queries hafd.contexts in the SAME session as the
-    SAME role through the SAME policy, so it sees zero rows too and reports success.
-    The observed outcome was: context survives, both schemas and both roles dropped,
-    script prints "haf_fyp removed" and exits 0.
+    policy of USING (hive.can_impersonate(current_user, owner)), so a caller the policy
+    filters out deletes ZERO ROWS WITHOUT ERROR.
+
+    Be accurate about what follows, because an earlier version of this docstring was
+    not. Step 6 DOES catch the orphan: SELECT on hafd.contexts is a SEPARATE policy,
+    USING (TRUE) (hive/haf src/hive_fork_manager/authorization.sql), so the verification
+    sees the surviving row and exits 1 with INCOMPLETE. The claim that it "reads through
+    the same filter and reports success" was wrong.
+
+    Refusing is still right, and this is the reason: the alternative is not a silent
+    success but a loud failure that arrives AFTER both DROP SCHEMA CASCADEs.
     """
     log = make_psql(tmp_path, can_remove="f")
     r = run(bash, tmp_path, "--force")
@@ -124,19 +128,30 @@ def test_refuses_when_the_role_cannot_delete_the_context(bash, tmp_path):
     assert "app_remove_context" not in sql_of(log)
 
 
-def test_the_role_probe_survives_the_role_being_gone(bash, tmp_path):
-    """pg_has_role RAISES 42704 on an unknown role, and this script advertises itself
-    as safe to re-run -- by which point haf_fyp_owner is dropped. Without the
-    `to_regrole(...) IS NULL` arm the second run refuses instead of finishing the
-    teardown, so the guard added for #30 would have broken idempotency."""
+def test_the_probe_asks_the_question_the_policy_asks(bash, tmp_path):
+    """It must test the CONTEXT ROW's owner, not a hardcoded role name.
+
+    hafd.contexts' DELETE policy is USING (hive.can_impersonate(current_user, owner)),
+    where `owner` is the row's column. An earlier revision tested
+    pg_has_role(current_user, 'haf_fyp_owner', 'MEMBER') -- a different question, which
+    answers TRUE in cases where the delete still matches nothing. install_app.sh's step
+    10 documents the case where they differ: a context registered by an older build is
+    owned by haf_admin.
+
+    Reading the row also removes the 42704 hazard that made the old to_regrole arm
+    necessary (pg_has_role raises on an unknown role, and this script advertises
+    idempotent re-runs, by which point haf_fyp_owner is dropped).
+    """
     body = SCRIPT.read_text()
     probe = body.split("_can_remove=", 1)[1].split('if [ "${_can_remove}"', 1)[0]
-    assert "to_regrole('haf_fyp_owner') IS NULL" in probe, (
-        "the probe must tolerate the role already being dropped"
+    assert "hive.can_impersonate(current_user, owner)" in probe, (
+        "the probe must ask what the DELETE policy asks"
     )
-    assert "'MEMBER'" in probe, (
-        "USAGE asks whether privileges arrive by INHERITANCE, which is false for a "
-        "NOINHERIT member that hive.can_impersonate would still permit"
+    assert "pg_has_role" not in probe, (
+        "membership of a role literal is not the question the policy asks"
+    )
+    assert "NOT EXISTS" in probe, (
+        "an already-removed context must not be treated as a permission failure"
     )
 
 
@@ -147,6 +162,86 @@ def test_a_permitted_role_proceeds(bash, tmp_path):
     r = run(bash, tmp_path, "--force")
     assert r.returncode == 0, r.stdout + r.stderr
     assert "app_remove_context" in sql_of(log)
+
+
+# --- the pre-flight, rewritten in round two ---------------------------------------
+
+def _guarded_psql(tmp_path, *, can_impersonate="t", createrole="t", has_contexts="t",
+                  fail_on=None):
+    """A psql that answers the three pre-flight probes independently."""
+    stub_bin(tmp_path)
+    logfile = tmp_path / "sql.log"
+    write_exec(
+        tmp_path / "bin" / "psql",
+        "#!/bin/sh\n"
+        "cmd=''\n"
+        'prev=""\n'
+        'for a in "$@"; do\n'
+        '  case "$prev" in -c) cmd="$cmd$a" ;; esac\n'
+        '  prev="$a"\n'
+        "done\n"
+        f'printf "%s\\n---\\n" "$cmd" >> "{logfile.as_posix()}"\n'
+        + (f'case "$cmd" in *{fail_on}*) echo "stub: failing" >&2; exit 2 ;; esac\n'
+           if fail_on else "")
+        + 'case "$cmd" in\n'
+        f'  *to_regclass*)     printf "%s" {has_contexts!r} ;;\n'
+        f'  *can_impersonate*) printf "%s" {can_impersonate!r} ;;\n'
+        f'  *rolcreaterole*)   printf "%s" {createrole!r} ;;\n'
+        '  *pg_stat_activity*) printf "0" ;;\n'
+        "esac\n"
+        "exit 0\n",
+    )
+    return logfile
+
+
+def test_refuses_when_the_role_cannot_impersonate_the_context_owner(bash, tmp_path):
+    log = _guarded_psql(tmp_path, can_impersonate="f")
+    r = run(bash, tmp_path, "--force")
+    assert r.returncode == 1
+    assert "Nothing has been changed" in r.stdout
+    assert "DROP SCHEMA" not in sql_of(log)
+    assert "app_remove_context" not in sql_of(log)
+
+
+def test_refuses_a_role_that_cannot_drop_roles(bash, tmp_path):
+    """--user=haf_fyp_owner PASSES the impersonation check -- a role can always
+    impersonate itself -- but step 5's DROP ROLE needs CREATEROLE or superuser, and a
+    role cannot drop itself. Without this the teardown dropped both schemas and only
+    failed at step 5, with the data already gone."""
+    log = _guarded_psql(tmp_path, createrole="f")
+    r = run(bash, tmp_path, "--force")
+    assert r.returncode == 1
+    assert "Nothing has been changed" in r.stdout
+    assert "DROP SCHEMA" not in sql_of(log)
+
+
+def test_a_permitted_role_gets_past_the_pre_flight(bash, tmp_path):
+    """The positive half. Asserting only the refusals leaves an inverted comparison
+    green, which would refuse every teardown including haf_admin's."""
+    log = _guarded_psql(tmp_path)
+    r = run(bash, tmp_path, "--force")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "app_remove_context" in sql_of(log)
+
+
+def test_a_failing_pre_flight_probe_refuses_rather_than_guessing(bash, tmp_path):
+    """It must not collapse a connection failure into "you lack permission". An earlier
+    revision wrapped the probe in `2>/dev/null || echo ""`, so a reset, an auth error
+    and a genuine "no" all produced the same message with the psql error discarded."""
+    log = _guarded_psql(tmp_path, fail_on="can_impersonate")
+    r = run(bash, tmp_path, "--force")
+    assert r.returncode == 1
+    assert "Nothing has been changed" in r.stdout
+    assert "DROP SCHEMA" not in sql_of(log)
+
+
+def test_a_non_haf_database_skips_the_context_pre_flight(bash, tmp_path):
+    """No hafd.contexts means no context to fail to delete. The guard must not refuse a
+    teardown of the schemas and roles on a database that never had HAF -- a path this
+    script explicitly supports and has its own test for."""
+    log = _guarded_psql(tmp_path, has_contexts="f", can_impersonate="f")
+    r = run(bash, tmp_path, "--force")
+    assert "DROP SCHEMA" in sql_of(log), r.stdout + r.stderr
 
 
 # --- the session guard ------------------------------------------------------------
@@ -544,15 +639,20 @@ def test_a_failing_verification_probe_does_not_report_success(bash, tmp_path):
         tmp_path / "bin" / "psql",
         "#!/bin/sh\n"
         "cmd=''\n"
+        "files=''\n"
         'prev=""\n'
         'for a in "$@"; do\n'
-        '  case "$prev" in -c) cmd="$cmd$a" ;; esac\n'
+        '  case "$prev" in -c) cmd="$cmd$a" ;; -f) files="$files$a" ;; esac\n'
         '  prev="$a"\n'
         "done\n"
-        'case "$cmd" in\n'
+        'case "$cmd$files" in\n'
         '  *is_superuser*)     printf "t" ;;\n'
         '  *pg_stat_activity*) printf "0"; exit 0 ;;\n'
-        '  *to_regclass*)      echo "ERROR: connection lost" >&2; exit 2 ;;\n'
+        # Fail the VERIFICATION FILE, not to_regclass. The new pre-flight uses the
+        # identical `SELECT to_regclass('hafd.contexts') IS NOT NULL` as step 6's guard,
+        # so failing that text trips the pre-flight and never reaches step 6 -- a
+        # different (also correct) refusal, covered by its own test.
+        '  *uninstall_verify.sql*) echo "ERROR: connection lost" >&2; exit 2 ;;\n'
         "esac\n"
         "exit 0\n",
     )

@@ -6,6 +6,8 @@
 #   --host=VALUE   PostgreSQL host (default: $POSTGRES_HOST, else haf)
 #   --port=NUMBER  PostgreSQL port (default: $POSTGRES_PORT, else 5432)
 #   --user=VALUE   PostgreSQL user (default: $POSTGRES_USER, else haf_fyp_owner)
+#   --postgres-url=URI  Full libpq connection URI; OVERRIDES --host/--port/--user
+#                  (--url= is accepted as a synonym)
 #   --schema=NAME  Accepted for haf_api_node module-file compatibility; ignored
 #                  with a warning unless it names haf_fyp_app
 #   --is_forking=  Accepted likewise; this app's context is always non-forking
@@ -33,10 +35,21 @@ for arg in "$@"; do
         --port=*) POSTGRES_PORT="${arg#*=}" ;;
         --user=*) POSTGRES_USER="${arg#*=}" ;;
 
-        # haf_api_node's module template passes --schema= on EVERY verb. Verified
+        # haf_api_node's hivemind.yaml passes
+        #   --postgres-url=postgresql://haf_admin@haf/haf_block_log
+        # to its uninstall service, and all three of balance_tracker's scripts take the
+        # flag. It CANNOT be warn-and-ignored the way --schema is: ignoring a connection
+        # URI does not mean "no effect", it means connecting somewhere else than asked.
+        # common.sh gives it to psql and pg_isready as a conninfo.
+        --postgres-url=*|--url=*) POSTGRES_URL="${arg#*=}" ;;
+
+        # balance_tracker's module file passes --schema= on ALL THREE verbs. Verified
         # against upstream rather than remembered: hive/balance_tracker's
         # scripts/process_blocks.sh has a `--schema=*) BTRACKER_SCHEMA=...` case, and
-        # balance_tracker.yaml ships it on install_app and uninstall_app too.
+        # balance_tracker.yaml ships it on install_app and uninstall_app too. Not
+        # "every module file" -- reputation_tracker.yaml and nft_tracker.yaml pass no
+        # --schema at all, and haf_block_explorer.yaml passes it only on its two
+        # balance-tracker services.
         #
         # !50 gave all three of this app's option loops an `exit 2` fallthrough and no
         # --schema case, so a haf_fyp module file copied from that template -- the whole
@@ -57,11 +70,15 @@ for arg in "$@"; do
             fi
             ;;
 
-        # haf_api_node's module template defaults --is_forking from a node-wide
-        # ${IS_FORKING:-TRUE}, so it arrives here without anyone choosing it for this
-        # app. It cannot be honoured -- db/haf_fyp_app.sql registers the context
-        # non-forking -- and it cannot be refused either, for the reason above.
-        # install_app.sh carries the long version of this note.
+        # NO upstream module file passes --is_forking to a verb other than install_app
+        # -- checked in balance_tracker.yaml, haf_block_explorer.yaml and
+        # reputation_tracker.yaml, where it appears only on install services, and
+        # balance_tracker's own process_blocks.sh/uninstall_app.sh have no case for it.
+        # An earlier revision of this comment claimed the template passes it here; that
+        # was wrong. Accepted anyway, for symmetry with install_app.sh and so a
+        # hand-written module file that does pass it cannot crash-loop the service.
+        # It could not be honoured in any case: db/haf_fyp_app.sql registers the context
+        # non-forking. install_app.sh carries the long version of this note.
         --is_forking=*)
             case "${arg#*=}" in
                 FALSE|false|False)

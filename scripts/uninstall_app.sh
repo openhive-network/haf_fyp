@@ -19,6 +19,8 @@
 #   --user=VALUE   PostgreSQL user (default: $POSTGRES_USER, else haf_admin)
 #                  --postgres-host=, --postgres-port= and --postgres-user= are
 #                  accepted as synonyms (balance_tracker's spelling)
+#   --postgres-url=URI  Full libpq connection URI; OVERRIDES --host/--port/--user
+#                  (--url= is accepted as a synonym)
 #   --schema=NAME  Accepted for haf_api_node module-file compatibility; ignored with
 #                  a warning unless it names haf_fyp_app
 #   --is_forking=  Accepted likewise; this app's context is always non-forking
@@ -70,10 +72,21 @@ for arg in "$@"; do
         --host=*|--postgres-host=*) POSTGRES_HOST="${arg#*=}" ;;
         --port=*|--postgres-port=*) POSTGRES_PORT="${arg#*=}" ;;
         --user=*|--postgres-user=*) POSTGRES_USER="${arg#*=}" ;;
-        # haf_api_node's module template passes --schema= on EVERY verb. Verified
+
+        # haf_api_node's hivemind.yaml passes
+        #   --postgres-url=postgresql://haf_admin@haf/haf_block_log
+        # to its uninstall service, and all three of balance_tracker's scripts take the
+        # flag. It CANNOT be warn-and-ignored the way --schema is: ignoring a connection
+        # URI does not mean "no effect", it means connecting somewhere else than asked.
+        # common.sh gives it to psql and pg_isready as a conninfo.
+        --postgres-url=*|--url=*) POSTGRES_URL="${arg#*=}" ;;
+        # balance_tracker's module file passes --schema= on ALL THREE verbs. Verified
         # against upstream rather than remembered: hive/balance_tracker's
         # scripts/process_blocks.sh has a `--schema=*) BTRACKER_SCHEMA=...` case, and
-        # balance_tracker.yaml ships it on install_app and uninstall_app too.
+        # balance_tracker.yaml ships it on install_app and uninstall_app too. Not
+        # "every module file" -- reputation_tracker.yaml and nft_tracker.yaml pass no
+        # --schema at all, and haf_block_explorer.yaml passes it only on its two
+        # balance-tracker services.
         #
         # !50 gave all three of this app's option loops an `exit 2` fallthrough and no
         # --schema case, so a haf_fyp module file copied from that template -- the whole
@@ -94,11 +107,15 @@ for arg in "$@"; do
             fi
             ;;
 
-        # haf_api_node's module template defaults --is_forking from a node-wide
-        # ${IS_FORKING:-TRUE}, so it arrives here without anyone choosing it for this
-        # app. It cannot be honoured -- db/haf_fyp_app.sql registers the context
-        # non-forking -- and it cannot be refused either, for the reason above.
-        # install_app.sh carries the long version of this note.
+        # NO upstream module file passes --is_forking to a verb other than install_app
+        # -- checked in balance_tracker.yaml, haf_block_explorer.yaml and
+        # reputation_tracker.yaml, where it appears only on install services, and
+        # balance_tracker's own process_blocks.sh/uninstall_app.sh have no case for it.
+        # An earlier revision of this comment claimed the template passes it here; that
+        # was wrong. Accepted anyway, for symmetry with install_app.sh and so a
+        # hand-written module file that does pass it cannot crash-loop the service.
+        # It could not be honoured in any case: db/haf_fyp_app.sql registers the context
+        # non-forking. install_app.sh carries the long version of this note.
         --is_forking=*)
             case "${arg#*=}" in
                 FALSE|false|False)
@@ -287,36 +304,91 @@ _psql_destructive() {
 # is reachable by an operator following the help text. install_app.sh's step 10 documents the
 # same RLS trap on the creation side and works around it with SET ROLE.
 #
-# An earlier revision only WARNED here, on the stated grounds that "step 6 catches the
-# resulting orphan". It does not, and that was the whole error. Step 6's probe is
-#     SELECT 'context ' || c.name FROM hafd.contexts AS c WHERE c.name = 'haf_fyp'
-# run in the SAME session, as the SAME role, through the SAME RLS policy that made the
-# DELETE affect zero rows -- so it also sees zero rows, _context_left is empty, and the
-# script prints "haf_fyp removed" and exits 0 while the context survives and both
-# schemas and both roles are gone. Refusing before anything is dropped is the only
-# response that leaves the operator somewhere recoverable.
+# (Step 6 DOES report the survivor -- see the policy quote below. What it cannot do is
+# report it before the schemas are gone.)
 #
-# to_regrole guard: pg_has_role RAISES 42704 on an unknown role, and this script
-# advertises itself as safe to re-run -- by which point haf_fyp_owner is gone. The
-# earlier version got away with the unguarded call only because `2>/dev/null || echo ""`
-# degraded the raise into the warning it was already going to print; now that the branch
-# refuses, an idempotent re-run would refuse spuriously without both the guard and the
-# "role already gone" arm.
+# WHY IT REFUSES, corrected. An earlier revision said step 6 could not catch the
+# orphan because it "reads through the same filter". That is false, and it was the
+# justification for the whole change, so it is worth being exact. From hive/haf,
+# src/hive_fork_manager/authorization.sql:
 #
-# MEMBER, not USAGE: USAGE asks whether the privileges arrive by INHERITANCE, which is
-# false for a NOINHERIT member -- while hive.can_impersonate, which is what the RLS
-# policy actually calls, would still permit the delete. USAGE therefore refuses a
-# connection that would have worked.
-_can_remove="$(psql_cmd -Atq -c "
-    SELECT current_setting('is_superuser') = 'on'
-        OR to_regrole('haf_fyp_owner') IS NULL
-        OR pg_has_role(current_user, 'haf_fyp_owner', 'MEMBER')" 2>/dev/null || echo "")"
+#     CREATE POLICY sp_applications_hive_context        ON hafd.contexts
+#       FOR SELECT TO hive_applications_group USING( TRUE );
+#     CREATE POLICY sp_applications_delete_hive_context ON hafd.contexts
+#       FOR DELETE TO hive_applications_group USING( hive.can_impersonate(current_user, owner) );
+#
+# SELECT and DELETE are SEPARATE policies. Only the DELETE is filtered. So step 6 does
+# see the surviving row, and the pre-MR behaviour was INCOMPLETE + exit 1, not
+# "haf_fyp removed" + exit 0.
+#
+# Refusing is still right, for a different reason: the alternative is not a silent
+# success, it is a LOUD FAILURE THAT ARRIVES TOO LATE -- after both DROP SCHEMA
+# CASCADEs. Failing here leaves the operator somewhere recoverable.
+#
+# ASK THE QUESTION THE POLICY ASKS. The predicate used to test membership of the literal
+# 'haf_fyp_owner'; the policy tests can_impersonate(current_user, owner) where `owner` is
+# the ROW's column. install_app.sh's step 10 documents the case where they differ -- a
+# context registered by an older build is owned by haf_admin, not haf_fyp_owner -- and
+# membership of the literal answers TRUE there while the DELETE still matches nothing.
+# Reading the row also subsumes the to_regrole dance (pg_has_role RAISES 42704 on an
+# unknown role, which mattered because this script advertises idempotent re-runs), the
+# already-removed context, and the database that never had HAF.
+_has_contexts="$(psql_cmd -Atq -c "SELECT to_regclass('hafd.contexts') IS NOT NULL")" || {
+    log "ERROR: could not query the database to check whether this is a HAF instance."
+    log "       Nothing has been changed. See the psql error above."
+    exit 1
+}
+
+_can_remove="t"
+if [ "${_has_contexts}" = "t" ]; then
+    # A separate statement, not an OR arm: a WHERE cannot protect a FROM, because
+    # PostgreSQL resolves relation names at parse analysis. Step 6 splits its probes for
+    # the same reason.
+    #
+    # NOT wrapped in `2>/dev/null || echo ""`: that collapsed a connection reset, a
+    # permission error and a genuine "no" into one confident and possibly wrong message,
+    # with the psql error that would have explained it discarded.
+    if ! _can_remove="$(psql_cmd -Atq -c "
+        SELECT current_setting('is_superuser') = 'on'
+            OR NOT EXISTS (SELECT 1 FROM hafd.contexts WHERE name = '${HAF_FYP_CONTEXT}')
+            OR EXISTS (SELECT 1 FROM hafd.contexts
+                       WHERE name = '${HAF_FYP_CONTEXT}'
+                         AND hive.can_impersonate(current_user, owner))")"; then
+        log "ERROR: could not determine whether '${POSTGRES_USER}' may remove the HAF"
+        log "       context. That query needs SELECT on hafd.contexts and EXECUTE on"
+        log "       hive.can_impersonate, both of which come with hive_applications_group."
+        log "       Nothing has been changed. See the psql error above."
+        exit 1
+    fi
+fi
+
 if [ "${_can_remove}" != "t" ]; then
-    log "ERROR: connected as '${POSTGRES_USER}', which is neither superuser nor a member"
-    log "       of haf_fyp_owner. RLS on hafd.contexts would silently delete zero rows,"
-    log "       so the context would survive a teardown that reports success -- and the"
-    log "       verification in step 6 reads through the same filter, so it could not"
-    log "       tell you. Re-run with --user=haf_admin. Nothing has been changed."
+    log "ERROR: '${POSTGRES_USER}' cannot remove the HAF context '${HAF_FYP_CONTEXT}'."
+    log "       hafd.contexts' DELETE policy is hive.can_impersonate(current_user, owner),"
+    log "       and this role cannot impersonate the context row's owner -- so the delete"
+    log "       would affect zero rows without error, and the teardown would drop both"
+    log "       schemas before step 6 reported the orphan."
+    log "       Re-run with --user=haf_admin. Nothing has been changed."
+    exit 1
+fi
+
+# Removing the context is not the only privilege this script needs. Step 5 runs
+# DROP ROLE, which requires CREATEROLE or superuser -- and a role cannot drop itself.
+# Without this, --user=haf_fyp_owner passes the check above (a role can always
+# impersonate itself, so the context removal is genuinely permitted), then drops both
+# schemas CASCADE and only fails at step 5, with the data already gone.
+_can_drop_roles="$(psql_cmd -Atq -c "
+    SELECT current_setting('is_superuser') = 'on'
+        OR COALESCE((SELECT rolcreaterole FROM pg_roles WHERE rolname = current_user), false)")" || {
+    log "ERROR: could not determine whether '${POSTGRES_USER}' may drop roles."
+    log "       Nothing has been changed. See the psql error above."
+    exit 1
+}
+if [ "${_can_drop_roles}" != "t" ]; then
+    log "ERROR: '${POSTGRES_USER}' is neither superuser nor CREATEROLE, so step 5's"
+    log "       DROP ROLE would fail -- after the schemas were already dropped."
+    log "       (A role also cannot drop itself, so --user=haf_fyp_owner is never"
+    log "       enough.) Re-run with --user=haf_admin. Nothing has been changed."
     exit 1
 fi
 
