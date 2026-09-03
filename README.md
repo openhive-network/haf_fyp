@@ -91,6 +91,9 @@ cp docker/.env docker/.env.local
 # Edit .env.local:
 #   - Set HAF_VERSION to a pinned release tag (not "latest") for production
 #   - Set FYP_ADMIN_API_KEY to a strong random secret
+#   - Set TRUSTED_PROXY_IPS to whatever fronts this app (Caddy/Varnish/HAProxy),
+#     or to `direct` if nothing does. Left empty, every caller shares one bucket
+#     and pre-validation rate limiting stays OFF -- see the deployment checklist.
 #
 # Every command below passes --env-file docker/.env.local. Without it Compose reads
 # docker/.env (the project-directory default) and the edits above are silently ignored,
@@ -146,10 +149,10 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 | GET | `/health` | Service health check |
 | GET | `/metrics` | Operational health: embedding coverage (#15) + credibility source health (#8) — not feed analytics |
 | GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
-| POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10 req/min) |
-| DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5 req/min) |
-| POST | `/v1/fyp/events` | Impression / engagement telemetry batch (120 req/min) |
-| POST | `/v1/fyp/admin/algorithm` | Activate an algorithm version (`X-Admin-Key` required) |
+| POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10/min per IP, 60/min total) |
+| DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5/min per IP, 30/min total) |
+| POST | `/v1/fyp/events` | Impression / engagement telemetry batch (120/min per IP, 600/min total) |
+| POST | `/v1/fyp/admin/algorithm` | Activate an algorithm version, `X-Admin-Key` required (5/min per IP; 30/min total, charged only on a wrong key) |
 
 The two metrics endpoints are unrelated and answer different questions. This one, on the
 FastAPI overlay, is the *operational* read — embedding coverage and credibility source
@@ -188,6 +191,30 @@ reconciles rotation membership and, for an account with no interests and no
 on-chain interactions, evicts its `active_users` row and drops its cached feed and
 profile vector. Accounts that have interacted on-chain stay ranked — their
 membership comes from the chain, not the picker.
+
+**The per-IP rate limit is charged before the request body is parsed (#28), so a
+rejected request costs the caller its own allowance.** A malformed batch answered
+`422` counts against the same per-IP bucket a successful one would, and a caller
+already over the limit gets a `429` without the body being read at all. This is what
+bounds total cost on `POST /v1/fyp/events`, which is unauthenticated by design:
+previously a 4 MB malformed batch cost ~700 ms of CPU and returned a ~3.9 MB
+validation error while charging nothing, repeatable without bound. Integrators
+should note the consequence: a client with a serialisation bug now burns its own
+quota rather than retrying for free.
+
+**The shared global ceiling on each endpoint is charged later — from inside the
+handler, so only requests that pass validation spend it.** The split matters. Both
+limits are listed together in the table above, but they do different jobs: the
+per-IP bucket bounds what one caller can make the service spend, while the ceiling
+bounds *accepted* volume (for `/v1/fyp/events`, 600/min x 200 events = 7.2M rows an
+hour, inside `prune_feed_events`' cap). Charging the ceiling before validation too
+would let malformed traffic spread across a handful of addresses — each staying
+inside its own per-IP allowance, so never throttled — drain the shared bucket and
+`429` every other caller, which is a denial of service the per-IP design exists to
+prevent. The admin route goes one step further and charges its ceiling only when
+the key is *wrong*, so guessing stays bounded at 30/min while the holder of the
+correct key can never be locked out by guessers. Per-IP keying depends on `TRUSTED_PROXY_IPS` being set correctly; see the
+deployment checklist.
 
 Clean URL rewrites (via nginx `endpoints/rewrite_rules.conf`):
 
@@ -400,7 +427,7 @@ Before going live:
 
 - [ ] `pgvector` extension installed by superuser on the HAF PostgreSQL server
 - [ ] `FYP_ADMIN_API_KEY` set to a strong random value in `docker/.env.local`
-- [ ] **`TRUSTED_PROXY_IPS` set to the reverse proxy's address or CIDR** if anything fronts this app. Rate limits key on `X-Real-IP` only from a trusted peer; unset, every caller keys on the proxy's address instead — one shared bucket for all of them, which is no per-client limit at all. The app logs a warning at startup when it is unset, and once more if a peer outside the list presents the header (which usually means the proxy was recreated with a new address and the list is now stale). Re-check it after anything that can renumber the proxy container.
+- [ ] **`TRUSTED_PROXY_IPS` set to the reverse proxy's address or CIDR** (or the literal `direct` if nothing fronts this app). Since #28 this also gates *when* limits are charged: with it unset the app logs an ERROR at startup and falls back to charging only after validation, because charging a request before it is validated is safe only when the bucket identifies the caller — into one shared bucket it lets a single sender 429 everybody else, which is worse than the bug #28 fixes. Rate limits key on `X-Real-IP` only from a trusted peer; unset, every caller keys on the proxy's address instead — one shared bucket for all of them, which is no per-client limit at all. The app logs a warning at startup when it is unset, and once more if a peer outside the list presents the header (which usually means the proxy was recreated with a new address and the list is now stale). Re-check it after anything that can renumber the proxy container.
 - [ ] `HAF_VERSION` pinned to a specific release tag (not `latest`)
 - [ ] HiveSense installed and synced → `grant_cross_schema.sh` re-run
 - [ ] Hivemind installed and synced (provides the (author, permlink) → hivemind post id bridge) → `grant_cross_schema.sh` re-run
@@ -408,6 +435,36 @@ Before going live:
 - [ ] reputation_tracker installed and synced → `grant_cross_schema.sh` re-run
 - [ ] Verify `hivesense_app.posts_vectors` on live instance: `\d hivesense_app.posts_vectors` (expected: `embedding halfvec(1024)`, keyed by hivemind post id, one row per chunk)
 - [ ] Smoke test all endpoints after first ranker cycle completes
+
+## Operating the rate limits
+
+Two levers, both read from the environment by slowapi at startup, neither needing a
+code change:
+
+| Variable | Effect |
+|---|---|
+| `RATELIMIT_ENABLED=false` | Turns *all* rate limiting off — the per-IP limits, the shared ceilings, and the pre-validation charging. Note this also restores the #28 amplifier: malformed batches become free again. |
+| `RATELIMIT_SWALLOW_ERRORS=1` | Only affects slowapi's own paths; this app already fails **open** on a limiter-storage error by design (see below), so it changes little here. |
+
+**Failure policy: the limiter fails open.** If Redis is unreachable or slow, a request
+is served *unmetered* rather than rejected — limits protect against abuse, they are not
+part of answering correctly, so a Redis incident degrades limiting instead of the
+service. Storage failures are logged once per minute with a suppressed-occurrence
+count, and again immediately if a *different* kind of failure appears.
+
+**Redis coupling.** Limiter buckets live on the same Redis as the ranker's
+`haf_fyp:refresh` pub/sub. There is no key collision (`LIMITER/…` vs a channel) and no
+unbounded key growth (every bucket carries a window TTL), but note that `limits`
+increments on *every* checked request including ones it then rejects, so a flood on the
+unauthenticated `/v1/fyp/events` is Redis write traffic. `MAX_REQUEST_BODY_BYTES`
+(default 256 KiB) and the per-IP limits are what bound it.
+
+**Deploying a change to this file's limits:** `requirements.txt` is part of the image,
+so use `up -d --build haf-fyp-api`, not a bare `up -d`, which silently reuses the cached
+image. `haf-fyp-ranker` builds from the same `Dockerfile.python`, so a plain
+`docker compose build` restarts it mid-cycle — rebuild the api service by name if that
+matters. Nothing needs ordering and a rollback strands nothing: bucket identities are
+unchanged and every key expires with its window.
 
 ## Development Phases
 

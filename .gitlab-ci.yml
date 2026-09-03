@@ -126,6 +126,17 @@ fastapi-tests:
     ADMIN_API_KEY: ""
     API_URL: "http://localhost:3001"
     FASTAPI_URL: "http://localhost:3002"
+    # Makes the tavern lane key rate limits on each stage's X-Real-IP rather than on
+    # the one loopback peer they all share. Since #28 the per-IP limit is charged
+    # before the body is parsed, so this file's 422/401 cases spend the allowance
+    # too, and the seven DELETE /v1/fyp/interests stages would blow that endpoint's
+    # 5/minute and start returning 429. A peer absent from this list has its header
+    # ignored -- correctly, and silently, which presents as the limits simply not
+    # working, so the value has to be right rather than approximately right.
+    # ::1 is belt-and-braces only: `uvicorn --host 0.0.0.0` binds AF_INET, so a v6
+    # loopback peer cannot actually reach it. Harmless, and survives someone
+    # switching the bind to `::`.
+    TRUSTED_PROXY_IPS: "127.0.0.1,::1"
   script:
     - pip install -r requirements.txt pytest -q
     - sleep 5
