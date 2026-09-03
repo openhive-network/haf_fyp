@@ -359,6 +359,141 @@ class _CapturingConn:
         self._sink["committed"] = True
 
 
+class TestWriteFeedCacheColumnAlignment:
+    """#24: the higher-traffic writer had no coverage of the columns it writes.
+
+    write_feed_cache produces every PERSONALIZED feed; write_global_feed_cache
+    produces the single shared Discover feed. Only the latter was pinned (!45), and
+    the two functions share a byte-identical anchor --
+
+            rank + 1,
+            algo_version,
+            now,
+
+    -- so an independent reviewer's mutation harness aimed at one and silently hit
+    the other. Deleting `algo_version` from THIS tuple left all 438 tests green.
+
+    The failure mode is silent rather than loud: five adjacent columns are floats,
+    so swapping two writes plausible numbers into the wrong fields and surfaces only
+    as feeds that rank oddly. So this asserts the ORDERED column list and then maps
+    each column NAME to the value that lands in it -- presence and count alone would
+    not catch a transposition.
+    """
+
+    COLUMNS = [
+        "username", "post_id", "final_score", "score_engagement", "score_recency",
+        "score_credibility", "score_relevance", "community_boost_applied",
+        "boost_source", "rank", "algorithm_version", "computed_at",
+    ]
+
+    @staticmethod
+    def _run(monkeypatch, algo_version="1.2.0"):
+        captured = {}
+
+        def fake_execute_values(cur, sql, rows):
+            captured["sql"] = sql
+            captured["rows"] = rows
+
+        monkeypatch.setattr(
+            scoring.psycopg2.extras, "execute_values", fake_execute_values
+        )
+        monkeypatch.setattr(scoring, "render_bridge_for_posts", lambda *a, **k: None)
+
+        # Every score distinct, and none equal to another column's value: an
+        # alignment test whose sentinels collide cannot see a swap.
+        df = pd.DataFrame([
+            {
+                "post_id": 464943962277281802,   # a real, > 2^53 id
+                "final_score": 0.91, "score_engagement": 0.52, "score_recency": 0.43,
+                "score_credibility": 0.34, "score_relevance": 0.25,
+            },
+            {
+                "post_id": 464943962277281999,
+                "final_score": 0.81, "score_engagement": 0.62, "score_recency": 0.73,
+                "score_credibility": 0.84, "score_relevance": 0.95,
+            },
+        ])
+        # Built the way apply_community_boost builds it, not from record dicts:
+        # assigning the whole column None gives an OBJECT column holding real None,
+        # whereas a None inside a record dict is coerced to NaN. The distinction is
+        # not cosmetic -- NaN would reach psycopg2 for a text column -- so the
+        # fixture has to reproduce the production shape or it tests a value the
+        # ranker never actually produces.
+        df["community_boost_applied"] = [True, False]
+        df["boost_source"] = None
+        df.loc[0, "boost_source"] = "interest"
+        scoring.write_feed_cache(_CapturingConn({}), "alice", df, algo_version)
+        return captured
+
+    @staticmethod
+    def _columns_in_sql(sql):
+        head = " ".join(sql.split())
+        inner = head[head.index("(") + 1:head.index(")")]
+        return [c.strip() for c in inner.split(",")]
+
+    def test_the_insert_names_the_columns_it_writes_in_order(self, monkeypatch):
+        captured = self._run(monkeypatch)
+        assert self._columns_in_sql(captured["sql"]) == self.COLUMNS
+
+    def test_every_column_receives_its_own_value(self, monkeypatch):
+        # The core of #24: name -> value, so any transposition fails here even when
+        # the tuple is still the right LENGTH and every value is still plausible.
+        captured = self._run(monkeypatch)
+        cols = self._columns_in_sql(captured["sql"])
+        first = dict(zip(cols, captured["rows"][0]))
+        assert first["username"] == "alice"
+        assert first["post_id"] == 464943962277281802
+        assert first["final_score"] == 0.91
+        assert first["score_engagement"] == 0.52
+        assert first["score_recency"] == 0.43
+        assert first["score_credibility"] == 0.34
+        assert first["score_relevance"] == 0.25
+        assert first["community_boost_applied"] is True
+        assert first["boost_source"] == "interest"
+        assert first["rank"] == 1
+        assert first["algorithm_version"] == "1.2.0"
+
+    def test_the_tuple_length_matches_the_column_count(self, monkeypatch):
+        # A dropped element makes execute_values fail at the DATABASE, not here, so
+        # nothing above would name the cause. This does.
+        captured = self._run(monkeypatch)
+        cols = self._columns_in_sql(captured["sql"])
+        for row in captured["rows"]:
+            assert len(row) == len(cols), (
+                f"{len(row)} values for {len(cols)} columns: {list(zip(cols, row))}"
+            )
+
+    def test_rank_is_one_based_and_follows_score_order(self, monkeypatch):
+        captured = self._run(monkeypatch)
+        cols = self._columns_in_sql(captured["sql"])
+        i = cols.index("rank")
+        assert [r[i] for r in captured["rows"]] == [1, 2]
+
+    def test_every_row_carries_the_version(self, monkeypatch):
+        captured = self._run(monkeypatch)
+        cols = self._columns_in_sql(captured["sql"])
+        i = cols.index("algorithm_version")
+        assert [r[i] for r in captured["rows"]] == ["1.2.0", "1.2.0"]
+
+    def test_a_nullable_boost_source_survives_as_none(self, monkeypatch):
+        # boost_source sits between a bool and an int; coercing it would be exactly
+        # the kind of quiet mis-write this class exists to catch.
+        captured = self._run(monkeypatch)
+        cols = self._columns_in_sql(captured["sql"])
+        i = cols.index("boost_source")
+        assert [r[i] for r in captured["rows"]] == ["interest", None]
+
+    def test_the_post_id_keeps_full_precision(self, monkeypatch):
+        # post_id is HAF block/op-derived and exceeds 2^53; !32 shipped it as text to
+        # the client for that reason. It must reach the DB as an exact int.
+        captured = self._run(monkeypatch)
+        cols = self._columns_in_sql(captured["sql"])
+        i = cols.index("post_id")
+        assert [r[i] for r in captured["rows"]] == [
+            464943962277281802, 464943962277281999,
+        ]
+
+
 class TestWriteGlobalFeedCacheStampsAlgorithmVersion:
     """#23: algo_version was accepted by write_global_feed_cache and then dropped.
 
