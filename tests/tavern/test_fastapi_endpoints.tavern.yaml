@@ -315,6 +315,39 @@ stages:
         accepted: 2
 
 ---
+test_name: POST /v1/fyp/events accepts the string post_id real clients send (#25)
+
+# Every other case here sends a small bare integer (123, 55, 1). Real ids are HAF
+# block/op-derived and exceed JavaScript's 2^53 safe range, so a browser MUST send
+# post_id as a STRING -- the feed already serves it as text for that reason (!32),
+# and Number()-ing it corrupts the value with no error. That the API accepts a
+# string at all is only pydantic v2's lax coercion; this exercises the production
+# shape end to end, through uvicorn, so the contract is not resting on a default.
+
+stages:
+  - name: a string id above 2^53 is accepted and written
+    request:
+      url: "{fastapi_url}/v1/fyp/events"
+      method: POST
+      headers:
+        X-Real-IP: "198.51.100.30"
+      json:
+        session: "sess-bigid-1"
+        events:
+          - t: "impression"
+            post_id: "469505934805172229"
+            rank: 0
+            source: "personalized"
+            algo_version: "v7"
+          - t: "action"
+            post_id: "469505934805172229"
+            kind: "vote"
+    response:
+      status_code: 202
+      json:
+        accepted: 2
+
+---
 test_name: POST /v1/fyp/events accepts anonymous impressions (no username)
 
 stages:
