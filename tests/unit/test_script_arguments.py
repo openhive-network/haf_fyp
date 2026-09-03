@@ -30,7 +30,14 @@ INSTALL = SCRIPTS / "install_app.sh"
 UNINSTALL = SCRIPTS / "uninstall_app.sh"
 PROCESS = SCRIPTS / "process_blocks.sh"
 
-TIMEOUT = 10
+# 60s, matching the sibling. The hang this detects is an UNBOUNDED `until pg_isready`
+# loop, so any finite value catches it and the number only bounds how long a real
+# hang costs. It has to clear the slowest legitimate case instead: the identical-SQL
+# tests call run_install_full_stub TWICE, and each call spawns the stub psql ~30
+# times -- 60 Git Bash process creations on Windows, which flaked at 10s and again
+# at 30s once develop's tests grew the suite to 536. The Linux CI runner does the
+# whole file in under 3s.
+TIMEOUT = 60
 
 
 @pytest.fixture
