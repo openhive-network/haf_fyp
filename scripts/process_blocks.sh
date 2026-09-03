@@ -6,6 +6,11 @@
 #   --host=VALUE   PostgreSQL host (default: $POSTGRES_HOST, else haf)
 #   --port=NUMBER  PostgreSQL port (default: $POSTGRES_PORT, else 5432)
 #   --user=VALUE   PostgreSQL user (default: $POSTGRES_USER, else haf_fyp_owner)
+#   --postgres-url=URI  NOT SUPPORTED YET -- recognised and refused, with a
+#                  message pointing at --host/--port/--user (--url= is the same)
+#   --schema=NAME  Accepted for haf_api_node module-file compatibility; ignored
+#                  with a warning unless it names haf_fyp_app
+#   --is_forking=  Accepted likewise; this app's context is always non-forking
 #   --help,-h,-?   Show this and exit                           # --- help-end ---
 
 set -euo pipefail
@@ -29,6 +34,87 @@ for arg in "$@"; do
         --host=*) POSTGRES_HOST="${arg#*=}" ;;
         --port=*) POSTGRES_PORT="${arg#*=}" ;;
         --user=*) POSTGRES_USER="${arg#*=}" ;;
+
+        # RECOGNISED AND REFUSED, deliberately -- not warn-and-continue like --schema,
+        # and not "is not a valid option" either.
+        #
+        # An earlier revision of this MR HONOURED it, handing the URI to psql as a
+        # conninfo. That was worse than rejecting it, because only psql moved: every
+        # message, the confirmation banner and the typed-the-database-name gate still
+        # read ${POSTGRES_HOST}/${POSTGRES_DB}. So `uninstall_app --postgres-url=...`
+        # dropped schemas on the URI's host while printing the discrete host, and
+        # accepted the discrete database name as confirmation -- in the one gate whose
+        # stated purpose is catching "the right command against the wrong host".
+        #
+        # Honouring it properly means the banner, the healthcheck's application_name
+        # tag (the uninstall session guard excludes the probe by that literal), passing
+        # the conninfo through to the healthcheck, a redactor that survives
+        # ?password= and keyword/value forms, and the other scripts. That is tracked
+        # separately.
+        #
+        # Refusing is safe here, unlike for --schema: --postgres-url appears in exactly
+        # one upstream module file (hivemind.yaml, on hivemind-uninstall) and that file
+        # carries no `restart:` key, so this cannot crash-loop a service. One clear
+        # error beats a silent connection to the wrong database.
+        --postgres-url=*|--url=*)
+            log "ERROR: --postgres-url is not supported yet."
+            log "       Use --host=, --port= and --user= instead. Accepting the URI"
+            log "       would move only the psql connection: this script's messages,"
+            log "       and the teardown's confirmation prompt, still read POSTGRES_HOST"
+            log "       and POSTGRES_DB -- so it could act on one database while"
+            log "       reporting another. Refusing is the safe answer until that is"
+            log "       fixed throughout."
+            exit 2
+            ;;
+
+        # balance_tracker's module file passes --schema= on ALL THREE verbs. Verified
+        # against upstream rather than remembered: hive/balance_tracker's
+        # scripts/process_blocks.sh has a `--schema=*) BTRACKER_SCHEMA=...` case, and
+        # balance_tracker.yaml ships it on install_app and uninstall_app too. Not
+        # "every module file" -- reputation_tracker.yaml and nft_tracker.yaml pass no
+        # --schema at all, and haf_block_explorer.yaml passes it only on its two
+        # balance-tracker services.
+        #
+        # !50 gave all three of this app's option loops an `exit 2` fallthrough and no
+        # --schema case, so a haf_fyp module file copied from that template -- the whole
+        # point of #27 -- exited 2 on every verb. On install that is a crash-loop under
+        # haf-fyp-setup's `restart: on-failure` with every other service waiting on
+        # service_completed_successfully, i.e. the stack never starts. It is also a
+        # REGRESSION: before !50 install_app's loop had no fallthrough, so the flag was
+        # ignored and the install worked.
+        #
+        # WARN and continue, for the same reason --is_forking below does: the flag
+        # cannot change behaviour here (the schema names are fixed in the SQL), so
+        # refusing buys nothing and costs the deployment.
+        --schema=*)
+            if [ "${arg#*=}" != "haf_fyp_app" ]; then
+                log "WARNING: --schema=${arg#*=} is ignored."
+                log "         haf_fyp owns two fixed schemas, haf_fyp_app and"
+                log "         haf_fyp_endpoints, named in the SQL. Continuing."
+            fi
+            ;;
+
+        # NO upstream module file passes --is_forking to a verb other than install_app
+        # -- checked in balance_tracker.yaml, haf_block_explorer.yaml and
+        # reputation_tracker.yaml, where it appears only on install services, and
+        # balance_tracker's own process_blocks.sh/uninstall_app.sh have no case for it.
+        # An earlier revision of this comment claimed the template passes it here; that
+        # was wrong. Accepted anyway, for symmetry with install_app.sh and so a
+        # hand-written module file that does pass it cannot crash-loop the service.
+        # It could not be honoured in any case: db/haf_fyp_app.sql registers the context
+        # non-forking. install_app.sh carries the long version of this note.
+        --is_forking=*)
+            case "${arg#*=}" in
+                FALSE|false|False)
+                    log "--is_forking=FALSE matches this app's context; nothing to do."
+                    ;;
+                *)
+                    log "WARNING: --is_forking=${arg#*=} is ignored; haf_fyp's HAF context"
+                    log "         is registered NON-forking by design. Continuing."
+                    ;;
+            esac
+            ;;
+
         --help|-h|-\?) print_help; exit 0 ;;
         *) log "ERROR: '${arg}' is not a valid option"; print_help; exit 2 ;;
     esac

@@ -46,6 +46,17 @@
 # even though no block was processed. That distinguishes "idle, waiting for the chain"
 # from "wedged", which a block pointer cannot.
 #
+# But be honest about the converse, which an earlier revision of this comment was not.
+# This proves the loop is ITERATING, not ADVANCING. The heartbeat UPDATE and its COMMIT
+# sit BEFORE EVERY early return in app_next_iteration -- the app_is_paused and
+# NOT is_instance_ready branches both pg_sleep and RETURN afterwards -- so with hived
+# down, or the app paused by hive.app_pause, the loop spins twice a second writing a
+# fresh heartbeat and this check reports HEALTHY while zero blocks are processed.
+#
+# Chain staleness is a different quantity and belongs to the HAProxy agent-check
+# (hive.get_app_current_block_age), tracked in #29. The two are complementary; this one
+# does not subsume it, and nothing here is a reason to drop it.
+#
 # The consequence, stated rather than hidden: during a long MASSIVE batch this check
 # CAN report unhealthy on a perfectly healthy replay. See MAX_AGE.
 #
@@ -87,7 +98,18 @@ postgres_user=${POSTGRES_USER:-"haf_admin"}
 postgres_host=${POSTGRES_HOST:-"haf"}
 postgres_port=${POSTGRES_PORT:-5432}
 postgres_db=${POSTGRES_DB:-"haf_block_log"}
-POSTGRES_ACCESS=${POSTGRES_URL:-"postgresql://$postgres_user@$postgres_host:$postgres_port/$postgres_db?application_name=haf_fyp_health_check"}
+# NO ${POSTGRES_URL:-...} FALLBACK. `:-` substitutes the WHOLE string, so setting
+# POSTGRES_URL replaced the ?application_name= tag along with the rest -- and the
+# uninstall session guard excludes this probe by exactly that literal
+# (`coalesce(application_name, '') <> 'haf_fyp_health_check'`). With the tag gone the
+# 60-second probe counts itself, and the teardown intermittently refuses with
+# "N session(s) are still connected" on a race the operator cannot reason about.
+#
+# Nothing else in this app honours POSTGRES_URL either: --postgres-url is
+# recognised and refused by all three scripts, because honouring it moved only the
+# psql connection while every message and the teardown's confirmation prompt still
+# read POSTGRES_HOST/POSTGRES_DB. One connection path, one description of it.
+POSTGRES_ACCESS="postgresql://$postgres_user@$postgres_host:$postgres_port/$postgres_db?application_name=haf_fyp_health_check"
 
 CONTEXT=${HAF_FYP_CONTEXT:-"haf_fyp"}
 

@@ -103,7 +103,12 @@ python-tests:
     # httpx: required by starlette.testclient, which tests/unit/test_ratelimit_key.py
     # uses to assert rate-limit bucketing end-to-end through slowapi. Test-only, so
     # it stays out of requirements.txt and off the runtime image.
-    - pip install -r requirements.txt pytest pytest-cov httpx -q
+    # pyyaml: tests/unit/test_compose_contract.py parses docker-compose.yml. That
+    # module FAILS rather than skips when it is missing under CI, for the same reason
+    # the bash harness does -- a silent skip would put the compose file, and the
+    # profile that keeps the destructive teardown from running on `up`, back to
+    # uncovered.
+    - pip install -r requirements.txt pytest pytest-cov httpx pyyaml -q
     - PYTHONPATH=. pytest tests/unit/ -v --cov=haf_fyp --cov-report=term-missing --cov-fail-under=40
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -266,8 +271,10 @@ docker-build-sql:
     # refusal, so smoke-testing that path here would hang in an unbounded
     # `until pg_isready` loop rather than fail. It is covered by a unit test instead.
     #
-    # `! cmd` rather than `cmd; test $? -ne 0`: under `set -e` the failing command
-    # aborts the block before the status can be inspected.
+    # NOTE: do NOT reach for `! cmd` to assert a failure here. Bash exempts a
+    # !-inverted pipeline from errexit, so `! grep -q X file` passes whatever the file
+    # contains -- that is the bug fixed below. Capture the status instead, which is what
+    # expect_fail does.
     - |
       set -e
       IMG="$IMAGE:$CI_COMMIT_SHORT_SHA"
@@ -276,7 +283,11 @@ docker-build-sql:
       # -- so it would have "verified" a healthcheck that had never been COPYed. And
       # `timeout` because a job that hangs reports "job timeout" rather than a diff.
       expect_ok()   { timeout 60 docker run --rm "$IMG" "$@"; }
-      expect_fail() { rc=0; timeout 60 docker run --rm "$IMG" "$@" >/tmp/o 2>&1 || rc=$?; cat /tmp/o; [ "$rc" -ne 0 ] && [ "$rc" -ne 127 ]; }
+      # 124 is timeout's own kill, 125/126 are docker/exec failures, 127 is
+      # "not found" -- none of them is the script rejecting its input. Excluding
+      # them is the rule round two arrived at the hard way: an assertion whose
+      # expected outcome is a non-zero exit must name a SPECIFIC reachable exit.
+      expect_fail() { rc=0; timeout 60 docker run --rm "$IMG" "$@" >/tmp/o 2>&1 || rc=$?; cat /tmp/o; case "$rc" in 0|124|125|126|127) return 1 ;; *) return 0 ;; esac; }
 
       echo "--- entrypoint dispatches its own usage on stdout ---"
       expect_ok --help | grep -q "install_app"
@@ -288,6 +299,28 @@ docker-build-sql:
       expect_ok process_blocks --help | grep -q -- "--host"
       echo "--- an invalid option is rejected, not ignored ---"
       expect_fail install_app --nope; grep -q "is not a valid option" /tmp/o
+      echo "--- the no-op module-file flags are accepted, not rejected ---"
+      # --help AFTER them on purpose: the option loop processes every argument, so this
+      # proves acceptance and then exits 0 WITHOUT reaching wait_for_postgres. Asserting
+      # these with expect_fail instead hung the sibling app's docker-build for 58
+      # minutes -- with nothing to exit at, the script fell into an unbounded
+      # `until pg_isready` and `timeout` could not reap it through the container.
+      for verb in install_app uninstall_app process_blocks; do
+        expect_ok "$verb" --schema=btracker_app --is_forking=TRUE --help >/tmp/f 2>&1
+        cat /tmp/f
+        grep -q "WARNING: --schema" /tmp/f || { echo "FAIL: $verb did not warn on a foreign --schema"; exit 1; }
+        grep -q "btracker_app" /tmp/f || { echo "FAIL: $verb did not name the ignored value"; exit 1; }
+      done
+      echo "--- but a connection URI is REFUSED, not half-honoured ---"
+      # Honouring it moved only the psql connection: the messages and the teardown's
+      # confirmation prompt still read POSTGRES_HOST/POSTGRES_DB, so it could act on one
+      # database while reporting another. Refusing is safe -- --postgres-url appears in
+      # one upstream module file, on a service with no restart policy.
+      for verb in install_app uninstall_app process_blocks; do
+        expect_fail "$verb" --postgres-url=postgresql://haf_admin@haf/haf_block_log
+        grep -q "not supported yet" /tmp/o || { echo "FAIL: $verb did not refuse --postgres-url clearly"; exit 1; }
+        grep -q -- "--host=" /tmp/o || { echo "FAIL: $verb did not name the alternative flags"; exit 1; }
+      done
       echo "--- the compat path the LIVE node uses still dispatches ---"
       expect_ok /app/scripts/install_app.sh --help | grep -q -- "--swagger-url"
       echo "--- the healthcheck is present at the path module files hardcode ---"
@@ -307,7 +340,14 @@ docker-build-sql:
       # and psql failed, rather than the script exiting 1 down the missing-SQL-file path
       # that the assertion above it exists to rule out.
       grep -q "psql: error:" /tmp/h2
-      ! grep -q "healthcheck SQL not found" /tmp/h2
+      # NOT `! grep -q ...`: bash exempts a !-inverted pipeline from errexit, so that
+      # form passes whatever the file contains -- and it is the only thing separating
+      # "failed closed for the right reason" from "failed because the SQL was never
+      # COPYed into the image".
+      if grep -q "healthcheck SQL not found" /tmp/h2; then
+        echo "FAIL: healthcheck could not find its .sql -- COPY missing from Dockerfile"
+        exit 1
+      fi
       echo "image smoke tests passed"
     - *push_if_default_branch
 
