@@ -5,7 +5,24 @@ pandas>=2.1
 redis>=5.0
 fastapi>=0.111
 uvicorn[standard]>=0.29
-slowapi>=0.1.9
+# Upper bound, not a floor alone: the rate limiter is charged before the body is
+# parsed (#28) via _route_limits / _check_request_limit(..., in_middleware=False),
+# which are slowapi internals. Verified identical in 0.1.9 and 0.1.10; a minor bump
+# is free to move them, and an image rebuild resolves this fresh -- exactly how an
+# unpinned pgvector silently broke ranking in !29. Bump deliberately, with the
+# tests/unit/test_ratelimit_ordering.py suite green.
+slowapi>=0.1.9,<0.2
+# Direct import: _charge_global_ceiling parses the ceiling specs itself (parse,
+# RateLimitItem, and strategy.hit(item, *ids)). It arrives via slowapi anyway, but
+# this module names it, so it is declared -- and bounded for the same reason slowapi
+# is: a major bump is free to move any of those three.
+limits>=3.0,<6
+# Named directly by api.py (CapacityLimiter, to_thread.run_sync's limiter=), not
+# just inherited from starlette -- same reason limits is declared above. Bounded
+# below 5 because the CapacityLimiter/to_thread surface this uses is exactly what a
+# major bump is free to move.
+anyio>=4.0,<5
+
 coincurve>=19.0
 base58>=2.1
 tavern>=2.9
