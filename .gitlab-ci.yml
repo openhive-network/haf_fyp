@@ -272,7 +272,11 @@ docker-build-sql:
       # -- so it would have "verified" a healthcheck that had never been COPYed. And
       # `timeout` because a job that hangs reports "job timeout" rather than a diff.
       expect_ok()   { timeout 60 docker run --rm "$IMG" "$@"; }
-      expect_fail() { rc=0; timeout 60 docker run --rm "$IMG" "$@" >/tmp/o 2>&1 || rc=$?; cat /tmp/o; [ "$rc" -ne 0 ] && [ "$rc" -ne 127 ]; }
+      # 124 is timeout's own kill, 125/126 are docker/exec failures, 127 is
+      # "not found" -- none of them is the script rejecting its input. Excluding
+      # them is the rule round two arrived at the hard way: an assertion whose
+      # expected outcome is a non-zero exit must name a SPECIFIC reachable exit.
+      expect_fail() { rc=0; timeout 60 docker run --rm "$IMG" "$@" >/tmp/o 2>&1 || rc=$?; cat /tmp/o; case "$rc" in 0|124|125|126|127) return 1 ;; *) return 0 ;; esac; }
 
       echo "--- entrypoint dispatches its own usage on stdout ---"
       expect_ok --help | grep -q "install_app"

@@ -32,7 +32,12 @@ from tests.unit.shell_harness import clean_env, require_bash, stub_bin, write_ex
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "uninstall_app.sh"
 
-TIMEOUT = 15
+# 30s, matching test_script_arguments.py. These resolve in milliseconds; the timeout
+# is a HANG detector (a regression that lets an argument fall through reaches
+# wait_for_postgres, an unbounded `until pg_isready`, and the orphaned sleep holds
+# the pipe open so subprocess's own timeout does not reliably fire). 15s flaked
+# under CPU contention on Windows, where every stub psql is a Git Bash process.
+TIMEOUT = 30
 
 
 @pytest.fixture
@@ -155,8 +160,13 @@ def test_the_probe_asks_the_question_the_policy_asks(bash, tmp_path):
     necessary (pg_has_role raises on an unknown role, and this script advertises
     idempotent re-runs, by which point haf_fyp_owner is dropped).
     """
-    body = SCRIPT.read_text()
-    probe = body.split("_can_remove=", 1)[1].split('if [ "${_can_remove}"', 1)[0]
+    # _probe_sql, NOT a hand-rolled region split. Two ways the loose region lied:
+    # comments (21 of its 39 lines) name every token asserted below, and so does the
+    # probe-failure handler's own error message ("...both of which come with
+    # hive_applications_group"). Deleting the group-membership arm from the SQL left
+    # this test green on both counts. _probe_sql strips comments AND extracts only the
+    # -c argument, so what is asserted here is the predicate itself.
+    probe = _probe_sql('_can_remove="$(psql_cmd')
     assert "hive.can_impersonate(current_user, owner)" in probe, (
         "the probe must ask what the DELETE policy asks"
     )
@@ -190,7 +200,7 @@ def test_a_permitted_role_proceeds(bash, tmp_path):
 # --- the pre-flight, rewritten in round two ---------------------------------------
 
 def _guarded_psql(tmp_path, *, can_impersonate="t", createrole="t", has_contexts="t",
-                  fail_on=None):
+                  group_member="t", admin_option="t", fail_on=None):
     """A psql that answers the three pre-flight probes independently."""
     stub_bin(tmp_path)
     logfile = tmp_path / "sql.log"
@@ -207,6 +217,18 @@ def _guarded_psql(tmp_path, *, can_impersonate="t", createrole="t", has_contexts
         + (f'case "$cmd" in *{fail_on}*) echo "stub: failing" >&2; exit 2 ;; esac\n'
            if fail_on else "")
         + 'case "$cmd" in\n'
+        # FIRST, and keyed on tokens that exist ONLY in the round-four predicates.
+        # The arms below key on `rolcreaterole` and `can_impersonate`, which appear in
+        # the broken round-three forms too -- so with only those, restoring a broken
+        # guard left every test named after its fix green.
+        #
+        # Each guard is ONE query carrying both its tokens, so these answer for the
+        # WHOLE predicate: true only when every component the caller set is true. If
+        # the script loses the round-four token, the arm stops matching, the old arm
+        # below answers "t", the teardown proceeds, and the test fails. That
+        # fall-through IS the discrimination.
+        f'  *"MEMBER WITH ADMIN OPTION"*) printf "%s" {("t" if createrole == "t" and admin_option == "t" else "f")!r} ;;\n'
+        f'  *hive_applications_group*)   printf "%s" {("t" if group_member == "t" and can_impersonate == "t" else "f")!r} ;;\n'
         # Guard 1 is a pg_class/pg_namespace join now, NOT to_regclass -- to_regclass
         # raises `permission denied for schema hafd` without USAGE on it, verified on
         # postgres:14 and :17. Both spellings answer here so a regression to the old
@@ -722,6 +744,13 @@ def test_the_teardown_emits_identical_sql_with_and_without_schema(bash, tmp_path
     run(bash, a, "--force")
     flag = make_psql(b)
     run(bash, b, "--force", f"--schema={value}")
+    # The baseline must actually contain the teardown, or this is "" == "" and
+    # passes on a script that does nothing. Demonstrated: inserting `exit 0`
+    # before wait_for_postgres left all four parametrisations green, in both
+    # repos, on the one test whose docstring calls itself "the only assertion
+    # that excludes" the retargeting mutant.
+    assert "DROP SCHEMA" in sql_of(base), "the baseline run emitted no teardown SQL"
+    assert "app_remove_context" in sql_of(base)
     assert sql_of(flag) == sql_of(base), f"--schema={value} changed the teardown's SQL"
 
 
@@ -751,10 +780,23 @@ def test_the_refusal_is_logged_as_an_ERROR(bash, tmp_path):
 def _probe_sql(marker: str, occurrence: int = 0) -> str:
     """The -c argument of the assignment beginning `marker`, whitespace-normalised.
 
-    `occurrence` selects among repeats -- _has_contexts is probed twice, once in the
-    pre-flight and once in step 6, and both must avoid to_regclass.
+    COMMENTS ARE STRIPPED FIRST, and the marker must be unique. Both matter: this
+    extractor takes the first TEXTUAL match, so a comment line containing the marker
+    shadows the real assignment -- and an audit demonstrated exactly that, restoring the
+    broken round-three guard while the whole suite stayed green. A commented-out copy of
+    an old predicate is not a hypothetical either; it is the natural thing to leave
+    behind when rewriting one.
+
+    `occurrence` selects among genuine repeats -- _has_contexts is probed twice, in the
+    pre-flight and in step 6, and both must avoid to_regclass.
     """
-    body = SCRIPT.read_text()
+    body = "\n".join(
+        line for line in SCRIPT.read_text().splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert body.count(marker) > occurrence, (
+        f"{marker!r} not found {occurrence + 1}x in the executable lines of {SCRIPT.name}"
+    )
     after = body.split(marker)[occurrence + 1]
     sql = after.split('-c "', 1)[1].split('")', 1)[0]
     return " ".join(sql.split())
@@ -906,7 +948,10 @@ def test_refuses_a_role_outside_hive_applications_group(bash, tmp_path):
     reported nothing to remove, both schemas were dropped, and step 6 -- same filter
     again -- printed success while the context survived. db/builtin_roles.sql creates
     exactly such a role."""
-    log = _guarded_psql(tmp_path, can_impersonate="f")
+    # Not a member of hive_applications_group, but otherwise able to impersonate:
+    # the RLS-invisible case. With can_impersonate="f" alone this passed against
+    # the vacuous round-three guard too.
+    log = _guarded_psql(tmp_path, group_member="f", can_impersonate="t")
     r = run(bash, tmp_path, "--force")
     assert r.returncode == 1
     assert "DROP SCHEMA" not in sql_of(log)
@@ -922,7 +967,10 @@ def test_refuses_createrole_without_the_admin_option(bash, tmp_path):
     postgres:14 and :17: DROP OWNED BY needs the privileges of the target role, and
     PG16+ DROP ROLE needs CREATEROLE *and* the ADMIN option.
     """
-    log = _guarded_psql(tmp_path, createrole="f")
+    # createrole TRUE, admin option FALSE -- the case round three waved through.
+    # With createrole="f" alone this passed against the BROKEN guard too, since
+    # both predicates mention rolcreaterole.
+    log = _guarded_psql(tmp_path, createrole="t", admin_option="f")
     r = run(bash, tmp_path, "--force")
     assert r.returncode == 1
     assert "DROP SCHEMA" not in sql_of(log)

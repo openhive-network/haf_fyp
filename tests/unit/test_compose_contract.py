@@ -51,6 +51,9 @@ CI = ROOT / ".gitlab-ci.yml"
 
 SETUP = "haf-fyp-setup"
 UNINSTALL = "haf-fyp-uninstall"
+SYNC = "haf-fyp-sync"
+RANKER = "haf-fyp-ranker"
+API = "haf-fyp-api"
 
 
 @pytest.fixture(scope="module")
@@ -98,12 +101,63 @@ def test_the_teardown_runs_non_interactively(services):
 # --- the verbs are the contract #27 exists to deliver -----------------------------
 
 @pytest.mark.parametrize(
-    ("service", "verb"), [(SETUP, "install_app"), (UNINSTALL, "uninstall_app")]
+    ("service", "verb"),
+    [(SETUP, "install_app"), (SYNC, "process_blocks"), (UNINSTALL, "uninstall_app")],
 )
 def test_services_invoke_the_entrypoint_verbs(services, service, verb):
     """Reverting these to /app/scripts/*.sh paths undoes the point of #27. The paths
     still WORK -- the entrypoint execs anything runnable -- so nothing else notices."""
     assert services[service]["command"][0] == verb
+
+
+# --- ported from the sibling MR (round five) ---------------------------------------
+#
+# An audit found this file carried 4 of the sibling's 7 assertions while its docstring
+# claimed parity. All four mutations below survived the full 433-test suite.
+
+
+def test_the_block_processing_healthcheck_is_the_in_image_script(services):
+    """It replaced `psql -U haf_fyp_user -c 'SELECT 1'`, which proved only that
+    PostgreSQL answers -- and connected as a role that cannot see hafd.contexts rows, so
+    any real check written that way reports unhealthy forever."""
+    test = services[SYNC]["healthcheck"]["test"]
+    assert test == ["CMD", "/app/block-processing-healthcheck.sh"], test
+
+
+def test_nothing_gates_on_block_processing_health(services):
+    """#27 changed what `healthy` MEANS for haf-fyp-sync, from `SELECT 1` to a committed
+    block-processing iteration. Anything gated on service_healthy may then never start on
+    a fresh node -- and `start_period: 72h` makes it worse, since the container reports
+    `starting` and the gate never releases.
+
+    Written over the WHOLE dependency graph, not per named service. The first version
+    took (RANKER, API) and returned early when neither depended on haf-fyp-sync -- which
+    is the actual state of this compose file, so it asserted nothing and a
+    service_started -> service_healthy mutation survived it.
+    """
+    assert SYNC in services, (
+        f"{SYNC} is not a service; this test would be vacuous"
+    )
+    gated = {
+        name: (svc.get("depends_on") or {})[SYNC]["condition"]
+        for name, svc in services.items()
+        if SYNC in (svc.get("depends_on") or {})
+    }
+    healthy = {n: c for n, c in gated.items() if c == "service_healthy"}
+    assert not healthy, (
+        f"these wait for block-processing to be HEALTHY, which may never happen: {healthy}"
+    )
+
+
+@pytest.mark.parametrize("service", [SYNC, RANKER, API], ids=["sync", "ranker", "api"])
+def test_services_still_wait_for_the_install(services, service):
+    """The relaxation above must not let anything start before the schemas exist. The
+    gate on setup is what keeps that true, and it must stay
+    service_completed_successfully -- service_started would release as soon as the
+    installer's container exists, not when it has finished installing."""
+    dep = services[service].get("depends_on", {}).get(SETUP)
+    assert dep is not None, f"{service} must depend on {SETUP}"
+    assert dep["condition"] == "service_completed_successfully"
 
 
 # --- CI assertions that cannot fail ------------------------------------------------
@@ -117,6 +171,11 @@ def test_no_inverted_pipeline_assertions_in_ci():
     offenders = [
         (n, line.strip())
         for n, line in enumerate(CI.read_text(encoding="utf-8").splitlines(), 1)
-        if re.match(r"^\s*!\s*\S", line) and "#" not in line.split("!")[0]
+        # Any !-inverted COMMAND, not any !-prefixed LINE. The old anchored form
+        # (`^\s*!`) could not match a single YAML script item, because those are
+        # `    - <cmd>` -- so `- ! grep`, `cmd && ! grep` and `x=1; ! grep` all survived,
+        # i.e. everything in the class except the one instance this MR fixed.
+        if re.search(r"(?:^|&&|\|\||;|\bthen\b|\bdo\b|^\s*-)\s+!\s+\S", line)
+        and "#" not in line.split("!")[0]
     ]
     assert not offenders, f"inverted-pipeline assertions cannot fail a job: {offenders}"

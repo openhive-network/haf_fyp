@@ -391,13 +391,45 @@ def test_no_script_silently_honours_a_connection_uri(bash, tmp_path, script):
     )
 
 
-def test_common_sh_has_no_uri_branch():
-    common = (SCRIPTS / "common.sh").read_text()
-    for token in ("POSTGRES_URL", "redacted_url"):
-        assert token not in common, (
-            f"common.sh still carries {token}; psql_cmd and wait_for_postgres must have "
-            "exactly one connection path so every message describes where it connected"
-        )
+def test_no_shipped_shell_file_honours_a_connection_uri():
+    """Every shipped shell file, and by SHAPE rather than by one variable name.
+
+    The earlier version grepped `common.sh` for POSTGRES_URL and the three verb scripts
+    for the same string. Both blind spots were demonstrated: docker_entrypoint.sh could
+    set POSTGRES_HOST from $POSTGRES_URL and survive the whole suite -- the verb scripts
+    never see --postgres-url, so their refusal never fires, and the half-honoured
+    connection the round-four back-out exists to prevent is reachable with
+    `-e POSTGRES_URL=...` on a compose run. A rename to ${DATABASE_URI} survived too.
+
+    Scoped to CONNECTION variables. Building a URI from the discrete four is fine and is
+    what block-processing-healthcheck.sh does; SWAGGER_URL and the openapi rewriter are
+    unrelated. What must never happen is a connection URI arriving from the environment.
+    """
+    import re
+    conn_var = re.compile(r"[$]{?(?:POSTGRES|PG|DATABASE|DB|CONN|CONNECTION)_(?:URL|URI)[}:]?")
+    # -d "${POSTGRES_DB}" is the correct discrete form; only a URI-SHAPED
+    # variable is a finding. The first cut flagged common.sh's own
+    # wait_for_postgres, which is exactly the code path we want to keep.
+    uri_to_client = re.compile(
+        r"(?:psql|pg_isready)[^\n#]*-d\s+\"?[$]{?[A-Z_]*(?:URL|URI)")
+    roots = [SCRIPTS, SCRIPTS.parent / "docker"]
+    files = sorted(f for root in roots for f in root.glob("*.sh"))
+    assert files, "no shell files found; the glob needs updating"
+
+    offenders = []
+    for f in files:
+        for n, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            code = line.split("#", 1)[0]
+            if conn_var.search(code):
+                offenders.append(f"{f.name}:{n} reads a connection-URI variable")
+            if uri_to_client.search(code):
+                offenders.append(f"{f.name}:{n} hands a variable to psql/pg_isready as -d")
+    assert not offenders, (
+        "connection URIs are refused, not honoured -- honouring one moves only the psql "
+        f"connection while every message still reads POSTGRES_HOST: {offenders}"
+    )
 
 
 # --- --schema must have NO EFFECT, not merely be tolerated (round three) ------------
