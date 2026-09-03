@@ -284,15 +284,27 @@ docker-build-sql:
       expect_ok process_blocks --help | grep -q -- "--host"
       echo "--- an invalid option is rejected, not ignored ---"
       expect_fail install_app --nope; grep -q "is not a valid option" /tmp/o
-      echo "--- the module-file flags are accepted, not rejected ---"
+      echo "--- the no-op module-file flags are accepted, not rejected ---"
       # --help AFTER them on purpose: the option loop processes every argument, so this
       # proves acceptance and then exits 0 WITHOUT reaching wait_for_postgres. Asserting
       # these with expect_fail instead hung the sibling app's docker-build for 58
       # minutes -- with nothing to exit at, the script fell into an unbounded
       # `until pg_isready` and `timeout` could not reap it through the container.
       for verb in install_app uninstall_app process_blocks; do
-        expect_ok "$verb" --schema=btracker_app --is_forking=TRUE                   --postgres-url=postgresql://haf_admin@haf/haf_block_log --help >/tmp/f 2>&1
-        grep -q "WARNING: --schema" /tmp/f || { echo "FAIL: $verb did not warn on a foreign --schema"; cat /tmp/f; exit 1; }
+        expect_ok "$verb" --schema=btracker_app --is_forking=TRUE --help >/tmp/f 2>&1
+        cat /tmp/f
+        grep -q "WARNING: --schema" /tmp/f || { echo "FAIL: $verb did not warn on a foreign --schema"; exit 1; }
+        grep -q "btracker_app" /tmp/f || { echo "FAIL: $verb did not name the ignored value"; exit 1; }
+      done
+      echo "--- but a connection URI is REFUSED, not half-honoured ---"
+      # Honouring it moved only the psql connection: the messages and the teardown's
+      # confirmation prompt still read POSTGRES_HOST/POSTGRES_DB, so it could act on one
+      # database while reporting another. Refusing is safe -- --postgres-url appears in
+      # one upstream module file, on a service with no restart policy.
+      for verb in install_app uninstall_app process_blocks; do
+        expect_fail "$verb" --postgres-url=postgresql://haf_admin@haf/haf_block_log
+        grep -q "not supported yet" /tmp/o || { echo "FAIL: $verb did not refuse --postgres-url clearly"; exit 1; }
+        grep -q -- "--host=" /tmp/o || { echo "FAIL: $verb did not name the alternative flags"; exit 1; }
       done
       echo "--- the compat path the LIVE node uses still dispatches ---"
       expect_ok /app/scripts/install_app.sh --help | grep -q -- "--swagger-url"
