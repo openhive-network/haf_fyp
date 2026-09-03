@@ -34,14 +34,15 @@ usage: $0 <verb> [args...]
 
 verbs:
   install_app [--swagger-url=HOST] [--schema=] [--is_forking=] [--host=] [--port=]
-              [--user=] [--postgres-url=]
-                                     install/upgrade schema, endpoints and roles
+              [--user=]              install/upgrade schema, endpoints and roles
   process_blocks [--schema=] [--is_forking=] [--host=] [--port=] [--user=]
-                 [--postgres-url=]
                                      run the block-processing loop (blocks forever)
   uninstall_app [--force] [--schema=] [--is_forking=] [--host=] [--port=] [--user=]
-                [--postgres-url=]
                                      remove context, schemas and roles (DESTRUCTIVE)
+
+--postgres-url= is deliberately NOT listed: every verb recognises it and refuses with a
+message pointing at --host/--port/--user. Honouring it moved only the psql connection,
+while the messages and the teardown's confirmation prompt still read POSTGRES_HOST.
 
 Each verb's own --help lists its flags in full; this is the first help an operator
 sees, so it must not omit the ones a module file passes.

@@ -417,3 +417,31 @@ def test_a_timed_out_check_kills_its_psql():
     body = SCRIPT.read_text()
     assert "trap " in body, "no signal handler; a timed-out check leaks its psql backend"
     assert "kill -- -$$" in body, "the handler must kill the process GROUP, not just $$"
+
+
+def test_the_application_name_tag_is_unconditional():
+    """The uninstall session guard excludes this probe by the LITERAL
+    `haf_fyp_health_check`, so the tag must always be present -- there is no other way
+    for the teardown to tell the 60-second healthcheck apart from a real client session.
+
+    It was breakable: the access string used to read
+    `POSTGRES_ACCESS=${POSTGRES_URL:-"...?application_name=haf_fyp_health_check"}`, and
+    `:-` substitutes the WHOLE string -- so setting POSTGRES_URL dropped the tag along
+    with the rest, the probe began counting itself, and the teardown intermittently
+    refused with "N session(s) are still connected". Neither this file nor the uninstall
+    tests set POSTGRES_URL, so the branch that broke the contract was never exercised.
+    """
+    body = SCRIPT.read_text()
+    access = [ln for ln in body.splitlines() if ln.startswith("POSTGRES_ACCESS=")]
+    assert len(access) == 1, f"expected one POSTGRES_ACCESS assignment, got {access}"
+    line = access[0]
+    assert "application_name=haf_fyp_health_check" in line
+    assert ":-" not in line, (
+        "no default-substitution in the access string: it can replace the whole value, "
+        "tag included"
+    )
+    # And the guard on the other side still keys on the same literal.
+    uninstall = (SCRIPT.parent.parent / "scripts" / "uninstall_app.sh").read_text()
+    assert "haf_fyp_health_check" in uninstall, (
+        "the uninstall session guard no longer excludes this probe by name"
+    )

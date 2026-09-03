@@ -348,56 +348,56 @@ def test_help_covers_every_option_the_loop_accepts(bash, tmp_path, script):
     )
 
 
-# --- --postgres-url (round two) ----------------------------------------------------
+# --- --postgres-url is RECOGNISED AND REFUSED (round four) --------------------------
 #
-# The same defect class as --schema, left unfixed by the first pass: all three verbs
-# exited 2 on it. haf_api_node's hivemind.yaml ships
-# --postgres-url=postgresql://haf_admin@haf/haf_block_log on its uninstall service, and
-# all three of balance_tracker's scripts take the flag.
+# An earlier revision of this MR HONOURED it. That was worse than rejecting it: only the
+# psql connection moved. Every message, the confirmation banner and the
+# type-the-database-name gate still read ${POSTGRES_HOST}/${POSTGRES_DB}, so
+# `uninstall_app --postgres-url=...` dropped schemas on the URI's host while printing
+# the discrete host and accepting the discrete database name as confirmation -- in the
+# one gate whose stated purpose is catching "the right command against the wrong host".
+#
+# Refusing is safe here, unlike for --schema: --postgres-url appears in exactly one
+# upstream module file (hivemind.yaml, on hivemind-uninstall) and that file carries no
+# `restart:` key, so it cannot crash-loop a service.
 
 
 @pytest.mark.parametrize(
     "script", [INSTALL, UNINSTALL, PROCESS], ids=["install", "uninstall", "process_blocks"]
 )
-def test_postgres_url_is_accepted_on_every_verb(bash, tmp_path, script):
-    r = run(bash, tmp_path, script, "--postgres-url=postgresql://haf_admin@haf/db", "--help")
-    assert r.returncode == 0, r.stdout + r.stderr
+@pytest.mark.parametrize("flag", ["--postgres-url", "--url"])
+def test_postgres_url_is_refused_with_a_useful_message(bash, tmp_path, script, flag):
+    r = run(bash, tmp_path, script, f"{flag}=postgresql://haf_admin@haf/db")
+    assert r.returncode == 2
+    # Not the generic fallthrough -- that would tell a module-file author nothing.
     assert "is not a valid option" not in r.stdout
+    assert "--postgres-url is not supported yet" in r.stdout
+    # It must name the alternative, or the operator has nowhere to go.
+    for alt in ("--host=", "--port=", "--user="):
+        assert alt in r.stdout
 
 
 @pytest.mark.parametrize(
     "script", [INSTALL, UNINSTALL, PROCESS], ids=["install", "uninstall", "process_blocks"]
 )
-def test_url_is_accepted_as_a_synonym(bash, tmp_path, script):
-    """balance_tracker's --help documents `--url=URL` while its case label reads
-    `--postgres-url=*` -- an upstream inconsistency, so accept both spellings."""
-    r = run(bash, tmp_path, script, "--url=postgresql://haf_admin@haf/db", "--help")
-    assert r.returncode == 0, r.stdout + r.stderr
+def test_no_script_silently_honours_a_connection_uri(bash, tmp_path, script):
+    """The invariant that matters more than the message: nothing may reach the database
+    on the strength of a URI while the rest of the script reasons about POSTGRES_HOST."""
+    body = script.read_text()
+    assert "POSTGRES_URL" not in body, (
+        f"{script.name} still references POSTGRES_URL; honouring it requires the "
+        "confirmation banner, the healthcheck's application_name tag and the other "
+        "scripts to move too"
+    )
 
 
-def test_the_url_overrides_the_discrete_connection_flags(bash, tmp_path):
-    """It must reach psql, and it must WIN.
-
-    Accepting the flag and connecting to $POSTGRES_HOST anyway is the silent wrong-host
-    failure that makes ignoring a connection URI different in kind from ignoring
-    --schema. Passing -U alongside the URI is the same bug in miniature: the later -U
-    overrides the URI's own user.
-    """
-    _, _, argv_log = run_install_full_stub(
-        bash, tmp_path, "--postgres-url=postgresql://someone@elsewhere:6543/otherdb")
-    argv = argv_log.read_text()
-    assert "postgresql://someone@elsewhere:6543/otherdb" in argv
-    assert "-h haf" not in argv, "the discrete host was passed alongside the URI"
-    assert "-U haf_fyp_owner" not in argv, "the discrete user would override the URI's"
-
-
-def test_a_password_in_the_url_is_not_logged(bash, tmp_path):
-    """These scripts run in CI and under `docker compose logs`, and wait_for_postgres
-    prints the target it is waiting on."""
-    out = run_install_with_stub_db(
-        bash, tmp_path, "--postgres-url=postgresql://u:hunter2@h:5432/db")
-    assert "hunter2" not in out
-    assert "postgresql://u:***@h:5432/db" in out
+def test_common_sh_has_no_uri_branch():
+    common = (SCRIPTS / "common.sh").read_text()
+    for token in ("POSTGRES_URL", "redacted_url"):
+        assert token not in common, (
+            f"common.sh still carries {token}; psql_cmd and wait_for_postgres must have "
+            "exactly one connection path so every message describes where it connected"
+        )
 
 
 # --- --schema must have NO EFFECT, not merely be tolerated (round three) ------------

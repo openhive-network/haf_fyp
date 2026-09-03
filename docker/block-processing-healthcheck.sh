@@ -98,7 +98,18 @@ postgres_user=${POSTGRES_USER:-"haf_admin"}
 postgres_host=${POSTGRES_HOST:-"haf"}
 postgres_port=${POSTGRES_PORT:-5432}
 postgres_db=${POSTGRES_DB:-"haf_block_log"}
-POSTGRES_ACCESS=${POSTGRES_URL:-"postgresql://$postgres_user@$postgres_host:$postgres_port/$postgres_db?application_name=haf_fyp_health_check"}
+# NO ${POSTGRES_URL:-...} FALLBACK. `:-` substitutes the WHOLE string, so setting
+# POSTGRES_URL replaced the ?application_name= tag along with the rest -- and the
+# uninstall session guard excludes this probe by exactly that literal
+# (`coalesce(application_name, '') <> 'haf_fyp_health_check'`). With the tag gone the
+# 60-second probe counts itself, and the teardown intermittently refuses with
+# "N session(s) are still connected" on a race the operator cannot reason about.
+#
+# Nothing else in this app honours POSTGRES_URL either: --postgres-url is
+# recognised and refused by all three scripts, because honouring it moved only the
+# psql connection while every message and the teardown's confirmation prompt still
+# read POSTGRES_HOST/POSTGRES_DB. One connection path, one description of it.
+POSTGRES_ACCESS="postgresql://$postgres_user@$postgres_host:$postgres_port/$postgres_db?application_name=haf_fyp_health_check"
 
 CONTEXT=${HAF_FYP_CONTEXT:-"haf_fyp"}
 

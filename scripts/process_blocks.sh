@@ -6,8 +6,8 @@
 #   --host=VALUE   PostgreSQL host (default: $POSTGRES_HOST, else haf)
 #   --port=NUMBER  PostgreSQL port (default: $POSTGRES_PORT, else 5432)
 #   --user=VALUE   PostgreSQL user (default: $POSTGRES_USER, else haf_fyp_owner)
-#   --postgres-url=URI  Full libpq connection URI; OVERRIDES --host/--port/--user
-#                  (--url= is accepted as a synonym)
+#   --postgres-url=URI  NOT SUPPORTED YET -- recognised and refused, with a
+#                  message pointing at --host/--port/--user (--url= is the same)
 #   --schema=NAME  Accepted for haf_api_node module-file compatibility; ignored
 #                  with a warning unless it names haf_fyp_app
 #   --is_forking=  Accepted likewise; this app's context is always non-forking
@@ -35,13 +35,37 @@ for arg in "$@"; do
         --port=*) POSTGRES_PORT="${arg#*=}" ;;
         --user=*) POSTGRES_USER="${arg#*=}" ;;
 
-        # haf_api_node's hivemind.yaml passes
-        #   --postgres-url=postgresql://haf_admin@haf/haf_block_log
-        # to its uninstall service, and all three of balance_tracker's scripts take the
-        # flag. It CANNOT be warn-and-ignored the way --schema is: ignoring a connection
-        # URI does not mean "no effect", it means connecting somewhere else than asked.
-        # common.sh gives it to psql and pg_isready as a conninfo.
-        --postgres-url=*|--url=*) POSTGRES_URL="${arg#*=}" ;;
+        # RECOGNISED AND REFUSED, deliberately -- not warn-and-continue like --schema,
+        # and not "is not a valid option" either.
+        #
+        # An earlier revision of this MR HONOURED it, handing the URI to psql as a
+        # conninfo. That was worse than rejecting it, because only psql moved: every
+        # message, the confirmation banner and the typed-the-database-name gate still
+        # read ${POSTGRES_HOST}/${POSTGRES_DB}. So `uninstall_app --postgres-url=...`
+        # dropped schemas on the URI's host while printing the discrete host, and
+        # accepted the discrete database name as confirmation -- in the one gate whose
+        # stated purpose is catching "the right command against the wrong host".
+        #
+        # Honouring it properly means the banner, the healthcheck's application_name
+        # tag (the uninstall session guard excludes the probe by that literal), passing
+        # the conninfo through to the healthcheck, a redactor that survives
+        # ?password= and keyword/value forms, and the other scripts. That is tracked
+        # separately.
+        #
+        # Refusing is safe here, unlike for --schema: --postgres-url appears in exactly
+        # one upstream module file (hivemind.yaml, on hivemind-uninstall) and that file
+        # carries no `restart:` key, so this cannot crash-loop a service. One clear
+        # error beats a silent connection to the wrong database.
+        --postgres-url=*|--url=*)
+            log "ERROR: --postgres-url is not supported yet."
+            log "       Use --host=, --port= and --user= instead. Accepting the URI"
+            log "       would move only the psql connection: this script's messages,"
+            log "       and the teardown's confirmation prompt, still read POSTGRES_HOST"
+            log "       and POSTGRES_DB -- so it could act on one database while"
+            log "       reporting another. Refusing is the safe answer until that is"
+            log "       fixed throughout."
+            exit 2
+            ;;
 
         # balance_tracker's module file passes --schema= on ALL THREE verbs. Verified
         # against upstream rather than remembered: hive/balance_tracker's

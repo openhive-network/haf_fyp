@@ -87,6 +87,10 @@ def make_psql(tmp_path, *, sessions: str = "0", remaining: str = "",
         + f'  *is_superuser*)         printf "%s" {can_remove!r} ;;\n'
         f'  *pg_stat_activity*)     printf "%s" {sessions!r} ;;\n'
         f'  *uninstall_verify.sql*) printf "%s" {remaining!r} ;;\n'
+        # Step 6's HAF probe is a pg_class/pg_namespace join (to_regclass raises
+        # without USAGE on hafd). Both spellings answer, so a regression to the
+        # old form fails the whole-expression test rather than silently passing.
+        '  *pg_class*)             printf "t" ;;\n'
         '  *to_regclass*)          printf "t" ;;\n'
         f'  *"hafd.contexts AS c"*) printf "%s" {context_left!r} ;;\n'
         + "esac\n"
@@ -156,8 +160,18 @@ def test_the_probe_asks_the_question_the_policy_asks(bash, tmp_path):
     assert "hive.can_impersonate(current_user, owner)" in probe, (
         "the probe must ask what the DELETE policy asks"
     )
-    assert "pg_has_role" not in probe, (
-        "membership of a role literal is not the question the policy asks"
+    # Scoped to the APP OWNER literal. Round four's guard legitimately uses pg_has_role
+    # for a different question -- membership of hive_applications_group, without which
+    # the row read below is filtered by RLS and `NOT EXISTS` cannot tell "the context is
+    # gone" from "the context is invisible to me". Forbidding pg_has_role outright, as
+    # this assertion first did, would have blocked that fix.
+    assert "'haf_fyp_owner'" not in probe, (
+        "membership of the app owner literal is not the question the policy asks -- "
+        "the policy tests can_impersonate against the context ROW's owner column"
+    )
+    assert "hive_applications_group" in probe, (
+        "the probe must establish that this role can SEE the row before believing what "
+        "it reads: SELECT on hafd.contexts is policy-gated on that group"
     )
     assert "NOT EXISTS" in probe, (
         "an already-removed context must not be treated as a permission failure"
@@ -193,10 +207,20 @@ def _guarded_psql(tmp_path, *, can_impersonate="t", createrole="t", has_contexts
         + (f'case "$cmd" in *{fail_on}*) echo "stub: failing" >&2; exit 2 ;; esac\n'
            if fail_on else "")
         + 'case "$cmd" in\n'
+        # Guard 1 is a pg_class/pg_namespace join now, NOT to_regclass -- to_regclass
+        # raises `permission denied for schema hafd` without USAGE on it, verified on
+        # postgres:14 and :17. Both spellings answer here so a regression to the old
+        # form is caught by the whole-expression test rather than silently passing.
+        f'  *pg_class*)        printf "%s" {has_contexts!r} ;;\n'
         f'  *to_regclass*)     printf "%s" {has_contexts!r} ;;\n'
         f'  *can_impersonate*) printf "%s" {can_impersonate!r} ;;\n'
         f'  *rolcreaterole*)   printf "%s" {createrole!r} ;;\n'
         '  *pg_stat_activity*) printf "0" ;;\n'
+        # AFTER pg_stat_activity, and matched on the identity query's own
+        # distinctive text: the session-count query ALSO says current_database(),
+        # and `case` takes the first match, so a *current_database* arm above it
+        # fed this string to the session guard as a count.
+        '  *"current_user ||"*) printf "someone on somedb" ;;\n'
         "esac\n"
         "exit 0\n",
     )
@@ -620,6 +644,10 @@ def test_a_failing_destructive_statement_does_not_abort_the_run(bash, tmp_path):
         '  *is_superuser*)     printf "t" ;;\n'
         '  *pg_stat_activity*)     printf "0" ;;\n'
         '  *uninstall_verify.sql*) printf "" ;;\n'
+        # Step 6's HAF probe is a pg_class/pg_namespace join (to_regclass raises
+        # without USAGE on hafd). Both spellings answer, so a regression to the
+        # old form fails the whole-expression test rather than silently passing.
+        '  *pg_class*)             printf "t" ;;\n'
         '  *to_regclass*)          printf "t" ;;\n'
         # The first schema drop fails, exactly as a lock timeout would.
         '  *"DROP SCHEMA IF EXISTS haf_fyp_app"*) echo "ERROR: canceling statement due to lock timeout" >&2; exit 1 ;;\n'
@@ -720,25 +748,54 @@ def test_the_refusal_is_logged_as_an_ERROR(bash, tmp_path):
 # earlier token greps could see.
 
 
-def _probe_sql(marker: str) -> str:
-    """The -c argument of the assignment beginning `marker`, whitespace-normalised."""
+def _probe_sql(marker: str, occurrence: int = 0) -> str:
+    """The -c argument of the assignment beginning `marker`, whitespace-normalised.
+
+    `occurrence` selects among repeats -- _has_contexts is probed twice, once in the
+    pre-flight and once in step 6, and both must avoid to_regclass.
+    """
     body = SCRIPT.read_text()
-    after = body.split(marker, 1)[1]
+    after = body.split(marker)[occurrence + 1]
     sql = after.split('-c "', 1)[1].split('")', 1)[0]
     return " ".join(sql.split())
 
 
-EXPECTED_CAN_REMOVE = (
-    "SELECT current_setting('is_superuser') = 'on' "
-    "OR NOT EXISTS (SELECT 1 FROM hafd.contexts WHERE name = '${HAF_FYP_CONTEXT}') "
-    "OR EXISTS (SELECT 1 FROM hafd.contexts "
-    "WHERE name = '${HAF_FYP_CONTEXT}' "
-    "AND hive.can_impersonate(current_user, owner))"
+EXPECTED_HAS_CONTEXTS = (
+    "SELECT EXISTS (SELECT 1 FROM pg_class c "
+    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE n.nspname = 'hafd' AND c.relname = 'contexts')"
 )
 
+# Guard 2 must require MEMBERSHIP OF hive_applications_group before believing what it
+# reads. Without that arm, `NOT EXISTS (row)` cannot distinguish "the context is gone"
+# from "the context is invisible to me under RLS" -- it reads the row through the very
+# policy in question -- and a role holding SELECT on hafd but outside the group passed
+# vacuously, then dropped every schema while step 6 printed success.
+EXPECTED_CAN_REMOVE = (
+    "SELECT current_setting('is_superuser') = 'on' "
+    "OR (to_regrole('hive_applications_group') IS NOT NULL "
+    "AND pg_has_role(current_user, 'hive_applications_group', 'USAGE') "
+    "AND (NOT EXISTS (SELECT 1 FROM hafd.contexts WHERE name = '${HAF_FYP_CONTEXT}') "
+    "OR EXISTS (SELECT 1 FROM hafd.contexts "
+    "WHERE name = '${HAF_FYP_CONTEXT}' "
+    "AND hive.can_impersonate(current_user, owner))))"
+)
+
+# CREATEROLE is NOT what step 5 needs. Verified on postgres:14 and :17 as a
+# non-superuser CREATEROLE role that is not a member of the target:
+#   DROP OWNED BY  -> "Only roles with privileges of role X may drop objects owned by it"
+#   DROP ROLE      -> "Only roles with the CREATEROLE attribute and the ADMIN option"
+# The second is the PG16+ rule, and HAF's Dockerfile pins POSTGRES_VERSION=17, so it is
+# live. USAGE is has_privs_of_role (what DROP OWNED BY checks); MEMBER WITH ADMIN OPTION
+# is what DROP ROLE checks.
 EXPECTED_CAN_DROP_ROLES = (
     "SELECT current_setting('is_superuser') = 'on' "
-    "OR COALESCE((SELECT rolcreaterole FROM pg_roles WHERE rolname = current_user), false)"
+    "OR (COALESCE((SELECT rolcreaterole FROM pg_roles WHERE rolname = current_user), false) "
+    "AND NOT EXISTS ( "
+    "SELECT 1 FROM pg_roles r "
+    "WHERE r.rolname IN ('haf_fyp_user', 'haf_fyp_owner') "
+    "AND NOT (pg_has_role(current_user, r.oid, 'USAGE') "
+    "AND pg_has_role(current_user, r.oid, 'MEMBER WITH ADMIN OPTION'))))"
 )
 
 
@@ -818,3 +875,65 @@ def test_the_confirmation_variable_names_every_role_the_script_drops():
     assert dropped <= declared, (
         f"dropped but not named in HAF_FYP_ROLES: {sorted(dropped - declared)}"
     )
+
+
+# --- the guards, corrected in round four ------------------------------------------
+
+def test_the_haf_detection_probe_needs_no_usage_on_hafd():
+    """to_regclass RESOLVES THE SCHEMA and raises `permission denied for schema hafd`
+    for any caller without USAGE on it -- aclcheck_error fires even under missing_ok.
+    Reproduced on postgres:14 and postgres:17. The script then announced "this is not a
+    HAF instance" about a database that plainly is one. This is the same trap step 6
+    already documents for `cron`; it was left in the pre-flight until round four."""
+    assert _probe_sql('_has_contexts="$(psql_cmd') == EXPECTED_HAS_CONTEXTS
+    # Scoped to the two _has_contexts PROBES, not the whole file. Step 3's DO block
+    # legitimately uses to_regclass to skip context removal on a non-HAF database:
+    # by then guard 2 has established membership of hive_applications_group, which
+    # holds SELECT on hafd tables and therefore USAGE on the schema. The probes run
+    # BEFORE that is known, which is exactly why they may not use it.
+    for occurrence in range(2):
+        probe = _probe_sql('_has_contexts="$(psql_cmd', occurrence=occurrence)
+        assert "to_regclass" not in probe, (
+            "_has_contexts probe %d resolves hafd.contexts by name; it raises "
+            "rather than returning NULL without USAGE on the schema" % occurrence
+        )
+
+
+def test_refuses_a_role_outside_hive_applications_group(bash, tmp_path):
+    """The RLS-invisible hole. A role with SELECT on hafd but outside
+    hive_applications_group sees zero context rows, so an `OR NOT EXISTS(row)` arm
+    passed it vacuously; hive.app_context_exists() then read through the same filter and
+    reported nothing to remove, both schemas were dropped, and step 6 -- same filter
+    again -- printed success while the context survived. db/builtin_roles.sql creates
+    exactly such a role."""
+    log = _guarded_psql(tmp_path, can_impersonate="f")
+    r = run(bash, tmp_path, "--force")
+    assert r.returncode == 1
+    assert "DROP SCHEMA" not in sql_of(log)
+    assert "app_remove_context" not in sql_of(log)
+
+
+def test_refuses_createrole_without_the_admin_option(bash, tmp_path):
+    """The guard added in round two to prevent a partial teardown CAUSED one.
+
+    It tested rolcreaterole alone, which answers TRUE for a CREATEROLE role that is not
+    a member of haf_fyp_user/haf_fyp_owner -- and that role then removed the context, dropped
+    every schema CASCADE, and failed on step 5's FIRST statement. Verified on
+    postgres:14 and :17: DROP OWNED BY needs the privileges of the target role, and
+    PG16+ DROP ROLE needs CREATEROLE *and* the ADMIN option.
+    """
+    log = _guarded_psql(tmp_path, createrole="f")
+    r = run(bash, tmp_path, "--force")
+    assert r.returncode == 1
+    assert "DROP SCHEMA" not in sql_of(log)
+    assert "DROP OWNED BY" not in sql_of(log)
+
+
+def test_a_refusal_names_the_role_the_database_actually_sees(bash, tmp_path):
+    """Every refusal used to interpolate ${POSTGRES_USER} -- what was REQUESTED --
+    while the probes correctly ask about current_user. The two differ whenever a
+    PGUSER/PGSERVICE/.pgpass in the environment redirects the connection, and a refusal
+    naming the wrong role sends the operator to change the wrong thing."""
+    _guarded_psql(tmp_path, createrole="f")
+    r = run(bash, tmp_path, "--force")
+    assert "connected as someone on somedb" in r.stdout
