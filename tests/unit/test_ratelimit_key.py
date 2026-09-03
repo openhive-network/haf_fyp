@@ -336,7 +336,10 @@ class TestLayeredCeilingsOnTheRealEndpoints:
     these assert the split rather than the old stacking.
     """
 
-    # func -> (per-IP limit, ceiling spec, ceiling is per-method)
+    # func -> (per-IP limit, ceiling spec, per-method).
+    # The flag is shared: slowapi scopes a bucket by path alone, and POST/DELETE
+    # share /v1/fyp/interests, so the decorator and the ceiling must agree on it or
+    # the two halves of one endpoint's limits would land in different scopes.
     EXPECTED = {
         "post_interests": ("10 per 1 minute", "60/minute", True),
         "delete_interests": ("5 per 1 minute", "30/minute", True),
@@ -356,7 +359,6 @@ class TestLayeredCeilingsOnTheRealEndpoints:
         through the app takes 600 requests. It still fails if the call is deleted,
         renamed, given the wrong amount, or loses per_method.
         """
-        import ast
         import inspect as _inspect
 
         import haf_fyp.api as _api

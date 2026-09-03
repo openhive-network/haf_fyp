@@ -91,6 +91,9 @@ cp docker/.env docker/.env.local
 # Edit .env.local:
 #   - Set HAF_VERSION to a pinned release tag (not "latest") for production
 #   - Set FYP_ADMIN_API_KEY to a strong random secret
+#   - Set TRUSTED_PROXY_IPS to whatever fronts this app (Caddy/Varnish/HAProxy),
+#     or to `direct` if nothing does. Left empty, every caller shares one bucket
+#     and pre-validation rate limiting stays OFF -- see the deployment checklist.
 #
 # Every command below passes --env-file docker/.env.local. Without it Compose reads
 # docker/.env (the project-directory default) and the edits above are silently ignored,
@@ -424,7 +427,7 @@ Before going live:
 
 - [ ] `pgvector` extension installed by superuser on the HAF PostgreSQL server
 - [ ] `FYP_ADMIN_API_KEY` set to a strong random value in `docker/.env.local`
-- [ ] **`TRUSTED_PROXY_IPS` set to the reverse proxy's address or CIDR** if anything fronts this app. Rate limits key on `X-Real-IP` only from a trusted peer; unset, every caller keys on the proxy's address instead — one shared bucket for all of them, which is no per-client limit at all. The app logs a warning at startup when it is unset, and once more if a peer outside the list presents the header (which usually means the proxy was recreated with a new address and the list is now stale). Re-check it after anything that can renumber the proxy container.
+- [ ] **`TRUSTED_PROXY_IPS` set to the reverse proxy's address or CIDR** (or the literal `direct` if nothing fronts this app). Since #28 this also gates *when* limits are charged: with it unset the app logs an ERROR at startup and falls back to charging only after validation, because charging a request before it is validated is safe only when the bucket identifies the caller — into one shared bucket it lets a single sender 429 everybody else, which is worse than the bug #28 fixes. Rate limits key on `X-Real-IP` only from a trusted peer; unset, every caller keys on the proxy's address instead — one shared bucket for all of them, which is no per-client limit at all. The app logs a warning at startup when it is unset, and once more if a peer outside the list presents the header (which usually means the proxy was recreated with a new address and the list is now stale). Re-check it after anything that can renumber the proxy container.
 - [ ] `HAF_VERSION` pinned to a specific release tag (not `latest`)
 - [ ] HiveSense installed and synced → `grant_cross_schema.sh` re-run
 - [ ] Hivemind installed and synced (provides the (author, permlink) → hivemind post id bridge) → `grant_cross_schema.sh` re-run
@@ -432,6 +435,36 @@ Before going live:
 - [ ] reputation_tracker installed and synced → `grant_cross_schema.sh` re-run
 - [ ] Verify `hivesense_app.posts_vectors` on live instance: `\d hivesense_app.posts_vectors` (expected: `embedding halfvec(1024)`, keyed by hivemind post id, one row per chunk)
 - [ ] Smoke test all endpoints after first ranker cycle completes
+
+## Operating the rate limits
+
+Two levers, both read from the environment by slowapi at startup, neither needing a
+code change:
+
+| Variable | Effect |
+|---|---|
+| `RATELIMIT_ENABLED=false` | Turns *all* rate limiting off — the per-IP limits, the shared ceilings, and the pre-validation charging. Note this also restores the #28 amplifier: malformed batches become free again. |
+| `RATELIMIT_SWALLOW_ERRORS=1` | Only affects slowapi's own paths; this app already fails **open** on a limiter-storage error by design (see below), so it changes little here. |
+
+**Failure policy: the limiter fails open.** If Redis is unreachable or slow, a request
+is served *unmetered* rather than rejected — limits protect against abuse, they are not
+part of answering correctly, so a Redis incident degrades limiting instead of the
+service. Storage failures are logged once per minute with a suppressed-occurrence
+count, and again immediately if a *different* kind of failure appears.
+
+**Redis coupling.** Limiter buckets live on the same Redis as the ranker's
+`haf_fyp:refresh` pub/sub. There is no key collision (`LIMITER/…` vs a channel) and no
+unbounded key growth (every bucket carries a window TTL), but note that `limits`
+increments on *every* checked request including ones it then rejects, so a flood on the
+unauthenticated `/v1/fyp/events` is Redis write traffic. `MAX_REQUEST_BODY_BYTES`
+(default 256 KiB) and the per-IP limits are what bound it.
+
+**Deploying a change to this file's limits:** `requirements.txt` is part of the image,
+so use `up -d --build haf-fyp-api`, not a bare `up -d`, which silently reuses the cached
+image. `haf-fyp-ranker` builds from the same `Dockerfile.python`, so a plain
+`docker compose build` restarts it mid-cycle — rebuild the api service by name if that
+matters. Nothing needs ordering and a rollback strands nothing: bucket identities are
+unchanged and every key expires with its window.
 
 ## Development Phases
 

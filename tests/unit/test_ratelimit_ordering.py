@@ -27,6 +27,11 @@ from slowapi.errors import RateLimitExceeded
 
 from haf_fyp.api import RateLimitBeforeValidationMiddleware
 
+# Captured at import, before any test mutates it: the throttle's sentinel is
+# process-global class state, so a test that resets it cannot also assert its
+# default. See test_the_first_failure_is_never_swallowed_just_after_boot.
+_SENTINEL_AS_DEFINED = RateLimitBeforeValidationMiddleware._last_storage_failure_log
+
 CLIENT = "203.0.113.7"
 OTHER = "198.51.100.4"
 
@@ -65,7 +70,7 @@ def _build(per_ip="3/minute", ceiling=None, middleware="ours"):
     app.state.limiter = lim
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     if middleware == "ours":
-        app.add_middleware(RateLimitBeforeValidationMiddleware, limiter=lim)
+        app.add_middleware(RateLimitBeforeValidationMiddleware, limiter=lim, early=True)
     elif middleware == "stock":
         from slowapi.middleware import SlowAPIMiddleware
 
@@ -221,7 +226,7 @@ class TestBlastRadiusIsNarrow:
         app = FastAPI()
         app.state.limiter = lim
         app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-        app.add_middleware(RateLimitBeforeValidationMiddleware, limiter=lim)
+        app.add_middleware(RateLimitBeforeValidationMiddleware, limiter=lim, early=True)
 
         @app.post("/v1/fyp/interests")
         @lim.limit("2/minute", per_method=True)
@@ -435,8 +440,10 @@ class TestMalformedTrafficCannotDrainTheSharedCeiling:
         )
 
     def test_but_well_formed_traffic_still_hits_the_ceiling(self, real_app):
-        # The other half: the ceiling must still bound brute-forcing the API key,
-        # which is why it is charged ahead of the key check rather than after it.
+        # The other half: the ceiling must still bound brute-forcing the API key.
+        # It is charged on the FAILURE branch -- every guess is a failed comparison,
+        # so the bound is the same as charging ahead of the comparison, without
+        # letting guessers spend what the real admin needs.
         from fastapi.testclient import TestClient
 
         c = TestClient(real_app.app)
@@ -471,10 +478,9 @@ class TestCallableLimitValuesAreCoveredToo:
 
 
 class TestStorageFailureDoesNotWorsenTheResponse:
-    """Kills M6. Catching bare Exception here would answer a bogus 429 during a
-    Redis outage; answering 500 here would turn every malformed request into a
-    bare text/plain 500, because this middleware sits outside ExceptionMiddleware.
-    Falling through reproduces pre-#28 behaviour exactly."""
+    """The limiter fails OPEN: it protects against abuse, it is not part of
+    answering the request, so a storage outage degrades limiting and not the
+    service. Catching bare Exception would instead answer a bogus 429."""
 
     @staticmethod
     def _broken(monkeypatch):
@@ -493,9 +499,41 @@ class TestStorageFailureDoesNotWorsenTheResponse:
             assert _post(c, INVALID).status_code == 422
 
     def test_the_outage_is_not_reported_as_a_rate_limit(self, monkeypatch):
-        app, _ = self._broken(monkeypatch)
+        app, parses = self._broken(monkeypatch)
         with TestClient(app, raise_server_exceptions=False) as c:
             assert _post(c, VALID).status_code != 429
+
+    def test_a_valid_request_is_still_served(self, monkeypatch):
+        # Fail OPEN, not closed. The previous revision retried the check inside the
+        # endpoint, which 500'd the caller for an outage they did not cause.
+        app, _ = self._broken(monkeypatch)
+        with TestClient(app, raise_server_exceptions=False) as c:
+            r = _post(c, VALID)
+        assert r.status_code == 200, r.text
+
+    def test_the_check_is_attempted_once_not_retried(self, monkeypatch):
+        """The double-charge, pinned.
+
+        The earlier fall-through left the request unmarked, so slowapi's decorator
+        ran the same check again inside the endpoint. Harmless with an unreachable
+        Redis -- but with socket timeouts on the storage the INCR lands on the
+        server and only the CLIENT times out, so the caller's bucket drained at 2x
+        while the request failed anyway. Measured 2 EVALSHA for one request.
+        """
+        app, _ = _build(per_ip="3/minute")
+        lim = app.state.limiter
+        attempts = []
+        real_hit = lim.limiter.hit
+
+        def hit_then_timeout(*a, **k):
+            attempts.append(1)
+            real_hit(*a, **k)          # the INCR really lands...
+            raise TimeoutError("socket timeout after the server applied it")
+
+        monkeypatch.setattr(lim.limiter, "hit", hit_then_timeout)
+        with TestClient(app, raise_server_exceptions=False) as c:
+            _post(c, VALID)
+        assert len(attempts) == 1, f"{len(attempts)} charges for one request"
 
 
 class TestCustomExceptionHandlersAreHonoured:
@@ -521,7 +559,7 @@ class TestCustomExceptionHandlersAreHonoured:
             return JSONResponse({"mine": True}, status_code=429)
 
         app.add_exception_handler(register, custom)
-        app.add_middleware(RateLimitBeforeValidationMiddleware, limiter=lim)
+        app.add_middleware(RateLimitBeforeValidationMiddleware, limiter=lim, early=True)
 
         @app.post("/e")
         @lim.limit("1/minute")
@@ -617,7 +655,7 @@ class TestUnlimitedRoutesStayUnlimitedEvenWithDefaultLimits:
         app = FastAPI()
         app.state.limiter = lim
         app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-        app.add_middleware(RateLimitBeforeValidationMiddleware, limiter=lim)
+        app.add_middleware(RateLimitBeforeValidationMiddleware, limiter=lim, early=True)
 
         @app.get("/health")
         def health():
@@ -819,7 +857,7 @@ class TestUnmatchedPathsAreNotChargedEitherWithDefaultLimits:
         app = FastAPI()
         app.state.limiter = lim
         app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-        app.add_middleware(RateLimitBeforeValidationMiddleware, limiter=lim)
+        app.add_middleware(RateLimitBeforeValidationMiddleware, limiter=lim, early=True)
 
         @app.get("/health")
         def health():
@@ -841,7 +879,7 @@ class TestHandlerShapesTheFallbackMustSurvive:
         app = FastAPI()
         app.state.limiter = lim
         app.add_exception_handler(RateLimitExceeded, handler)
-        app.add_middleware(RateLimitBeforeValidationMiddleware, limiter=lim)
+        app.add_middleware(RateLimitBeforeValidationMiddleware, limiter=lim, early=True)
 
         @app.get("/probe")
         @lim.limit("1/minute")
@@ -1026,7 +1064,7 @@ class TestAHandlerReturningNothingIsNotA500:
             return None
 
         app.add_exception_handler(RateLimitExceeded, returns_nothing)
-        app.add_middleware(RateLimitBeforeValidationMiddleware, limiter=lim)
+        app.add_middleware(RateLimitBeforeValidationMiddleware, limiter=lim, early=True)
 
         @app.get("/probe")
         @lim.limit("1/minute")
@@ -1039,3 +1077,278 @@ class TestAHandlerReturningNothingIsNotA500:
         assert r.text != "Internal Server Error", (
             "a None-returning handler produced a 500 where Starlette produces none"
         )
+
+
+class TestTheBodyCapBoundsCostNotJustCount:
+    """#28's motivating number is a body-size problem, and metering per request
+    bounds the count rather than the cost: one address inside its 120/minute still
+    drove ~110s of server work and ~250MB of 422 bodies a minute, because uvicorn
+    has no body cap and EventsBatch's 200-event limit is enforced only after the
+    whole document is parsed."""
+
+    def test_an_oversized_body_is_refused_without_being_parsed(self, real_app):
+        from fastapi.testclient import TestClient
+
+        c = TestClient(real_app.app)
+        big = b'{"session":"s","events":[' + b'{"t":"impression"},' * 40000 + b'{}]}'
+        assert len(big) > real_app._MAX_BODY_BYTES
+        r = c.post("/v1/fyp/events", content=big,
+                   headers={"X-Real-IP": "203.0.113.150",
+                            "Content-Type": "application/json"})
+        assert r.status_code == 413, r.status_code
+        assert "exceeds" in r.json()["detail"], r.json()
+
+    def test_an_oversized_body_still_costs_the_sender_its_allowance(self, real_app):
+        # Otherwise it is the #28 amplifier again, just with a cheaper response.
+        from fastapi.testclient import TestClient
+
+        c = TestClient(real_app.app)
+        big = b"x" * (real_app._MAX_BODY_BYTES + 1)
+        h = {"X-Real-IP": "203.0.113.151", "Content-Type": "application/json"}
+        codes = [c.post("/v1/fyp/interests", content=big, headers=h).status_code
+                 for _ in range(11)]
+        assert codes[:10] == [413] * 10, codes
+        assert codes[10] == 429, codes
+
+    def test_a_normal_batch_is_unaffected(self, real_app):
+        from fastapi.testclient import TestClient
+
+        # raise_server_exceptions=False: passing the cap means it reaches the
+        # handler, which wants the DB this fixture deliberately has not started.
+        c = TestClient(real_app.app, raise_server_exceptions=False)
+        body = {"session": "s", "events": [{"t": "impression", "post_id": "1"}] * 200}
+        r = c.post("/v1/fyp/events", json=body,
+                   headers={"X-Real-IP": "203.0.113.152"})
+        assert r.status_code != 413, "a full 200-event batch tripped the body cap"
+
+
+class TestTheLimiterNeverBlocksTheRequestIndefinitely:
+    """8 slots without a timeout is an unbounded, untimed queue: 40 concurrent
+    requests against a stalled Redis measured 12.5s each and still errored."""
+
+    def test_a_stalled_limiter_gives_up_and_serves(self, monkeypatch):
+        import time
+
+        from haf_fyp import api
+
+        app, _ = _build(per_ip="3/minute")
+        lim = app.state.limiter
+        monkeypatch.setattr(api, "_LIMITER_WAIT_SECONDS", 0.2)
+        monkeypatch.setattr(
+            lim.limiter, "hit", lambda *a, **k: (time.sleep(5), True)[1]
+        )
+        t0 = time.perf_counter()
+        with TestClient(app, raise_server_exceptions=False) as c:
+            r = _post(c, VALID)
+        waited = time.perf_counter() - t0
+        assert r.status_code == 200, r.status_code
+        assert waited < 4, f"waited {waited:.1f}s for a limiter that never answered"
+
+
+class TestTheOutageLogIsUsable:
+    """A bare time window hides the two things an operator needs: how big the
+    outage is, and a DIFFERENT failure arriving mid-window."""
+
+    @staticmethod
+    def _reset():
+        RateLimitBeforeValidationMiddleware._last_storage_failure_log = float("-inf")
+        RateLimitBeforeValidationMiddleware._last_storage_failure_kind = None
+        RateLimitBeforeValidationMiddleware._suppressed_storage_failures = 0
+
+    def test_the_first_failure_is_never_swallowed_just_after_boot(self, caplog, monkeypatch):
+        """time.monotonic() is uptime on Linux, so with a 0.0 sentinel the FIRST
+        failure is silently dropped whenever the container starts within the
+        suppression interval of host boot -- exactly when Redis is likeliest to be
+        missing. Asserted behaviourally: a class attribute would be whatever an
+        earlier test left it as."""
+        import logging
+
+        from haf_fyp import api
+
+        # Restore the sentinel the CLASS was defined with, not a value of our own --
+        # resetting it to -inf here would make the assertion vacuous.
+        monkeypatch.setattr(
+            RateLimitBeforeValidationMiddleware,
+            "_last_storage_failure_log", _SENTINEL_AS_DEFINED,
+        )
+        # Same failure kind as the one we are about to log: a DIFFERENT kind logs
+        # immediately by design, which would rescue the call no matter what the
+        # sentinel is and make this assertion vacuous.
+        monkeypatch.setattr(
+            RateLimitBeforeValidationMiddleware,
+            "_last_storage_failure_kind", "ConnectionError",
+        )
+        monkeypatch.setattr(api.time, "monotonic", lambda: 5.0)   # 5s since boot
+        with caplog.at_level(logging.WARNING, logger="haf_fyp.api"):
+            RateLimitBeforeValidationMiddleware.log_storage_failure(
+                ConnectionError("redis missing at boot")
+            )
+        assert [r for r in caplog.records if "storage failed" in r.getMessage()], (
+            "the first failure was suppressed because the sentinel is inside the "
+            "window when monotonic() is small"
+        )
+
+    def test_suppressed_occurrences_are_counted(self, caplog, monkeypatch):
+        import logging
+
+        self._reset()
+        monkeypatch.setattr(
+            RateLimitBeforeValidationMiddleware, "_last_storage_failure_log", 0.0
+        )
+        monkeypatch.setattr(
+            RateLimitBeforeValidationMiddleware, "_last_storage_failure_kind", None
+        )
+        with caplog.at_level(logging.WARNING, logger="haf_fyp.api"):
+            for _ in range(5):
+                RateLimitBeforeValidationMiddleware.log_storage_failure(
+                    ConnectionError("down")
+                )
+            RateLimitBeforeValidationMiddleware._last_storage_failure_log = float("-inf")
+            RateLimitBeforeValidationMiddleware.log_storage_failure(
+                ConnectionError("down")
+            )
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("4 further occurrence(s) suppressed" in m for m in msgs), msgs
+
+    def test_a_different_failure_is_logged_immediately(self, caplog):
+        import logging
+
+        self._reset()
+        with caplog.at_level(logging.WARNING, logger="haf_fyp.api"):
+            RateLimitBeforeValidationMiddleware.log_storage_failure(TimeoutError("t"))
+            RateLimitBeforeValidationMiddleware.log_storage_failure(TimeoutError("t"))
+            RateLimitBeforeValidationMiddleware.log_storage_failure(
+                PermissionError("NOAUTH")
+            )
+        kinds = [r.getMessage() for r in caplog.records]
+        assert len(kinds) == 2, kinds
+        assert "PermissionError" in kinds[1], (
+            "a new failure kind was suppressed by the previous one's window"
+        )
+
+
+class TestTheCheckDoesNotShareTheEndpointThreadPool:
+    """anyio's default pool is 40 tokens and FastAPI runs every `def` endpoint
+    through it -- /health included. Passing no limiter is what made the round-two
+    fix only raise the starvation bar from 1 concurrent request to ~41.
+
+    Structural rather than behavioural on purpose: reproducing the starvation needs
+    >40-way concurrency and a wall-clock threshold, and a threshold here measures
+    the runner as much as the code (that is why the event-loop test was rewritten
+    to count overlap instead).
+    """
+
+    def test_a_dedicated_capacity_limiter_is_passed(self, monkeypatch):
+        import anyio.to_thread
+
+        from haf_fyp import api
+
+        # ALL calls, not the last: FastAPI runs the sync endpoint through this same
+        # function, so recording a single value captures the endpoint's call (which
+        # correctly uses the default pool) and never the middleware's.
+        seen = []
+        real = anyio.to_thread.run_sync
+
+        async def spy(func, *a, **kw):
+            seen.append(kw.get("limiter"))
+            return await real(func, *a, **kw)
+
+        monkeypatch.setattr(anyio.to_thread, "run_sync", spy)
+        app, _ = _build(per_ip="3/minute")
+        with TestClient(app) as c:
+            _post(c, VALID)
+
+        dedicated = api._thread_limiter()
+        assert dedicated in seen, (
+            "the limiter check ran on anyio's shared default pool, so a slow Redis "
+            f"starves the threads /health needs (limiters seen: {seen})"
+        )
+        assert dedicated.total_tokens == api._LIMITER_THREAD_SLOTS
+
+
+class TestTheCeilingFailsOpenToo:
+    """Both halves of one request must degrade the same way. Raising here would
+    500 a caller whose per-IP limit was cheerfully skipped a moment earlier."""
+
+    def test_a_ceiling_storage_failure_still_serves(self, real_app, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        monkeypatch.setattr(
+            real_app.limiter.limiter, "hit",
+            lambda *a, **k: (_ for _ in ()).throw(ConnectionError("redis is down")),
+        )
+        c = TestClient(real_app.app, raise_server_exceptions=False)
+        r = c.post("/v1/fyp/admin/algorithm", json={"version": "1.0.0"},
+                   headers={"X-Real-IP": "203.0.113.199", "X-Admin-Key": "wrong"})
+        assert r.status_code == 403, (
+            f"a limiter-storage outage turned a 403 into {r.status_code}; the "
+            "ceiling is failing closed while the per-IP limit fails open"
+        )
+
+
+class TestEarlyChargingRequiresIdentifiableCallers:
+    """The shipped compose leaves TRUSTED_PROXY_IPS empty, so every caller keys on
+    the one edge address. Charging before validation into a SHARED bucket is not a
+    stricter limit, it is a denial of service -- measured in a container behind one
+    edge, twelve malformed POSTs claiming twelve different client IPs 429'd an
+    innocent thirteenth caller. The fix has to switch itself off there."""
+
+    @staticmethod
+    def _real(monkeypatch, trusted):
+        from haf_fyp import api
+
+        monkeypatch.setattr(api, "_TRUSTED_LITERALS", trusted)
+        monkeypatch.setattr(api, "_TRUSTED_NETS", ())
+        monkeypatch.setattr(
+            api.limiter, "_limiter",
+            type(api.limiter._limiter)(__import__("limits.storage", fromlist=["x"]).MemoryStorage()),
+        )
+        api._GLOBAL_CEILINGS.clear()
+        return api
+
+    def test_junk_cannot_lock_out_a_clean_caller_when_the_trust_list_is_empty(
+        self, monkeypatch
+    ):
+        from fastapi.testclient import TestClient
+
+        api = self._real(monkeypatch, frozenset())
+        c = TestClient(api.app)
+        # All from one peer, as a real edge produces. DELETE interests is 5/minute.
+        for _ in range(12):
+            c.request("DELETE", "/v1/fyp/interests", json={"username": "u"})
+        r = c.request("DELETE", "/v1/fyp/interests", json={"username": "u"})
+        assert r.status_code != 429, (
+            "malformed traffic exhausted the shared bucket before validation, so a "
+            "clean caller is locked out -- worse than the bug #28 fixes"
+        )
+
+    def test_and_charging_resumes_once_the_edge_is_declared(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        api = self._real(monkeypatch, frozenset({"testclient"}))
+        c = TestClient(api.app)
+        codes = [
+            c.request("DELETE", "/v1/fyp/interests", json={"username": "u"},
+                      headers={"X-Real-IP": "203.0.113.60"}).status_code
+            for _ in range(6)
+        ]
+        assert codes == [422, 422, 422, 422, 422, 429], codes
+
+    def test_direct_deployments_can_opt_back_in(self, monkeypatch):
+        # `direct` never matches a peer, so the header stays ignored and keying
+        # stays on the socket peer -- which IS per-client with nothing in front.
+        from haf_fyp.api import _parse_trusted
+
+        literals, nets = _parse_trusted("direct")
+        assert literals == frozenset({"direct"}) and nets == ()
+        mw = RateLimitBeforeValidationMiddleware(object(), limiter=_dummy_limiter())
+        monkeypatch.setattr(
+            __import__("haf_fyp.api", fromlist=["x"]), "_TRUSTED_LITERALS", literals
+        )
+        assert mw._early_charge_is_safe() is True
+
+
+def _dummy_limiter():
+    from haf_fyp import api
+
+    return api.limiter

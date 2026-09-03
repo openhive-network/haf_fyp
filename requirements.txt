@@ -17,6 +17,12 @@ slowapi>=0.1.9,<0.2
 # this module names it, so it is declared -- and bounded for the same reason slowapi
 # is: a major bump is free to move any of those three.
 limits>=3.0,<6
+# Named directly by api.py (CapacityLimiter, to_thread.run_sync's limiter=), not
+# just inherited from starlette -- same reason limits is declared above. Bounded
+# below 5 because the CapacityLimiter/to_thread surface this uses is exactly what a
+# major bump is free to move.
+anyio>=4.0,<5
+
 coincurve>=19.0
 base58>=2.1
 tavern>=2.9

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import math
 import ipaddress
 import json
 import logging
@@ -42,6 +43,7 @@ from slowapi.errors import RateLimitExceeded
 # middleware class for the mechanics.
 from slowapi.middleware import _find_route_handler, _get_route_name
 from slowapi.util import get_remote_address
+from starlette._utils import is_async_callable
 from starlette.concurrency import run_in_threadpool
 
 from limits import RateLimitItem
@@ -127,10 +129,18 @@ if not _TRUSTED_LITERALS:
     # caller keys on the proxy's address, i.e. one bucket for the whole internet.
     # That regression has shipped twice already and is invisible at runtime, so it
     # gets the same treatment as HIVE_RPC_URL rather than a comment nobody reads.
-    log.warning(
-        "TRUSTED_PROXY_IPS is not set - rate limits will key on the socket peer. "
-        "Behind a reverse proxy that is ONE SHARED BUCKET for all callers. Set it "
-        "to the edge's address or CIDR."
+    #
+    # ERROR, not warning, since #28: charging a request BEFORE it is validated is
+    # only safe when the bucket identifies the caller. Into a shared bucket it
+    # converts "one bad client wastes CPU" into "one bad client locks everyone
+    # out", which is strictly worse than the bug being fixed -- so the early charge
+    # is DISABLED while this is unset (see RateLimitBeforeValidationMiddleware),
+    # and the app runs with pre-#28 behaviour until an operator says which it is.
+    log.error(
+        "TRUSTED_PROXY_IPS is not set - rate limits will key on the socket peer, "
+        "which behind a reverse proxy is ONE SHARED BUCKET for all callers. "
+        "Pre-validation rate limiting (#28) is DISABLED until this is set. Use the "
+        "edge's address or CIDR, or the literal 'direct' if nothing fronts this app."
     )
 elif any(net.prefixlen == 0 for net in _TRUSTED_NETS):
     # strict=False quietly widens a typo: 10.0.0.5/0 parses as 0.0.0.0/0.
@@ -259,8 +269,24 @@ limiter = Limiter(
 # default 40-token pool anyio shares with every sync endpoint. Without this the fix
 # for the event-loop stall only RAISES the bar: at ~41 concurrent junk requests the
 # checks take every slot and /health stops answering again, which is exactly the
-# HAProxy agent-check failure it was meant to close. Created lazily -- a
-# CapacityLimiter wants a running event loop.
+# HAProxy agent-check failure it was meant to close. Constructed lazily because
+# anyio < 4.2 required a running event loop; 4.13 does not, but anyio is unpinned
+# here, so the laziness stays and this comment says why rather than asserting a
+# fact about the installed version.
+# How long a request will wait to be metered before giving up and being served
+# unmetered. Without a bound, an unresponsive Redis turns the 8 slots above into an
+# unbounded, untimed queue: measured 40 concurrent requests taking 12.5s each and
+# still ending in an error. Failing open after a short wait keeps latency bounded.
+_LIMITER_WAIT_SECONDS = float(os.environ.get("RATE_LIMIT_WAIT_SECONDS", "3"))
+
+# #28's motivating measurement is a BODY SIZE problem -- 704ms of CPU and a ~3.9MB
+# error for one 4MB batch -- and metering per REQUEST bounds the count, not the cost.
+# One address staying inside its 120/minute still drove ~110s of server work and
+# ~250MB of 422 bodies per minute, because uvicorn has no body cap, the nginx
+# rewriter fronts only PostgREST, and EventsBatch's 200-event cap is enforced only
+# after the whole document has been parsed. This is the cheap, direct bound.
+_MAX_BODY_BYTES = int(os.environ.get("MAX_REQUEST_BODY_BYTES", 256 * 1024))
+
 _LIMITER_THREAD_SLOTS = 8
 _limiter_threads: anyio.CapacityLimiter | None = None
 
@@ -346,7 +372,8 @@ _REQUIRED_SLOWAPI_INTERNALS = (
 # The global ceilings: charged AFTER validation, deliberately (#28)
 # ---------------------------------------------------------------------------
 #
-# These used to be a second @limiter.limit decorator alongside the per-IP one, so
+# (defined below.) These used to be a second @limiter.limit decorator alongside
+# the per-IP one, so
 # once the middleware below started charging before the body was parsed, BOTH were
 # charged on a request that then 422'd. That handed anyone a new lever the per-IP
 # design specifically exists to deny: malformed traffic, spread over a handful of
@@ -372,8 +399,8 @@ _REQUIRED_SLOWAPI_INTERNALS = (
 class _Ceiling:
     """The two attributes RateLimitExceeded reads off a slowapi Limit.
 
-    Constructing a real slowapi Limit would mean calling LimitGroup positionally,
-    and its argument list is exactly the kind of thing a release moves. This keeps
+    Constructing a real slowapi Limit means a nine-argument positional call, and
+    that argument list is exactly the kind of thing a release moves. This keeps
     the 429 body byte-identical to the decorator's -- str(item), i.e.
     {"error": "Rate limit exceeded: 600 per 1 minute"} -- with no such coupling.
     """
@@ -416,15 +443,15 @@ def _charge_global_ceiling(request: Request, spec: str, per_method: bool = False
 
     try:
         allowed = limiter.limiter.hit(item, *args)
-    except Exception:
-        # Going through hit() directly means slowapi's own storage-error policy in
-        # _check_request_limit does not apply, so honour the part of it that is
-        # configurable. Default (unset) re-raises, which is what the ceiling did as
-        # a decorator: a storage outage surfaces rather than silently uncapping.
-        if getattr(limiter, "_swallow_errors", False):
-            log.warning("ceiling storage unreachable; allowing %s", scope)
-            return
-        raise
+    except Exception as exc:
+        # FAIL OPEN, and throttled -- the same policy the middleware applies to the
+        # per-IP limit, so the two halves of one request cannot diverge during an
+        # outage. Raising here instead would 500 a request whose per-IP limit was
+        # cheerfully skipped a moment earlier, and slowapi's own three-branch policy
+        # (in-memory fallback / swallow / raise) is not reachable from a direct
+        # hit() call anyway.
+        RateLimitBeforeValidationMiddleware.log_storage_failure(exc)
+        return
 
     if not allowed:
         # Mirrors __evaluate_limits' failure path: record the limit that failed so
@@ -445,8 +472,11 @@ class RateLimitBeforeValidationMiddleware:
     anyio task group and a streaming-response bridge in front of every request.
     """
 
-    def __init__(self, app, limiter=None):
+    def __init__(self, app, limiter=None, early=None):
         self.app = app
+        # None = decide per request from TRUSTED_PROXY_IPS, so a test (or a reload)
+        # that changes the trust list is honoured. True/False force it.
+        self._early = early
         # Defaults to this module's limiter, which is the one the real app installs;
         # taking it as an argument is what lets a test drive a fresh, isolated one.
         self.limiter = limiter if limiter is not None else globals()["limiter"]
@@ -479,6 +509,26 @@ class RateLimitBeforeValidationMiddleware:
                 "RateLimitBeforeValidationMiddleware would stop metering silently."
             )
 
+    def _early_charge_is_safe(self) -> bool:
+        """Only meter before validation when the bucket can tell callers apart.
+
+        With TRUSTED_PROXY_IPS unset every caller keys on the socket peer, which
+        behind this stack's Caddy -> Varnish -> HAProxy chain is one address for the
+        whole internet. Charging pre-validation into that shared bucket is not a
+        stricter limit, it is a denial of service: measured in a container behind a
+        single edge, twelve malformed POSTs claiming twelve different client IPs
+        429'd an innocent thirteenth caller who had sent nothing. On develop the
+        same twelve cost nothing.
+
+        So the fix switches itself off rather than shipping that. `direct` (or any
+        value) in TRUSTED_PROXY_IPS re-enables it: it never matches a real peer, so
+        the header stays ignored and keying stays on the peer -- which IS per-client
+        when nothing fronts the app.
+        """
+        if self._early is not None:
+            return self._early
+        return bool(_TRUSTED_LITERALS)
+
     def _is_limited(self, handler) -> bool:
         if handler is None:
             return False
@@ -505,13 +555,19 @@ class RateLimitBeforeValidationMiddleware:
         handler = _find_route_handler(scope["app"].routes, scope)
         # No route match (404, or a method this path does not serve), and routes
         # with no decorator of their own: nothing to charge, behave as before.
-        if not self._is_limited(handler):
+        if not self._is_limited(handler) or not self._early_charge_is_safe():
             return await self.app(scope, receive, send)
 
         # Built for the key func and the handler only. Do NOT read the body here --
         # `receive` is handed on to the app untouched, and consuming it (even to log
         # a size) leaves the endpoint waiting on a stream that will never arrive.
         request = Request(scope, receive=receive)
+
+        # Cheapest possible rejection, and it happens after metering so it still
+        # costs the sender its allowance. Content-Length is absent on a chunked
+        # request, which this cannot pre-empt -- the per-IP limit is the bound there.
+        declared = request.headers.get("content-length")
+
         try:
             # OFF THE EVENT LOOP, AND OFF THE SHARED POOL. With REDIS_URL set
             # (docker/docker-compose.yml, the deployed config) the limiter storage
@@ -532,77 +588,103 @@ class RateLimitBeforeValidationMiddleware:
             # in_middleware is passed BY KEYWORD: slowapi already carries a `cost`
             # argument on limit(), and a future release inserting one positionally
             # ahead of it would turn our False into a cost and stop metering.
-            await anyio.to_thread.run_sync(
-                functools.partial(
-                    self.limiter._check_request_limit,
-                    request,
-                    handler,
-                    in_middleware=False,
-                ),
-                limiter=_thread_limiter(),
-            )
+            with anyio.fail_after(_LIMITER_WAIT_SECONDS):
+                await anyio.to_thread.run_sync(
+                    functools.partial(
+                        self.limiter._check_request_limit,
+                        request,
+                        handler,
+                        in_middleware=False,
+                    ),
+                    # abandon_on_cancel: without it the wait below cannot actually
+                    # end -- run_sync waits for the worker to finish even when the
+                    # surrounding scope is cancelled, so fail_after would bound only
+                    # the queue for a slot, not a call already in flight. Abandoned,
+                    # the thread finishes into nothing; its late write to
+                    # view_rate_limit is harmless because the request is already
+                    # marked complete and header injection is off.
+                    abandon_on_cancel=True,
+                    limiter=_thread_limiter(),
+                )
         except RateLimitExceeded as exc:
             return await self._reject(scope, receive, send, request, exc)
         except Exception as exc:
-            # Limiter storage unreachable (Redis down). Fall THROUGH rather than
-            # answering 500 here: the decorator inside the endpoint attempts the
-            # same check and fails the same way, which reproduces pre-#28 behaviour
-            # exactly -- an invalid body still gets its 422, a valid one still gets
-            # the 500 it always got. Answering from here instead would turn every
-            # malformed request into a bare text/plain 500 for the duration of the
-            # outage, because this middleware sits outside ExceptionMiddleware.
-            # Deliberately does NOT mark the request complete, so the retry happens.
+            # FAIL OPEN. The limiter protects against abuse; it is not part of
+            # answering the request correctly, so a storage outage degrades limiting
+            # rather than the service.
             #
-            # NOTE the retry is only safe while a route carries a single Limit:
-            # __evaluate_limits restarts from the top, so if an earlier hit()
-            # succeeded and a later one raised, the earlier bucket is charged twice.
-            # One decorator per route today, and a multi-limit string
-            # ("10/minute;3/second") is enough to break that --
-            # test_every_limited_route_carries_exactly_one_limit pins it.
+            # The previous revision fell through WITHOUT marking the request
+            # complete, so slowapi's decorator retried the same check inside the
+            # endpoint. With socket timeouts on the storage that is actively
+            # harmful: the INCR reaches Redis, the client times out, the decorator
+            # issues the SAME INCR again, and the caller's bucket drains at 2x while
+            # the request 500s anyway -- measured, 2 EVALSHA for one request. It also
+            # doubled request latency and, because the fall-through sat inside this
+            # `except`, chained this frame into every resulting uvicorn traceback:
+            # 16KB of log per request, ~7x what the throttle below was sized for.
             #
-            # THROTTLED, and warning rather than exception: this fires on the one
-            # path that by construction charges nothing, so a single client can
-            # drive it as fast as it can send. A full traceback per request measured
-            # ~2.3 KB -- roughly 19 GB/day from one sender -- and an unrotated log
-            # filling the pool is how this fleet has taken a node down before.
-            self._log_storage_failure(exc)
-            return await self.app(scope, receive, send)
+            # view_rate_limit must be set explicitly: __evaluate_limits assigns it
+            # only after its loop, so a hit() that raised leaves it absent, and
+            # slowapi's decorator dereferences it eagerly on the way out (500).
+            self.log_storage_failure(exc)
+            request.state.view_rate_limit = None
 
         # Shared with the Request the endpoint receives (both are built from this
         # scope, and Starlette backs .state with scope["state"]), so slowapi's
         # decorator sees it and skips its own check rather than charging twice.
         request.state._rate_limiting_complete = True
+
+        if declared is not None and declared.isdigit() and int(declared) > _MAX_BODY_BYTES:
+            return await self._too_large(scope, receive, send, int(declared))
+
         return await self.app(scope, receive, send)
 
-    _last_storage_failure_log = 0.0
+    @staticmethod
+    async def _too_large(scope, receive, send, size: int):
+        body = json.dumps({
+            "detail": f"request body of {size} bytes exceeds the "
+                      f"{_MAX_BODY_BYTES}-byte limit"
+        }).encode()
+        await send({
+            "type": "http.response.start", "status": 413,
+            "headers": [(b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode())],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+    # -inf, not 0.0: time.monotonic() is uptime on Linux, so a 0.0 sentinel silently
+    # swallows the FIRST failure when the container starts within the interval of
+    # host boot -- exactly when Redis is likeliest to be missing.
+    _last_storage_failure_log = -math.inf
+    _last_storage_failure_kind: str | None = None
+    _suppressed_storage_failures = 0
     _STORAGE_FAILURE_LOG_INTERVAL = 60.0
 
     @classmethod
-    def _log_storage_failure(cls, exc) -> None:
-        now = time.monotonic()
-        if now - cls._last_storage_failure_log < cls._STORAGE_FAILURE_LOG_INTERVAL:
-            return
-        cls._last_storage_failure_log = now
-        log.warning(
-            "rate-limit storage failed (%s: %s); deferring to the endpoint. "
-            "Further occurrences suppressed for %.0fs.",
-            type(exc).__name__, exc, cls._STORAGE_FAILURE_LOG_INTERVAL,
-        )
+    def log_storage_failure(cls, exc) -> None:
+        """One line per interval, with a count, and immediately on a NEW error kind.
 
-    @staticmethod
-    def _is_async_callable(obj) -> bool:
-        """What starlette._utils.is_async_callable does, without importing it.
-
-        inspect.iscoroutinefunction says False for an object with an async
-        __call__, which Starlette accepts as a handler. The isawaitable re-check
-        below would still return the right response, but only after spending a
-        threadpool slot to build the coroutine -- on the 429 path, during the
-        flood the 429 exists to shed.
+        This fires on paths that by construction charge nothing, so a single client
+        drives it as fast as it can send; an unrotated log filling the pool is how
+        this fleet has taken a node down before. But a bare time window hides two
+        things an operator needs: how big the outage is, and a DIFFERENT failure
+        arriving mid-window (a timeout at t=0 would mask rotated credentials at
+        t=10s). Hence the count and the kind.
         """
-        while isinstance(obj, functools.partial):
-            obj = obj.func
-        return inspect.iscoroutinefunction(obj) or (
-            callable(obj) and inspect.iscoroutinefunction(getattr(obj, "__call__", None))
+        now = time.monotonic()
+        kind = type(exc).__name__
+        due = now - cls._last_storage_failure_log >= cls._STORAGE_FAILURE_LOG_INTERVAL
+        if not due and kind == cls._last_storage_failure_kind:
+            cls._suppressed_storage_failures += 1
+            return
+        suppressed = cls._suppressed_storage_failures
+        cls._suppressed_storage_failures = 0
+        cls._last_storage_failure_log = now
+        cls._last_storage_failure_kind = kind
+        log.warning(
+            "rate-limit storage failed (%s: %s); serving unmetered. "
+            "%d further occurrence(s) suppressed since the last line.",
+            kind, exc, suppressed,
         )
 
     @staticmethod
@@ -640,7 +722,7 @@ class RateLimitBeforeValidationMiddleware:
 
         # Starlette runs a sync handler in a threadpool; a user-supplied one is free
         # to do blocking work, and this middleware is on the event loop.
-        if RateLimitBeforeValidationMiddleware._is_async_callable(handle):
+        if is_async_callable(handle):
             response = await handle(request, exc)
         else:
             response = await run_in_threadpool(handle, request, exc)
@@ -1334,7 +1416,12 @@ def delete_interests(request: Request, req: InterestsDeleteRequest):
 # 120/min per IP is deliberately generous -- a sendBeacon flush every few seconds is
 # ~20/min, and CGNAT means many real users can share one address. It is charged BEFORE
 # the body is parsed (#28), so a malformed batch spends the sender's own allowance
-# instead of being answered 422 for free. That is what bounds total CPU here.
+# instead of being answered 422 for free.
+#
+# That bounds the NUMBER of requests, not the cost of each: metering alone still let
+# one address inside its allowance drive ~110s of server work and ~250MB of 422
+# bodies per minute. The bound on cost is _MAX_BODY_BYTES, enforced in the same
+# middleware -- the two together are what bounds total CPU here.
 #
 # The 600/min ceiling is charged from inside the body instead (_charge_global_ceiling),
 # so only ACCEPTED batches spend it: 600/min x 200 events = 120k rows/min = 7.2M/hour,
@@ -1415,18 +1502,26 @@ def post_events(request: Request, req: EventsBatch):
 
 
 @app.post("/v1/fyp/admin/algorithm")
-# The 30/min ceiling bounds brute-forcing the API key. 30, not 10: at 10 the ratio to
-# the per-IP limit is 2:1, so two source IPs staying inside their own allowance
-# consume the whole ceiling and lock the real admin out indefinitely. 6x headroom
-# matches the other three endpoints, and 30/min is nowhere near brute-forcing a
-# 256-bit key.
+# The 30/min ceiling bounds brute-forcing the API key, and is charged ONLY when the
+# key is wrong (see the body). Three consequences, none of them obvious:
 #
-# It is charged inside the body, ahead of the API-key check, so it still bounds
-# well-formed guessing -- but a request with no X-Admin-Key header at all is a 422
-# from FastAPI and never reaches it. That distinction is the point: while the ceiling
-# was a decorator charged before validation, 8 addresses sending header-less junk
-# (each inside its own 5/min, so never throttled) drained the shared 30 and locked
-# the real admin out. Only the per-IP limit is charged before the body is parsed.
+#   * A wrong guess spends it, so guessing stays bounded at 30/min however many
+#     addresses it comes from.
+#   * The holder of the CORRECT key never spends it, so guessers cannot lock the
+#     real admin out. Charging ahead of the comparison -- which two earlier
+#     revisions did, one of them with a comment arguing for it -- priced that
+#     lockout at six addresses rather than preventing it: 6 IPs x 5 wrong guesses,
+#     each inside its own 5/minute so never throttled, left the real admin holding
+#     a 429. The old "30, not 10, for 6x headroom" argument was about that ratio and
+#     is moot now: no ratio makes a lockout possible on this path.
+#   * SUCCESSFUL activations are therefore bounded by the per-IP 5/minute alone,
+#     which multiplies by source address. Each one runs two full-table UPDATEs. That
+#     is accepted rather than overlooked: it requires a VALID key, so the actor is
+#     already authenticated, and the answer to a leaked key is rotation rather than
+#     a shared bucket that a guesser could exhaust on the admin's behalf.
+#
+# A request with no X-Admin-Key header at all is a 422 from FastAPI and reaches
+# neither branch. Only the per-IP limit is charged before the body is parsed.
 @limiter.limit("5/minute")
 def activate_algorithm(
     request: Request,
