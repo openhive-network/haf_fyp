@@ -529,8 +529,8 @@ DECLARE
               }
             }
           },
-          "503": {
-            "description": "Temporarily unavailable, and the two cases are distinguished by message rather than by status. Either the HAF instance is still in massive sync (hafd.blocks' primary key is dropped for the duration, so the call fails fast instead of seq-scanning the largest table in the database), or the HAF context is missing or not visible to the reader. Both are raised as SQLSTATE 53000, which PostgREST maps to 503.",
+          "500": {
+            "description": "Unavailable, and the two cases are distinguished by message rather than by status. Either the HAF instance is still in massive sync (hafd.blocks' primary key is dropped for the duration, so the call fails fast instead of seq-scanning the largest table in the database), or the HAF context is not registered on this node. Both are raised as SQLSTATE 55000 -- the code every other HAF app uses for the massive-sync guard -- which PostgREST maps to 500. 503 would be the better status for a temporary condition, but it is not what the ecosystem does, and one app diverging is worse than the imperfection; changing it belongs everywhere at once.",
             "content": {
               "application/json": {
                 "schema": {
@@ -538,7 +538,7 @@ DECLARE
                   "properties": {
                     "code": {
                       "type": "string",
-                      "description": "PostgreSQL SQLSTATE, '53000' for both cases"
+                      "description": "PostgreSQL SQLSTATE, '55000' for both cases"
                     },
                     "message": {
                       "type": "string"
@@ -558,7 +558,7 @@ DECLARE
                   }
                 },
                 "example": {
-                  "code": "53000",
+                  "code": "55000",
                   "message": "HAF instance is not ready (massive sync in progress)",
                   "details": null,
                   "hint": null
@@ -1193,14 +1193,17 @@ $$;
             example:
               last_block_num: 109603308
               last_block_time: '2026-09-03T22:46:54'
-      '503':
+      '500':
         description: >-
-          Temporarily unavailable, and the two cases are distinguished by message
-          rather than by status. Either the HAF instance is still in massive sync
-          (hafd.blocks' primary key is dropped for the duration, so the call fails
-          fast instead of seq-scanning the largest table in the database), or the
-          HAF context is missing or not visible to the reader. Both are raised as
-          SQLSTATE 53000, which PostgREST maps to 503.
+          Unavailable, and the two cases are distinguished by message rather than by
+          status. Either the HAF instance is still in massive sync (hafd.blocks'
+          primary key is dropped for the duration, so the call fails fast instead of
+          seq-scanning the largest table in the database), or the HAF context is not
+          registered on this node. Both are raised as SQLSTATE 55000 -- the code
+          every other HAF app uses for the massive-sync guard -- which PostgREST
+          maps to 500. 503 would be the better status for a temporary condition, but
+          it is not what the ecosystem does, and one app diverging is worse than the
+          imperfection; changing it belongs everywhere at once.
         content:
           application/json:
             schema:
@@ -1208,7 +1211,7 @@ $$;
               properties:
                 code:
                   type: string
-                  description: PostgreSQL SQLSTATE, '53000' for both cases
+                  description: PostgreSQL SQLSTATE, '55000' for both cases
                 message:
                   type: string
                 details:
@@ -1220,7 +1223,7 @@ $$;
                     - string
                     - "null"
             example:
-              code: '53000'
+              code: '55000'
               message: HAF instance is not ready (massive sync in progress)
               details: null
               hint: null
@@ -1244,15 +1247,20 @@ BEGIN
     -- and haf_fyp_user deliberately stays out of that group. The definer owns the
     -- massive-sync guard and the context name; this function owns only the wire format.
     --
-    -- The definer raises 55000 for "instance not ready". PostgREST does not map that
-    -- class to 503, so it is re-raised as 53000 here: a freshness probe that answers
-    -- 500 during massive sync is indistinguishable from a broken app, and every other
-    -- HAF app answers 503 for this case.
-    BEGIN
-        SELECT * INTO _s FROM haf_fyp_app.sync_status();
-    EXCEPTION WHEN SQLSTATE '55000' THEN
-        RAISE EXCEPTION '%', SQLERRM USING ERRCODE = '53000';
-    END;
+    -- The definer's 55000 ("instance not ready") is passed straight through, because
+    -- 55000 is the ecosystem standard for this condition: hafah, haf_block_explorer,
+    -- reputation_tracker, balance_tracker, nft_tracker and hivesense all raise exactly
+    -- that, and so does haf_fyp's own definer. haf_stats is the only app using 53000.
+    --
+    -- An earlier revision here re-raised it as 53000 so PostgREST would answer 503
+    -- rather than 500 (it maps 53xxx -> 503 and 55xxx -> 500). 503 IS the better
+    -- status for a temporary, self-healing condition -- but making one app diverge is
+    -- worse than the imperfection: a consumer written against HAF apps would then get
+    -- 500 from six of them and 503 from this one for the identical state, which
+    -- defeats the point of a uniform endpoint. It also changes nothing for the health
+    -- check, since HAProxy's `expect status 200` rejects both. If 503 is right it
+    -- should change everywhere at once -- filed separately.
+    SELECT * INTO _s FROM haf_fyp_app.sync_status();
 
     -- Zero rows means the HAF context has not been registered yet, or it was removed.
     -- Answering 200 with a null body would merge those with "healthy" and hide a
@@ -1265,9 +1273,12 @@ BEGIN
     -- 42501 on an anonymous request to 401, not 503. A probe expecting 200-or-503
     -- misreads that as an auth failure. Detecting it belongs in the installer's
     -- privilege checks, not here.
+    -- No other app has this branch -- hafah and friends build the JSON unconditionally
+    -- -- so it is an addition rather than a divergence, and it uses the SAME error
+    -- class as the guard above so haf_fyp emits exactly one, like every other app.
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'HAF context ''haf_fyp'' is not visible: the app is not installed on this node, its context was removed, or haf_fyp_owner lost its hive_applications_group membership'
-            USING ERRCODE = '53000';
+        RAISE EXCEPTION 'HAF context ''haf_fyp'' is not registered on this node, or it was removed'
+            USING ERRCODE = '55000';
     END IF;
 
     -- Two keys only. The CONTRACT is the key names and the timestamp format --

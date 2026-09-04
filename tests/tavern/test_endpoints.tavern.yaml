@@ -233,14 +233,18 @@ stages:
         last_block_time: "2016-09-15T19:47:21"
 
 ---
-test_name: Sync status - the documented 503 contract (#34)
+test_name: Sync status - the documented error contract (#34)
 
-# Both 503 conditions were documented in the OpenAPI response schema and asserted
-# nowhere, so dropping the 55000 -> 53000 remap turned every massive-sync probe into
-# a 500 with the suite still green. HAProxy would still mark the backend DOWN (it
-# rejects any non-200), but the schema this MR adds would be a lie and every other
-# consumer -- status-api, monitoring, retry logic that distinguishes transient 5xx --
-# would see a hard error instead of "temporarily unavailable".
+# The documented error conditions were asserted nowhere, so the endpoint could stop
+# raising -- or start raising a different SQLSTATE than the schema declares -- with
+# the suite still green.
+#
+# 55000 is the ecosystem standard for the massive-sync guard: hafah,
+# haf_block_explorer, reputation_tracker, balance_tracker, nft_tracker and hivesense
+# all raise it, and so does haf_fyp's own definer. PostgREST maps it to 500. An
+# earlier revision of this MR re-raised it as 53000 to get a 503, which reads better
+# for a temporary condition but made this the only app answering differently for the
+# identical state.
 #
 # hive.ci_instance_state is the stub's readiness flag, designed to be flipped
 # (tests/haf_stub.sql). ci_set_instance_ready is a CI-only RPC over it.
@@ -258,14 +262,14 @@ stages:
     response:
       status_code: 200
 
-  - name: sync-status answers 503 with SQLSTATE 53000, not 500
+  - name: sync-status raises SQLSTATE 55000, the ecosystem standard
     request:
       url: "{api_url}/rpc/get_sync_status"
       method: GET
     response:
-      status_code: 503
+      status_code: 500
       json:
-        code: "53000"
+        code: "55000"
         message: "HAF instance is not ready (massive sync in progress)"
         details: null
         hint: null
@@ -275,7 +279,7 @@ stages:
       url: "{rewriter_url}/sync-status"
       method: GET
     response:
-      status_code: 503
+      status_code: 500
 
   - name: restore readiness so later stages are unaffected
     request:
