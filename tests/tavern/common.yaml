@@ -4,4 +4,5 @@ description: Shared variables for all haf_fyp Tavern tests
 
 variables:
   api_url: "{tavern.env_vars.API_URL}"
+  rewriter_url: "{tavern.env_vars.REWRITER_URL}"
   fastapi_url: "{tavern.env_vars.FASTAPI_URL}"

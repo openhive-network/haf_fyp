@@ -1092,13 +1092,19 @@ def sync_status(response: Response):
     staleness in a single call (age = now() - last_block_time) with no separate
     head-block reference.
 
-    Served ONLY on this FastAPI overlay (port 3002), as #16 specifies. Note that
-    haf_api_node's agent checks probe http://<app>-postgrest-rewriter:80/sync-status,
-    and haf_fyp's rewrite rules have no /sync-status entry — its catch-all maps it
-    to /rpc/sync-status, which does not exist. A haf_api_node profile must
-    therefore point its *_HEALTH_URL at this port, or #17 must add a PostgREST
-    twin (haf_fyp_endpoints.get_fyp_sync_status) so the standard probe URL works
-    and the rewriter -> postgrest -> postgres path is what gets exercised.
+    NOT the endpoint to monitor. Since #34 the same contract is also served by
+    haf_fyp_endpoints.get_sync_status through the rewriter, at the standard
+    http://<app>-postgrest-rewriter:80/sync-status, and THAT is what a
+    haf_api_node profile should point *_HEALTH_URL at: it exercises the real
+    request path (rewriter -> postgrest -> postgres), so a wedged postgrest or
+    rewriter shows up. This one bypasses both and cannot see either.
+
+    It stays because it is useful on its own -- port 3002 is reachable when the
+    postgrest side is broken, which is exactly when you want to ask.
+
+    Both call the same haf_fyp_app.sync_status() definer, so they cannot disagree
+    on DATA. They can disagree on FORMAT, because the wire format is implemented
+    twice: to_char(...) in SQL and format_block_time() here. Keep them in step.
 
     Read from hafd.contexts.current_block_num for the 'haf_fyp' context, LEFT
     JOINed to hafd.blocks for that block's created_at. last_block_time is null

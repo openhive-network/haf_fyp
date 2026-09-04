@@ -49,6 +49,7 @@ services:
         PGOPTIONS="-c role=ci_restricted_installer" PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /cross_schema_grants.sql > /tmp/restricted.log 2>&1; __rc=$$?; cat /tmp/restricted.log; [ "$$__rc" -eq 0 ] &&
         grep -q "could not set default privileges for owner role" /tmp/restricted.log &&
         grep -q "Self-healing incomplete" /tmp/restricted.log &&
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_test_hooks.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_privileges.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_invariants.sql
     volumes:
@@ -57,6 +58,9 @@ services:
       # grants on top of these tables.
       - ../tests/haf_stub.sql:/haf_stub.sql:ro
       - ../tests/ci_setup.sql:/ci_setup.sql:ro
+      # CI-only: lets a tavern stage drive the stub's readiness flag over HTTP so
+      # the documented 503 contract is asserted rather than only described.
+      - ../tests/ci_test_hooks.sql:/ci_test_hooks.sql:ro
       # #20: the SHIPPED app_version DDL, not a copy. db/haf_fyp_app.sql cannot be loaded
       # in this lane (it calls the hive.* API the stub does not implement), which is why
       # this table's DDL lives in its own file -- so tests/ci_invariants.sql probes the
@@ -122,6 +126,22 @@ services:
       setup:
         condition: service_completed_successfully
 
+  # The rewriter, built from the SHIPPED Dockerfile -- not a stand-in. Without a
+  # lane that requests a public path through it, endpoints/rewrite_rules.conf is
+  # built into an image and never exercised: removing the /sync-status rule, moving
+  # it after the catch-all, or typo'ing its target all leave the suite green while
+  # HAProxy marks the backend DOWN. Verified: all three mutations pass CI without
+  # this service.
+  rewriter:
+    build:
+      context: ..
+      dockerfile: Dockerfile.rewriter
+    environment:
+      POSTGREST_HOST: postgrest
+      POSTGREST_PORT: 3000
+    depends_on:
+      - postgrest
+
   tavern:
     image: python:3.12-slim
     command: >
@@ -131,6 +151,9 @@ services:
       - ../tests/tavern:/tests/tavern:ro
     environment:
       API_URL: "http://postgrest:3000"
+      # The public path an operator (and HAProxy) actually requests.
+      REWRITER_URL: "http://rewriter"
       FASTAPI_URL: "http://localhost:9999"
     depends_on:
       - postgrest
+      - rewriter

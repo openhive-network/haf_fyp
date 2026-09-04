@@ -487,6 +487,88 @@ DECLARE
         }
       }
     },
+    "/sync-status": {
+      "get": {
+        "tags": [
+          "Other"
+        ],
+        "summary": "Sync status",
+        "description": "Last block consumed by the haf_fyp HAF context, and its timestamp. The uniform HAF-app freshness endpoint: same two keys and the same timestamp format as haf_stats' /sync-status. NOTE this reports REACHABILITY and the context head, not liveness -- a stalled app whose context sits at block 0 answers 200 with a null timestamp, which is a state observed in the wild (tests/ci_invariants.sql). Pair it with a block-freshness agent-check, as haf_api_node does for its own apps.",
+        "operationId": "haf_fyp_endpoints.get_sync_status",
+        "responses": {
+          "200": {
+            "description": "last_block_time is null when that block has no hafd.blocks row - i.e. nothing has been processed yet (there is no block 0), or the node is pruned and the context is behind the prune tail.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "x-sql-datatype": "JSON",
+                  "type": "object",
+                  "required": [
+                    "last_block_num",
+                    "last_block_time"
+                  ],
+                  "properties": {
+                    "last_block_num": {
+                      "type": "integer",
+                      "description": "last block consumed by the haf_fyp HAF context"
+                    },
+                    "last_block_time": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "date-time",
+                      "description": "UTC timestamp of that block; null if it has no hafd.blocks row"
+                    }
+                  }
+                },
+                "example": {
+                  "last_block_num": 109603308,
+                  "last_block_time": "2026-09-03T22:46:54"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unavailable, and the two cases are distinguished by message rather than by status. Either the HAF instance is still in massive sync (hafd.blocks' primary key is dropped for the duration, so the call fails fast instead of seq-scanning the largest table in the database), or the HAF context is not registered on this node. Both are raised as SQLSTATE 55000 -- the code every other HAF app uses for the massive-sync guard -- which PostgREST maps to 500. 503 would be the better status for a temporary condition, but it is not what the ecosystem does, and one app diverging is worse than the imperfection; changing it belongs everywhere at once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "description": "PostgreSQL SQLSTATE, '55000' for both cases"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "hint": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "55000",
+                  "message": "HAF instance is not ready (massive sync in progress)",
+                  "details": null,
+                  "hint": null
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/fyp/algorithm": {
       "get": {
         "tags": [
@@ -1066,6 +1148,155 @@ AS $$
         (SELECT git_hash FROM haf_fyp_app.app_version LIMIT 1) AS version
     FROM haf_fyp_app.app_status s
     LIMIT 1;
+$$;
+
+/** openapi:paths
+/sync-status:
+  get:
+    tags:
+      - Other
+    summary: Sync status
+    description: >-
+      Last block consumed by the haf_fyp HAF context, and its timestamp. The
+      uniform HAF-app freshness endpoint: same two keys and the same timestamp
+      format as haf_stats' /sync-status. NOTE this reports REACHABILITY and the
+      context head, not liveness -- a stalled app whose context sits at block 0
+      answers 200 with a null timestamp, which is a state observed in the wild
+      (tests/ci_invariants.sql). Pair it with a block-freshness agent-check, as
+      haf_api_node does for its own apps.
+    operationId: haf_fyp_endpoints.get_sync_status
+    responses:
+      '200':
+        description: >-
+          last_block_time is null when that block has no hafd.blocks row - i.e.
+          nothing has been processed yet (there is no block 0), or the node is
+          pruned and the context is behind the prune tail.
+        content:
+          application/json:
+            schema:
+              x-sql-datatype: JSON
+              type: object
+              required: [last_block_num, last_block_time]
+              properties:
+                last_block_num:
+                  type: integer
+                  description: last block consumed by the haf_fyp HAF context
+                last_block_time:
+                  # ["string", "null"], not `nullable: true`: this document declares
+                  # openapi 3.1.0, where `nullable` was removed and is inert.
+                  type:
+                    - string
+                    - "null"
+                  format: date-time
+                  description: >-
+                    UTC timestamp of that block; null if it has no hafd.blocks row
+            example:
+              last_block_num: 109603308
+              last_block_time: '2026-09-03T22:46:54'
+      '500':
+        description: >-
+          Unavailable, and the two cases are distinguished by message rather than by
+          status. Either the HAF instance is still in massive sync (hafd.blocks'
+          primary key is dropped for the duration, so the call fails fast instead of
+          seq-scanning the largest table in the database), or the HAF context is not
+          registered on this node. Both are raised as SQLSTATE 55000 -- the code
+          every other HAF app uses for the massive-sync guard -- which PostgREST
+          maps to 500. 503 would be the better status for a temporary condition, but
+          it is not what the ecosystem does, and one app diverging is worse than the
+          imperfection; changing it belongs everywhere at once.
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                code:
+                  type: string
+                  description: PostgreSQL SQLSTATE, '55000' for both cases
+                message:
+                  type: string
+                details:
+                  type:
+                    - string
+                    - "null"
+                hint:
+                  type:
+                    - string
+                    - "null"
+            example:
+              code: '55000'
+              message: HAF instance is not ready (massive sync in progress)
+              details: null
+              hint: null
+ */
+-- openapi-generated-code-begin
+DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_sync_status;
+CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_sync_status()
+RETURNS JSON
+-- openapi-generated-code-end
+LANGUAGE plpgsql STABLE
+AS $$
+DECLARE
+    _s RECORD;
+BEGIN
+    -- Never cache: a freshness probe served from cache reports the cache's age,
+    -- not the app's. HAProxy's per-app backend check reads this endpoint.
+    PERFORM set_config('response.headers', '[{"Cache-Control": "public, max-age=0"}]', true);
+
+    -- haf_fyp_app.sync_status() is SECURITY DEFINER (db/sync_status.sql): hafd.contexts
+    -- has RLS whose only application SELECT policy is granted TO hive_applications_group,
+    -- and haf_fyp_user deliberately stays out of that group. The definer owns the
+    -- massive-sync guard and the context name; this function owns only the wire format.
+    --
+    -- The definer's 55000 ("instance not ready") is passed straight through, because
+    -- 55000 is the ecosystem standard for this condition: hafah, haf_block_explorer,
+    -- reputation_tracker, balance_tracker, nft_tracker and hivesense all raise exactly
+    -- that, and so does haf_fyp's own definer. haf_stats is the only app using 53000.
+    --
+    -- An earlier revision here re-raised it as 53000 so PostgREST would answer 503
+    -- rather than 500 (it maps 53xxx -> 503 and 55xxx -> 500). 503 IS the better
+    -- status for a temporary, self-healing condition -- but making one app diverge is
+    -- worse than the imperfection: a consumer written against HAF apps would then get
+    -- 500 from six of them and 503 from this one for the identical state, which
+    -- defeats the point of a uniform endpoint. It also changes nothing for the health
+    -- check, since HAProxy's `expect status 200` rejects both. If 503 is right it
+    -- should change everywhere at once -- filed separately.
+    SELECT * INTO _s FROM haf_fyp_app.sync_status();
+
+    -- Zero rows means the HAF context has not been registered yet, or it was removed.
+    -- Answering 200 with a null body would merge those with "healthy" and hide a
+    -- misconfiguration behind a healthy-looking response.
+    --
+    -- It does NOT cover haf_fyp_owner losing hive_applications_group. That was the
+    -- original claim here and it is wrong: the definer's FIRST statement calls
+    -- hive.is_instance_ready(), whose EXECUTE comes only through that group, so the
+    -- loss raises 42501 before any RLS-filtered row is read -- and PostgREST maps
+    -- 42501 on an anonymous request to 401, not 503. A probe expecting 200-or-503
+    -- misreads that as an auth failure. Detecting it belongs in the installer's
+    -- privilege checks, not here.
+    -- No other app has this branch -- hafah and friends build the JSON unconditionally
+    -- -- so it is an addition rather than a divergence, and it uses the SAME error
+    -- class as the guard above so haf_fyp emits exactly one, like every other app.
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'HAF context ''haf_fyp'' is not registered on this node, or it was removed'
+            USING ERRCODE = '55000';
+    END IF;
+
+    -- Two keys only. The CONTRACT is the key names and the timestamp format --
+    -- literal 'T', 19 characters, no fractional seconds, no timezone suffix --
+    -- because consumers parse it with a fixed format, so drift there is a silent
+    -- breaking change.
+    --
+    -- Byte-identical to haf_stats' /sync-status, which builds it the same way.
+    -- NOT byte-identical to this app's own FastAPI twin: json_build_object (json,
+    -- not jsonb) emits spaces around colons, `{"k" : v}`, where FastAPI emits
+    -- `{"k":v}`. Semantically identical, and no consumer should be byte-comparing
+    -- JSON -- but do not restate the stronger claim, it was measured false.
+    -- hafbe, hafah and balance_tracker serve no /sync-status at all.
+    RETURN json_build_object(
+        'last_block_num', _s.last_block_num,
+        'last_block_time', to_char(_s.last_block_time, 'YYYY-MM-DD"T"HH24:MI:SS')
+    );
+END
 $$;
 
 -- ---------------------------------------------------------------------------

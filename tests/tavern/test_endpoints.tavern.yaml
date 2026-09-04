@@ -173,3 +173,126 @@ stages:
     response:
       status_code: 200
       json: !anylist
+
+---
+test_name: Sync status - PostgREST (#34)
+
+# The uniform HAF-app freshness endpoint. haf_fyp previously served /sync-status
+# ONLY from its FastAPI overlay, so a haf_fyp backend written to haf_api_node's
+# standard per-app template -- `http-check send meth GET uri /sync-status` +
+# `expect status 200` against <app>-postgrest-rewriter:80 -- would have been pinned
+# permanently DOWN, and a wedged postgrest was invisible to every health probe.
+#
+# To be precise about WHICH config: that pattern is on haf_api_node's `develop`
+# (8 app backends use it). Our own node's 30-proxies.cfg predates it and probes
+# `/`, `/version` and `/last-synced-block` instead, with haf_fyp freshness done by
+# a psql agent-check -- so this is prospective, for the module file, not a fix for
+# a backend that is DOWN today.
+#
+# Note also what this endpoint does NOT prove: 200 means reachable and reports the
+# context head, not that the app is advancing. A stalled context at block 0 answers
+# 200 with a null timestamp. Staleness needs the agent-check, not this.
+#
+# Exact values, not !anything: the fixture is block 5,000,000 at its real chain
+# time, the same fixture haf_block_explorer's sync-status pattern uses, so the
+# assertion is comparable across repos. The timestamp format is the contract --
+# literal 'T', 19 characters, no fractional seconds, no timezone suffix -- and
+# consumers parse it with a fixed format, so drift here is a silent break.
+
+includes:
+  - !include common.yaml
+
+stages:
+  - name: GET /rpc/get_sync_status returns the context head and its block time
+    request:
+      url: "{api_url}/rpc/get_sync_status"
+      method: GET
+    response:
+      status_code: 200
+      # Pinned, not merely present: behind Varnish a cached freshness probe reports
+      # the CACHE's age, not the app's. The FastAPI twin's stage pins the same header
+      # for the same reason; omitting it here left deleting the set_config line green.
+      headers:
+        cache-control: "public, max-age=0"
+      json:
+        last_block_num: 5000000
+        last_block_time: "2016-09-15T19:47:21"
+
+  # THE ACTUAL DELIVERABLE. The stage above proves the SQL function works and proves
+  # nothing about /sync-status: it addresses PostgREST directly. Removing the rewrite
+  # rule, moving it after the catch-all, or typo'ing its target each leave every other
+  # test green while an upstream HAProxy backend goes DOWN.
+  - name: GET /sync-status through the rewriter resolves to the same function
+    request:
+      url: "{rewriter_url}/sync-status"
+      method: GET
+    response:
+      status_code: 200
+      json:
+        last_block_num: 5000000
+        last_block_time: "2016-09-15T19:47:21"
+
+---
+test_name: Sync status - the documented error contract (#34)
+
+# The documented error conditions were asserted nowhere, so the endpoint could stop
+# raising -- or start raising a different SQLSTATE than the schema declares -- with
+# the suite still green.
+#
+# 55000 is the ecosystem standard for the massive-sync guard: hafah,
+# haf_block_explorer, reputation_tracker, balance_tracker, nft_tracker and hivesense
+# all raise it, and so does haf_fyp's own definer. PostgREST maps it to 500. An
+# earlier revision of this MR re-raised it as 53000 to get a 503, which reads better
+# for a temporary condition but made this the only app answering differently for the
+# identical state.
+#
+# hive.ci_instance_state is the stub's readiness flag, designed to be flipped
+# (tests/haf_stub.sql). ci_set_instance_ready is a CI-only RPC over it.
+
+includes:
+  - !include common.yaml
+
+stages:
+  - name: put the stub instance into massive sync
+    request:
+      url: "{api_url}/rpc/ci_set_instance_ready"
+      method: POST
+      json:
+        ready: false
+    response:
+      status_code: 200
+
+  - name: sync-status raises SQLSTATE 55000, the ecosystem standard
+    request:
+      url: "{api_url}/rpc/get_sync_status"
+      method: GET
+    response:
+      status_code: 500
+      json:
+        code: "55000"
+        message: "HAF instance is not ready (massive sync in progress)"
+        details: null
+        hint: null
+
+  - name: and through the rewriter too
+    request:
+      url: "{rewriter_url}/sync-status"
+      method: GET
+    response:
+      status_code: 500
+
+  - name: restore readiness so later stages are unaffected
+    request:
+      url: "{api_url}/rpc/ci_set_instance_ready"
+      method: POST
+      json:
+        ready: true
+    response:
+      status_code: 200
+
+  - name: healthy again
+    request:
+      url: "{api_url}/rpc/get_sync_status"
+      method: GET
+    response:
+      status_code: 200
