@@ -132,6 +132,7 @@ All read endpoints are served by PostgREST on port 3001. The FastAPI overlay on 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/rpc/get_health` | App status and last processed block |
+| GET | `/rpc/get_sync_status` | HAF context head + its UTC timestamp — **the endpoint to monitor** (#34) |
 | GET | `/rpc/get_algorithm` | Active algorithm version and weights |
 | GET | `/rpc/list_algorithm_versions` | All registered algorithm versions |
 | GET | `/rpc/get_personalized_feed?username=alice&limit=20` | Ranked feed for a user |
@@ -173,10 +174,20 @@ they have different failure modes, and only this one carries a timestamp.
 `last_block_time` is null before the first block is processed, and the endpoint returns
 503 while HAF is in massive sync.
 
-It is served **only on the FastAPI overlay (port 3002)**, per #16. haf_api_node's stock
-agent checks probe `http://<app>-postgrest-rewriter:80/sync-status`, which haf_fyp does
-not serve, so a haf_api_node profile must point its `*_HEALTH_URL` at port 3002 — or
-#17 should add a PostgREST twin so the standard probe URL works.
+Since #34 it is served from **both** surfaces, and **the PostgREST one is what you
+should monitor**: `http://<app>-postgrest-rewriter:80/sync-status`, the standard probe
+URL haf_api_node's per-app backends use. It exercises the real request path (rewriter
+-> postgrest -> postgres), so a wedged postgrest or rewriter shows up; the FastAPI copy
+on port 3002 bypasses both and cannot see either. Point `*_HEALTH_URL` at the rewriter.
+
+The FastAPI copy stays because it is useful when the postgrest side is broken — which
+is exactly when you want to ask. Both call the same `haf_fyp_app.sync_status()`, so
+they cannot disagree on data; they format the timestamp in two places, so keep those
+in step.
+
+Note what 200 does **not** prove: it means reachable, and reports the context head.
+A stalled app whose context sits at block 0 answers 200 with a null timestamp. For
+staleness, pair it with a block-freshness agent-check.
 
 Both interest routes are authenticated with a Hive posting-key signature over a
 canonical challenge — `hivefy:interests:v1:<username>:<timestamp>:<ids>` to opt in
@@ -226,6 +237,7 @@ Clean URL rewrites (via nginx `endpoints/rewrite_rules.conf`):
 /v1/fyp/algorithms                   →  /rpc/list_algorithm_versions
 /v1/fyp/explain/{username}/{post_id} →  /rpc/get_score_explanation
 /v1/fyp/feed-metrics                 →  /rpc/get_feed_metrics
+/sync-status                         →  /rpc/get_sync_status
 /health                              →  /rpc/get_health
 /version                             →  /rpc/get_version
 <anything else>                      →  /rpc/<anything else>      (catch-all)

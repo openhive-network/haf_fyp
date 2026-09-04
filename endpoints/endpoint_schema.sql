@@ -493,7 +493,7 @@ DECLARE
           "Other"
         ],
         "summary": "Sync status",
-        "description": "Last block consumed by the haf_fyp HAF context, and its timestamp. The uniform HAF-app freshness endpoint, byte-compatible with haf_stats', hafbe's and hivemind's.",
+        "description": "Last block consumed by the haf_fyp HAF context, and its timestamp. The uniform HAF-app freshness endpoint: same two keys and the same timestamp format as haf_stats' /sync-status. NOTE this reports REACHABILITY and the context head, not liveness -- a stalled app whose context sits at block 0 answers 200 with a null timestamp, which is a state observed in the wild (tests/ci_invariants.sql). Pair it with a block-freshness agent-check, as haf_api_node does for its own apps.",
         "operationId": "haf_fyp_endpoints.get_sync_status",
         "responses": {
           "200": {
@@ -1158,8 +1158,12 @@ $$;
     summary: Sync status
     description: >-
       Last block consumed by the haf_fyp HAF context, and its timestamp. The
-      uniform HAF-app freshness endpoint, byte-compatible with haf_stats',
-      hafbe's and hivemind's.
+      uniform HAF-app freshness endpoint: same two keys and the same timestamp
+      format as haf_stats' /sync-status. NOTE this reports REACHABILITY and the
+      context head, not liveness -- a stalled app whose context sits at block 0
+      answers 200 with a null timestamp, which is a state observed in the wild
+      (tests/ci_invariants.sql). Pair it with a block-freshness agent-check, as
+      haf_api_node does for its own apps.
     operationId: haf_fyp_endpoints.get_sync_status
     responses:
       '200':
@@ -1250,20 +1254,33 @@ BEGIN
         RAISE EXCEPTION '%', SQLERRM USING ERRCODE = '53000';
     END;
 
-    -- Zero rows means one of: the HAF context has not been registered yet, it was
-    -- removed, or haf_fyp_owner (the definer) lost hive_applications_group so RLS hides
-    -- every row - which fails SILENTLY, with no error. Answering 200 with a null body
-    -- would merge all three with "healthy" and hide a privilege misconfiguration behind
-    -- a healthy-looking response.
+    -- Zero rows means the HAF context has not been registered yet, or it was removed.
+    -- Answering 200 with a null body would merge those with "healthy" and hide a
+    -- misconfiguration behind a healthy-looking response.
+    --
+    -- It does NOT cover haf_fyp_owner losing hive_applications_group. That was the
+    -- original claim here and it is wrong: the definer's FIRST statement calls
+    -- hive.is_instance_ready(), whose EXECUTE comes only through that group, so the
+    -- loss raises 42501 before any RLS-filtered row is read -- and PostgREST maps
+    -- 42501 on an anonymous request to 401, not 503. A probe expecting 200-or-503
+    -- misreads that as an auth failure. Detecting it belongs in the installer's
+    -- privilege checks, not here.
     IF NOT FOUND THEN
         RAISE EXCEPTION 'HAF context ''haf_fyp'' is not visible: the app is not installed on this node, its context was removed, or haf_fyp_owner lost its hive_applications_group membership'
             USING ERRCODE = '53000';
     END IF;
 
-    -- Two keys only, byte-compatible with hafbe's, haf_stats' and this app's own
-    -- FastAPI /sync-status: literal 'T', 19 characters, no fractional seconds, no
-    -- timezone suffix. Consumers parse it with a fixed format, so drift here is a
-    -- silent breaking change.
+    -- Two keys only. The CONTRACT is the key names and the timestamp format --
+    -- literal 'T', 19 characters, no fractional seconds, no timezone suffix --
+    -- because consumers parse it with a fixed format, so drift there is a silent
+    -- breaking change.
+    --
+    -- Byte-identical to haf_stats' /sync-status, which builds it the same way.
+    -- NOT byte-identical to this app's own FastAPI twin: json_build_object (json,
+    -- not jsonb) emits spaces around colons, `{"k" : v}`, where FastAPI emits
+    -- `{"k":v}`. Semantically identical, and no consumer should be byte-comparing
+    -- JSON -- but do not restate the stronger claim, it was measured false.
+    -- hafbe, hafah and balance_tracker serve no /sync-status at all.
     RETURN json_build_object(
         'last_block_num', _s.last_block_num,
         'last_block_time', to_char(_s.last_block_time, 'YYYY-MM-DD"T"HH24:MI:SS')
