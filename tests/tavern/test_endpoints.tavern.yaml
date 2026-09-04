@@ -173,3 +173,32 @@ stages:
     response:
       status_code: 200
       json: !anylist
+
+---
+test_name: Sync status - PostgREST (#34)
+
+# The uniform HAF-app freshness endpoint. haf_fyp previously served /sync-status
+# ONLY from its FastAPI overlay, so haf_api_node's per-app HAProxy backend --
+# `http-check send meth GET uri /sync-status` + `expect status 200` against the
+# rewriter -- would have pinned the backend permanently DOWN, and a wedged
+# postgrest was invisible to every health probe.
+#
+# Exact values, not !anything: the fixture is block 5,000,000 at its real chain
+# time, the same fixture haf_block_explorer's sync-status pattern uses, so the
+# assertion is comparable across repos. The timestamp format is the contract --
+# literal 'T', 19 characters, no fractional seconds, no timezone suffix -- and
+# consumers parse it with a fixed format, so drift here is a silent break.
+
+includes:
+  - !include common.yaml
+
+stages:
+  - name: GET /rpc/get_sync_status returns the context head and its block time
+    request:
+      url: "{api_url}/rpc/get_sync_status"
+      method: GET
+    response:
+      status_code: 200
+      json:
+        last_block_num: 5000000
+        last_block_time: "2016-09-15T19:47:21"

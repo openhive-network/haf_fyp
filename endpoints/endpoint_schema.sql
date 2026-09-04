@@ -487,6 +487,88 @@ DECLARE
         }
       }
     },
+    "/sync-status": {
+      "get": {
+        "tags": [
+          "Other"
+        ],
+        "summary": "Sync status",
+        "description": "Last block consumed by the haf_fyp HAF context, and its timestamp. The uniform HAF-app freshness endpoint, byte-compatible with haf_stats', hafbe's and hivemind's.",
+        "operationId": "haf_fyp_endpoints.get_sync_status",
+        "responses": {
+          "200": {
+            "description": "last_block_time is null when that block has no hafd.blocks row - i.e. nothing has been processed yet (there is no block 0), or the node is pruned and the context is behind the prune tail.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "x-sql-datatype": "JSON",
+                  "type": "object",
+                  "required": [
+                    "last_block_num",
+                    "last_block_time"
+                  ],
+                  "properties": {
+                    "last_block_num": {
+                      "type": "integer",
+                      "description": "last block consumed by the haf_fyp HAF context"
+                    },
+                    "last_block_time": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "date-time",
+                      "description": "UTC timestamp of that block; null if it has no hafd.blocks row"
+                    }
+                  }
+                },
+                "example": {
+                  "last_block_num": 109603308,
+                  "last_block_time": "2026-09-03T22:46:54"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Temporarily unavailable, and the two cases are distinguished by message rather than by status. Either the HAF instance is still in massive sync (hafd.blocks' primary key is dropped for the duration, so the call fails fast instead of seq-scanning the largest table in the database), or the HAF context is missing or not visible to the reader. Both are raised as SQLSTATE 53000, which PostgREST maps to 503.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "description": "PostgreSQL SQLSTATE, '53000' for both cases"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "hint": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "53000",
+                  "message": "HAF instance is not ready (massive sync in progress)",
+                  "details": null,
+                  "hint": null
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/fyp/algorithm": {
       "get": {
         "tags": [
@@ -1066,6 +1148,127 @@ AS $$
         (SELECT git_hash FROM haf_fyp_app.app_version LIMIT 1) AS version
     FROM haf_fyp_app.app_status s
     LIMIT 1;
+$$;
+
+/** openapi:paths
+/sync-status:
+  get:
+    tags:
+      - Other
+    summary: Sync status
+    description: >-
+      Last block consumed by the haf_fyp HAF context, and its timestamp. The
+      uniform HAF-app freshness endpoint, byte-compatible with haf_stats',
+      hafbe's and hivemind's.
+    operationId: haf_fyp_endpoints.get_sync_status
+    responses:
+      '200':
+        description: >-
+          last_block_time is null when that block has no hafd.blocks row - i.e.
+          nothing has been processed yet (there is no block 0), or the node is
+          pruned and the context is behind the prune tail.
+        content:
+          application/json:
+            schema:
+              x-sql-datatype: JSON
+              type: object
+              required: [last_block_num, last_block_time]
+              properties:
+                last_block_num:
+                  type: integer
+                  description: last block consumed by the haf_fyp HAF context
+                last_block_time:
+                  # ["string", "null"], not `nullable: true`: this document declares
+                  # openapi 3.1.0, where `nullable` was removed and is inert.
+                  type:
+                    - string
+                    - "null"
+                  format: date-time
+                  description: >-
+                    UTC timestamp of that block; null if it has no hafd.blocks row
+            example:
+              last_block_num: 109603308
+              last_block_time: '2026-09-03T22:46:54'
+      '503':
+        description: >-
+          Temporarily unavailable, and the two cases are distinguished by message
+          rather than by status. Either the HAF instance is still in massive sync
+          (hafd.blocks' primary key is dropped for the duration, so the call fails
+          fast instead of seq-scanning the largest table in the database), or the
+          HAF context is missing or not visible to the reader. Both are raised as
+          SQLSTATE 53000, which PostgREST maps to 503.
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                code:
+                  type: string
+                  description: PostgreSQL SQLSTATE, '53000' for both cases
+                message:
+                  type: string
+                details:
+                  type:
+                    - string
+                    - "null"
+                hint:
+                  type:
+                    - string
+                    - "null"
+            example:
+              code: '53000'
+              message: HAF instance is not ready (massive sync in progress)
+              details: null
+              hint: null
+ */
+-- openapi-generated-code-begin
+DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_sync_status;
+CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_sync_status()
+RETURNS JSON
+-- openapi-generated-code-end
+LANGUAGE plpgsql STABLE
+AS $$
+DECLARE
+    _s RECORD;
+BEGIN
+    -- Never cache: a freshness probe served from cache reports the cache's age,
+    -- not the app's. HAProxy's per-app backend check reads this endpoint.
+    PERFORM set_config('response.headers', '[{"Cache-Control": "public, max-age=0"}]', true);
+
+    -- haf_fyp_app.sync_status() is SECURITY DEFINER (db/sync_status.sql): hafd.contexts
+    -- has RLS whose only application SELECT policy is granted TO hive_applications_group,
+    -- and haf_fyp_user deliberately stays out of that group. The definer owns the
+    -- massive-sync guard and the context name; this function owns only the wire format.
+    --
+    -- The definer raises 55000 for "instance not ready". PostgREST does not map that
+    -- class to 503, so it is re-raised as 53000 here: a freshness probe that answers
+    -- 500 during massive sync is indistinguishable from a broken app, and every other
+    -- HAF app answers 503 for this case.
+    BEGIN
+        SELECT * INTO _s FROM haf_fyp_app.sync_status();
+    EXCEPTION WHEN SQLSTATE '55000' THEN
+        RAISE EXCEPTION '%', SQLERRM USING ERRCODE = '53000';
+    END;
+
+    -- Zero rows means one of: the HAF context has not been registered yet, it was
+    -- removed, or haf_fyp_owner (the definer) lost hive_applications_group so RLS hides
+    -- every row - which fails SILENTLY, with no error. Answering 200 with a null body
+    -- would merge all three with "healthy" and hide a privilege misconfiguration behind
+    -- a healthy-looking response.
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'HAF context ''haf_fyp'' is not visible: the app is not installed on this node, its context was removed, or haf_fyp_owner lost its hive_applications_group membership'
+            USING ERRCODE = '53000';
+    END IF;
+
+    -- Two keys only, byte-compatible with hafbe's, haf_stats' and this app's own
+    -- FastAPI /sync-status: literal 'T', 19 characters, no fractional seconds, no
+    -- timezone suffix. Consumers parse it with a fixed format, so drift here is a
+    -- silent breaking change.
+    RETURN json_build_object(
+        'last_block_num', _s.last_block_num,
+        'last_block_time', to_char(_s.last_block_time, 'YYYY-MM-DD"T"HH24:MI:SS')
+    );
+END
 $$;
 
 -- ---------------------------------------------------------------------------
