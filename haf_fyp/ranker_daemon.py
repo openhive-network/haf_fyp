@@ -112,6 +112,12 @@ _refresh_queue: queue.Queue[str] = queue.Queue()
 
 
 def _dsn() -> str:
+    # POSTGRES_URL wins outright when set; see api._db_kwargs and scripts/common.sh. The
+    # ranker writing to a different database than the block processor reads would be
+    # silent -- feeds would simply stop matching the chain (#31).
+    url = os.environ.get("POSTGRES_URL", "").strip()
+    if url:
+        return url
     return (
         f"host={os.environ.get('POSTGRES_HOST', 'haf')} "
         f"port={os.environ.get('POSTGRES_PORT', '5432')} "

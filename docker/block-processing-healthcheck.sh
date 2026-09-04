@@ -109,7 +109,26 @@ postgres_db=${POSTGRES_DB:-"haf_block_log"}
 # recognised and refused by all three scripts, because honouring it moved only the
 # psql connection while every message and the teardown's confirmation prompt still
 # read POSTGRES_HOST/POSTGRES_DB. One connection path, one description of it.
-POSTGRES_ACCESS="postgresql://$postgres_user@$postgres_host:$postgres_port/$postgres_db?application_name=haf_fyp_health_check"
+# application_name via PGAPPNAME, NOT a ?application_name= query parameter. A
+# caller-supplied URI would drop a parameter appended here -- and the uninstall session
+# guard excludes this probe by that exact literal, so losing it makes the probe count
+# itself and the teardown refuse at random. libpq honours PGAPPNAME however the
+# connection is specified.
+PGAPPNAME=haf_fyp_health_check
+export PGAPPNAME
+
+# Prefer the conninfo process_blocks recorded, so this probes the database the loop is
+# actually processing. Docker runs this as a fresh process with the container's
+# configured environment, not PID 1's, so a --postgres-url on the service's command line
+# reaches us ONLY through that file.
+CONN_FILE=${HAF_FYP_CONNINFO_FILE:-/tmp/block_processing_conninfo.txt}
+POSTGRES_ACCESS=""
+if [ -s "${CONN_FILE}" ]; then
+    POSTGRES_ACCESS="$(cat "${CONN_FILE}")"
+fi
+if [ -z "${POSTGRES_ACCESS}" ]; then
+    POSTGRES_ACCESS="${POSTGRES_URL:-postgresql://$postgres_user@$postgres_host:$postgres_port/$postgres_db}"
+fi
 
 CONTEXT=${HAF_FYP_CONTEXT:-"haf_fyp"}
 

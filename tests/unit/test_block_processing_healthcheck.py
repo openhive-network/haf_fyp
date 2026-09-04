@@ -347,7 +347,12 @@ def test_the_application_name_matches_what_the_uninstall_guard_excludes(bash, tm
     set_startup(env)
     captured = capture_argv(tmp_path)
     run(bash, env)
-    assert "application_name=haf_fyp_health_check" in captured.read_text()
+    # The tag travels as PGAPPNAME now, not as a ?application_name= query parameter:
+    # a caller-supplied conninfo would drop a parameter appended here, and losing it is
+    # what makes this probe count itself in the guard below.
+    body = SCRIPT.read_text()
+    assert "PGAPPNAME=haf_fyp_health_check" in body
+    assert "export PGAPPNAME" in body
     uninstall = (SCRIPT.parents[1] / "scripts" / "uninstall_app.sh").read_text()
     assert "'haf_fyp_health_check'" in uninstall
 
@@ -375,9 +380,11 @@ def test_the_application_name_is_set_on_the_connection(bash, tmp_path, env):
     this literal; losing it here makes a staged teardown refuse for a probe that holds
     no lock."""
     set_startup(env)
-    captured = capture_argv(tmp_path)
     run(bash, env)
-    assert "application_name=haf_fyp_health_check" in captured.read_text()
+    # Asserted on the script, because PGAPPNAME is an ENVIRONMENT variable now and so
+    # never appears in psql's argv. That is the point: it survives a caller-supplied
+    # conninfo, which a query parameter would not.
+    assert "PGAPPNAME=haf_fyp_health_check" in SCRIPT.read_text()
 
 
 # --- the three lines with no assertions at all (round three) -----------------------
@@ -432,14 +439,17 @@ def test_the_application_name_tag_is_unconditional():
     tests set POSTGRES_URL, so the branch that broke the contract was never exercised.
     """
     body = SCRIPT.read_text()
-    access = [ln for ln in body.splitlines() if ln.startswith("POSTGRES_ACCESS=")]
-    assert len(access) == 1, f"expected one POSTGRES_ACCESS assignment, got {access}"
-    line = access[0]
-    assert "application_name=haf_fyp_health_check" in line
-    assert ":-" not in line, (
-        "no default-substitution in the access string: it can replace the whole value, "
-        "tag included"
+    assert "PGAPPNAME=haf_fyp_health_check" in body, (
+        "the tag must be set unconditionally, not folded into a conninfo a caller can "
+        "replace wholesale"
     )
+    # And it must not have gone back to a query parameter, which a supplied URI drops.
+    # Comments stripped: this script's own comment EXPLAINS why a query parameter is
+    # wrong, so scanning raw text asserts against the documentation rather than the
+    # code -- the same trap an earlier assertion in this suite fell into.
+    code = "\n".join(
+        ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
+    assert "?application_name=" not in code
     # And the guard on the other side still keys on the same literal.
     uninstall = (SCRIPT.parent.parent / "scripts" / "uninstall_app.sh").read_text()
     assert "haf_fyp_health_check" in uninstall, (

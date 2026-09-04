@@ -744,6 +744,17 @@ _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
 
 def _db_kwargs() -> dict:
+    """Connection settings for the pool.
+
+    POSTGRES_URL wins outright when set, and is passed as psycopg2's `dsn` rather than
+    merged with the discrete values -- the same rule scripts/common.sh follows. Merging
+    is what makes a half-honoured URI dangerous: the process would connect somewhere the
+    logs do not name. If it is set, the shell scripts are already pointed at it, and this
+    service must not be the one that disagrees (#31).
+    """
+    url = os.environ.get("POSTGRES_URL", "").strip()
+    if url:
+        return dict(dsn=url)
     return dict(
         host=os.environ.get("POSTGRES_HOST", "haf"),
         port=int(os.environ.get("POSTGRES_PORT", "5432")),

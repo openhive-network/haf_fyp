@@ -19,8 +19,8 @@
 #   --user=VALUE   PostgreSQL user (default: $POSTGRES_USER, else haf_admin)
 #                  --postgres-host=, --postgres-port= and --postgres-user= are
 #                  accepted as synonyms (balance_tracker's spelling)
-#   --postgres-url=URI  NOT SUPPORTED YET -- recognised and refused, with a
-#                  message pointing at --host/--port/--user (--url= is the same)
+#   --postgres-url=URI  Full libpq conninfo; REPLACES --host/--port/--user
+#                  (--url= is the same flag; an empty value is an error)
 #   --schema=NAME  Accepted for haf_api_node module-file compatibility; ignored with
 #                  a warning unless it names haf_fyp_app
 #   --is_forking=  Accepted likewise; this app's context is always non-forking
@@ -73,36 +73,25 @@ for arg in "$@"; do
         --port=*|--postgres-port=*) POSTGRES_PORT="${arg#*=}" ;;
         --user=*|--postgres-user=*) POSTGRES_USER="${arg#*=}" ;;
 
-        # RECOGNISED AND REFUSED, deliberately -- not warn-and-continue like --schema,
-        # and not "is not a valid option" either.
+        # ACCEPTED, and honoured in exactly one place: common.sh's pg_conn_args, which
+        # both psql and pg_isready go through. An earlier revision of this flag moved
+        # only the psql connection and left every message, and the teardown's
+        # type-the-database-name gate, reading POSTGRES_HOST/POSTGRES_DB -- so the
+        # script could act on one database while reporting another. That is why the
+        # rule here is one connection path and one description of it.
         #
-        # An earlier revision of this MR HONOURED it, handing the URI to psql as a
-        # conninfo. That was worse than rejecting it, because only psql moved: every
-        # message, the confirmation banner and the typed-the-database-name gate still
-        # read ${POSTGRES_HOST}/${POSTGRES_DB}. So `uninstall_app --postgres-url=...`
-        # dropped schemas on the URI's host while printing the discrete host, and
-        # accepted the discrete database name as confirmation -- in the one gate whose
-        # stated purpose is catching "the right command against the wrong host".
-        #
-        # Honouring it properly means the banner, the healthcheck's application_name
-        # tag (the uninstall session guard excludes the probe by that literal), passing
-        # the conninfo through to the healthcheck, a redactor that survives
-        # ?password= and keyword/value forms, and the other scripts. That is tracked
-        # separately.
-        #
-        # Refusing is safe here, unlike for --schema: --postgres-url appears in exactly
-        # one upstream module file (hivemind.yaml, on hivemind-uninstall) and that file
-        # carries no `restart:` key, so this cannot crash-loop a service. One clear
-        # error beats a silent connection to the wrong database.
+        # An EMPTY value is an error, not a fallback. A module file writing
+        # --postgres-url=${DB_URL} with DB_URL unset would otherwise connect silently to
+        # $POSTGRES_HOST instead -- and for uninstall_app that is a destructive command
+        # quietly retargeted.
         --postgres-url=*|--url=*)
-            log "ERROR: --postgres-url is not supported yet."
-            log "       Use --host=, --port= and --user= instead. Accepting the URI"
-            log "       would move only the psql connection: this script's messages,"
-            log "       and the teardown's confirmation prompt, still read POSTGRES_HOST"
-            log "       and POSTGRES_DB -- so it could act on one database while"
-            log "       reporting another. Refusing is the safe answer until that is"
-            log "       fixed throughout."
-            exit 2
+            POSTGRES_URL="${arg#*=}"
+            if [ -z "${POSTGRES_URL}" ]; then
+                log "ERROR: ${arg%%=*}= was given an empty value."
+                log "       Refusing rather than falling back to POSTGRES_HOST: an empty"
+                log "       expansion is a mistake, and falling back would hide it."
+                exit 2
+            fi
             ;;
         # balance_tracker's module file passes --schema= on ALL THREE verbs. Verified
         # against upstream rather than remembered: hive/balance_tracker's
@@ -255,13 +244,25 @@ if [ "$FORCE" -ne 1 ]; then
         log "       This drops schemas ${HAF_FYP_SCHEMAS} CASCADE and cannot be undone."
         exit 2
     fi
-    log "About to PERMANENTLY remove haf_fyp from ${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}:"
+    # The TARGET AS THE DATABASE REPORTS IT, not as it was requested. This gate exists
+    # to catch "the right command against the wrong host", and interpolating
+    # ${POSTGRES_HOST}/${POSTGRES_DB} defeated that the moment --postgres-url existed:
+    # the banner named the discrete host while psql was connected to the URI's.
+    _target_db="$(psql_cmd -Atq -c "SELECT current_database()" 2>/dev/null || echo "")"
+    if [ -z "${_target_db}" ]; then
+        log "ERROR: could not ask the database which database this is. Refusing to prompt"
+        log "       for a confirmation this script cannot check. Nothing has been changed."
+        exit 1
+    fi
+    log "About to PERMANENTLY remove haf_fyp from $(redacted_target)"
+    log "  connected as : $(connected_identity)"
     log "  context : ${HAF_FYP_CONTEXT}"
     log "  schemas : ${HAF_FYP_SCHEMAS} (CASCADE -- all tables and all data)"
     log "  roles   : ${HAF_FYP_ROLES}"
     printf '[haf_fyp] Type the database name to confirm: '
     read -r _reply
-    if [ "${_reply}" != "${POSTGRES_DB}" ]; then
+    # Compared against the database ACTUALLY connected to, for the same reason.
+    if [ "${_reply}" != "${_target_db}" ]; then
         log "Aborted -- nothing was changed."
         exit 1
     fi

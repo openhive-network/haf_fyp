@@ -6,8 +6,8 @@
 #   --host=VALUE   PostgreSQL host (default: $POSTGRES_HOST, else haf)
 #   --port=NUMBER  PostgreSQL port (default: $POSTGRES_PORT, else 5432)
 #   --user=VALUE   PostgreSQL user (default: $POSTGRES_USER, else haf_fyp_owner)
-#   --postgres-url=URI  NOT SUPPORTED YET -- recognised and refused, with a
-#                  message pointing at --host/--port/--user (--url= is the same)
+#   --postgres-url=URI  Full libpq conninfo; REPLACES --host/--port/--user
+#                  (--url= is the same flag; an empty value is an error)
 #   --schema=NAME  Accepted for haf_api_node module-file compatibility; ignored
 #                  with a warning unless it names haf_fyp_app
 #   --is_forking=  Accepted likewise; this app's context is always non-forking
@@ -35,36 +35,25 @@ for arg in "$@"; do
         --port=*) POSTGRES_PORT="${arg#*=}" ;;
         --user=*) POSTGRES_USER="${arg#*=}" ;;
 
-        # RECOGNISED AND REFUSED, deliberately -- not warn-and-continue like --schema,
-        # and not "is not a valid option" either.
+        # ACCEPTED, and honoured in exactly one place: common.sh's pg_conn_args, which
+        # both psql and pg_isready go through. An earlier revision of this flag moved
+        # only the psql connection and left every message, and the teardown's
+        # type-the-database-name gate, reading POSTGRES_HOST/POSTGRES_DB -- so the
+        # script could act on one database while reporting another. That is why the
+        # rule here is one connection path and one description of it.
         #
-        # An earlier revision of this MR HONOURED it, handing the URI to psql as a
-        # conninfo. That was worse than rejecting it, because only psql moved: every
-        # message, the confirmation banner and the typed-the-database-name gate still
-        # read ${POSTGRES_HOST}/${POSTGRES_DB}. So `uninstall_app --postgres-url=...`
-        # dropped schemas on the URI's host while printing the discrete host, and
-        # accepted the discrete database name as confirmation -- in the one gate whose
-        # stated purpose is catching "the right command against the wrong host".
-        #
-        # Honouring it properly means the banner, the healthcheck's application_name
-        # tag (the uninstall session guard excludes the probe by that literal), passing
-        # the conninfo through to the healthcheck, a redactor that survives
-        # ?password= and keyword/value forms, and the other scripts. That is tracked
-        # separately.
-        #
-        # Refusing is safe here, unlike for --schema: --postgres-url appears in exactly
-        # one upstream module file (hivemind.yaml, on hivemind-uninstall) and that file
-        # carries no `restart:` key, so this cannot crash-loop a service. One clear
-        # error beats a silent connection to the wrong database.
+        # An EMPTY value is an error, not a fallback. A module file writing
+        # --postgres-url=${DB_URL} with DB_URL unset would otherwise connect silently to
+        # $POSTGRES_HOST instead -- and for uninstall_app that is a destructive command
+        # quietly retargeted.
         --postgres-url=*|--url=*)
-            log "ERROR: --postgres-url is not supported yet."
-            log "       Use --host=, --port= and --user= instead. Accepting the URI"
-            log "       would move only the psql connection: this script's messages,"
-            log "       and the teardown's confirmation prompt, still read POSTGRES_HOST"
-            log "       and POSTGRES_DB -- so it could act on one database while"
-            log "       reporting another. Refusing is the safe answer until that is"
-            log "       fixed throughout."
-            exit 2
+            POSTGRES_URL="${arg#*=}"
+            if [ -z "${POSTGRES_URL}" ]; then
+                log "ERROR: ${arg%%=*}= was given an empty value."
+                log "       Refusing rather than falling back to POSTGRES_HOST: an empty"
+                log "       expansion is a mistake, and falling back would hide it."
+                exit 2
+            fi
             ;;
 
         # balance_tracker's module file passes --schema= on ALL THREE verbs. Verified
@@ -158,6 +147,22 @@ _startup_tmp="${STARTUP_TIME_FILE}.tmp.$$"
 psql_cmd -Atq -c "SELECT now()::timestamp" > "${_startup_tmp}"
 mv "${_startup_tmp}" "${STARTUP_TIME_FILE}"
 log "Block processing start time recorded: $(cat "${STARTUP_TIME_FILE}")"
+
+# The EFFECTIVE connection, written next to the startup time and by the same atomic
+# rename, so the healthcheck probes the database this loop is actually processing.
+#
+# It cannot simply read $POSTGRES_URL: Docker runs a container healthcheck as a FRESH
+# process with the container's configured environment, not with PID 1's. A
+# --postgres-url passed on this service's command line is therefore invisible to it, and
+# the probe would silently report on $POSTGRES_HOST while the loop worked elsewhere.
+# `export` does not fix that either. A file does.
+CONN_FILE="${HAF_FYP_CONNINFO_FILE:-/tmp/block_processing_conninfo.txt}"
+_conn_tmp="${CONN_FILE}.tmp.$$"
+printf '%s' "${POSTGRES_URL}" > "${_conn_tmp}"
+mv "${_conn_tmp}" "${CONN_FILE}"
+if [ -n "${POSTGRES_URL}" ]; then
+    log "Block processing connection recorded: $(redacted_target)"
+fi
 
 log "Starting block processing loop..."
 

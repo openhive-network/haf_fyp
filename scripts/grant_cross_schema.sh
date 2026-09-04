@@ -23,6 +23,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # sets no POSTGRES_USER, so every other documented invocation -- a host checkout,
 # docker run on the SQL image, docker exec into a running container -- silently did
 # nothing. The header above has always said haf_admin; now the code agrees with it.
+# NOTE: this default is ignored when POSTGRES_URL is set -- common.sh hands the URI to
+# psql and does not pass -U alongside it. The check below therefore asks the DATABASE who
+# it is connected as, rather than trusting this variable: running as haf_fyp_owner does
+# not FAIL here, it silently heals nothing (the schema-guarded blocks read "not found"
+# and psql exits 0), which is the failure this script's header describes.
 : "${POSTGRES_USER:=haf_admin}"
 
 source "${SCRIPT_DIR}/common.sh"

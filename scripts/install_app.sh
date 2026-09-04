@@ -17,8 +17,9 @@
 #                       TRUE is warned about and ignored -- see below.
 #   --schema=NAME       Accepted likewise. Anything but haf_fyp_app is warned about
 #                       and ignored; the schema names are fixed in the SQL.
-#   --postgres-url=URI  NOT SUPPORTED YET -- recognised and refused with a message
-#                       pointing at --host/--port/--user. --url= is the same flag.
+#   --postgres-url=URI  Full libpq conninfo (URI or keyword/value). REPLACES
+#                       --host/--port/--user rather than merging with them.
+#                       --url= is the same flag. An empty value is an error.
 #   --help,-h,-?        Show this and exit                       # --- help-end ---
 
 set -euo pipefail
@@ -62,36 +63,25 @@ for arg in "$@"; do
         --port=*|--postgres-port=*) POSTGRES_PORT="${arg#*=}" ;;
         --user=*|--postgres-user=*) POSTGRES_USER="${arg#*=}" ;;
 
-        # RECOGNISED AND REFUSED, deliberately -- not warn-and-continue like --schema,
-        # and not "is not a valid option" either.
+        # ACCEPTED, and honoured in exactly one place: common.sh's pg_conn_args, which
+        # both psql and pg_isready go through. An earlier revision of this flag moved
+        # only the psql connection and left every message, and the teardown's
+        # type-the-database-name gate, reading POSTGRES_HOST/POSTGRES_DB -- so the
+        # script could act on one database while reporting another. That is why the
+        # rule here is one connection path and one description of it.
         #
-        # An earlier revision of this MR HONOURED it, handing the URI to psql as a
-        # conninfo. That was worse than rejecting it, because only psql moved: every
-        # message, the confirmation banner and the typed-the-database-name gate still
-        # read ${POSTGRES_HOST}/${POSTGRES_DB}. So `uninstall_app --postgres-url=...`
-        # dropped schemas on the URI's host while printing the discrete host, and
-        # accepted the discrete database name as confirmation -- in the one gate whose
-        # stated purpose is catching "the right command against the wrong host".
-        #
-        # Honouring it properly means the banner, the healthcheck's application_name
-        # tag (the uninstall session guard excludes the probe by that literal), passing
-        # the conninfo through to the healthcheck, a redactor that survives
-        # ?password= and keyword/value forms, and the other scripts. That is tracked
-        # separately.
-        #
-        # Refusing is safe here, unlike for --schema: --postgres-url appears in exactly
-        # one upstream module file (hivemind.yaml, on hivemind-uninstall) and that file
-        # carries no `restart:` key, so this cannot crash-loop a service. One clear
-        # error beats a silent connection to the wrong database.
+        # An EMPTY value is an error, not a fallback. A module file writing
+        # --postgres-url=${DB_URL} with DB_URL unset would otherwise connect silently to
+        # $POSTGRES_HOST instead -- and for uninstall_app that is a destructive command
+        # quietly retargeted.
         --postgres-url=*|--url=*)
-            log "ERROR: --postgres-url is not supported yet."
-            log "       Use --host=, --port= and --user= instead. Accepting the URI"
-            log "       would move only the psql connection: this script's messages,"
-            log "       and the teardown's confirmation prompt, still read POSTGRES_HOST"
-            log "       and POSTGRES_DB -- so it could act on one database while"
-            log "       reporting another. Refusing is the safe answer until that is"
-            log "       fixed throughout."
-            exit 2
+            POSTGRES_URL="${arg#*=}"
+            if [ -z "${POSTGRES_URL}" ]; then
+                log "ERROR: ${arg%%=*}= was given an empty value."
+                log "       Refusing rather than falling back to POSTGRES_HOST: an empty"
+                log "       expansion is a mistake, and falling back would hide it."
+                exit 2
+            fi
             ;;
 
         # haf_api_node's module template passes --is_forking defaulted from a node-wide

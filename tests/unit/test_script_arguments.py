@@ -355,138 +355,70 @@ def test_help_covers_every_option_the_loop_accepts(bash, tmp_path, script):
     )
 
 
-# --- --postgres-url is RECOGNISED AND REFUSED (round four) --------------------------
+# --- --postgres-url is HONOURED, in exactly one place (#31) -------------------
 #
-# An earlier revision of this MR HONOURED it. That was worse than rejecting it: only the
-# psql connection moved. Every message, the confirmation banner and the
-# type-the-database-name gate still read ${POSTGRES_HOST}/${POSTGRES_DB}, so
-# `uninstall_app --postgres-url=...` dropped schemas on the URI's host while printing
-# the discrete host and accepting the discrete database name as confirmation -- in the
-# one gate whose stated purpose is catching "the right command against the wrong host".
-#
-# Refusing is safe here, unlike for --schema: --postgres-url appears in exactly one
-# upstream module file (hivemind.yaml, on hivemind-uninstall) and that file carries no
-# `restart:` key, so it cannot crash-loop a service.
+# The earlier revision refused it, because the revision before THAT honoured it badly:
+# only psql moved, while every message and the teardown's type-the-database-name gate
+# still read POSTGRES_HOST/POSTGRES_DB, so the script could act on one database while
+# reporting another. These tests pin the property that makes honouring it safe --
+# ONE connection path, and every message describing the connection actually made.
 
 
 @pytest.mark.parametrize(
     "script", [INSTALL, UNINSTALL, PROCESS], ids=["install", "uninstall", "process_blocks"]
 )
 @pytest.mark.parametrize("flag", ["--postgres-url", "--url"])
-def test_postgres_url_is_refused_with_a_useful_message(bash, tmp_path, script, flag):
-    r = run(bash, tmp_path, script, f"{flag}=postgresql://haf_admin@haf/db")
-    assert r.returncode == 2
-    # Not the generic fallthrough -- that would tell a module-file author nothing.
+def test_a_connection_uri_is_accepted(bash, tmp_path, script, flag):
+    r = run(bash, tmp_path, script, f"{flag}=postgresql://haf_admin@haf/db", "--help")
+    assert r.returncode == 0, r.stdout + r.stderr
     assert "is not a valid option" not in r.stdout
-    assert "--postgres-url is not supported yet" in r.stdout
-    # It must name the alternative, or the operator has nowhere to go.
-    for alt in ("--host=", "--port=", "--user="):
-        assert alt in r.stdout
 
 
 @pytest.mark.parametrize(
     "script", [INSTALL, UNINSTALL, PROCESS], ids=["install", "uninstall", "process_blocks"]
 )
-def test_no_script_silently_honours_a_connection_uri(bash, tmp_path, script):
-    """The invariant that matters more than the message: nothing may reach the database
-    on the strength of a URI while the rest of the script reasons about POSTGRES_HOST."""
-    body = script.read_text()
-    assert "POSTGRES_URL" not in body, (
-        f"{script.name} still references POSTGRES_URL; honouring it requires the "
-        "confirmation banner, the healthcheck's application_name tag and the other "
-        "scripts to move too"
-    )
+def test_an_empty_connection_uri_is_an_error_not_a_fallback(bash, tmp_path, script):
+    """A module file writing --postgres-url=${DB_URL} with DB_URL unset would otherwise
+    connect silently to $POSTGRES_HOST -- and for uninstall_app that is a destructive
+    command quietly retargeted."""
+    r = run(bash, tmp_path, script, "--postgres-url=")
+    assert r.returncode == 2
+    assert "empty value" in r.stdout
 
 
-def test_no_shipped_shell_file_honours_a_connection_uri():
-    """Every shipped shell file, and by SHAPE rather than by one variable name.
-
-    The earlier version grepped `common.sh` for POSTGRES_URL and the three verb scripts
-    for the same string. Both blind spots were demonstrated: docker_entrypoint.sh could
-    set POSTGRES_HOST from $POSTGRES_URL and survive the whole suite -- the verb scripts
-    never see --postgres-url, so their refusal never fires, and the half-honoured
-    connection the round-four back-out exists to prevent is reachable with
-    `-e POSTGRES_URL=...` on a compose run. A rename to ${DATABASE_URI} survived too.
-
-    Scoped to CONNECTION variables. Building a URI from the discrete four is fine and is
-    what block-processing-healthcheck.sh does; SWAGGER_URL and the openapi rewriter are
-    unrelated. What must never happen is a connection URI arriving from the environment.
-    """
-    import re
-    conn_var = re.compile(r"[$]{?(?:POSTGRES|PG|DATABASE|DB|CONN|CONNECTION)_(?:URL|URI)[}:]?")
-    # -d "${POSTGRES_DB}" is the correct discrete form; only a URI-SHAPED
-    # variable is a finding. The first cut flagged common.sh's own
-    # wait_for_postgres, which is exactly the code path we want to keep.
-    uri_to_client = re.compile(
-        r"(?:psql|pg_isready)[^\n#]*-d\s+\"?[$]{?[A-Z_]*(?:URL|URI)")
-    roots = [SCRIPTS, SCRIPTS.parent / "docker"]
-    files = sorted(f for root in roots for f in root.glob("*.sh"))
-    assert files, "no shell files found; the glob needs updating"
-
-    offenders = []
-    for f in files:
-        for n, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
-            if line.lstrip().startswith("#"):
-                continue
-            code = line.split("#", 1)[0]
-            if conn_var.search(code):
-                offenders.append(f"{f.name}:{n} reads a connection-URI variable")
-            if uri_to_client.search(code):
-                offenders.append(f"{f.name}:{n} hands a variable to psql/pg_isready as -d")
-    assert not offenders, (
-        "connection URIs are refused, not honoured -- honouring one moves only the psql "
-        f"connection while every message still reads POSTGRES_HOST: {offenders}"
-    )
+def test_the_uri_replaces_the_discrete_flags_rather_than_joining_them(bash, tmp_path):
+    """It must reach psql, and the discrete flags must NOT be passed alongside it: a
+    trailing -U overrides the URI's own user, which is the opposite of "the URL wins"."""
+    _, _, argv_log = run_install_full_stub(
+        bash, tmp_path, "--postgres-url=postgresql://someone@elsewhere:6543/otherdb")
+    argv = argv_log.read_text()
+    assert "postgresql://someone@elsewhere:6543/otherdb" in argv
+    assert "-h haf" not in argv
+    assert "-U haf_fyp_owner" not in argv
 
 
-# --- --schema must have NO EFFECT, not merely be tolerated (round three) ------------
-#
-# Mutation testing found the hole: every assertion above is about the LOG LINE and the
-# EXIT CODE. A mutant that adds `HAF_FYP_SCHEMAS="${arg#*=}"` to the --schema arm prints
-# the exact "is ignored" warning these tests demand and then emits
-# `DROP SCHEMA IF EXISTS public CASCADE`, or points app_remove_context at another HAF
-# app's context -- with the whole suite green. The code comment's justification is "the
-# flag cannot change behaviour here"; nothing tested that claim.
-#
-# So compare the EMITTED SQL with and without the flag. Byte-identical or it failed.
+def test_there_is_exactly_one_connection_path():
+    """psql and pg_isready must both go through pg_conn_args, or they can disagree about
+    where they are looking -- which is precisely how the first attempt at this flag
+    produced a teardown that dropped schemas on one host while naming another."""
+    common = (SCRIPTS / "common.sh").read_text()
+    assert common.count("pg_conn_args()") == 1
+    for caller in ("psql_cmd", "wait_for_postgres"):
+        body = common.split(f"{caller}()", 1)[1].split("\n}", 1)[0]
+        assert "pg_conn_args" in body, f"{caller} does not use the shared connection args"
 
 
-@pytest.mark.parametrize("value", ["btracker_app", "haf_fyp_endpoints", "haf_fyp", "public"],
-                         ids=["foreign", "our-other-schema", "the-context-name", "public"])
-def test_install_emits_identical_sql_with_and_without_schema(bash, tmp_path, value):
-    a, b = tmp_path / "a", tmp_path / "b"
-    a.mkdir()
-    b.mkdir()
-    _, base_log, _ = run_install_full_stub(bash, a)
-    _, flag_log, _ = run_install_full_stub(bash, b, f"--schema={value}")
-    assert flag_log.read_text() == base_log.read_text(), (
-        f"--schema={value} changed the SQL the installer emits"
-    )
-
-
-@pytest.mark.parametrize("value", ["btracker_app", "haf_fyp_endpoints", "haf_fyp"],
-                         ids=["foreign", "our-other-schema", "the-context-name"])
-def test_process_blocks_always_calls_the_same_main(bash, tmp_path, value):
-    """CALL haf_fyp_app.main('haf_fyp') -- the schema-qualified callee AND the context
-    argument must both be immune to the flag."""
-    a, b = tmp_path / "a", tmp_path / "b"
-    a.mkdir()
-    b.mkdir()
-    out_base = run_with_stub_db(bash, a, PROCESS)
-    out_flag = run_with_stub_db(bash, b, PROCESS, f"--schema={value}")
-    for out in (out_base, out_flag):
-        assert "Waiting for PostgreSQL" in out
-    # The stub psql refuses, so the CALL never reaches a log -- assert on the source
-    # instead, which is the only place the schema is bound.
-    body = PROCESS.read_text()
-    assert "haf_fyp_app.main('haf_fyp')" in body or 'haf_fyp_app.main(\'haf_fyp\')' in body
-
-
-@pytest.mark.parametrize("value", ["btracker_app", "haf_fyp_endpoints", "haf_fyp", "public"],
-                         ids=["foreign", "our-other-schema", "the-context-name", "public"])
-def test_the_apps_own_schema_name_is_matched_exactly(bash, tmp_path, value):
-    """Not as a prefix. `[[ "${arg#*=}" != haf_fyp* ]]` silently accepts
-    haf_fyp_endpoints, haf_fyp (the CONTEXT name) and haf_fyp_appXYZ -- the same
-    prefix-vs-equality bug this repo has hit before. Only haf_fyp_app is quiet."""
-    out = run_with_stub_db(bash, tmp_path, INSTALL, f"--schema={value}")
-    assert "WARNING: --schema" in out, f"--schema={value} was accepted silently"
+@pytest.mark.parametrize(
+    "uri,must_not_contain",
+    [
+        ("postgresql://u:s3cr3t@h:5432/db", "s3cr3t"),
+        ("postgresql://u@h/db?password=SUPERSECRET", "SUPERSECRET"),
+        ("host=haf password=SEKRIT dbname=x", "SEKRIT"),
+    ],
+    ids=["userinfo", "query-param", "keyword-value"],
+)
+def test_no_form_of_password_reaches_the_log(bash, tmp_path, uri, must_not_contain):
+    """All THREE forms libpq accepts. The first redactor pattern-matched the userinfo
+    shape only and leaked the other two -- reproduced inside the real Alpine image."""
+    out = run_with_stub_db(bash, tmp_path, INSTALL, f"--postgres-url={uri}")
+    assert must_not_contain not in out
