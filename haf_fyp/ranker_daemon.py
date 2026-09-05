@@ -208,6 +208,14 @@ def _fetch_candidates(conn) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# The last embedding-fetch failure KIND reported, so a permanently absent HiveSense
+# does not write one traceback per cycle forever. Not a cache of the answer -- the
+# fetch is retried every cycle regardless -- only a record of what has been said.
+# Locked because the ranker cycle and the targeted-refresh path can both reach it.
+_last_embedding_failure: str | None = None
+_embedding_failure_lock = threading.Lock()
+
+
 def _fetch_post_vectors_safe(conn, post_ids: list[int]) -> dict:
     """
     Fetch semantic embeddings, degrading gracefully on failure.
@@ -216,15 +224,39 @@ def _fetch_post_vectors_safe(conn, post_ids: list[int]) -> dict:
     HiveSense/hivemind not yet caught up, a transient query error), the cycle
     must still produce a feed from recency/engagement/credibility rather than
     aborting. On any non-connection error we roll back the poisoned transaction
-    and return {} (relevance scored as neutral 0.5). OperationalError is left to
-    propagate so the main loop can reconnect.
+    and return {}. OperationalError is left to propagate so the main loop can
+    reconnect.
+
+    NOT "relevance scored as neutral 0.5" -- that was the old wording here and in
+    the README, and it describes the wrong outcome (#36). With no vectors the user
+    profile cannot be built, compute_scores takes its cold-start branch and sets the
+    relevance WEIGHT to 0.0, renormalising the other three. Relevance is dropped from
+    the sum rather than contributing a constant, so every user's ranking collapses to
+    the global feed plus the community boost.
+
+    Logging is transition-only, for the same reason credibility's is: on a node with
+    no HiveSense at all this path is taken on EVERY cycle, and an unconditional
+    log.exception wrote a full traceback every CYCLE_SECONDS for the life of the
+    process -- burying real incidents under a permanent, unactionable one. The first
+    failure and each CHANGE of failure kind are logged with a traceback; repeats of
+    the same kind are silent. GET /metrics reports the standing state.
     """
     try:
         return fetch_post_vectors(conn, post_ids)
     except psycopg2.OperationalError:
         raise
-    except Exception:
-        log.exception("embedding fetch failed — continuing with relevance disabled")
+    except Exception as exc:
+        global _last_embedding_failure
+        kind = f"{type(exc).__name__}:{getattr(exc, 'pgcode', None)}"
+        with _embedding_failure_lock:
+            first_or_changed = kind != _last_embedding_failure
+            _last_embedding_failure = kind
+        if first_or_changed:
+            log.exception(
+                "embedding fetch failed — relevance weight drops to 0 for this cycle; "
+                "further identical failures will be silent, see GET /metrics "
+                "ranking_sources"
+            )
         conn.rollback()
         return {}
 

@@ -34,7 +34,14 @@ import logging
 from datetime import date
 from statistics import median
 
-from haf_fyp.credibility import STATE_ABSENT, STATE_UNKNOWN, probe_credibility_sources
+from haf_fyp.credibility import (
+    STATE_ABSENT,
+    STATE_READABLE,
+    STATE_UNKNOWN,
+    STATE_UNREADABLE,
+    probe_credibility_sources,
+    probe_relations,
+)
 
 log = logging.getLogger(__name__)
 
@@ -128,6 +135,104 @@ def _source(relation: str, state: str) -> dict:
     return {
         "relation": relation if relation and state != STATE_ABSENT else None,
         "state": state,
+    }
+
+
+# The two foreign relations the RANKING signals read, as opposed to the
+# credibility ones. Split by consequence, not by schema:
+#   hivemind  -- HARD dependency. post_candidates.hive_post_id is resolved from it,
+#                and both feed endpoints filter on that column being non-null, so
+#                without it every feed is []. Nothing raises: the resolver is
+#                exception-guarded so a missing schema cannot stall block
+#                processing, which is correct but leaves empty feeds as the only
+#                symptom. This probe is how an operator sees it (#36).
+#   hivesense -- optional. Without it compute_scores takes its cold-start branch and
+#                zeroes the relevance weight, so the feed is community-boosted
+#                trending rather than personalized.
+_RANKING_SOURCES = (
+    ("hivemind_app", "hive_posts"),
+    ("hivesense_app", "posts_vectors"),
+)
+
+
+def fetch_ranking_sources(conn) -> dict | None:
+    """Probe the ranking sources, or None if the probe itself failed."""
+    try:
+        return probe_relations(conn, _RANKING_SOURCES)
+    except Exception as exc:
+        # Same treatment, and the same reasoning, as fetch_credibility_sources:
+        # no rollback (the pool handles a dirty connection), and no exc_info,
+        # because monitors poll this route and a dead backend would otherwise
+        # write a traceback per scrape.
+        log.warning("ranking: source probe failed (%s) -- reporting state unknown", exc)
+        return None
+
+
+def build_ranking_sources_report(probe: dict | None) -> dict:
+    """
+    Shape a probe_relations() result for GET /metrics (#36).
+
+    Separate from build_credibility_sources_report for the same reason that one is
+    separate from build_coverage_report: the existing shapes are pinned by
+    tests/unit/test_metrics.py, and keeping them apart is what makes this addition
+    provably additive.
+
+    The two sources are reported with DIFFERENT severities, because they have
+    different consequences:
+
+      * hivemind absent or unreadable  -> feeds_empty: true. This is not a degraded
+        feed, it is no feed, and it is otherwise silent.
+      * hivesense absent               -> personalized: false, degraded: false. A
+        deliberate deployment choice, not a fault.
+      * hivesense unreadable           -> personalized: false, degraded: TRUE. The
+        relation is there and the grant was lost; grant_cross_schema.sh repairs it.
+
+    probe is None when the probe could not run: every boolean then fails safe
+    (feeds_empty and degraded true, personalized false) and state carries the
+    distinction for a human. A monitor writing `if body.ranking_sources.feeds_empty`
+    must never read "I could not check" as "fine".
+    """
+    if probe is None:
+        return {
+            "state": STATE_UNKNOWN,
+            "hivemind": STATE_UNKNOWN,
+            "hivesense": STATE_UNKNOWN,
+            "feeds_empty": True,
+            "personalized": False,
+            "degraded": True,
+            "detail": "ranking source probe failed -- state unknown",
+        }
+
+    hivemind = probe["hivemind_app.hive_posts"]
+    hivesense = probe["hivesense_app.posts_vectors"]
+    feeds_empty = hivemind != STATE_READABLE
+    personalized = not feeds_empty and hivesense == STATE_READABLE
+    degraded = hivemind == STATE_UNREADABLE or hivesense == STATE_UNREADABLE
+
+    if feeds_empty:
+        detail = (
+            f"hivemind_app.hive_posts is {hivemind} -- every feed returns []; "
+            "hivemind is a required dependency"
+        )
+        state = "no_feed"
+    elif personalized:
+        detail = "hivemind and hivesense readable -- feeds personalized"
+        state = "full"
+    else:
+        detail = (
+            f"hivesense_app.posts_vectors is {hivesense} -- relevance weight is 0, "
+            "feeds are community-boosted trending rather than personalized"
+        )
+        state = "no_personalization"
+
+    return {
+        "state": state,
+        "hivemind": hivemind,
+        "hivesense": hivesense,
+        "feeds_empty": feeds_empty,
+        "personalized": personalized,
+        "degraded": degraded,
+        "detail": detail,
     }
 
 

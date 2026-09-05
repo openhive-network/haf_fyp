@@ -301,6 +301,38 @@ def _log_transition(probe: dict) -> None:
         log.info("credibility: %s", probe["detail"])
 
 
+def probe_relations(conn, relations: tuple) -> dict:
+    """
+    Classify each (schema, name) as readable / unreadable / absent for THIS role.
+
+    The primitive behind probe_credibility_sources, exposed so the ranking-signal
+    sources (hivemind, hivesense) can be reported by GET /metrics through the same
+    catalog read and the same three states, rather than growing a second probe with
+    its own vocabulary. Answers for the CALLING role, so the endpoint (haf_fyp_user)
+    can only err conservatively against the ranker (haf_fyp_owner) -- see
+    probe_credibility_sources for why that direction is the safe one.
+
+    "unreadable" is the actionable state: the relation exists but SELECT was lost,
+    which scripts/grant_cross_schema.sh repairs. "absent" just means the app is not
+    deployed here, which for an optional source is not a fault.
+    """
+    schemas = [s for s, _ in relations]
+    names = [n for _, n in relations]
+    with conn.cursor() as cur:
+        cur.execute(_SOURCE_PROBE_SQL, (schemas, names))
+        seen = {
+            (schema, name): bool(readable)
+            for schema, name, readable, _relkind in cur.fetchall()
+        }
+    out = {}
+    for rel in relations:
+        if rel not in seen:
+            out[".".join(rel)] = STATE_ABSENT
+        else:
+            out[".".join(rel)] = STATE_READABLE if seen[rel] else STATE_UNREADABLE
+    return out
+
+
 def probe_credibility_sources(conn) -> dict:
     """
     Classify every credibility source as readable / unreadable / absent (#8).

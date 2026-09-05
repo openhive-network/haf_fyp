@@ -52,23 +52,69 @@ hived ──► sql_serializer ──► HAF PostgreSQL
   CREATE EXTENSION IF NOT EXISTS vector;
   ```
 - Docker and Docker Compose
+- **[Hivemind](https://gitlab.syncad.com/hive/hivemind), installed and synced on the
+  same PostgreSQL server.** This is a hard dependency, not an accuracy enhancement:
 
-### External HAF Apps (for full scoring accuracy)
+  > **Without Hivemind, every feed returns `[]`.**
 
-The ranker degrades gracefully without these — relevance defaults to 0.5, and credibility is computed from whichever source is available with the weights renormalised — but full accuracy requires all of them installed and synced on the same PostgreSQL server:
+  The feed endpoints render each post through
+  `hivemind_app.get_full_post_view_by_id` and select only rows where
+  `post_candidates.hive_post_id IS NOT NULL`. That column is filled by
+  `haf_fyp_app.resolve_hivemind_post_ids`, which returns immediately when
+  `hivemind_app.hive_posts` is absent, so on a node without Hivemind it stays NULL
+  for every post and both `/v1/fyp/feed` and `/v1/fyp/global` return an empty list.
+  Block processing continues normally and nothing raises — the resolver is
+  deliberately exception-guarded so a missing schema cannot stall the processor —
+  so the only symptom is empty feeds.
 
-| App | Provides | Degrades to |
-|-----|----------|-------------|
-| [HiveSense](https://gitlab.syncad.com/hive/hivesense) | 1024-dim post embeddings (`hivesense_app.posts_vectors`, halfvec; keyed by hivemind post id) | relevance = 0.5 neutral |
-| [Hivemind](https://gitlab.syncad.com/hive/hivemind) | `(author, permlink)` → hivemind post id, the bridge to HiveSense embeddings (`hivemind_app.hive_posts`) | relevance = 0.5 neutral |
+  Hivemind is also the bridge to HiveSense: embeddings are keyed by hivemind post
+  id, so without Hivemind there is no relevance signal either.
+
+### External HAF Apps (optional)
+
+Each of these is genuinely optional — haf_fyp installs, syncs and serves without
+them. What each one costs you is stated exactly; "degrades gracefully" is not a
+claim any of these rows makes on its own.
+
+| App | Provides | Without it |
+|-----|----------|------------|
+| [HiveSense](https://gitlab.syncad.com/hive/hivesense) | 1024-dim post embeddings (`hivesense_app.posts_vectors`, halfvec; keyed by hivemind post id) | **no personalization at all** — see below |
 | [reputation_tracker](https://gitlab.syncad.com/hive/reputation_tracker) | Per-account reputation scores (`reptracker_app.account_reputations`) | credibility from VESTS alone, renormalised |
 | [balance_tracker](https://gitlab.syncad.com/hive/balance_tracker) | Per-account VESTS stake (`btracker_app.current_account_balances`, or `btracker_backend` / `hafbe_bal` under the block explorer) | credibility from reputation alone, renormalised |
+
+#### Without HiveSense there is no personalization, not "neutral relevance"
+
+An earlier version of this README said relevance falls back to a neutral 0.5. That
+is misleading about the outcome. With no embeddings, `build_user_profile_vector`
+and `bootstrap_vector_from_communities` both return `None`, and `compute_scores`
+takes its cold-start branch and sets the **relevance weight to 0.0**, renormalising
+recency/engagement/credibility to sum to 1.0. Relevance is dropped from the sum
+rather than contributing a constant.
+
+The consequence is what matters: every user's ranking becomes identical to the
+global feed apart from the ×1.2 subscribed / ×1.1 engaged community boost. A node
+running haf_fyp without HiveSense serves a "For You" page that is a
+community-boosted trending list. It works, it is stable, and it is not personalized.
+
+HiveSense needs a GPU to compute embeddings at a useful rate, so "just run HiveSense
+as well" is a real operational cost rather than a checkbox. Running haf_fyp without
+it is a legitimate choice — just make it deliberately.
+
+#### Credibility sources
 
 With NEITHER credibility source readable, every author scores the 0.3 default. A
 missing component is dropped from the weighted average rather than scored 0 at full
 weight (#8) — zeroing it compressed every author's credibility into `[0, 0.6]` and
 shifted the ranking, so a missing tracker changed the ORDER of the feed rather than
 just widening it.
+
+#### Checking what this node actually has
+
+`GET /metrics` reports every foreign relation the ranking and credibility signals
+read, each classified `readable` / `unreadable` / `absent`, so the answer does not
+depend on reading this table and hoping. `unreadable` means the relation exists but
+the role has lost SELECT on it — repair with `scripts/grant_cross_schema.sh`;
+`absent` means the app is simply not deployed here.
 
 `GET /metrics` reports each source as `readable` / `unreadable` / `absent`.
 `unreadable` means the relation exists but this deployment has lost `SELECT` on it —
@@ -118,7 +164,8 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml up \
 curl http://localhost:3001/rpc/get_health
 curl http://localhost:3001/rpc/get_algorithm
 
-# 5. After installing HiveSense / btracker / reptracker — grant cross-schema access
+# 5. After installing Hivemind (required) / HiveSense / btracker / reptracker
+#    — grant cross-schema access
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml run --rm haf-fyp-setup \
   /app/scripts/grant_cross_schema.sh
 ```
@@ -441,10 +488,10 @@ Before going live:
 - [ ] `FYP_ADMIN_API_KEY` set to a strong random value in `docker/.env.local`
 - [ ] **`TRUSTED_PROXY_IPS` set to the reverse proxy's address or CIDR** (or the literal `direct` if nothing fronts this app). Since #28 this also gates *when* limits are charged: with it unset the app logs an ERROR at startup and falls back to charging only after validation, because charging a request before it is validated is safe only when the bucket identifies the caller — into one shared bucket it lets a single sender 429 everybody else, which is worse than the bug #28 fixes. Rate limits key on `X-Real-IP` only from a trusted peer; unset, every caller keys on the proxy's address instead — one shared bucket for all of them, which is no per-client limit at all. The app logs a warning at startup when it is unset, and once more if a peer outside the list presents the header (which usually means the proxy was recreated with a new address and the list is now stale). Re-check it after anything that can renumber the proxy container.
 - [ ] `HAF_VERSION` pinned to a specific release tag (not `latest`)
-- [ ] HiveSense installed and synced → `grant_cross_schema.sh` re-run
-- [ ] Hivemind installed and synced (provides the (author, permlink) → hivemind post id bridge) → `grant_cross_schema.sh` re-run
-- [ ] balance_tracker installed and synced → `grant_cross_schema.sh` re-run
-- [ ] reputation_tracker installed and synced → `grant_cross_schema.sh` re-run
+- [ ] **Hivemind installed and synced** → `grant_cross_schema.sh` re-run. REQUIRED: without it every feed returns `[]`, silently. Confirm with `GET /metrics` → `ranking_sources.hivemind` = `readable`, not by assuming.
+- [ ] HiveSense installed and synced → `grant_cross_schema.sh` re-run (optional; without it the feed is community-boosted trending, not personalized)
+- [ ] balance_tracker installed and synced → `grant_cross_schema.sh` re-run (optional)
+- [ ] reputation_tracker installed and synced → `grant_cross_schema.sh` re-run (optional)
 - [ ] Verify `hivesense_app.posts_vectors` on live instance: `\d hivesense_app.posts_vectors` (expected: `embedding halfvec(1024)`, keyed by hivemind post id, one row per chunk)
 - [ ] Smoke test all endpoints after first ranker cycle completes
 
