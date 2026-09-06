@@ -2,6 +2,8 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
+import psycopg2
+import psycopg2.errors
 import pytest
 
 import haf_fyp.embeddings as embeddings
@@ -9,6 +11,7 @@ import haf_fyp.scoring as scoring
 from haf_fyp.scoring import (
     _apply_diversity_cap,
     bootstrap_vector_from_communities,
+    build_user_profile_vector,
     compute_credibility,
     compute_engagement_quality,
     compute_recency,
@@ -563,3 +566,134 @@ class TestWriteGlobalFeedCacheStampsAlgorithmVersion:
         self._run(monkeypatch, "1.2.0", sink=sink)
         assert sink.get("deleted") is True
         assert sink.get("committed") is True
+
+
+class TestHiveSenseUnavailableDegradesInsteadOfRaising:
+    """
+    #41: the two vector builders called fetch_post_vectors DIRECTLY and unguarded.
+
+    On a node with no HiveSense -- or one that has lost SELECT on
+    hivesense_app.posts_vectors -- every user with recent interaction history or a
+    community raised inside _rank_user, which rolled back and wrote NO feed_cache
+    row for them. They then fell through to the endpoint's global-feed fallback
+    WITHOUT the community boost, because the boost is applied during the per-user
+    ranking that never completed. Meanwhile the guarded third call site's docstring
+    claimed "the cycle must still produce a feed from recency/engagement/credibility
+    rather than aborting".
+
+    Both builders must now return None so compute_scores reaches its cold-start
+    branch. These tests raise the exact exception classes a missing relation and a
+    revoked grant produce.
+    """
+
+    class _Conn(_FakeConn):
+        """
+        _FakeConn plus rollback, which the guard calls on a swallowed failure.
+
+        Rolling back inside per-user scoring is safe, and it is worth saying why:
+        write_global_feed_cache commits before the per-user loop starts, and
+        write_feed_cache commits per user, so the only thing in flight when this
+        fires is the current user's own partial work -- exactly what the per-user
+        handler in run_cycle discarded anyway.
+        """
+
+        def __init__(self, rows):
+            super().__init__(rows)
+            self.rolled_back = 0
+
+        def rollback(self):
+            self.rolled_back += 1
+
+    @staticmethod
+    def _explode(exc):
+        def _fake(conn, post_ids):
+            raise exc
+        return _fake
+
+    def test_profile_vector_returns_none_when_hivesense_is_missing(self, monkeypatch):
+        monkeypatch.setattr(
+            embeddings, "fetch_user_interactions",
+            lambda conn, username, days: [(1, 1.0, 0.0)],
+        )
+        monkeypatch.setattr(
+            embeddings, "fetch_post_vectors",
+            self._explode(psycopg2.errors.lookup("42P01")("relation does not exist")),
+        )
+        vec, sampled = build_user_profile_vector(self._Conn([]), "alice", {})
+        assert vec is None and sampled == 0
+
+    def test_profile_vector_returns_none_when_the_grant_is_revoked(self, monkeypatch):
+        monkeypatch.setattr(
+            embeddings, "fetch_user_interactions",
+            lambda conn, username, days: [(1, 1.0, 0.0)],
+        )
+        monkeypatch.setattr(
+            embeddings, "fetch_post_vectors",
+            self._explode(psycopg2.errors.lookup("42501")("permission denied")),
+        )
+        vec, sampled = build_user_profile_vector(self._Conn([]), "alice", {})
+        assert vec is None and sampled == 0
+
+    def test_bootstrap_returns_none_when_hivesense_is_missing(self, monkeypatch):
+        monkeypatch.setattr(
+            embeddings, "fetch_post_vectors",
+            self._explode(psycopg2.errors.lookup("42P01")("relation does not exist")),
+        )
+        assert bootstrap_vector_from_communities(self._Conn([(7,)]), {123}, {}) is None
+
+    def test_a_lost_connection_still_propagates(self, monkeypatch):
+        # OperationalError must NOT be swallowed -- the main loop reconnects on it,
+        # and degrading here would hide a dead database behind cold-start feeds.
+        monkeypatch.setattr(
+            embeddings, "fetch_post_vectors",
+            self._explode(psycopg2.OperationalError("connection lost")),
+        )
+        with pytest.raises(psycopg2.OperationalError):
+            bootstrap_vector_from_communities(self._Conn([(7,)]), {123}, {})
+
+
+class TestStoredVectorDoesNotDefeatColdStart:
+    """
+    #41's real target: a node where HiveSense DEGRADED, not one that never had it.
+
+    Step 2 of the bootstrap ladder reads a STORED vector from
+    haf_fyp_app.user_profile_vectors, which HiveSense cannot affect. So every
+    previously-ranked user still has `user_vector is not None` after HiveSense goes
+    away -- and compute_scores used to test only that, leaving w_v at 0.40 while
+    compute_semantic_relevance returned a constant 0.5 for every post (it has its
+    own `or not post_vectors` test). Relevance as a neutral constant at FULL weight
+    is precisely what #36 established is wrong, and guarding the call sites widened
+    the population reaching it, because those users previously raised at step 1.
+    """
+
+    def test_a_stored_vector_with_no_post_embeddings_drops_relevance(self):
+        stored = np.ones(1024, dtype=np.float32)
+        df = compute_scores(
+            _candidates(2), post_vectors={}, user_vector=stored,
+            author_credibility={}, subscribed_communities=set(),
+            engaged_communities=set(), algorithm_weights={},
+        )
+        # Cold-start renormalisation: the three remaining weights sum to 1.0, so no
+        # score can carry the +0.2 floor a full-weight neutral relevance would add.
+        assert (df["final_score"] <= 1.0).all()
+        recomputed = (
+            0.5 * df["score_recency"] + (0.2 / 0.6) * df["score_engagement"]
+            + (0.1 / 0.6) * df["score_credibility"]
+        )
+        assert np.allclose(df["final_score"], recomputed, atol=1e-6)
+
+    def test_a_stored_vector_WITH_embeddings_still_uses_relevance(self):
+        # The guard must not fire when relevance IS computable, or every node loses
+        # personalization.
+        stored = np.ones(1024, dtype=np.float32)
+        vectors = {1: np.ones(1024, dtype=np.float32), 2: np.ones(1024, dtype=np.float32)}
+        df = compute_scores(
+            _candidates(2), post_vectors=vectors, user_vector=stored,
+            author_credibility={}, subscribed_communities=set(),
+            engaged_communities=set(), algorithm_weights={},
+        )
+        recomputed = (
+            0.5 * df["score_recency"] + (0.2 / 0.6) * df["score_engagement"]
+            + (0.1 / 0.6) * df["score_credibility"]
+        )
+        assert not np.allclose(df["final_score"], recomputed, atol=1e-6)

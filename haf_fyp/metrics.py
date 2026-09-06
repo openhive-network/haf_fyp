@@ -149,11 +149,12 @@ def _source(relation: str, state: str) -> dict:
 #       nothing resolved. get_personalized_feed also reads hive_accounts
 #       UNGUARDED, so losing that one makes every authenticated feed request RAISE
 #       rather than return [].
-#   hivesense_app.posts_vectors -- optional. compute_scores zeroes the relevance
-#       weight without it, but most users never reach that branch: the profile and
-#       bootstrap vector builders call hivesense directly and unguarded, so a user
-#       with recent history or a community raises inside _rank_user and gets no
-#       feed_cache row at all (#41).
+#   hivesense_app.posts_vectors -- optional. Without it compute_scores drops the
+#       relevance weight and renormalises the other three, so every user is still
+#       ranked and still gets the community boost -- just not on what they read.
+#       (Before #41 that was only the theory: the profile and bootstrap vector
+#       builders called hivesense unguarded, so a user with recent history or a
+#       community raised inside _rank_user and got no feed_cache row at all.)
 _HIVEMIND_RELATION = ("hivemind_app", "hive_posts")
 _HIVESENSE_RELATION = ("hivesense_app", "posts_vectors")
 _RESOLVER_RELATIONS = (
@@ -424,8 +425,9 @@ def build_ranking_sources_report(
     elif not _readable(hivesense):
         state = RANKING_STATE_NO_PERSONALIZATION
         detail = (
-            f"{_HIVESENSE_KEY} is {hivesense} -- no personalization; per-user "
-            "ranking cannot complete and users fall back to the global feed (#41)"
+            f"{_HIVESENSE_KEY} is {hivesense} -- no personalization; every user is "
+            "still ranked, on recency/engagement/credibility with the community "
+            "boost, but not on what they read"
         )
     else:
         state = RANKING_STATE_FULL

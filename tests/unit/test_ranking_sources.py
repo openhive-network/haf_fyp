@@ -17,7 +17,7 @@ import psycopg2
 
 import pytest
 
-from haf_fyp import ranker_daemon
+from haf_fyp import embeddings, ranker_daemon
 from haf_fyp.credibility import (
     STATE_ABSENT,
     STATE_READABLE,
@@ -170,7 +170,7 @@ def test_the_declared_sources_are_the_relations_the_code_actually_reads():
 
 @pytest.fixture
 def vectors(monkeypatch):
-    """Drive _fetch_post_vectors_safe's underlying fetch."""
+    """Drive fetch_post_vectors_safe's underlying fetch."""
     calls = []
 
     def _fake(conn, post_ids):
@@ -179,7 +179,7 @@ def vectors(monkeypatch):
             raise outcome
         return outcome
 
-    monkeypatch.setattr(ranker_daemon, "fetch_post_vectors", _fake)
+    monkeypatch.setattr(embeddings, "fetch_post_vectors", _fake)
     return calls
 
 
@@ -188,17 +188,17 @@ def test_repeated_identical_failures_log_once(vectors, caplog):
     vectors.extend([err, err, err])
     conn = MagicMock()
     for _ in range(3):
-        assert ranker_daemon._fetch_post_vectors_safe(conn, [1]) == {}
+        assert embeddings.fetch_post_vectors_safe(conn, [1]) == {}
     assert sum("embedding fetch failed" in r.message for r in caplog.records) == 1
 
 
 def test_a_different_failure_kind_is_reported(vectors, caplog):
     vectors.extend([RuntimeError("a"), ValueError("b")])
     conn = MagicMock()
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    embeddings.fetch_post_vectors_safe(conn, [1])
+    embeddings.fetch_post_vectors_safe(conn, [1])
     assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
-    assert ranker_daemon._last_embedding_failure == "ValueError:None"
+    assert ("candidates", "ValueError:None") in embeddings._last_embedding_failure
 
 
 
@@ -210,16 +210,16 @@ def test_a_standing_failure_is_re_reported_after_the_throttle_window(vectors, ca
     # /metrics reports healthy while relevance is absent from every ranking. Going
     # quiet there trades a true signal for a false one.
     clock = [1000.0]
-    monkeypatch.setattr(ranker_daemon.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(embeddings.time, "monotonic", lambda: clock[0])
     err = RuntimeError("stale model")
     vectors.extend([err, err, err])
     conn = MagicMock()
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
-    clock[0] += ranker_daemon.EMBEDDING_RELOG_SECONDS / 2
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    embeddings.fetch_post_vectors_safe(conn, [1])
+    clock[0] += embeddings.EMBEDDING_RELOG_SECONDS / 2
+    embeddings.fetch_post_vectors_safe(conn, [1])
     assert sum("embedding fetch failed" in r.message for r in caplog.records) == 1
-    clock[0] += ranker_daemon.EMBEDDING_RELOG_SECONDS
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    clock[0] += embeddings.EMBEDDING_RELOG_SECONDS
+    embeddings.fetch_post_vectors_safe(conn, [1])
     assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
 
 def test_same_class_different_pgcode_is_a_different_kind(vectors, caplog):
@@ -232,8 +232,8 @@ def test_same_class_different_pgcode_is_a_different_kind(vectors, caplog):
     assert type(lost_grant).__mro__[1] is type(dropped).__mro__[1]
     vectors.extend([lost_grant, dropped])
     conn = MagicMock()
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    embeddings.fetch_post_vectors_safe(conn, [1])
+    embeddings.fetch_post_vectors_safe(conn, [1])
     assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
 
 
@@ -241,13 +241,13 @@ def test_recovery_is_logged_and_a_relapse_is_reported_again(vectors, caplog):
     # The bug this pins: without clearing the memo on success, a grant lost, repaired
     # and lost again is SILENT the second time -- the opposite of transition logging,
     # and it shipped once with a docstring claiming otherwise.
-    caplog.set_level(logging.INFO, logger="haf_fyp.ranker_daemon")
+    caplog.set_level(logging.INFO, logger="haf_fyp.embeddings")
     err = RuntimeError("grant lost")
     vectors.extend([err, {1: "vec"}, err])
     conn = MagicMock()
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    embeddings.fetch_post_vectors_safe(conn, [1])
+    embeddings.fetch_post_vectors_safe(conn, [1])
+    embeddings.fetch_post_vectors_safe(conn, [1])
     assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
     assert sum("embedding fetch recovered" in r.message for r in caplog.records) == 1
 
@@ -258,9 +258,9 @@ def test_a_clean_run_says_nothing(vectors, caplog):
     # that -- with it vacuous, deleting the `if recovered is not None` guard reported
     # "recovered (was None)" on EVERY cycle of a healthy node, which is the per-cycle
     # spam this whole change exists to remove, reintroduced in the same function.
-    caplog.set_level(logging.INFO, logger="haf_fyp.ranker_daemon")
+    caplog.set_level(logging.INFO, logger="haf_fyp.embeddings")
     vectors.append({1: "vec"})
-    assert ranker_daemon._fetch_post_vectors_safe(MagicMock(), [1]) == {1: "vec"}
+    assert embeddings.fetch_post_vectors_safe(MagicMock(), [1]) == {1: "vec"}
     assert not [r for r in caplog.records if "embedding fetch" in r.message]
 
 
@@ -271,15 +271,15 @@ def test_operational_error_propagates_untouched(vectors):
     vectors.append(psycopg2.OperationalError("connection lost"))
     conn = MagicMock()
     with pytest.raises(psycopg2.OperationalError):
-        ranker_daemon._fetch_post_vectors_safe(conn, [1])
+        embeddings.fetch_post_vectors_safe(conn, [1])
     conn.rollback.assert_not_called()
-    assert ranker_daemon._last_embedding_failure is None
+    assert not embeddings._last_embedding_failure
 
 
 def test_failure_rolls_back_so_the_cycle_can_continue(vectors):
     vectors.append(RuntimeError("boom"))
     conn = MagicMock()
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    embeddings.fetch_post_vectors_safe(conn, [1])
     assert conn.rollback.call_args_list == [call()]
 
 
@@ -470,3 +470,113 @@ def test_servability_query_names_the_relations_and_predicate_it_should():
     assert "hive_post_id IS NOT NULL" in endpoints
 
 
+
+
+# --------------------------------------------------------------------------
+# _log_user_failure -- the per-user throttle (#41)
+#
+# This is the MR's headline deliverable (~200 tracebacks per cycle -> 1 per hour)
+# and it shipped with no tests at all, while the structurally identical embedding
+# throttle had eight. Every property below can regress silently otherwise.
+# --------------------------------------------------------------------------
+
+
+def _boom(msg="boom", cls=RuntimeError):
+    return cls(msg)
+
+
+def test_one_cause_across_many_users_logs_once(caplog):
+    # The whole point: 200 users failing for ONE reason is one line, not 200.
+    for i in range(200):
+        ranker_daemon._log_user_failure(f"user{i}", _boom())
+    assert sum("failed to rank user" in r.message for r in caplog.records) == 1
+
+
+def test_the_username_is_not_part_of_the_key(caplog):
+    # Keying on username would reinstate the flood, since one cause hits everyone.
+    # Pinned explicitly because the comment claims it and nothing else would notice.
+    ranker_daemon._log_user_failure("alice", _boom())
+    ranker_daemon._log_user_failure("bob", _boom())
+    assert sum("failed to rank user" in r.message for r in caplog.records) == 1
+
+
+def test_two_alternating_kinds_do_not_defeat_the_throttle(caplog):
+    # A single "last kind seen" is defeated by two coexisting causes: A,B,A,B differs
+    # from its predecessor every time, so the full flood returned. Keyed per kind,
+    # each is reported once.
+    for _ in range(50):
+        ranker_daemon._log_user_failure("a", _boom(cls=RuntimeError))
+        ranker_daemon._log_user_failure("b", _boom(cls=ValueError))
+    assert sum("failed to rank user" in r.message for r in caplog.records) == 2
+
+
+def test_a_standing_failure_is_re_reported_hourly(caplog, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(ranker_daemon.time, "monotonic", lambda: clock[0])
+    ranker_daemon._log_user_failure("a", _boom())
+    clock[0] += ranker_daemon.RANK_FAILURE_RELOG_SECONDS / 2
+    ranker_daemon._log_user_failure("a", _boom())
+    assert sum("failed to rank user" in r.message for r in caplog.records) == 1
+    clock[0] += ranker_daemon.RANK_FAILURE_RELOG_SECONDS
+    ranker_daemon._log_user_failure("a", _boom())
+    assert sum("failed to rank user" in r.message for r in caplog.records) == 2
+
+
+def test_a_clean_cycle_announces_recovery_and_re_arms(caplog):
+    caplog.set_level(logging.INFO, logger="haf_fyp.ranker_daemon")
+    ranker_daemon._log_user_failure("a", _boom())
+    ranker_daemon._clear_user_failure_memo()
+    assert sum("per-user ranking recovered" in r.message for r in caplog.records) == 1
+    # and the next failure is reported again rather than swallowed
+    ranker_daemon._log_user_failure("a", _boom())
+    assert sum("failed to rank user" in r.message for r in caplog.records) == 2
+
+
+def test_clearing_an_empty_memo_says_nothing(caplog):
+    caplog.set_level(logging.INFO, logger="haf_fyp.ranker_daemon")
+    ranker_daemon._clear_user_failure_memo()
+    assert not [r for r in caplog.records if "recovered" in r.message]
+
+
+def test_a_per_user_success_does_not_clear_the_bulk_fetch_memo(caplog):
+    """
+    Scoped memo (#41 review): one memo shared by every call site THRASHED.
+
+    The bulk candidate fetch and the per-user builders fail independently -- a
+    5000-id fetch can time out while a small per-user list succeeds. With one memo,
+    that success cleared the bulk failure's record and the next cycle logged a fresh
+    traceback: per cycle, forever, which is noisier than the per-site behaviour the
+    merge replaced.
+    """
+    conn = MagicMock()
+    boom = RuntimeError("bulk timeout")
+
+    def _fake(c, ids):
+        if ids == [999]:
+            raise boom
+        return {1: "vec"}
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(embeddings, "fetch_post_vectors", _fake)
+        embeddings.fetch_post_vectors_safe(conn, [999], scope="candidates")
+        # a DIFFERENT scope succeeding must not re-arm the candidates line
+        embeddings.fetch_post_vectors_safe(conn, [1], scope="user-profile")
+        embeddings.fetch_post_vectors_safe(conn, [999], scope="candidates")
+
+    assert sum("embedding fetch failed" in r.message for r in caplog.records) == 1
+
+
+def test_each_scope_reports_its_own_failure(caplog):
+    # The flip side: two scopes failing are two distinct conditions and both deserve
+    # a line, even when the exception kind is identical.
+    conn = MagicMock()
+
+    def _fake(c, ids):
+        raise RuntimeError("gone")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(embeddings, "fetch_post_vectors", _fake)
+        embeddings.fetch_post_vectors_safe(conn, [1], scope="candidates")
+        embeddings.fetch_post_vectors_safe(conn, [2], scope="user-profile")
+
+    assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
