@@ -17,7 +17,7 @@ import psycopg2
 
 import pytest
 
-from haf_fyp import ranker_daemon
+from haf_fyp import embeddings, ranker_daemon
 from haf_fyp.credibility import (
     STATE_ABSENT,
     STATE_READABLE,
@@ -170,7 +170,7 @@ def test_the_declared_sources_are_the_relations_the_code_actually_reads():
 
 @pytest.fixture
 def vectors(monkeypatch):
-    """Drive _fetch_post_vectors_safe's underlying fetch."""
+    """Drive fetch_post_vectors_safe's underlying fetch."""
     calls = []
 
     def _fake(conn, post_ids):
@@ -179,7 +179,7 @@ def vectors(monkeypatch):
             raise outcome
         return outcome
 
-    monkeypatch.setattr(ranker_daemon, "fetch_post_vectors", _fake)
+    monkeypatch.setattr(embeddings, "fetch_post_vectors", _fake)
     return calls
 
 
@@ -188,17 +188,17 @@ def test_repeated_identical_failures_log_once(vectors, caplog):
     vectors.extend([err, err, err])
     conn = MagicMock()
     for _ in range(3):
-        assert ranker_daemon._fetch_post_vectors_safe(conn, [1]) == {}
+        assert embeddings.fetch_post_vectors_safe(conn, [1]) == {}
     assert sum("embedding fetch failed" in r.message for r in caplog.records) == 1
 
 
 def test_a_different_failure_kind_is_reported(vectors, caplog):
     vectors.extend([RuntimeError("a"), ValueError("b")])
     conn = MagicMock()
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    embeddings.fetch_post_vectors_safe(conn, [1])
+    embeddings.fetch_post_vectors_safe(conn, [1])
     assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
-    assert ranker_daemon._last_embedding_failure == "ValueError:None"
+    assert embeddings._last_embedding_failure == "ValueError:None"
 
 
 
@@ -210,16 +210,16 @@ def test_a_standing_failure_is_re_reported_after_the_throttle_window(vectors, ca
     # /metrics reports healthy while relevance is absent from every ranking. Going
     # quiet there trades a true signal for a false one.
     clock = [1000.0]
-    monkeypatch.setattr(ranker_daemon.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(embeddings.time, "monotonic", lambda: clock[0])
     err = RuntimeError("stale model")
     vectors.extend([err, err, err])
     conn = MagicMock()
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
-    clock[0] += ranker_daemon.EMBEDDING_RELOG_SECONDS / 2
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    embeddings.fetch_post_vectors_safe(conn, [1])
+    clock[0] += embeddings.EMBEDDING_RELOG_SECONDS / 2
+    embeddings.fetch_post_vectors_safe(conn, [1])
     assert sum("embedding fetch failed" in r.message for r in caplog.records) == 1
-    clock[0] += ranker_daemon.EMBEDDING_RELOG_SECONDS
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    clock[0] += embeddings.EMBEDDING_RELOG_SECONDS
+    embeddings.fetch_post_vectors_safe(conn, [1])
     assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
 
 def test_same_class_different_pgcode_is_a_different_kind(vectors, caplog):
@@ -232,8 +232,8 @@ def test_same_class_different_pgcode_is_a_different_kind(vectors, caplog):
     assert type(lost_grant).__mro__[1] is type(dropped).__mro__[1]
     vectors.extend([lost_grant, dropped])
     conn = MagicMock()
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    embeddings.fetch_post_vectors_safe(conn, [1])
+    embeddings.fetch_post_vectors_safe(conn, [1])
     assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
 
 
@@ -241,13 +241,13 @@ def test_recovery_is_logged_and_a_relapse_is_reported_again(vectors, caplog):
     # The bug this pins: without clearing the memo on success, a grant lost, repaired
     # and lost again is SILENT the second time -- the opposite of transition logging,
     # and it shipped once with a docstring claiming otherwise.
-    caplog.set_level(logging.INFO, logger="haf_fyp.ranker_daemon")
+    caplog.set_level(logging.INFO, logger="haf_fyp.embeddings")
     err = RuntimeError("grant lost")
     vectors.extend([err, {1: "vec"}, err])
     conn = MagicMock()
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    embeddings.fetch_post_vectors_safe(conn, [1])
+    embeddings.fetch_post_vectors_safe(conn, [1])
+    embeddings.fetch_post_vectors_safe(conn, [1])
     assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
     assert sum("embedding fetch recovered" in r.message for r in caplog.records) == 1
 
@@ -258,9 +258,9 @@ def test_a_clean_run_says_nothing(vectors, caplog):
     # that -- with it vacuous, deleting the `if recovered is not None` guard reported
     # "recovered (was None)" on EVERY cycle of a healthy node, which is the per-cycle
     # spam this whole change exists to remove, reintroduced in the same function.
-    caplog.set_level(logging.INFO, logger="haf_fyp.ranker_daemon")
+    caplog.set_level(logging.INFO, logger="haf_fyp.embeddings")
     vectors.append({1: "vec"})
-    assert ranker_daemon._fetch_post_vectors_safe(MagicMock(), [1]) == {1: "vec"}
+    assert embeddings.fetch_post_vectors_safe(MagicMock(), [1]) == {1: "vec"}
     assert not [r for r in caplog.records if "embedding fetch" in r.message]
 
 
@@ -271,15 +271,15 @@ def test_operational_error_propagates_untouched(vectors):
     vectors.append(psycopg2.OperationalError("connection lost"))
     conn = MagicMock()
     with pytest.raises(psycopg2.OperationalError):
-        ranker_daemon._fetch_post_vectors_safe(conn, [1])
+        embeddings.fetch_post_vectors_safe(conn, [1])
     conn.rollback.assert_not_called()
-    assert ranker_daemon._last_embedding_failure is None
+    assert embeddings._last_embedding_failure is None
 
 
 def test_failure_rolls_back_so_the_cycle_can_continue(vectors):
     vectors.append(RuntimeError("boom"))
     conn = MagicMock()
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    embeddings.fetch_post_vectors_safe(conn, [1])
     assert conn.rollback.call_args_list == [call()]
 
 

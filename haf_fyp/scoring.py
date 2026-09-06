@@ -110,7 +110,7 @@ def build_user_profile_vector(
     Returns (vector: np.ndarray, posts_sampled: int) or (None, 0) if the
     user has no interactions with indexed posts that have embeddings.
     """
-    from haf_fyp.embeddings import fetch_post_vectors, fetch_user_interactions
+    from haf_fyp.embeddings import fetch_post_vectors_safe, fetch_user_interactions
 
     interactions = fetch_user_interactions(conn, username, lookback_days)
     if not interactions:
@@ -124,7 +124,10 @@ def build_user_profile_vector(
     vectors = {pid: post_vectors[pid] for pid in interaction_ids if pid in post_vectors}
     missing = [pid for pid in interaction_ids if pid not in vectors]
     if missing:
-        vectors.update(fetch_post_vectors(conn, missing))
+        # Guarded (#41): an unavailable HiveSense yields {}, this returns None,
+        # and compute_scores takes its cold-start branch -- instead of raising
+        # inside _rank_user and leaving the user with no feed_cache row at all.
+        vectors.update(fetch_post_vectors_safe(conn, missing))
 
     weighted: list[np.ndarray] = []
     total_w = 0.0
@@ -156,7 +159,7 @@ def bootstrap_vector_from_communities(
     if not community_ids:
         return None
 
-    from haf_fyp.embeddings import fetch_post_vectors
+    from haf_fyp.embeddings import fetch_post_vectors_safe
 
     with conn.cursor() as cur:
         cur.execute(
@@ -183,7 +186,10 @@ def bootstrap_vector_from_communities(
     vectors = {pid: post_vectors[pid] for pid in post_ids if pid in post_vectors}
     missing = [pid for pid in post_ids if pid not in vectors]
     if missing:
-        vectors.update(fetch_post_vectors(conn, missing))
+        # Guarded (#41): an unavailable HiveSense yields {}, this returns None,
+        # and compute_scores takes its cold-start branch -- instead of raising
+        # inside _rank_user and leaving the user with no feed_cache row at all.
+        vectors.update(fetch_post_vectors_safe(conn, missing))
 
     vecs = [vectors[pid] for pid in post_ids if pid in vectors]
     if not vecs:
