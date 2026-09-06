@@ -64,6 +64,7 @@ from .sync_status import (
     build_sync_status,
     fetch_sync_status_row,
 )
+from haf_fyp.dbenv import env_or_default
 
 if TYPE_CHECKING:  # typing only -- not imported at runtime
     from slowapi.wrappers import Limit
@@ -746,11 +747,16 @@ _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
 
 def _db_kwargs() -> dict:
+    # env_or_default, not os.environ.get: .get() returns its default only when the key
+    # is ABSENT, so POSTGRES_HOST= in a compose file yielded host="" and libpq
+    # substituted the local socket. The shell verbs are safe from this by using the
+    # colon form `: "${POSTGRES_HOST:=haf}"`; this restores the same semantics here.
+    # See #40 -- the flag guard cannot see the environment channel.
     return dict(
-        host=os.environ.get("POSTGRES_HOST", "haf"),
-        port=int(os.environ.get("POSTGRES_PORT", "5432")),
-        dbname=os.environ.get("POSTGRES_DB", "haf_block_log"),
-        user=os.environ.get("POSTGRES_USER", "haf_fyp_user"),
+        host=env_or_default("POSTGRES_HOST", "haf"),
+        port=int(env_or_default("POSTGRES_PORT", "5432")),
+        dbname=env_or_default("POSTGRES_DB", "haf_block_log"),
+        user=env_or_default("POSTGRES_USER", "haf_fyp_user"),
         password=os.environ.get("POSTGRES_PASSWORD", ""),
     )
 

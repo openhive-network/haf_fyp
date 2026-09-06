@@ -31,15 +31,33 @@ require_flag_value() {
     local arg="$1"
     local flag="${arg%%=*}"
     local value="${arg#*=}"
+
     case "${value}" in
         "")
             log "ERROR: ${flag}= was given an empty value."
             log "       An empty value is NOT ignored -- libpq substitutes its own"
-            log "       default, which for --host= is the local socket. This is almost"
-            log "       always an unset variable in a module file or runbook; fix the"
-            log "       variable rather than removing the flag."
+            log "       default: the local socket for --host, 5432 for --port, the"
+            log "       OS user for --user. This is almost always an unset variable"
+            log "       in a module file or runbook; fix the variable rather than"
+            log "       removing the flag."
             exit 2
             ;;
+    esac
+
+    # A newline splits one value into what reads as two settings, and every message that
+    # echoes it prints only the first line -- so the log names one target while libpq is
+    # handed another. Both #40 and its sibling asked for this explicitly.
+    case "${value}" in
+        *"
+"*)
+            log "ERROR: ${flag}= was given a value containing a newline."
+            log "       Refused: messages that echo it would show only its first line,"
+            log "       so the log would name a different target than the connection."
+            exit 2
+            ;;
+    esac
+
+    case "${value}" in
         *[![:space:]]*)
             : # at least one non-whitespace character -- fine
             ;;
@@ -51,6 +69,24 @@ require_flag_value() {
             ;;
     esac
 }
+
+# The same values reach these variables through the ENVIRONMENT, where the flag guard
+# never runs. Empty is already handled: the `:=` above is the COLON form, which
+# substitutes on unset OR null, so POSTGRES_HOST="" becomes haf. Whitespace-only is not.
+#
+# NOTE this covers the shell only. haf_fyp/api.py and haf_fyp/ranker_daemon.py read the
+# same variables through os.environ.get(k, default), which returns the default only when
+# the key is ABSENT -- see haf_fyp/dbenv.py, which restores these semantics there.
+for _var in POSTGRES_HOST POSTGRES_PORT POSTGRES_DB POSTGRES_USER; do
+    case "${!_var}" in
+        *[![:space:]]*) : ;;
+        *)  log "ERROR: ${_var} is set to a whitespace-only value."
+            log "       Refused for the same reason as the equivalent flag."
+            exit 2
+            ;;
+    esac
+done
+unset _var
 
 wait_for_postgres() {
     log "Waiting for PostgreSQL at ${POSTGRES_HOST}:${POSTGRES_PORT}..."

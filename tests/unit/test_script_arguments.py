@@ -596,25 +596,138 @@ def test_a_valid_connection_flag_value_is_still_accepted(bash, tmp_path):
         )
 
 
-def test_every_connection_flag_in_the_loop_is_guarded():
-    """Source-text, and honest about it: a completeness check over the option loop, not
-    a behavioural one. It exists because the behavioural tests above can only cover
-    flags someone remembered to list, and the failure mode for #40 was precisely that
-    the empty-value check was applied to one flag and not its neighbours.
+CONNECTION_FLAGS = ("--host", "--port", "--user", "--postgres-url", "--url",
+                    "--postgres-host", "--postgres-port", "--postgres-user",
+                    "--postgres-access")
 
-    Any option arm that assigns a POSTGRES_* variable must call require_flag_value.
+
+def _all_shell_files() -> list[Path]:
+    """Discovered, not listed. The sibling repo's first version of this test listed the
+    three scripts its fix touched and was therefore blind to three it did not."""
+    root = Path(__file__).resolve().parents[2]
+    found = [p for p in root.rglob("*.sh")
+             if ".git" not in p.parts and "node_modules" not in p.parts]
+    assert len(found) > 3, f"shell-file discovery found only {len(found)} files"
+    return sorted(found)
+
+
+def test_every_connection_flag_arm_validates_its_value():
+    """Source-text, and honest about it: a completeness check, not a behavioural one.
+    The behavioural tests can only cover flags and scripts someone remembered to list,
+    and forgetting a neighbour is exactly how #40 arose.
+
+    An arm is recognised by SHAPE -- `--flag=*)` assigning from ${arg#*=} or ${1#*=} --
+    not by the variable name it assigns to, because the sibling repo's missed scripts
+    assigned to PG_HOST and used ${1#*=}.
     """
     missing = []
-    for script in (INSTALL, UNINSTALL, PROCESS):
-        for line in script.read_text(encoding="utf-8").splitlines():
+    considered = 0
+    for script in _all_shell_files():
+        for lineno, line in enumerate(script.read_text(encoding="utf-8").splitlines(), 1):
             stripped = line.strip()
-            if not stripped.startswith("--") or "POSTGRES_" not in stripped:
+            if not stripped.startswith("--"):
                 continue
-            if "=${arg#*=}" not in stripped.replace(" ", ""):
+            flag = stripped.split("=")[0].split(")")[0].split("|")[0]
+            if flag not in CONNECTION_FLAGS:
                 continue
+            squashed = stripped.replace(" ", "")
+            if "${arg#*=}" not in squashed and "${1#*=}" not in squashed:
+                continue
+            considered += 1
             if "require_flag_value" not in stripped:
-                missing.append(f"{script.name}: {stripped}")
-    assert not missing, (
-        "these option arms assign a connection variable without checking the value "
-        "first, which is the #40 bug:\n  " + "\n  ".join(missing)
+                rel = script.relative_to(Path(__file__).resolve().parents[2])
+                missing.append(f"{rel}:{lineno}: {stripped}")
+
+    # The sibling repo's first version of this check was VACUOUS, not merely narrow: its
+    # filter looked for "=${arg#*=}" while the arms are written
+    # POSTGRES_HOST="${arg#*=}" -- a quote sits between the = and the $. It considered
+    # ZERO arms and passed with every guard deleted. Assert the scan found something, so
+    # the same rot cannot switch this test off silently.
+    assert considered >= 8, (
+        f"the completeness scan matched only {considered} option arms, which means its "
+        f"pattern has gone stale rather than that the repo got safer"
     )
+    assert not missing, (
+        "these option arms take a connection value without validating it first, which "
+        "is the #40 bug. An empty value is not ignored by libpq -- it substitutes its "
+        "own default, and for --host= that is the local socket:" + "".join(
+            chr(10) + "  " + m for m in missing)
+    )
+
+
+def test_a_newline_in_a_connection_flag_value_is_refused(bash, tmp_path):
+    """Both #40 and its sibling asked for this explicitly. A newline makes every message
+    that echoes the value print only its first line, so the log would name one target
+    while libpq is handed another.
+
+    Driven through `bash -c` with the newline inside the SCRIPT TEXT rather than as an
+    argv element. On Windows a newline does not survive subprocess argument passing at
+    all -- measured, bash receives only the text before it -- so the obvious spelling of
+    this test would silently exercise `--host=haf` and pass for the wrong reason.
+    """
+    nl = chr(10)
+    script = (
+        "source '" + (SCRIPTS / "common.sh").as_posix() + "' 2>/dev/null" + nl
+        + 'require_flag_value "--host=haf' + nl + 'evil"' + nl
+        + "echo ACCEPTED" + nl
+    )
+    proc = subprocess.run(
+        [bash, "-c", script], env=clean_env(stub_bin(tmp_path)),
+        capture_output=True, text=True, timeout=TIMEOUT,
+    )
+    out = proc.stdout + proc.stderr
+    assert "ACCEPTED" not in out, "the newline value was accepted:" + nl + out
+    assert proc.returncode == 2, f"exited {proc.returncode}, not 2:" + nl + out
+    assert "newline" in out
+
+
+# --- #40, second half: the Python services take the same variables ------------------
+#
+# The shell is safe against an EMPTY environment value by accident of spelling:
+# common.sh uses `: "${POSTGRES_HOST:=haf}"`, and the COLON form substitutes on unset OR
+# null. os.environ.get(key, default) has no such property -- it returns the default only
+# when the key is ABSENT -- so POSTGRES_HOST= in a compose file produced host="" and
+# libpq substituted the local socket, in a daemon that DELETEs and retries forever.
+
+def test_python_services_treat_an_empty_env_value_as_unset(monkeypatch):
+    """The shell's `:=` semantics, restored for the Python overlay."""
+    from haf_fyp.dbenv import env_or_default
+
+    monkeypatch.setenv("POSTGRES_HOST", "")
+    assert env_or_default("POSTGRES_HOST", "haf") == "haf"
+
+    monkeypatch.delenv("POSTGRES_HOST", raising=False)
+    assert env_or_default("POSTGRES_HOST", "haf") == "haf"
+
+    monkeypatch.setenv("POSTGRES_HOST", "realhost")
+    assert env_or_default("POSTGRES_HOST", "haf") == "realhost"
+
+
+@pytest.mark.parametrize("bad", ["   ", "\t", "x dbname=other", "a'b"])
+def test_python_services_refuse_a_value_that_would_break_the_conninfo(monkeypatch, bad):
+    """ranker_daemon builds its DSN by f-string concatenation, so a space starts a new
+    keyword: POSTGRES_HOST="x dbname=other" would silently change the database."""
+    from haf_fyp.dbenv import ConnectionSettingError, env_or_default
+
+    monkeypatch.setenv("POSTGRES_HOST", bad)
+    with pytest.raises(ConnectionSettingError):
+        env_or_default("POSTGRES_HOST", "haf")
+
+
+def test_both_python_services_route_through_the_same_helper(monkeypatch):
+    """The API and the ranker must not disagree about what an empty value means -- they
+    connect as different roles to the same database, and a split would point one of them
+    somewhere else entirely."""
+    import haf_fyp.api as api
+    import haf_fyp.ranker_daemon as ranker
+
+    for key in ("POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DB"):
+        monkeypatch.setenv(key, "")
+
+    kwargs = api._db_kwargs()
+    dsn = ranker._dsn()
+
+    assert kwargs["host"] == "haf", f"api fell through to {kwargs['host']!r}"
+    assert "host=haf " in dsn, f"ranker fell through to {dsn!r}"
+    assert kwargs["dbname"] == "haf_block_log"
+    assert "dbname=haf_block_log " in dsn
