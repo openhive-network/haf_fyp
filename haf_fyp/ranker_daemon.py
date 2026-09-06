@@ -210,8 +210,19 @@ def _fetch_candidates(conn) -> pd.DataFrame:
 
 # The last embedding-fetch failure KIND reported, so a permanently absent HiveSense
 # does not write one traceback per cycle forever. Not a cache of the answer -- the
-# fetch is retried every cycle regardless -- only a record of what has been said.
-# Locked because the ranker cycle and the targeted-refresh path can both reach it.
+# fetch is retried every cycle regardless -- only a record of what has been said,
+# cleared on success so a recurrence after recovery is reported again.
+#
+# The lock is defensive, NOT closing a known race: main() drives run_cycle and
+# _run_targeted_refresh sequentially on one thread, and the only other thread here is
+# the redis subscriber, which does nothing but queue.put. It costs a compare and is
+# the same shape credibility.py uses, where the race IS real (FastAPI runs the sync
+# /metrics route in a worker threadpool). Said plainly so the next reader does not
+# infer a concurrency model this daemon does not have.
+#
+# Reset by the autouse fixture in tests/unit/conftest.py, for the reason that fixture
+# already gives for credibility._last_state: a module global that remembers what has
+# been reported makes tests order-dependent the moment one drives this path.
 _last_embedding_failure: str | None = None
 _embedding_failure_lock = threading.Lock()
 
@@ -252,12 +263,12 @@ def _fetch_post_vectors_safe(conn, post_ids: list[int]) -> dict:
     docstring describes -- so it is filed separately rather than changed here on the
     back of a documentation fix. Tracked as #41.
     """
+    global _last_embedding_failure
     try:
-        return fetch_post_vectors(conn, post_ids)
+        vectors = fetch_post_vectors(conn, post_ids)
     except psycopg2.OperationalError:
         raise
     except Exception as exc:
-        global _last_embedding_failure
         kind = f"{type(exc).__name__}:{getattr(exc, 'pgcode', None)}"
         with _embedding_failure_lock:
             first_or_changed = kind != _last_embedding_failure
@@ -270,6 +281,22 @@ def _fetch_post_vectors_safe(conn, post_ids: list[int]) -> dict:
             )
         conn.rollback()
         return {}
+    else:
+        # Clearing on success is what makes this a TRANSITION log rather than a
+        # once-per-process one, and it is the half a review caught missing while the
+        # docstring above already promised it. Without it: a grant is lost and
+        # logged, the operator re-runs grant_cross_schema.sh, and when the same grant
+        # is lost again weeks later the kind is unchanged, so NOTHING is logged and
+        # relevance drops out of every ranking in silence. credibility.py avoids this
+        # by memoising the full CURRENT state including healthy ones; the equivalent
+        # here is to forget the failure once it stops happening, and to say so when
+        # it does -- an operator who saw the first line needs to see it end.
+        with _embedding_failure_lock:
+            recovered = _last_embedding_failure
+            _last_embedding_failure = None
+        if recovered is not None:
+            log.info("embedding fetch recovered (was %s)", recovered)
+        return vectors
 
 
 def _fetch_author_credibility_safe(conn, authors: list[str]) -> dict:

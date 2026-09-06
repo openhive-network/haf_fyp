@@ -147,9 +147,13 @@ def _source(relation: str, state: str) -> dict:
 #                exception-guarded so a missing schema cannot stall block
 #                processing, which is correct but leaves empty feeds as the only
 #                symptom. This probe is how an operator sees it (#36).
-#   hivesense -- optional. Without it compute_scores takes its cold-start branch and
-#                zeroes the relevance weight, so the feed is community-boosted
-#                trending rather than personalized.
+#   hivesense -- optional, and its absence is quieter than hivemind's but not as
+#                gentle as "cold-start ranking". compute_scores DOES zero the
+#                relevance weight, but most users never reach it: the profile and
+#                bootstrap vector builders call hivesense directly and unguarded, so
+#                a user with recent history or a community raises inside _rank_user
+#                and gets no feed_cache row, falling back to the global feed without
+#                the community boost (#41). Either way: not personalized.
 _HIVEMIND_RELATION = ("hivemind_app", "hive_posts")
 _HIVESENSE_RELATION = ("hivesense_app", "posts_vectors")
 _RANKING_SOURCES = (_HIVEMIND_RELATION, _HIVESENSE_RELATION)

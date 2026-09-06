@@ -342,3 +342,16 @@ def test_probe_missing_a_key_does_not_raise():
     assert report["hivemind"] == "unknown"
     assert report["feeds_empty"] is True
     assert report["degraded"] is True
+
+
+def test_full_state_detail_names_both_sources():
+    # The two failure details are pinned above; this one was not, so it could be
+    # blanked or swapped with the probe-failed detail and the suite stayed green.
+    report = build_ranking_sources_report(_ranking())
+    assert "hivemind" in report["detail"] and "hivesense" in report["detail"]
+
+
+def test_failed_probe_detail_says_the_probe_failed():
+    # Distinct from the healthy detail, so a monitor surfacing `detail` verbatim
+    # cannot show "feeds personalized" for a node nobody could check.
+    assert "probe failed" in build_ranking_sources_report(None)["detail"]

@@ -99,19 +99,21 @@ for any user who has interaction history — or a subscribed/interest community 
 the per-user ranking raises instead of degrading. The ranker catches it per user,
 rolls back, and writes **no `feed_cache` row for them at all**.
 
-What those users are served is the endpoint's cold-start fallback: the global feed,
-and *without* the ×1.2 subscribed / ×1.1 engaged community boost, since the boost is
-applied during the per-user ranking that never completed. `fyp.source` reports
-cold-start, correctly.
+What those users are served is the endpoint's fallback: the global feed, reported as
+`fyp.source: "global"`, and *without* the ×1.2 subscribed / ×1.1 engaged community
+boost, since the boost is applied during the per-user ranking that never completed.
+
+Two narrow exceptions, for accuracy: a user whose interactions are all older than the
+90-day lookback and who has no community does get a real `feed_cache` row with the
+`w_v = 0` ranking (and the engaged boost), as does a user with no history at all.
+They are the minority on any active node.
 
 So a node without HiveSense serves a working, stable "For You" page that is the
-global trending feed for everyone. It also logs one traceback per affected user per
-ranking cycle (`MAX_USERS_PER_CYCLE`, default 200, every 300s), which is the loudest
-symptom and the least useful one.
-
-Running without HiveSense is a legitimate choice — it needs a GPU, so "just run it
-too" is a real cost, not a checkbox. It is not a cheap one, and the log volume above
-is tracked separately in [#41](https://gitlab.syncad.com/hive/haf_fyp/-/issues/41).
+global trending feed for practically everyone. It also logs one traceback per
+affected user per ranking cycle — up to `MAX_USERS_PER_CYCLE` (default 200) every
+`CYCLE_SECONDS` (300, not tunable), plus more from Redis-driven targeted refreshes
+outside that cadence. That is the loudest symptom and the least useful one; it is
+tracked separately in [#41](https://gitlab.syncad.com/hive/haf_fyp/-/issues/41).
 
 HiveSense needs a GPU to compute embeddings at a useful rate, so "just run HiveSense
 as well" is a real operational cost rather than a checkbox. Running haf_fyp without
@@ -127,18 +129,28 @@ just widening it.
 
 #### Checking what this node actually has
 
-`GET /metrics` reports every foreign relation the ranking and credibility signals
-read, each classified `readable` / `unreadable` / `absent`, so the answer does not
-depend on reading this table and hoping. `unreadable` means the relation exists but
-the role has lost SELECT on it — repair with `scripts/grant_cross_schema.sh`;
-`absent` means the app is simply not deployed here.
+`GET /metrics` classifies each probed relation, under `credibility_sources` (#8) and
+`ranking_sources` (#36), so the answer does not depend on reading this table and
+hoping. The distinction between the first two states matters: they used to be
+indistinguishable, so a lost grant silently degraded ranking quality with nothing to
+notice.
 
-`GET /metrics` reports each source as `readable` / `unreadable` / `absent`.
-`unreadable` means the relation exists but this deployment has lost `SELECT` on it —
-a repairable misconfiguration, fixed by re-running `scripts/grant_cross_schema.sh`.
-`absent` just means the app is not installed here. The distinction matters: those two
-used to be indistinguishable, so a lost grant silently degraded ranking quality with
-nothing to notice.
+| state | meaning |
+|-------|---------|
+| `readable` | fine |
+| `unreadable` | the relation exists but this deployment has lost `SELECT` on it — repairable, re-run `scripts/grant_cross_schema.sh` |
+| `absent` | the app is not installed here. For an optional source that is not a fault; for hivemind it means empty feeds |
+| `readable_view` | readable, but it is a view, and `has_table_privilege` on a view stays true after the view's owner loses access to what it reads. Treated as healthy, flagged because it cannot be verified |
+| `unknown` | the probe itself failed. **Never** means healthy — every boolean in that section fails safe |
+
+Alert on `ranking_sources.feeds_empty`, not on a state string: it is already the
+answer to "is this node serving anything", across all five states.
+
+What is **not** covered: only `hivemind_app.hive_posts` and
+`hivesense_app.posts_vectors` are probed. The resolver also reads
+`hivemind_app.hive_accounts` and `hive_permlink_data`, and the feed render path reads
+hivemind views through `get_full_post_view_by_id`. A grant lost on one of those alone
+produces empty feeds while `ranking_sources.hivemind` still reads `readable`.
 
 After installing each external app, run:
 ```bash
@@ -212,7 +224,7 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Service health check |
-| GET | `/metrics` | Operational health: embedding coverage (#15) + credibility source health (#8) — not feed analytics |
+| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), ranking source health (#36 — `feeds_empty` is the field to alert on) — not feed analytics |
 | GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
 | POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10/min per IP, 60/min total) |
 | DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5/min per IP, 30/min total) |
@@ -346,6 +358,12 @@ All weights are stored in `haf_fyp_app.algorithm_versions` and activated via `PO
 3. Average embedding of top posts in on-chain subscribed communities
 4. Average embedding of top posts in declared interests (`POST /v1/fyp/interests`)
 5. No vector — cold-start weights applied (no relevance signal)
+
+This ladder describes a node **with** HiveSense. Without it, steps 1, 3 and 4 raise
+rather than falling through to step 5, so the affected users get no cached feed at
+all and are served the global feed by the endpoint instead — see
+[Without HiveSense there is no personalization](#without-hivesense-there-is-no-personalization-not-neutral-relevance)
+and [#41](https://gitlab.syncad.com/hive/haf_fyp/-/issues/41).
 
 ## Database Schema
 
@@ -505,8 +523,8 @@ Before going live:
 - [ ] `FYP_ADMIN_API_KEY` set to a strong random value in `docker/.env.local`
 - [ ] **`TRUSTED_PROXY_IPS` set to the reverse proxy's address or CIDR** (or the literal `direct` if nothing fronts this app). Since #28 this also gates *when* limits are charged: with it unset the app logs an ERROR at startup and falls back to charging only after validation, because charging a request before it is validated is safe only when the bucket identifies the caller — into one shared bucket it lets a single sender 429 everybody else, which is worse than the bug #28 fixes. Rate limits key on `X-Real-IP` only from a trusted peer; unset, every caller keys on the proxy's address instead — one shared bucket for all of them, which is no per-client limit at all. The app logs a warning at startup when it is unset, and once more if a peer outside the list presents the header (which usually means the proxy was recreated with a new address and the list is now stale). Re-check it after anything that can renumber the proxy container.
 - [ ] `HAF_VERSION` pinned to a specific release tag (not `latest`)
-- [ ] **Hivemind installed and synced** → `grant_cross_schema.sh` re-run. REQUIRED: without it every feed returns `[]`, silently. Confirm with `GET /metrics` → `ranking_sources.hivemind` = `readable`, not by assuming.
-- [ ] HiveSense installed and synced → `grant_cross_schema.sh` re-run (optional; without it the feed is community-boosted trending, not personalized)
+- [ ] **Hivemind installed and synced** → `grant_cross_schema.sh` re-run. REQUIRED: without it every feed returns `[]`. Confirm with `GET /metrics` → `ranking_sources.feeds_empty` is `false`, not by assuming — and check the boolean rather than `hivemind == "readable"`, which misses the `readable_view` case. (An absent schema is silent; a lost grant does at least `RAISE WARNING` from the resolver.)
+- [ ] HiveSense installed and synced → `grant_cross_schema.sh` re-run (optional; without it nobody is personalized — see [Without HiveSense there is no personalization](#without-hivesense-there-is-no-personalization-not-neutral-relevance))
 - [ ] balance_tracker installed and synced → `grant_cross_schema.sh` re-run (optional)
 - [ ] reputation_tracker installed and synced → `grant_cross_schema.sh` re-run (optional)
 - [ ] Verify `hivesense_app.posts_vectors` on live instance: `\d hivesense_app.posts_vectors` (expected: `embedding halfvec(1024)`, keyed by hivemind post id, one row per chunk)
