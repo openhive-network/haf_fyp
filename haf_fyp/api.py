@@ -1058,7 +1058,7 @@ def metrics(response: Response):
     # _db_conn, not the inline getconn prologue: it borrows INSIDE the guarded region,
     # so a PoolError("connection pool exhausted") -- reachable with maxconn=5 and a
     # monitor polling both this and /sync-status -- is mapped to JSON here instead of
-    # escaping as a bare text/plain 500. This route also now issues two queries while
+    # escaping as a bare text/plain 500. This route also now issues three queries while
     # holding the connection, which raises the exhaustion pressure that makes it worth
     # doing. The remaining handlers still use the inline prologue (#17).
     # Headers first: the 503 below raises, and a raised HTTPException is rendered from
@@ -1071,8 +1071,22 @@ def metrics(response: Response):
     try:
         with _db_conn() as conn:
             rows = fetch_coverage_rows(conn)
-            probe = fetch_credibility_sources(conn)
+            # ORDER IS LOAD-BEARING: ranking BEFORE credibility. These share one
+            # pooled connection and one transaction (the pool is not autocommit),
+            # and fetch_credibility_sources deliberately does NOT roll back on
+            # failure -- its docstring justifies that with "/metrics issues no
+            # further statement after this", which stopped being true the moment a
+            # third read was added. Run the other way round, any credibility hiccup
+            # (statement timeout, a cancelled backend) leaves the transaction
+            # aborted, the ranking probe then fails with 25P02, and the report
+            # fails safe to feeds_empty=true -- which README.md and this route both
+            # tell operators to alert on. A catalog-read hiccup would page someone
+            # with "every feed is empty". Ranking first means only a genuine
+            # ranking-probe failure can raise that alarm; credibility inherits the
+            # aborted transaction instead, and "unknown" is already its documented
+            # fail-safe.
             ranking_probe = fetch_ranking_sources(conn)
+            probe = fetch_credibility_sources(conn)
     except psycopg2.pool.PoolError as exc:
         # Monitors poll this route, so a persistently exhausted pool must not write a
         # traceback per scrape. Same treatment /sync-status gives the identical error,

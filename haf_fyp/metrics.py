@@ -37,6 +37,7 @@ from statistics import median
 from haf_fyp.credibility import (
     STATE_ABSENT,
     STATE_READABLE,
+    STATE_READABLE_VIEW,
     STATE_UNKNOWN,
     STATE_UNREADABLE,
     probe_credibility_sources,
@@ -149,10 +150,18 @@ def _source(relation: str, state: str) -> dict:
 #   hivesense -- optional. Without it compute_scores takes its cold-start branch and
 #                zeroes the relevance weight, so the feed is community-boosted
 #                trending rather than personalized.
-_RANKING_SOURCES = (
-    ("hivemind_app", "hive_posts"),
-    ("hivesense_app", "posts_vectors"),
-)
+_HIVEMIND_RELATION = ("hivemind_app", "hive_posts")
+_HIVESENSE_RELATION = ("hivesense_app", "posts_vectors")
+_RANKING_SOURCES = (_HIVEMIND_RELATION, _HIVESENSE_RELATION)
+_HIVEMIND_KEY = ".".join(_HIVEMIND_RELATION)
+_HIVESENSE_KEY = ".".join(_HIVESENSE_RELATION)
+
+# Prefixed, because "full" alone is already credibility.STATE_FULL's value and the
+# two enums would share a member in one payload under the same key name -- a
+# consumer validating states against one enum would silently accept the other's.
+RANKING_STATE_FULL = "ranking_full"
+RANKING_STATE_NO_FEED = "ranking_no_feed"
+RANKING_STATE_NO_PERSONALIZATION = "ranking_no_personalization"
 
 
 def fetch_ranking_sources(conn) -> dict | None:
@@ -203,27 +212,53 @@ def build_ranking_sources_report(probe: dict | None) -> dict:
             "detail": "ranking source probe failed -- state unknown",
         }
 
-    hivemind = probe["hivemind_app.hive_posts"]
-    hivesense = probe["hivesense_app.posts_vectors"]
-    feeds_empty = hivemind != STATE_READABLE
-    personalized = not feeds_empty and hivesense == STATE_READABLE
-    degraded = hivemind == STATE_UNREADABLE or hivesense == STATE_UNREADABLE
+    # .get, not [], and keys derived from the tuples rather than retyped: a bare
+    # index on a string literal turns a rename of _RANKING_SOURCES into a KeyError,
+    # and this builder is called OUTSIDE the route's try/except, so that KeyError
+    # would escape as a bare 500 with no JSON body and none of the no-cache headers.
+    hivemind = probe.get(_HIVEMIND_KEY, STATE_UNKNOWN)
+    hivesense = probe.get(_HIVESENSE_KEY, STATE_UNKNOWN)
+
+    # readable_view counts as readable for the BOOLEANS, and keeps its own name in
+    # the per-source field. Both relations probed here are base tables today, so
+    # this branch is unreachable until hivemind or hivesense changes one to a view
+    # -- and if that happens, the honest answer is "we can read it, but this module
+    # cannot verify that its owner still can". Alarming on it would page an operator
+    # over an upstream schema change that may be entirely fine; hiding the
+    # distinction would claim a certainty we do not have.
+    def _readable(state: str) -> bool:
+        return state in (STATE_READABLE, STATE_READABLE_VIEW)
+
+    feeds_empty = not _readable(hivemind)
+    personalized = not feeds_empty and _readable(hivesense)
+    # degraded means "a fault with a known remedy", and a total feed outage is the
+    # most degraded a node can be. An earlier revision counted only UNREADABLE, so
+    # an ABSENT hivemind reported feeds_empty with degraded false -- reproducing, in
+    # the adjacent section of the same payload, exactly the "healthy in the one state
+    # where the signal is entirely dead" misreport that credibility probes
+    # hafd.accounts to prevent. A monitor generalising `if body.*.degraded` across
+    # this response would have missed the outage.
+    degraded = (
+        feeds_empty
+        or hivemind == STATE_UNREADABLE
+        or hivesense == STATE_UNREADABLE
+    )
 
     if feeds_empty:
         detail = (
-            f"hivemind_app.hive_posts is {hivemind} -- every feed returns []; "
+            f"{_HIVEMIND_KEY} is {hivemind} -- every feed returns []; "
             "hivemind is a required dependency"
         )
-        state = "no_feed"
+        state = RANKING_STATE_NO_FEED
     elif personalized:
         detail = "hivemind and hivesense readable -- feeds personalized"
-        state = "full"
+        state = RANKING_STATE_FULL
     else:
         detail = (
-            f"hivesense_app.posts_vectors is {hivesense} -- relevance weight is 0, "
-            "feeds are community-boosted trending rather than personalized"
+            f"{_HIVESENSE_KEY} is {hivesense} -- no personalization; per-user "
+            "ranking cannot complete and users fall back to the global feed"
         )
-        state = "no_personalization"
+        state = RANKING_STATE_NO_PERSONALIZATION
 
     return {
         "state": state,

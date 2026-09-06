@@ -88,6 +88,11 @@ _ALL_SOURCES = _BALANCE_CANDIDATES + (_REPUTATION_RELATION, _ACCOUNTS_RELATION)
 STATE_READABLE = "readable"
 STATE_UNREADABLE = "unreadable"  # exists, but this role cannot SELECT it
 STATE_ABSENT = "absent"  # not installed on this deployment
+# SELECT is held on a VIEW, which cannot be trusted the way a base table can: the
+# privilege stays true after the view owner loses access to what it reads. Reported
+# distinctly so a consumer is not told "readable" about the one case this module
+# says it cannot verify.
+STATE_READABLE_VIEW = "readable_view"
 
 # Overall signal states.
 STATE_UNKNOWN = "unknown"  # the probe itself failed; never means "healthy"
@@ -316,20 +321,33 @@ def probe_relations(conn, relations: tuple) -> dict:
     which scripts/grant_cross_schema.sh repairs. "absent" just means the app is not
     deployed here, which for an optional source is not a fault.
     """
+    if not relations:
+        return {}
     schemas = [s for s, _ in relations]
     names = [n for _, n in relations]
     with conn.cursor() as cur:
         cur.execute(_SOURCE_PROBE_SQL, (schemas, names))
         seen = {
-            (schema, name): bool(readable)
-            for schema, name, readable, _relkind in cur.fetchall()
+            (schema, name): (bool(readable), relkind)
+            for schema, name, readable, relkind in cur.fetchall()
         }
     out = {}
     for rel in relations:
         if rel not in seen:
             out[".".join(rel)] = STATE_ABSENT
+            continue
+        readable, relkind = seen[rel]
+        # relkind is not decoration. has_table_privilege on a VIEW stays true after
+        # the view's OWNER loses SELECT on the table behind it, so "readable" is a
+        # lie for views -- the one undetectable failure _classify documents, and the
+        # shape of a real haf_fyp outage (db/cross_schema_grants.sql records a
+        # recreated hivemind view answering 401 on every request). Everything this
+        # function currently probes is a base table, but it is offered as the
+        # GENERAL primitive, so a view must not be reported as plainly readable.
+        if readable and relkind == 'v':
+            out[".".join(rel)] = STATE_READABLE_VIEW
         else:
-            out[".".join(rel)] = STATE_READABLE if seen[rel] else STATE_UNREADABLE
+            out[".".join(rel)] = STATE_READABLE if readable else STATE_UNREADABLE
     return out
 
 

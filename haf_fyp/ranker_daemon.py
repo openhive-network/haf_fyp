@@ -237,9 +237,20 @@ def _fetch_post_vectors_safe(conn, post_ids: list[int]) -> dict:
     Logging is transition-only, for the same reason credibility's is: on a node with
     no HiveSense at all this path is taken on EVERY cycle, and an unconditional
     log.exception wrote a full traceback every CYCLE_SECONDS for the life of the
-    process -- burying real incidents under a permanent, unactionable one. The first
-    failure and each CHANGE of failure kind are logged with a traceback; repeats of
-    the same kind are silent. GET /metrics reports the standing state.
+    process. The first failure and each CHANGE of failure kind are logged with a
+    traceback; repeats of the same kind are silent, and a success clears the memo so
+    a recurrence after recovery is reported again. GET /metrics reports the standing
+    state.
+
+    SCOPE, because it is easy to overestimate: this quiets ONE of the call sites.
+    build_user_profile_vector and bootstrap_vector_from_communities (scoring.py) call
+    fetch_post_vectors directly and unguarded, so on a HiveSense-less node every user
+    with interaction history or a community still raises inside _rank_user, which
+    logs its own unconditional traceback and writes no feed_cache row for them. That
+    is the bulk of the volume AND a behaviour question -- those users fall through to
+    the endpoint's global-feed fallback rather than getting the w_v=0 ranking this
+    docstring describes -- so it is filed separately rather than changed here on the
+    back of a documentation fix. Tracked as #41.
     """
     try:
         return fetch_post_vectors(conn, post_ids)

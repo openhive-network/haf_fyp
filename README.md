@@ -85,16 +85,33 @@ claim any of these rows makes on its own.
 #### Without HiveSense there is no personalization, not "neutral relevance"
 
 An earlier version of this README said relevance falls back to a neutral 0.5. That
-is misleading about the outcome. With no embeddings, `build_user_profile_vector`
-and `bootstrap_vector_from_communities` both return `None`, and `compute_scores`
-takes its cold-start branch and sets the **relevance weight to 0.0**, renormalising
-recency/engagement/credibility to sum to 1.0. Relevance is dropped from the sum
-rather than contributing a constant.
+is wrong about the mechanism and wrong about the outcome.
 
-The consequence is what matters: every user's ranking becomes identical to the
-global feed apart from the ×1.2 subscribed / ×1.1 engaged community boost. A node
-running haf_fyp without HiveSense serves a "For You" page that is a
-community-boosted trending list. It works, it is stable, and it is not personalized.
+**The mechanism.** With no embeddings, `compute_scores` takes its cold-start branch
+and sets the **relevance weight to 0.0**, renormalising recency/engagement/
+credibility to sum to 1.0. Relevance is dropped from the sum rather than
+contributing a constant.
+
+**The outcome, which is worse than that sounds.** The cold-start branch is only
+reached for a user the ranker can score at all. `build_user_profile_vector` and
+`bootstrap_vector_from_communities` call HiveSense **directly and unguarded**, so
+for any user who has interaction history — or a subscribed/interest community —
+the per-user ranking raises instead of degrading. The ranker catches it per user,
+rolls back, and writes **no `feed_cache` row for them at all**.
+
+What those users are served is the endpoint's cold-start fallback: the global feed,
+and *without* the ×1.2 subscribed / ×1.1 engaged community boost, since the boost is
+applied during the per-user ranking that never completed. `fyp.source` reports
+cold-start, correctly.
+
+So a node without HiveSense serves a working, stable "For You" page that is the
+global trending feed for everyone. It also logs one traceback per affected user per
+ranking cycle (`MAX_USERS_PER_CYCLE`, default 200, every 300s), which is the loudest
+symptom and the least useful one.
+
+Running without HiveSense is a legitimate choice — it needs a GPU, so "just run it
+too" is a real cost, not a checkbox. It is not a cheap one, and the log volume above
+is tracked separately in [#41](https://gitlab.syncad.com/hive/haf_fyp/-/issues/41).
 
 HiveSense needs a GPU to compute embeddings at a useful rate, so "just run HiveSense
 as well" is a real operational cost rather than a checkbox. Running haf_fyp without
