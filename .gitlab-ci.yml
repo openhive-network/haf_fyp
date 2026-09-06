@@ -181,11 +181,21 @@ postgrest-tests:
   variables:
     DOCKER_TLS_CERTDIR: "/certs"
   script:
-    - docker compose -f docker/docker-compose-ci.yml up --detach
+    # --build is load-bearing for LOCAL runs of this file: compose only builds when the
+    # derived image is absent, so after the first run an edit to
+    # endpoints/rewrite_rules.conf or Dockerfile.rewriter would be silently ignored and
+    # the suite would go green on the OLD rules -- exactly the failure the rewriter
+    # stages exist to catch (#44). In CI's ephemeral dind nothing is cached, so it
+    # changes nothing there.
+    - docker compose -f docker/docker-compose-ci.yml up --detach --build
     - docker compose -f docker/docker-compose-ci.yml wait tavern
   after_script:
     - docker compose -f docker/docker-compose-ci.yml logs setup
     - docker compose -f docker/docker-compose-ci.yml logs tavern
+    # Turns "some path 404'd" into "that rule rewrote to X". `|| true` because
+    # after_script runs under set -e: if the build failed the service has no
+    # container, and a non-zero here would skip the `down -v` below.
+    - docker compose -f docker/docker-compose-ci.yml logs rewriter || true
     - docker compose -f docker/docker-compose-ci.yml down -v
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"

@@ -1,0 +1,229 @@
+---
+test_name: Every rewrite rule reaches the endpoint it names
+
+includes:
+  - !include ../common.yaml
+
+# THE GAP THIS CLOSES (#44): endpoints/rewrite_rules.conf defines every URL a third
+# party actually requests, and #34 traversed exactly one of them (/sync-status). Every
+# other stage in this suite addresses PostgREST directly at {api_url}/rpc/<fn>, so a
+# removed, mis-ordered or typo'd rule ships with a green pipeline while the public API
+# 404s. haf_stats hit the ordering half of this in !72 before its equivalent lane
+# existed.
+#
+# `status_code: 200` ALONE DOES NOT PROVE ROUTING. This is the trap, and the sibling
+# repo paid four review rounds to find it: seventeen of its functions have every
+# parameter defaulted, so they all answer 200 to a bare GET, and its no-parameter rules
+# were freely PERMUTABLE among themselves with the suite green. haf_fyp has the same
+# hazard -- get_algorithm, list_algorithm_versions, get_health, get_sync_status and
+# get_version all take no arguments and all answer 200 to a bare GET.
+#
+# So every stage below carries a DISCRIMINATOR that only its intended target can
+# satisfy, and each is a SHAPE assertion rather than a data assertion -- it holds on an
+# empty result set, so these stages neither duplicate nor compete with the suites that
+# own the values.
+#
+# Three discriminator kinds are used, in order of preference:
+#
+#   * `select=<column>` -- PostgREST vertical filtering. Naming a column the function
+#     does not return is 42703 -> 400, so a rule repointed at any other endpoint fails
+#     loudly. Only usable on the five TABLE-returning functions; the other five return
+#     json/jsonb/text scalars, which have no columns to select.
+#
+#   * a unique PARAMETER, where the return type has no columns. PostgREST resolves an
+#     RPC by its named argument set, so passing an argument the target does not declare
+#     is PGRST202 -> 404.
+#
+#   * a NEGATIVE select, for the one case where neither works: get_algorithm's columns
+#     are a strict SUBSET of list_algorithm_versions' (version, description, weights,
+#     deployed_at against those plus is_active), and both take no arguments. Nothing
+#     get_algorithm returns is unique to it, so instead we assert that a column only the
+#     OTHER function has is REJECTED. If /v1/fyp/algorithm were repointed at
+#     list_algorithm_versions, `select=is_active` would answer 200 instead of 400.
+#
+# Column uniqueness below was checked against pg_get_function_result for all ten
+# functions haf_fyp_endpoints exposes through the rewriter.
+
+stages:
+  # --- TABLE-returning: pinned by a column only this function returns ---------------
+
+  - name: /health reaches get_health
+    request:
+      url: "{rewriter_url}/health"
+      method: GET
+      params: {select: "last_processed_block"}
+    response:
+      status_code: 200
+
+  - name: /v1/fyp/algorithms reaches list_algorithm_versions
+    # is_active is the ONLY column separating this from get_algorithm.
+    request:
+      url: "{rewriter_url}/v1/fyp/algorithms"
+      method: GET
+      params: {select: "is_active"}
+    response:
+      status_code: 200
+
+  - name: /v1/fyp/profile/{username} reaches get_user_profile
+    # posts_sampled is returned by no other endpoint. The username is deliberately one
+    # that does not exist: this asserts ROUTING, not data, and get_user_profile answers
+    # for an unknown account.
+    request:
+      url: "{rewriter_url}/v1/fyp/profile/nonexistent-routing-probe"
+      method: GET
+      params: {select: "posts_sampled"}
+    response:
+      status_code: 200
+
+  - name: /v1/fyp/explain/{username}/{post_id} reaches get_score_explanation
+    # score_credibility is unique to this function. Both path segments must survive the
+    # rewrite as separate captures ($1 and $2), which a single-capture typo would break.
+    request:
+      url: "{rewriter_url}/v1/fyp/explain/nonexistent-routing-probe/1"
+      method: GET
+      params: {select: "score_credibility"}
+    response:
+      status_code: 200
+
+  # --- json/jsonb/text returns: pinned by a parameter only this function declares ----
+
+  - name: /v1/fyp/global reaches get_global_feed
+    # community_id is declared by get_global_feed alone. get_personalized_feed -- the
+    # most plausible mis-target, since both return a jsonb feed -- does not declare it,
+    # so a repointed rule is PGRST202 -> 404 rather than a 200 with the wrong feed.
+    request:
+      url: "{rewriter_url}/v1/fyp/global"
+      method: GET
+      params: {page-size: "1", community_id: "1"}
+    response:
+      status_code: 200
+
+  - name: /v1/fyp/feed/{username} reaches get_personalized_feed
+    # username + truncate_body together are declared by no other function:
+    # get_global_feed has truncate_body but not username; get_user_profile and
+    # get_score_explanation have username but not truncate_body.
+    request:
+      url: "{rewriter_url}/v1/fyp/feed/nonexistent-routing-probe"
+      method: GET
+      params: {page-size: "1", truncate_body: "1"}
+    response:
+      status_code: 200
+
+  - name: /v1/fyp/feed-metrics reaches get_feed_metrics
+    # `source` is declared by get_feed_metrics alone.
+    request:
+      url: "{rewriter_url}/v1/fyp/feed-metrics"
+      method: GET
+      params: {source: "global"}
+    response:
+      status_code: 200
+
+  # --- no columns AND no parameters: pinned by body shape ---------------------------
+
+  - name: /sync-status reaches get_sync_status
+    request:
+      url: "{rewriter_url}/sync-status"
+      method: GET
+    response:
+      status_code: 200
+      json:
+        last_block_num: 5000000
+        last_block_time: "2016-09-15T19:47:21"
+
+  - name: /version reaches get_version
+    # get_version returns a bare text scalar; every other no-argument endpoint returns
+    # an object or an array, so the scalar type alone discriminates.
+    request:
+      url: "{rewriter_url}/version"
+      method: GET
+    response:
+      status_code: 200
+      verify_response_with:
+        function: tavern.helpers:validate_content
+        extra_kwargs:
+          comparisons:
+            - jmespath: "type(@)"
+              operator: "eq"
+              expected: "string"
+
+  # --- the subset case: a NEGATIVE probe ---------------------------------------------
+
+  - name: /v1/fyp/algorithm reaches get_algorithm and NOT list_algorithm_versions
+    # Positive half: it answers, and returns a column get_algorithm has.
+    request:
+      url: "{rewriter_url}/v1/fyp/algorithm"
+      method: GET
+      params: {select: "version"}
+    response:
+      status_code: 200
+
+  - name: /v1/fyp/algorithm rejects a column only list_algorithm_versions returns
+    # The discriminator. get_algorithm's columns are a strict subset of
+    # list_algorithm_versions', and both take no arguments, so every positive probe
+    # passes for either. Asking for is_active is 42703 -> 400 against get_algorithm and
+    # 200 against list_algorithm_versions, so this stage is the one that would fail if
+    # the two rules were swapped.
+    request:
+      url: "{rewriter_url}/v1/fyp/algorithm"
+      method: GET
+      params: {select: "is_active"}
+    response:
+      status_code: 400
+
+---
+test_name: The rules stay anchored, and unknown paths do not reach a function
+
+includes:
+  - !include ../common.yaml
+
+# Every rule in endpoints/rewrite_rules.conf is anchored `^...$`. Dropping a trailing
+# `$` is a one-character edit that no positive probe above would notice: the intended
+# path still routes, and only a SUFFIXED request reveals that the rule now also swallows
+# everything beginning with it. The sibling repo's lane needed a dedicated probe for
+# exactly this.
+#
+# The file ends with a catch-all -- `rewrite ^/(.*)$ /rpc/$1 break;` -- so an unmatched
+# path becomes /rpc/<path>. For a name no function has, PostgREST answers PGRST202 ->
+# 404. That is the correct behaviour to pin: these stages assert the suffixed forms are
+# NOT absorbed by the anchored rules.
+
+stages:
+  - name: a suffix on /v1/fyp/global is not swallowed by its rule
+    request:
+      url: "{rewriter_url}/v1/fyp/globalXYZ"
+      method: GET
+    response:
+      status_code: 404
+
+  - name: a suffix on /sync-status is not swallowed by its rule
+    request:
+      url: "{rewriter_url}/sync-statusXYZ"
+      method: GET
+    response:
+      status_code: 404
+
+  - name: a suffix on /health is not swallowed by its rule
+    request:
+      url: "{rewriter_url}/healthXYZ"
+      method: GET
+    response:
+      status_code: 404
+
+  - name: a suffix on /version is not swallowed by its rule
+    request:
+      url: "{rewriter_url}/versionXYZ"
+      method: GET
+    response:
+      status_code: 404
+
+  - name: /v1/fyp/algorithms is not reached by a suffix on /v1/fyp/algorithm
+    # These two rules differ by one character, and `algorithms` is a suffix of
+    # `algorithm`. If /v1/fyp/algorithm lost its anchor it would swallow
+    # /v1/fyp/algorithms, and both would answer 200 -- with the wrong function.
+    # Ordering in the file already matters here; this pins it.
+    request:
+      url: "{rewriter_url}/v1/fyp/algorithms"
+      method: GET
+      params: {select: "is_active"}
+    response:
+      status_code: 200
