@@ -44,6 +44,12 @@ includes:
 # Column uniqueness below was checked against pg_get_function_result for all ten
 # functions haf_fyp_endpoints exposes through the rewriter.
 
+# NOTE ON STAGE NAMES: no braces. Tavern formats the `name` of every stage through the
+# variable context, so a literal {username} in a name is read as a variable reference and
+# the whole test errors with "Key(s) not found in format" before a single request is made
+# -- which looks like a routing failure and is not one. Angle brackets carry the same
+# "path parameter" meaning with no templating semantics.
+
 stages:
   # --- TABLE-returning: pinned by a column only this function returns ---------------
 
@@ -64,7 +70,7 @@ stages:
     response:
       status_code: 200
 
-  - name: /v1/fyp/profile/{username} reaches get_user_profile
+  - name: /v1/fyp/profile/<username> reaches get_user_profile
     # posts_sampled is returned by no other endpoint. The username is deliberately one
     # that does not exist: this asserts ROUTING, not data, and get_user_profile answers
     # for an unknown account.
@@ -75,7 +81,7 @@ stages:
     response:
       status_code: 200
 
-  - name: /v1/fyp/explain/{username}/{post_id} reaches get_score_explanation
+  - name: /v1/fyp/explain/<username>/<post_id> reaches get_score_explanation
     # score_credibility is unique to this function. Both path segments must survive the
     # rewrite as separate captures ($1 and $2), which a single-capture typo would break.
     request:
@@ -98,7 +104,7 @@ stages:
     response:
       status_code: 200
 
-  - name: /v1/fyp/feed/{username} reaches get_personalized_feed
+  - name: /v1/fyp/feed/<username> reaches get_personalized_feed
     # username + truncate_body together are declared by no other function:
     # get_global_feed has truncate_body but not username; get_user_profile and
     # get_score_explanation have username but not truncate_body.
