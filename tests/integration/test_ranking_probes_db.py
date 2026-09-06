@@ -56,6 +56,14 @@ def conn():
     try:
         c = _connect()
     except Exception:  # noqa: BLE001
+        # Skipping is right on a developer's machine and WRONG in CI. This file is
+        # the only place _BACKLOG_SQL and _SERVABILITY_SQL execute at all, so a
+        # mistyped POSTGRES_* variable would turn the whole semantic coverage of the
+        # #43 detector into green skips with no signal. It has already bitten once
+        # in the other direction: an assertion these tests would have caught got
+        # through because they skipped locally.
+        if os.environ.get("CI"):
+            raise
         pytest.skip("no postgres available")
     c.autocommit = True
     with c.cursor() as cur:
@@ -192,7 +200,11 @@ def test_a_clean_node_has_no_backlog(conn):
     with conn.cursor() as cur:
         _candidate(cur, 1, days_ago=30, hive_post_id=12345)
         _candidate(cur, 2, days_ago=1, hive_post_id=12346)
-    assert fetch_resolution_backlog(conn) == {"backlog": 0, "capped": False}
+    assert fetch_resolution_backlog(conn) == {
+        "backlog": 0,
+        "capped": False,
+        "window_days": 7,
+    }
 
 
 def test_unresolved_posts_past_the_window_are_the_backlog(conn):
@@ -201,7 +213,11 @@ def test_unresolved_posts_past_the_window_are_the_backlog(conn):
     with conn.cursor() as cur:
         _candidate(cur, 1, days_ago=30, hive_post_id=None)
         _candidate(cur, 2, days_ago=60, hive_post_id=None)
-    assert fetch_resolution_backlog(conn) == {"backlog": 2, "capped": False}
+    assert fetch_resolution_backlog(conn) == {
+        "backlog": 2,
+        "capped": False,
+        "window_days": 7,
+    }
 
 
 def test_unresolved_posts_INSIDE_the_window_are_not_a_backlog(conn):
@@ -212,7 +228,11 @@ def test_unresolved_posts_INSIDE_the_window_are_not_a_backlog(conn):
     with conn.cursor() as cur:
         _candidate(cur, 1, days_ago=1, hive_post_id=None)
         _candidate(cur, 2, days_ago=6, hive_post_id=None)
-    assert fetch_resolution_backlog(conn) == {"backlog": 0, "capped": False}
+    assert fetch_resolution_backlog(conn) == {
+        "backlog": 0,
+        "capped": False,
+        "window_days": 7,
+    }
 
 
 def test_the_window_boundary_is_the_resolver_window(conn):
@@ -230,7 +250,11 @@ def test_resolved_old_posts_are_not_a_backlog(conn):
     with conn.cursor() as cur:
         for i in range(5):
             _candidate(cur, i, days_ago=90, hive_post_id=1000 + i)
-    assert fetch_resolution_backlog(conn) == {"backlog": 0, "capped": False}
+    assert fetch_resolution_backlog(conn) == {
+        "backlog": 0,
+        "capped": False,
+        "window_days": 7,
+    }
 
 
 def test_the_count_is_capped_so_the_cost_cannot_grow_with_the_backlog(conn):
