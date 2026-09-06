@@ -490,3 +490,131 @@ def test_the_apps_own_schema_name_is_matched_exactly(bash, tmp_path, value):
     prefix-vs-equality bug this repo has hit before. Only haf_fyp_app is quiet."""
     out = run_with_stub_db(bash, tmp_path, INSTALL, f"--schema={value}")
     assert "WARNING: --schema" in out, f"--schema={value} was accepted silently"
+
+
+# --- #40: an empty connection-flag value silently retargets the connection ----------
+#
+# libpq does not treat an empty value as absent and does not error on it -- it
+# substitutes its own default. Measured against PostgreSQL 17 in the node's haf
+# container:
+#
+#     pg_isready -h ""    ->  :5432 - accepting connections          the LOCAL SOCKET
+#     pg_isready -p ""    ->  127.0.0.1: - accepting connections     the default port
+#     pg_isready -U ""    ->  accepting connections                  the OS user
+#
+# So `uninstall_app --force --host=${HAF_HOST}` with HAF_HOST unset does not fail; it
+# connects somewhere else and drops haf_fyp_app and haf_fyp_endpoints there. --force
+# skips the type-the-database-name gate and is the form docker-compose.yml ships, so
+# the refusal in the option loop is the only thing standing in the way.
+#
+# The assertions are behavioural on purpose. The one that matters is not "an error was
+# printed" but "no connection was ever attempted" -- a guard that logged and then
+# carried on would satisfy a message-only assertion while still dropping the schemas.
+
+EMPTY_VALUE_FLAGS = [
+    "--host=", "--postgres-host=",
+    "--port=", "--postgres-port=",
+    "--user=", "--postgres-user=",
+]
+
+# process_blocks.sh accepts only the short spellings. That is a pre-existing divergence
+# from the sibling app -- install_app.sh and uninstall_app.sh take both -- so the
+# synonym cases are asserted only where the synonyms actually exist.
+SHORT_ONLY_FLAGS = ["--host=", "--port=", "--user="]
+
+_EMPTY_CASES = (
+    [(INSTALL, f) for f in EMPTY_VALUE_FLAGS]
+    + [(UNINSTALL, f) for f in EMPTY_VALUE_FLAGS]
+    + [(PROCESS, f) for f in SHORT_ONLY_FLAGS]
+)
+
+
+@pytest.mark.parametrize("script,flag", _EMPTY_CASES,
+                         ids=[f"{s.stem}{f}" for s, f in _EMPTY_CASES])
+def test_an_empty_connection_flag_value_is_refused(bash, tmp_path, script, flag):
+    r = run(bash, tmp_path, script, flag)
+    assert r.returncode == 2, (
+        f"{script.name} {flag} exited {r.returncode}, not 2. An empty value is not "
+        f"ignored by libpq -- it substitutes its own default, which for --host= is "
+        f"the local socket."
+    )
+    assert "empty value" in (r.stdout + r.stderr)
+
+
+@pytest.mark.parametrize("script", [INSTALL, UNINSTALL, PROCESS],
+                         ids=lambda p: p.name)
+@pytest.mark.parametrize("value", ["   ", " ", "\t"], ids=["spaces", "space", "tab"])
+def test_a_whitespace_only_connection_flag_value_is_refused(bash, tmp_path, script, value):
+    """--host= and --port= happen to fail loudly on whitespace (pg_isready reports no
+    response), but --user= accepts it, and it cannot be what the caller meant on any
+    of them."""
+    r = run(bash, tmp_path, script, "--user=" + value)
+    assert r.returncode == 2, f"{script.name} --user={value!r} exited {r.returncode}"
+    assert "whitespace-only" in (r.stdout + r.stderr)
+
+
+def test_the_refusal_happens_before_any_connection_is_attempted(bash, tmp_path):
+    """The point of the guard. A version that logged an error and carried on would pass
+    a message-only assertion and still drop the schemas -- so assert that neither psql
+    nor pg_isready was ever invoked.
+
+    Run with --force, the shape docker-compose.yml ships and the one that skips the
+    type-the-database-name gate.
+    """
+    bindir = stub_bin(tmp_path)
+    calls = tmp_path / "calls.log"
+    for tool in ("psql", "pg_isready"):
+        write_exec(
+            bindir / tool,
+            "#!/bin/sh\necho \"%s $*\" >> '%s'\nexit 0\n" % (tool, calls.as_posix()),
+        )
+
+    r = subprocess.run(
+        [bash, str(UNINSTALL), "--force", "--host="],
+        env=clean_env(bindir), capture_output=True, text=True, timeout=TIMEOUT,
+    )
+
+    assert r.returncode == 2
+    assert not calls.exists(), (
+        "a connection was attempted despite the empty --host=:\n"
+        + calls.read_text(encoding="utf-8")
+    )
+
+
+def test_a_valid_connection_flag_value_is_still_accepted(bash, tmp_path):
+    """The guard must reject empty and whitespace-only values, not values in general.
+    A value containing a space is legitimate -- PostgreSQL role names may contain one --
+    and must not be caught by the whitespace-only branch."""
+    for args in (
+        ("--host=otherhost", "--port=6543", "--user=someone", "--help"),
+        ("--user=my user", "--help"),
+    ):
+        r = run(bash, tmp_path, UNINSTALL, *args)
+        assert r.returncode == 0, (
+            f"uninstall_app {' '.join(args)} exited {r.returncode}: "
+            f"{r.stdout}{r.stderr}"
+        )
+
+
+def test_every_connection_flag_in_the_loop_is_guarded():
+    """Source-text, and honest about it: a completeness check over the option loop, not
+    a behavioural one. It exists because the behavioural tests above can only cover
+    flags someone remembered to list, and the failure mode for #40 was precisely that
+    the empty-value check was applied to one flag and not its neighbours.
+
+    Any option arm that assigns a POSTGRES_* variable must call require_flag_value.
+    """
+    missing = []
+    for script in (INSTALL, UNINSTALL, PROCESS):
+        for line in script.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("--") or "POSTGRES_" not in stripped:
+                continue
+            if "=${arg#*=}" not in stripped.replace(" ", ""):
+                continue
+            if "require_flag_value" not in stripped:
+                missing.append(f"{script.name}: {stripped}")
+    assert not missing, (
+        "these option arms assign a connection variable without checking the value "
+        "first, which is the #40 bug:\n  " + "\n  ".join(missing)
+    )
