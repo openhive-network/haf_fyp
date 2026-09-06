@@ -61,7 +61,7 @@ stages:
           #
           # No `feeds_empty` here, deliberately. #36 shipped that boolean and #43
           # tried to make it authoritative; it was wrong in BOTH directions, so the
-          # payload reports three independent observations and `degraded` is the
+          # payload reports two independent observations and `degraded` is the
           # alert field. See build_ranking_sources_report's docstring.
           state: "ranking_no_feed"
           degraded: true

@@ -238,7 +238,7 @@ def fetch_feed_servability(conn) -> dict | None:
     transaction and none of them rolls back, so the first to fail aborts the
     transaction and every later one dies with 25P02 regardless. That is why the
     order in the route is load-bearing and why this one -- the secondary signal, and
-    the likeliest to fail -- runs after the #43 detector. A docstring here used to
+    the likeliest to fail -- runs last. A docstring here used to
     claim any of them could fail without the others; that was never true.
     """
     try:
@@ -257,7 +257,7 @@ def fetch_feed_servability(conn) -> dict | None:
 
 def build_ranking_sources_report(
     probe: dict | None,
-    servability: dict | None = None,
+    servability: dict | None,
 ) -> dict:
     """
     Shape the ranking signals for GET /metrics (#36, #43).
@@ -276,7 +276,7 @@ def build_ranking_sources_report(
         recency-weighted top 200, so the backfill case this section exists to catch
         leaves it green while per-user feeds are empty.
 
-    So the payload now reports three INDEPENDENT observations and lets the operator
+    So the payload now reports two INDEPENDENT observations and lets the operator
     (and `degraded`) combine them, instead of collapsing them into one boolean that
     is wrong at both ends:
 
@@ -300,15 +300,22 @@ def build_ranking_sources_report(
     # Split by what they explain: a resolution fault is caused by the hivemind
     # relations the resolver joins, and hivesense has nothing to do with it. Naming
     # hivesense in a resolution remedy sent the operator to the wrong grant.
-    unreadable_resolution = [
+    # NOT readable, rather than == UNREADABLE. Equality tests fail OPEN on the one
+    # value that must not: `unknown` is what a probe reports when it could not
+    # answer, and an earlier revision of this chain reported state ranking_full and
+    # degraded false for it -- contradicting this module's own rule that "I could
+    # not check" never reads as fine. ABSENT belongs here too: a renamed or dropped
+    # resolver relation stops resolution exactly as dead as a revoked grant, and
+    # get_personalized_feed reads hive_accounts UNGUARDED, so authenticated requests
+    # RAISE. The remedy differs (see the detail below), the severity does not.
+    broken_resolution = [
         name
         for name, state in [(_HIVEMIND_KEY, hivemind)]
         + list(sources["resolver_inputs"].items())
-        if state == STATE_UNREADABLE
+        if not _readable(state)
     ]
-    unreadable_sources = unreadable_resolution + (
-        [_HIVESENSE_KEY] if hivesense == STATE_UNREADABLE else []
-    )
+    # Resolver inputs only -- hivemind itself has its own earlier branches.
+    broken_resolver_inputs = [n for n in broken_resolution if n != _HIVEMIND_KEY]
 
     global_section = None if servability is None else {
         "cached": servability["cached"],
@@ -319,10 +326,13 @@ def build_ranking_sources_report(
     cache_unservable = bool(servability and servability["cached"] and not servability["servable"])
     no_cycle_yet = bool(servability and not servability["cached"])
 
+    # hivesense ABSENT is the one not-readable state that is a deployment choice
+    # rather than a fault, so it is excluded here while still costing
+    # personalization below.
     degraded = bool(
-        unreadable_sources
+        broken_resolution
+        or hivesense == STATE_UNREADABLE
         or cache_unservable
-        or hivemind == STATE_ABSENT
         or probe is None
         or servability is None
     )
@@ -344,24 +354,35 @@ def build_ranking_sources_report(
             f"{_HIVEMIND_KEY} is absent -- hivemind is a required dependency; "
             "install it, then run CALL haf_fyp_app.run_hive_post_id_backfill()"
         )
-    elif hivemind == STATE_UNREADABLE:
+    elif not _readable(hivemind):
         state = RANKING_STATE_NO_FEED
         detail = (
             f"{_HIVEMIND_KEY} is unreadable -- resolution has stopped; re-run "
             "scripts/grant_cross_schema.sh. Already-rendered posts may still serve "
             "from post_bridge_cache, so this is not necessarily a visible outage yet"
         )
-    elif unreadable_resolution:
+    elif broken_resolver_inputs:
         # Without this branch the payload reported state ranking_full with detail
         # "global feed servable" WHILE degraded was true: health asserted in two
         # fields and a fault in a third. get_personalized_feed reads hive_accounts
         # UNGUARDED, so in this state every authenticated feed request is already
         # raising, and sending the operator nowhere was the worst part.
         state = RANKING_STATE_NO_FEED
+        # The remedy differs by WHY it is not readable, so say which.
+        states = ", ".join(
+            f"{n} is {sources['resolver_inputs'][n]}" for n in broken_resolver_inputs
+        )
+        remedy = (
+            "re-run scripts/grant_cross_schema.sh"
+            if any(
+                sources["resolver_inputs"][n] == STATE_UNREADABLE
+                for n in broken_resolver_inputs
+            )
+            else "the relation is missing -- check the hivemind install/version"
+        )
         detail = (
-            f"{', '.join(unreadable_resolution)} unreadable -- resolution has "
-            "stopped and posts will stop resolving; authenticated feed requests that "
-            "read hive_accounts raise now. Re-run scripts/grant_cross_schema.sh"
+            f"{states} -- resolution has stopped; authenticated feed requests that "
+            f"read hive_accounts raise now. {remedy}"
         )
     elif cache_unservable:
         state = RANKING_STATE_NO_FEED

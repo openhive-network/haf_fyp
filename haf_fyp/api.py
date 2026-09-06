@@ -7,7 +7,7 @@ Handles write operations and admin actions that PostgREST cannot serve:
   POST   /v1/fyp/events            — impression / engagement telemetry (batched)
   POST   /v1/fyp/admin/algorithm   — activate an algorithm version (API-key gated)
   GET    /health                   — service health check
-  GET    /metrics                  — embedding coverage (#15) + credibility sources (#8)
+  GET    /metrics                  — embedding coverage (#15) + credibility sources (#8) + ranking sources (#36)
   GET    /sync-status              — uniform HAF-app sync freshness (#16)
 
 PostgREST (port 3001) serves all read endpoints from haf_fyp_endpoints schema.
@@ -1046,8 +1046,8 @@ def metrics(response: Response):
     authoritative, and it was wrong in BOTH directions -- true on a node that was
     serving (post_bridge_cache answers without touching hivemind), and false on a
     node that was not (the global cache is the recency-weighted top 200, so the
-    backfill case leaves it green while per-user feeds are empty). Three separate
-    observations are reported instead, and none of them is a proxy for the others:
+    backfill case leaves it green while per-user feeds are empty). Two separate
+    observations are reported instead, and neither is a proxy for the others:
 
       global_feed -- whether the global feed cache holds anything, and whether any
           of it is servable. `cached and not servable` is the failure no privilege
@@ -1073,7 +1073,7 @@ def metrics(response: Response):
     # _db_conn, not the inline getconn prologue: it borrows INSIDE the guarded region,
     # so a PoolError("connection pool exhausted") -- reachable with maxconn=5 and a
     # monitor polling both this and /sync-status -- is mapped to JSON here instead of
-    # escaping as a bare text/plain 500. This route also now issues three queries while
+    # escaping as a bare text/plain 500. This route also now issues four queries while
     # holding the connection, which raises the exhaustion pressure that makes it worth
     # doing. The remaining handlers still use the inline prologue (#17).
     # Headers first: the 503 below raises, and a raised HTTPException is rendered from

@@ -201,6 +201,27 @@ def test_a_different_failure_kind_is_reported(vectors, caplog):
     assert ranker_daemon._last_embedding_failure == "ValueError:None"
 
 
+
+def test_a_standing_failure_is_re_reported_after_the_throttle_window(vectors, caplog, monkeypatch):
+    # Throttled, not suppressed. An earlier revision went silent for the life of the
+    # process on the reasoning that /metrics carries the standing state -- but
+    # ranking_sources is a privilege probe, so a RUNTIME failure (a stale-model
+    # dimension mismatch, a malformed vector) leaves the relation readable and
+    # /metrics reports healthy while relevance is absent from every ranking. Going
+    # quiet there trades a true signal for a false one.
+    clock = [1000.0]
+    monkeypatch.setattr(ranker_daemon.time, "monotonic", lambda: clock[0])
+    err = RuntimeError("stale model")
+    vectors.extend([err, err, err])
+    conn = MagicMock()
+    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    clock[0] += ranker_daemon.EMBEDDING_RELOG_SECONDS / 2
+    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    assert sum("embedding fetch failed" in r.message for r in caplog.records) == 1
+    clock[0] += ranker_daemon.EMBEDDING_RELOG_SECONDS
+    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
+
 def test_same_class_different_pgcode_is_a_different_kind(vectors, caplog):
     # The operational case the class name alone cannot see: a lost grant (42501) and
     # a dropped relation (42P01) are BOTH psycopg2 ProgrammingError. Discriminating on
@@ -442,10 +463,5 @@ def test_servability_query_names_the_relations_and_predicate_it_should():
     # entirely the probe is answering a question nobody asks any more.
     endpoints = io.open("endpoints/endpoint_schema.sql", encoding="utf-8").read()
     assert "hive_post_id IS NOT NULL" in endpoints
-
-
-# --------------------------------------------------------------------------
-# fetch_resolution_backlog (#43) -- the detector
-# --------------------------------------------------------------------------
 
 

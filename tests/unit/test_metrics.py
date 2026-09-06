@@ -210,11 +210,11 @@ def test_fetch_does_not_roll_back_a_dead_connection():
 
 
 # --------------------------------------------------------------------------
-# ranking_sources (#36 privilege states, #43 backlog detection)
+# ranking_sources (#36) -- privilege states plus global-feed servability
 #
 # The shape changed deliberately: `feeds_empty` is gone. It was wrong in both
 # directions (see build_ranking_sources_report's docstring), so the payload reports
-# three independent observations and `degraded` is what a monitor alerts on.
+# two independent observations and `degraded` is what a monitor alerts on.
 # --------------------------------------------------------------------------
 
 
@@ -375,3 +375,44 @@ def test_a_revoked_resolver_grant_outranks_the_unservable_cache_it_causes():
     assert report["state"] == "ranking_no_feed"
     assert "grant_cross_schema.sh" in report["detail"]
     assert "none resolve" not in report["detail"]
+
+
+def test_an_absent_resolver_input_is_a_fault_not_a_choice():
+    """
+    A renamed or dropped resolver relation stops resolution exactly as dead as a
+    revoked grant.
+
+    An earlier revision collected only `== unreadable`, so this state reported
+    `ranking_full` / `degraded: false` while get_personalized_feed -- which reads
+    hive_accounts UNGUARDED -- was raising on every authenticated request. The
+    severity is the same as the unreadable case; only the remedy differs.
+    """
+    report = _report(_sources(resolver="absent"))
+    assert report["state"] == "ranking_no_feed"
+    assert report["degraded"] is True
+    assert "hivemind install" in report["detail"]
+    assert "grant_cross_schema.sh" not in report["detail"]
+
+
+def test_an_unknown_relation_state_fails_safe():
+    """
+    `unknown` is what a probe reports when it could not answer, and it must never
+    read as healthy.
+
+    Replacing `not _readable(...)` with `== STATE_UNREADABLE` in the branch chain
+    made this fail OPEN -- `ranking_full`, `degraded: false` -- contradicting both
+    this module's docstring and the README's own table row. Latent, because
+    probe_relations returns a key per requested relation, but it is a fail-open
+    default guarding the one value that must not have one.
+    """
+    report = _report(_sources(hivemind="unknown"))
+    assert report["state"] == "ranking_no_feed"
+    assert report["degraded"] is True
+
+
+def test_hivesense_absent_stays_a_choice_not_a_fault():
+    # The one not-readable state that must NOT page: running without HiveSense is a
+    # deployment decision (it needs a GPU). It still costs personalization.
+    report = _report(_sources(hivesense="absent"))
+    assert report["state"] == "ranking_no_personalization"
+    assert report["degraded"] is False

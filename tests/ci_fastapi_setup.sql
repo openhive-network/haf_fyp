@@ -153,10 +153,18 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.post_candidates (
 -- reported "unknown" for four sources that were fine. Creating the table is what
 -- makes the query actually execute here, which is the only place it runs against
 -- a real PostgreSQL. Only the two columns the check touches.
+-- Mirrors db/create_tables.sql rather than a subset: a CI schema that diverges
+-- from the shipped one means the next thing touching algorithm_version or
+-- computed_at passes here and fails in production.
 CREATE TABLE IF NOT EXISTS haf_fyp_app.global_feed_cache (
     post_id BIGINT PRIMARY KEY,
     final_score FLOAT NOT NULL,
-    rank INT NOT NULL
+    score_engagement FLOAT,
+    score_recency FLOAT,
+    score_credibility FLOAT,
+    rank INT NOT NULL,
+    algorithm_version VARCHAR(16),
+    computed_at TIMESTAMP
 );
 
 -- Deliberately NOT seeded here: the integration tests in this same job TRUNCATE

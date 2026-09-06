@@ -45,9 +45,9 @@ def conn():
         c = _connect()
     except Exception:  # noqa: BLE001
         # Skipping is right on a developer's machine and WRONG in CI. This file is
-        # the only place _BACKLOG_SQL and _SERVABILITY_SQL execute at all, so a
+        # the only place _SERVABILITY_SQL executes at all, so a
         # mistyped POSTGRES_* variable would turn the whole semantic coverage of the
-        # #43 detector into green skips with no signal. It has already bitten once
+        # coverage of that query into green skips with no signal. It has already bitten once
         # in the other direction: an assertion these tests would have caught got
         # through because they skipped locally.
         if os.environ.get("CI"):
