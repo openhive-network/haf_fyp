@@ -58,7 +58,6 @@ from .metrics import (
     fetch_credibility_sources,
     fetch_feed_servability,
     fetch_ranking_sources,
-    fetch_resolution_backlog,
 )
 from .sync_status import (
     ContextNotFound,
@@ -1050,10 +1049,6 @@ def metrics(response: Response):
     backfill case leaves it green while per-user feeds are empty). Three separate
     observations are reported instead, and none of them is a proxy for the others:
 
-      unresolved_backlog -- posts past the resolver's 7-day window, which it will
-          never revisit. This is what detects the case #43 was filed for: hivemind
-          installed after haf_fyp, backfill never run. Bounded probe, so the cost
-          does not grow with the backlog. null if it could not run.
       global_feed -- whether the global feed cache holds anything, and whether any
           of it is servable. `cached and not servable` is the failure no privilege
           probe can see.
@@ -1122,14 +1117,6 @@ def metrics(response: Response):
             # read in the middle re-opened it, and it was live -- the CI stack has
             # no global_feed_cache, so this probe raised on every run and
             # credibility_sources reported "unknown" for four healthy sources.)
-            # Backlog BEFORE servability: both read app tables on the shared,
-            # never-rolled-back transaction, so whichever fails first takes the rest
-            # with it (25P02). Servability is the one most likely to fail -- a role
-            # that has lost SELECT on global_feed_cache is the probe's most
-            # plausible production fault -- and it is the SECONDARY signal, so it
-            # must not be able to take out the #43 detector and have the report
-            # blame the backlog probe for a fault it never had.
-            backlog = fetch_resolution_backlog(conn)
             servability = fetch_feed_servability(conn)
     except psycopg2.pool.PoolError as exc:
         # Monitors poll this route, so a persistently exhausted pool must not write a
@@ -1151,9 +1138,7 @@ def metrics(response: Response):
     today = datetime.now(tz=timezone.utc).date()
     report = build_coverage_report(rows, today)
     report["credibility_sources"] = build_credibility_sources_report(probe)
-    report["ranking_sources"] = build_ranking_sources_report(
-        ranking_probe, servability, backlog
-    )
+    report["ranking_sources"] = build_ranking_sources_report(ranking_probe, servability)
     return report
 
 

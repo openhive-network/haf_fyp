@@ -10,7 +10,6 @@ from haf_fyp.metrics import (
     build_credibility_sources_report,
     build_ranking_sources_report,
     fetch_credibility_sources,
-    fetch_ranking_sources,
 )
 
 TODAY = date(2026, 7, 27)
@@ -231,13 +230,11 @@ def _sources(hivemind="readable", hivesense="readable", resolver="readable"):
 SERVING = {"cached": True, "servable": True}
 NO_CYCLE_YET = {"cached": False, "servable": False}
 NOTHING_RESOLVES = {"cached": True, "servable": False}
-NO_BACKLOG = {"backlog": 0, "capped": False, "window_days": 7}
-BIG_BACKLOG = {"backlog": 1000, "capped": True, "window_days": 7}
 
 
-def _report(sources=None, servability=SERVING, backlog=NO_BACKLOG):
+def _report(sources=None, servability=SERVING):
     return build_ranking_sources_report(
-        _sources() if sources is None else sources, servability, backlog
+        _sources() if sources is None else sources, servability
     )
 
 
@@ -246,7 +243,6 @@ def test_shape_and_healthy_node():
     assert set(report) == {
         "state",
         "degraded",
-        "unresolved_backlog",
         "global_feed",
         "sources",
         "detail",
@@ -256,35 +252,7 @@ def test_shape_and_healthy_node():
     assert report["degraded"] is False
 
 
-def test_an_unresolved_backlog_is_the_43_signal():
-    """
-    The case #43 was filed for, and the one everything else here misses.
 
-    hivemind installed after haf_fyp, backfill never run: the resolver's 7-day
-    window means older posts never resolve. Every privilege reads readable, and the
-    global cache -- recency-weighted top 200 -- stays servable, so an earlier design
-    that keyed on the cache reported this node healthy.
-    """
-    report = _report(backlog=BIG_BACKLOG)
-    assert report["state"] == "ranking_unresolved_backlog"
-    assert report["degraded"] is True
-    assert report["unresolved_backlog"]["at_least"] is True
-    assert "run_hive_post_id_backfill" in report["detail"]
-
-
-def test_a_backlog_with_a_lost_grant_names_the_grant_not_the_backfill():
-    # Two causes, opposite remedies. Re-granting fixes resolution going forward;
-    # the backfill is only the answer when the grants are fine.
-    report = _report(_sources(resolver="unreadable"), backlog=BIG_BACKLOG)
-    assert "hivemind_app.hive_accounts" in report["detail"]
-    assert "run_hive_post_id_backfill" not in report["detail"]
-
-
-def test_an_exact_small_backlog_is_reported_without_at_least():
-    report = _report(backlog={"backlog": 12, "capped": False, "window_days": 7})
-    assert report["unresolved_backlog"] == {"posts": 12, "at_least": False, "window_days": 7}
-    assert "12 posts" in report["detail"]
-    assert "at least" not in report["detail"]
 
 
 def test_hivemind_absent_and_unreadable_are_different_verdicts():
@@ -353,7 +321,6 @@ def test_resolver_inputs_are_reported_and_degrade():
     "kwargs,missing",
     [
         ({"sources": None, "servability": None}, "global_feed"),
-        ({"backlog": None}, "backlog"),
     ],
 )
 def test_a_failed_probe_names_itself_and_fails_safe(kwargs, missing):
@@ -367,7 +334,7 @@ def test_a_failed_probe_names_itself_and_fails_safe(kwargs, missing):
 
 
 def test_a_failed_sources_probe_reports_unknown_states_not_absent():
-    report = build_ranking_sources_report(None, SERVING, NO_BACKLOG)
+    report = build_ranking_sources_report(None, SERVING)
     assert report["sources"]["hivemind"] == "unknown"
     assert all(v == "unknown" for v in report["sources"]["resolver_inputs"].values())
     assert report["degraded"] is True
@@ -380,3 +347,31 @@ def test_readable_unverified_counts_as_readable():
     assert report["state"] == "ranking_full"
     assert report["degraded"] is False
     assert report["sources"]["hivemind"] == "readable_unverified"
+
+
+def test_an_unreadable_resolver_input_gets_its_own_verdict():
+    """
+    Pins the branch that stops `state: ranking_full` being reported alongside
+    `degraded: true`.
+
+    Deleting that branch lets control fall through to the healthy `else`, and since
+    `degraded` is computed separately the suite stayed green -- so the fix for that
+    defect was itself unpinned. get_personalized_feed reads hive_accounts UNGUARDED,
+    so in this state every authenticated feed request is already raising, and
+    reporting "global feed servable" was the worst possible answer.
+    """
+    report = _report(_sources(resolver="unreadable"))
+    assert report["state"] == "ranking_no_feed"
+    assert report["degraded"] is True
+    assert "hivemind_app.hive_accounts" in report["detail"]
+    assert "grant_cross_schema.sh" in report["detail"]
+
+
+def test_a_revoked_resolver_grant_outranks_the_unservable_cache_it_causes():
+    # Ordering, pinned deliberately: a revoked resolver grant is WHY the cache went
+    # unservable, so naming the cache would send the operator to the ranker instead
+    # of to the grant. Cause before symptom.
+    report = _report(_sources(resolver="unreadable"), servability=NOTHING_RESOLVES)
+    assert report["state"] == "ranking_no_feed"
+    assert "grant_cross_schema.sh" in report["detail"]
+    assert "none resolve" not in report["detail"]

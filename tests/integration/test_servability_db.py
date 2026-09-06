@@ -1,24 +1,16 @@
 """
-Postgres-backed tests for the two ranking probes that read app tables (#43).
+Postgres-backed test for the global-feed servability check (#43).
 
 Runs in the fastapi-tests CI job (postgres already loaded with
 tests/ci_fastapi_setup.sql, which creates the minimal post_candidates /
 global_feed_cache tables). Skipped when no DB is reachable so it never breaks the
 pure-unit run.
 
-This is the ONLY place _BACKLOG_SQL and _SERVABILITY_SQL execute against a real
-PostgreSQL. The unit tests feed both wrappers a mocked cursor, so they verify the
-wrapper and nothing about the query: a review showed that swapping the two columns
-in the servability SELECT list, inverting an EXISTS, or breaking the join predicate
-all left the whole suite green -- and the swap in particular makes a total feed
-outage report as healthy. The tavern /metrics stage proves both queries RUN, but
-that stack has no hivemind_app so nothing there depends on their values.
-
-The backlog probe is the #43 detector, so its semantics matter most: it must count
-only posts the per-block resolver will never revisit, i.e. unresolved AND older than
-the resolver window. Getting either half of that wrong makes it either blind (misses
-the backfill case) or permanently noisy (counts posts still inside the window that
-will resolve on their own).
+This is the ONLY place _SERVABILITY_SQL executes against a real PostgreSQL. The
+unit tests feed the wrapper a mocked cursor, so they verify the wrapper and nothing
+about the query: a review showed that swapping the two columns in the SELECT list,
+inverting an EXISTS, or breaking the join predicate all left the whole suite green
+-- and the swap in particular makes a total feed outage report as healthy.
 
 Two limits worth knowing. The lane connects as the postgres superuser, so the
 probe's most plausible production failure -- SELECT revoked on global_feed_cache or
@@ -33,11 +25,7 @@ import os
 import psycopg2
 import pytest
 
-from haf_fyp.metrics import (
-    _BACKLOG_PROBE_LIMIT,
-    fetch_feed_servability,
-    fetch_resolution_backlog,
-)
+from haf_fyp.metrics import fetch_feed_servability
 
 
 def _connect():
@@ -172,15 +160,6 @@ def test_the_query_does_not_depend_on_search_path(conn):
             cur.execute(f"SET search_path TO {original}")
 
 
-# --------------------------------------------------------------------------
-# the backlog probe -- THE #43 detector
-# --------------------------------------------------------------------------
-
-
-# The CI stub's head block is 5,000,000 at 2016-09-15 (tests/haf_stub.sql) while the
-# wall clock is a decade later, so this lane IS the lagging-node case the probe has to
-# get right. Fixtures are therefore expressed relative to the head BLOCK time, which
-# is the clock post_candidates.created_at and the resolver both use.
 def _candidate(cur, post_id, *, days_ago, hive_post_id):
     cur.execute(
         """
@@ -196,111 +175,3 @@ def _candidate(cur, post_id, *, days_ago, hive_post_id):
     )
 
 
-def test_a_clean_node_has_no_backlog(conn):
-    with conn.cursor() as cur:
-        _candidate(cur, 1, days_ago=30, hive_post_id=12345)
-        _candidate(cur, 2, days_ago=1, hive_post_id=12346)
-    assert fetch_resolution_backlog(conn) == {
-        "backlog": 0,
-        "capped": False,
-        "window_days": 7,
-    }
-
-
-def test_unresolved_posts_past_the_window_are_the_backlog(conn):
-    # The #43 scenario: hivemind installed late, these are older than the resolver's
-    # 7-day window so it will never revisit them, and no privilege probe can see it.
-    with conn.cursor() as cur:
-        _candidate(cur, 1, days_ago=30, hive_post_id=None)
-        _candidate(cur, 2, days_ago=60, hive_post_id=None)
-    assert fetch_resolution_backlog(conn) == {
-        "backlog": 2,
-        "capped": False,
-        "window_days": 7,
-    }
-
-
-def test_unresolved_posts_INSIDE_the_window_are_not_a_backlog(conn):
-    # This is the half that stops the probe being permanently noisy. A post from
-    # yesterday that hivemind has not indexed yet is normal -- the resolver is still
-    # going to reach it. Counting those would make every healthy node report a
-    # backlog and train operators to ignore the field.
-    with conn.cursor() as cur:
-        _candidate(cur, 1, days_ago=1, hive_post_id=None)
-        _candidate(cur, 2, days_ago=6, hive_post_id=None)
-    assert fetch_resolution_backlog(conn) == {
-        "backlog": 0,
-        "capped": False,
-        "window_days": 7,
-    }
-
-
-def test_the_window_boundary_is_the_resolver_window(conn):
-    # Pins WHICH window. The resolver looks back 7 days
-    # (db/process_block_range.sql); a probe using a different figure is either
-    # blind to real backlog or noisy about posts that will still resolve.
-    with conn.cursor() as cur:
-        _candidate(cur, 1, days_ago=8, hive_post_id=None)
-    assert fetch_resolution_backlog(conn)["backlog"] == 1
-    assert fetch_resolution_backlog(conn, window_days=30)["backlog"] == 0
-
-
-def test_resolved_old_posts_are_not_a_backlog(conn):
-    # Pins the other half of the predicate: age alone is not the condition.
-    with conn.cursor() as cur:
-        for i in range(5):
-            _candidate(cur, i, days_ago=90, hive_post_id=1000 + i)
-    assert fetch_resolution_backlog(conn) == {
-        "backlog": 0,
-        "capped": False,
-        "window_days": 7,
-    }
-
-
-def test_the_count_is_capped_so_the_cost_cannot_grow_with_the_backlog(conn):
-    # The whole reason for the LIMIT: an unbounded count over this table measured
-    # 898 ms on the reference node and gets slower the worse the problem is --
-    # i.e. slowest exactly when a monitor is polling hardest. The cap makes it
-    # constant, and "at least N" is all an operator needs to run the backfill.
-    with conn.cursor() as cur:
-        for i in range(_BACKLOG_PROBE_LIMIT + 5):
-            _candidate(cur, i, days_ago=30, hive_post_id=None)
-    assert fetch_resolution_backlog(conn) == {
-        "backlog": _BACKLOG_PROBE_LIMIT,
-        "capped": True,
-        "window_days": 7,
-    }
-
-
-def test_wall_clock_old_posts_are_not_a_backlog_when_the_node_lags(conn):
-    """
-    The regression test for the bug this probe shipped with.
-
-    An earlier revision compared created_at against now(). post_candidates.created_at
-    is BLOCK time and the resolver's window is head_block_time - 7 days, so on any
-    node whose head lags wall clock by more than the window -- one replaying history,
-    or one recovering from an outage -- every unresolved row looked ancient and the
-    probe reported a backlog on a node that was working correctly, telling the
-    operator to run a backfill it did not need.
-
-    This lane reproduces that exactly: the stub's head block is 2016 and the wall
-    clock is a decade later. These rows are recent in BLOCK time (inside the
-    resolver's window, so it will retry them next batch) while being years old by
-    wall clock. Under the old query they counted; under the correct one they do not.
-    """
-    with conn.cursor() as cur:
-        _candidate(cur, 1, days_ago=1, hive_post_id=None)
-        _candidate(cur, 2, days_ago=3, hive_post_id=None)
-    assert fetch_resolution_backlog(conn) == {
-        "backlog": 0,
-        "capped": False,
-        "window_days": 7,
-    }
-
-
-def test_the_threshold_follows_the_head_block_not_the_wall_clock(conn):
-    # The other direction: rows genuinely past the window in BLOCK time do count,
-    # even though by wall clock they are no older than the ones above.
-    with conn.cursor() as cur:
-        _candidate(cur, 1, days_ago=8, hive_post_id=None)
-    assert fetch_resolution_backlog(conn)["backlog"] == 1
