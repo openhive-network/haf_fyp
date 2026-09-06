@@ -1,4 +1,4 @@
-"""Unit tests for the /metrics reports (#15 embedding coverage, #8 credibility)."""
+"""Unit tests for the /metrics reports (#15 coverage, #8 credibility, #36 ranking)."""
 
 from datetime import date, datetime, timezone
 from unittest.mock import MagicMock
@@ -6,7 +6,9 @@ from unittest.mock import MagicMock
 from haf_fyp.metrics import (
     build_coverage_report,
     build_credibility_sources_report,
+    build_ranking_sources_report,
     fetch_credibility_sources,
+    fetch_ranking_sources,
 )
 
 TODAY = date(2026, 7, 27)
@@ -204,3 +206,155 @@ def test_fetch_does_not_roll_back_a_dead_connection():
     conn.rollback.side_effect = AssertionError("must not roll back a dead connection")
     assert fetch_credibility_sources(conn) is None
     conn.rollback.assert_not_called()
+
+
+# --------------------------------------------------------------------------
+# ranking_sources (#36)
+#
+# The section exists because this is the one failure the app cannot report any
+# other way: without hivemind every feed is [], nothing raises, and block
+# processing carries on normally. These tests pin the two things a monitor keys
+# on -- feeds_empty and degraded -- against every combination that produces them.
+# --------------------------------------------------------------------------
+
+
+def _ranking(hivemind="readable", hivesense="readable"):
+    return {
+        "hivemind_app.hive_posts": hivemind,
+        "hivesense_app.posts_vectors": hivesense,
+    }
+
+
+def test_ranking_sources_shape_and_healthy_node():
+    report = build_ranking_sources_report(_ranking())
+    assert set(report) == {
+        "state",
+        "hivemind",
+        "hivesense",
+        "feeds_empty",
+        "personalized",
+        "degraded",
+        "detail",
+    }
+    assert report["state"] == "ranking_full"
+    assert report["feeds_empty"] is False
+    assert report["personalized"] is True
+    assert report["degraded"] is False
+
+
+def test_absent_hivemind_reports_empty_feeds():
+    # The headline case. Not "degraded ranking" -- no content at all, and silent.
+    report = build_ranking_sources_report(_ranking(hivemind="absent"))
+    assert report["state"] == "ranking_no_feed"
+    assert report["feeds_empty"] is True
+    assert report["personalized"] is False
+    # degraded TRUE even though nothing is misconfigured -- absent is a valid state
+    # for an optional app, but hivemind is not optional. An earlier revision reported
+    # degraded false here, which reproduced in this section the exact "healthy in the
+    # one state where the signal is entirely dead" misreport that credibility probes
+    # hafd.accounts to prevent. A monitor generalising `if body.*.degraded` across
+    # the payload -- the natural read, given the shared key name -- missed it.
+    assert report["degraded"] is True
+    assert "returns []" in report["detail"]
+
+
+def test_unreadable_hivemind_is_both_empty_and_degraded():
+    # Distinct from absent: the relation is there and the grant was lost, which
+    # grant_cross_schema.sh repairs -- so this one is actionable, not a choice.
+    report = build_ranking_sources_report(_ranking(hivemind="unreadable"))
+    assert report["feeds_empty"] is True
+    assert report["degraded"] is True
+
+
+def test_absent_hivesense_is_not_degraded():
+    # Running without HiveSense is a legitimate deployment choice (it needs a GPU),
+    # so it must not page anyone. It costs personalization, and says so.
+    report = build_ranking_sources_report(_ranking(hivesense="absent"))
+    assert report["state"] == "ranking_no_personalization"
+    assert report["feeds_empty"] is False
+    assert report["personalized"] is False
+    assert report["degraded"] is False
+    assert "no personalization" in report["detail"]
+
+
+def test_unreadable_hivesense_is_degraded():
+    # Same outcome as absent, different cause: a lost grant is a fault with a fix.
+    report = build_ranking_sources_report(_ranking(hivesense="unreadable"))
+    assert report["personalized"] is False
+    assert report["degraded"] is True
+
+
+def test_hivemind_absent_dominates_hivesense_readable():
+    # personalized must not read true off a readable hivesense when there is no
+    # feed to personalize -- embeddings are keyed by hivemind post id.
+    report = build_ranking_sources_report(_ranking(hivemind="absent", hivesense="readable"))
+    assert report["personalized"] is False
+    assert report["state"] == "ranking_no_feed"
+
+
+def test_failed_ranking_probe_fails_safe():
+    # Same rule as credibility: never answer "fine" when the answer is unknown.
+    # A monitor writing `if body.ranking_sources.feeds_empty` reads JSON null as
+    # falsy, so unknown has to present as the alarming value, not as null.
+    report = build_ranking_sources_report(None)
+    # ranking_unknown, not credibility's bare "unknown": the state field must stay
+    # inside the enum this section documents, or a consumer validating against it
+    # rejects the one value meaning "I could not check".
+    assert report["state"] == "ranking_unknown"
+    assert report["feeds_empty"] is True
+    assert report["degraded"] is True
+    assert report["personalized"] is False
+    assert report["hivemind"] == "unknown"
+    assert report["hivesense"] == "unknown"
+
+
+def test_fetch_ranking_sources_swallows_a_failed_probe():
+    conn = MagicMock()
+    conn.cursor.side_effect = RuntimeError("boom")
+    assert fetch_ranking_sources(conn) is None
+
+
+def test_fetch_ranking_sources_does_not_roll_back_a_dead_connection():
+    conn = MagicMock()
+    conn.cursor.side_effect = RuntimeError("connection already closed")
+    conn.rollback.side_effect = AssertionError("must not roll back a dead connection")
+    assert fetch_ranking_sources(conn) is None
+    conn.rollback.assert_not_called()
+
+
+def test_readable_unverified_counts_as_readable_but_keeps_its_name():
+    # Both relations are base tables today, so this is reachable only if hivemind or
+    # hivesense turns one into a view. The honest answer then is "readable, but this
+    # module cannot verify the view's owner still has access" -- so the booleans stay
+    # calm (no page over an upstream schema change) while the per-source field keeps
+    # the distinction a human needs.
+    report = build_ranking_sources_report(
+        _ranking(hivemind="readable_unverified", hivesense="readable_unverified")
+    )
+    assert report["feeds_empty"] is False
+    assert report["personalized"] is True
+    assert report["degraded"] is False
+    assert report["hivemind"] == "readable_unverified"
+
+
+def test_probe_missing_a_key_does_not_raise():
+    # build_ranking_sources_report runs OUTSIDE the /metrics try/except, so a
+    # KeyError here escapes as a bare 500 with no JSON body and none of the no-cache
+    # headers. A probe that lost a key must fail safe like a probe that failed.
+    report = build_ranking_sources_report({})
+    assert report["hivemind"] == "unknown"
+    assert report["feeds_empty"] is True
+    assert report["degraded"] is True
+
+
+def test_full_state_detail_names_both_sources():
+    # The two failure details are pinned above; this one was not, so it could be
+    # blanked or swapped with the probe-failed detail and the suite stayed green.
+    report = build_ranking_sources_report(_ranking())
+    assert "hivemind" in report["detail"] and "hivesense" in report["detail"]
+
+
+def test_failed_probe_detail_says_the_probe_failed():
+    # Distinct from the healthy detail, so a monitor surfacing `detail` verbatim
+    # cannot show "feeds personalized" for a node nobody could check.
+    assert "probe failed" in build_ranking_sources_report(None)["detail"]

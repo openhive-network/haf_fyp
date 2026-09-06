@@ -20,3 +20,29 @@ def _reset_credibility_log_state():
     credibility._last_state = None
     yield
     credibility._last_state = None
+
+
+@pytest.fixture(autouse=True)
+def _reset_embedding_failure_state():
+    """
+    Clear the ranker's transition-logging global between tests (#36).
+
+    Exactly the hazard the fixture above exists for, in the module that copied the
+    pattern: ranker_daemon._last_embedding_failure records the last embedding-fetch
+    failure KIND so a permanently absent HiveSense does not write a traceback every
+    cycle. Left dirty, the first test that drives that path passes alone and fails in
+    suite order, or the reverse. Added with the tests that drive it rather than after
+    the flake.
+    """
+    # Imported inside the fixture, not at module scope: conftest is collected for
+    # every unit test file, and importing the ranker there pulls pandas, redis and
+    # psycopg2 into every session and evaluates its module-level int(os.environ[...])
+    # constants. A malformed value in one developer's environment would then abort
+    # collection of the WHOLE suite rather than of the ranker tests.
+    from haf_fyp import ranker_daemon
+
+    ranker_daemon._last_embedding_failure = None
+    ranker_daemon._last_embedding_failure_at = 0.0
+    yield
+    ranker_daemon._last_embedding_failure = None
+    ranker_daemon._last_embedding_failure_at = 0.0

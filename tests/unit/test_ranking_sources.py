@@ -1,0 +1,357 @@
+"""
+Tests for the ranking-source probe and its transition-only logging (#36).
+
+Separate from test_metrics.py deliberately: that file tests the pure report
+BUILDER, which is fed hand-written probe dicts. Everything here tests the parts a
+mutation review found untested — the probe that produces those dicts, the fetch
+wrapper's happy path, and the failure memo in the ranker. All three were survivable
+mutations: `fetch_ranking_sources` could be replaced with `return {}` and the whole
+suite stayed green, while reporting "every feed is empty" on a healthy node.
+"""
+
+import io
+import logging
+from unittest.mock import MagicMock, call
+
+import psycopg2
+
+import pytest
+
+from haf_fyp import ranker_daemon
+from haf_fyp.credibility import (
+    STATE_ABSENT,
+    STATE_READABLE,
+    STATE_READABLE_UNVERIFIED,
+    STATE_UNREADABLE,
+    probe_relations,
+)
+from haf_fyp.metrics import _RANKING_SOURCES, fetch_ranking_sources
+
+HIVEMIND = ("hivemind_app", "hive_posts")
+HIVESENSE = ("hivesense_app", "posts_vectors")
+
+
+def _conn(rows):
+    """A connection whose cursor returns `rows` from the catalog probe."""
+    conn = MagicMock()
+    cur = conn.cursor.return_value.__enter__.return_value
+    cur.fetchall.return_value = rows
+    return conn
+
+
+# --------------------------------------------------------------------------
+# probe_relations — the primitive, previously with no test of its own
+# --------------------------------------------------------------------------
+
+
+def test_readable_base_table():
+    conn = _conn([("hivemind_app", "hive_posts", True, "r")])
+    assert probe_relations(conn, (HIVEMIND,)) == {"hivemind_app.hive_posts": STATE_READABLE}
+
+
+def test_present_but_not_selectable_is_unreadable_not_absent():
+    # The distinction the whole probe exists for: a lost grant is repairable and an
+    # uninstalled app is not a fault, and they used to be indistinguishable.
+    conn = _conn([("hivesense_app", "posts_vectors", False, "r")])
+    assert probe_relations(conn, (HIVESENSE,)) == {
+        "hivesense_app.posts_vectors": STATE_UNREADABLE
+    }
+
+
+def test_row_missing_entirely_is_absent():
+    assert probe_relations(_conn([]), (HIVEMIND,)) == {"hivemind_app.hive_posts": STATE_ABSENT}
+
+
+def test_readable_view_is_reported_as_unverified():
+    # has_table_privilege on a VIEW stays true after the view's owner loses access to
+    # what it reads, so "readable" would be a claim this module cannot support. The
+    # report builder treats it as healthy; the probe must still say which it is, or
+    # the distinction cannot exist downstream.
+    conn = _conn([("hivemind_app", "hive_posts", True, "v")])
+    assert probe_relations(conn, (HIVEMIND,)) == {
+        "hivemind_app.hive_posts": STATE_READABLE_UNVERIFIED
+    }
+
+
+@pytest.mark.parametrize("relkind", ["r", "p", "m"])
+def test_relkinds_whose_privilege_answer_is_the_whole_story(relkind):
+    # Base table, partitioned parent and matview are all plainly readable: a matview
+    # holds its own data (a broken underlying grant degrades REFRESH, not SELECT), and
+    # a query through a partitioned parent is privilege-checked on the parent.
+    conn = _conn([("hivemind_app", "hive_posts", True, relkind)])
+    assert probe_relations(conn, (HIVEMIND,)) == {"hivemind_app.hive_posts": STATE_READABLE}
+
+
+@pytest.mark.parametrize("relkind", ["v", "f"])
+def test_relkinds_whose_privilege_answer_is_not(relkind):
+    # A view's privilege stays true after its owner loses access to what it reads; a
+    # foreign table's is a purely local check while the read traverses an FDW.
+    conn = _conn([("hivemind_app", "hive_posts", True, relkind)])
+    assert probe_relations(conn, (HIVEMIND,)) == {
+        "hivemind_app.hive_posts": STATE_READABLE_UNVERIFIED
+    }
+
+
+def test_unreadable_view_is_unreadable_not_unverified():
+    conn = _conn([("hivemind_app", "hive_posts", False, "v")])
+    assert probe_relations(conn, (HIVEMIND,)) == {"hivemind_app.hive_posts": STATE_UNREADABLE}
+
+
+def test_each_relation_is_keyed_by_what_was_ASKED_for():
+    # The SQL filters on two arrays, so it can return a cross-product row for a
+    # schema/name pair nobody asked about. Keying the output by the requested tuples
+    # is what stops that contaminating an answer.
+    conn = _conn([
+        ("hivemind_app", "hive_posts", True, "r"),
+        ("hivesense_app", "hive_posts", True, "r"),  # cross-product noise
+    ])
+    out = probe_relations(conn, (HIVEMIND, HIVESENSE))
+    assert out == {
+        "hivemind_app.hive_posts": STATE_READABLE,
+        "hivesense_app.posts_vectors": STATE_ABSENT,
+    }
+
+
+def test_empty_relations_makes_no_query():
+    conn = MagicMock()
+    assert probe_relations(conn, ()) == {}
+    conn.cursor.assert_not_called()
+
+
+# --------------------------------------------------------------------------
+# fetch_ranking_sources — the happy path, previously unexercised
+# --------------------------------------------------------------------------
+
+
+def test_fetch_returns_a_state_for_every_declared_source():
+    # The survivable mutation this kills: `return {}` here reports feeds_empty=true
+    # on a healthy node, i.e. a permanent false page, with every other test green.
+    conn = _conn([
+        ("hivemind_app", "hive_posts", True, "r"),
+        ("hivesense_app", "posts_vectors", True, "r"),
+    ])
+    probe = fetch_ranking_sources(conn)
+    assert probe == {
+        "hivemind_app.hive_posts": STATE_READABLE,
+        "hivesense_app.posts_vectors": STATE_READABLE,
+    }
+
+
+def test_the_declared_sources_are_the_relations_the_code_actually_reads():
+    # Not a white-box check on the SQL binding -- that only compared the constant
+    # against itself. This pins the constant against the OTHER places the same two
+    # relations are named, so a typo in _RANKING_SOURCES (which would report `absent`
+    # for a present relation, and page forever) cannot pass.
+    assert set(_RANKING_SOURCES) == {HIVEMIND, HIVESENSE}
+    embeddings_sql = io.open("haf_fyp/embeddings.py", encoding="utf-8").read()
+    assert "hivesense_app.posts_vectors" in embeddings_sql
+    resolver_sql = io.open("db/process_posts.sql", encoding="utf-8").read()
+    assert "hivemind_app.hive_posts" in resolver_sql
+
+
+# --------------------------------------------------------------------------
+# the failure memo — transition-only logging
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def vectors(monkeypatch):
+    """Drive _fetch_post_vectors_safe's underlying fetch."""
+    calls = []
+
+    def _fake(conn, post_ids):
+        outcome = calls.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(ranker_daemon, "fetch_post_vectors", _fake)
+    return calls
+
+
+def test_repeated_identical_failures_log_once(vectors, caplog):
+    err = RuntimeError("hivesense gone")
+    vectors.extend([err, err, err])
+    conn = MagicMock()
+    for _ in range(3):
+        assert ranker_daemon._fetch_post_vectors_safe(conn, [1]) == {}
+    assert sum("embedding fetch failed" in r.message for r in caplog.records) == 1
+
+
+def test_a_different_failure_kind_is_reported(vectors, caplog):
+    vectors.extend([RuntimeError("a"), ValueError("b")])
+    conn = MagicMock()
+    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
+    assert ranker_daemon._last_embedding_failure == "ValueError:None"
+
+
+def test_same_class_different_pgcode_is_a_different_kind(vectors, caplog):
+    # The operational case the class name alone cannot see: a lost grant (42501) and
+    # a dropped relation (42P01) are BOTH psycopg2 ProgrammingError. Discriminating on
+    # the class only -- which every other test here tolerates, since they use
+    # RuntimeError vs ValueError -- would make that transition silent.
+    lost_grant = psycopg2.errors.InsufficientPrivilege("permission denied")
+    dropped = psycopg2.errors.UndefinedTable("relation does not exist")
+    assert type(lost_grant).__mro__[1] is type(dropped).__mro__[1]
+    vectors.extend([lost_grant, dropped])
+    conn = MagicMock()
+    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
+
+
+def test_a_standing_failure_is_re_reported_after_the_throttle_window(vectors, caplog, monkeypatch):
+    # Throttled, not suppressed. An earlier revision went silent for the life of the
+    # process on the reasoning that /metrics carries the standing state -- but
+    # ranking_sources is a privilege probe, so a RUNTIME failure (a stale-model
+    # dimension mismatch, a malformed vector) leaves the relation readable and
+    # /metrics reports healthy while relevance is absent from every ranking. Going
+    # quiet there trades a true signal for a false one.
+    clock = [1000.0]
+    monkeypatch.setattr(ranker_daemon.time, "monotonic", lambda: clock[0])
+    err = RuntimeError("stale model")
+    vectors.extend([err, err, err])
+    conn = MagicMock()
+    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    clock[0] += ranker_daemon.EMBEDDING_RELOG_SECONDS / 2
+    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    assert sum("embedding fetch failed" in r.message for r in caplog.records) == 1
+    clock[0] += ranker_daemon.EMBEDDING_RELOG_SECONDS
+    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
+
+
+def test_recovery_is_logged_and_a_relapse_is_reported_again(vectors, caplog):
+    # The bug this pins: without clearing the memo on success, a grant lost, repaired
+    # and lost again is SILENT the second time -- the opposite of transition logging,
+    # and it shipped once with a docstring claiming otherwise.
+    caplog.set_level(logging.INFO, logger="haf_fyp.ranker_daemon")
+    err = RuntimeError("grant lost")
+    vectors.extend([err, {1: "vec"}, err])
+    conn = MagicMock()
+    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
+    assert sum("embedding fetch recovered" in r.message for r in caplog.records) == 1
+
+
+def test_a_clean_run_says_nothing(vectors, caplog):
+    # set_level is load-bearing: the only thing the success path can log is INFO, and
+    # without it caplog sits at WARNING and this assertion is vacuous. A review caught
+    # that -- with it vacuous, deleting the `if recovered is not None` guard reported
+    # "recovered (was None)" on EVERY cycle of a healthy node, which is the per-cycle
+    # spam this whole change exists to remove, reintroduced in the same function.
+    caplog.set_level(logging.INFO, logger="haf_fyp.ranker_daemon")
+    vectors.append({1: "vec"})
+    assert ranker_daemon._fetch_post_vectors_safe(MagicMock(), [1]) == {1: "vec"}
+    assert not [r for r in caplog.records if "embedding fetch" in r.message]
+
+
+def test_operational_error_propagates_untouched(vectors):
+    # The main loop owns reconnection, so this path must not roll back a connection
+    # it is about to discard, and must not record a "kind" that would then suppress
+    # the first real failure after the reconnect.
+    vectors.append(psycopg2.OperationalError("connection lost"))
+    conn = MagicMock()
+    with pytest.raises(psycopg2.OperationalError):
+        ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    conn.rollback.assert_not_called()
+    assert ranker_daemon._last_embedding_failure is None
+
+
+def test_failure_rolls_back_so_the_cycle_can_continue(vectors):
+    vectors.append(RuntimeError("boom"))
+    conn = MagicMock()
+    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    assert conn.rollback.call_args_list == [call()]
+
+
+# --------------------------------------------------------------------------
+# the /metrics probe ORDER, which is load-bearing and trivially "tidied" away
+# --------------------------------------------------------------------------
+
+
+def test_metrics_probes_ranking_before_credibility(monkeypatch):
+    """
+    Ranking must be probed FIRST, and this is not a style preference.
+
+    All three /metrics reads share one pooled connection and one transaction (the
+    pool is not autocommit), and fetch_credibility_sources deliberately does not roll
+    back on failure -- its docstring justifies that with "/metrics issues no further
+    statement after this". Run the other way round, a credibility hiccup leaves the
+    transaction aborted, the ranking probe fails with 25P02, and the report fails safe
+    to feeds_empty=true, which README and the route both tell operators to alert on.
+    A catalog-read timeout would page someone with "every feed is empty".
+
+    Nothing else pins the order, so a refactor could swap two adjacent lines and the
+    only symptom would be a false page months later.
+    """
+    from contextlib import contextmanager
+
+    from haf_fyp import api
+
+    order = []
+    conns = []
+
+    @contextmanager
+    def _conn_cm():
+        conn = MagicMock()
+        conns.append(conn)
+        yield conn
+
+    monkeypatch.setattr(api, "_db_conn", _conn_cm)
+    monkeypatch.setattr(api, "fetch_coverage_rows", lambda conn: (order.append("coverage"), [])[1])
+    monkeypatch.setattr(
+        api, "fetch_credibility_sources", lambda conn: order.append("credibility")
+    )
+    monkeypatch.setattr(api, "fetch_ranking_sources", lambda conn: order.append("ranking"))
+    monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
+    monkeypatch.setattr(api, "build_credibility_sources_report", lambda probe: {})
+    monkeypatch.setattr(api, "build_ranking_sources_report", lambda probe: {})
+
+    api.metrics(MagicMock())
+
+    assert order.index("ranking") < order.index("credibility")
+    # Both probes must receive the SAME connection, which is the premise the whole
+    # ordering argument rests on -- give each its own _db_conn() block and the
+    # rationale evaporates while the order assertion above still passes.
+    assert len(conns) == 1
+    assert conns[0] is not None
+
+
+def test_metrics_feeds_each_probe_to_its_own_builder(monkeypatch):
+    """
+    Swapping the two builder arguments survives every other test in this suite.
+
+    test_metrics.py exercises the builders in isolation with hand-written dicts, and
+    the ordering test above stubs them out entirely, so nothing catches the ranking
+    builder being handed the credibility probe -- which would read feeds_empty=true
+    forever, the exact false page this section was written to prevent.
+    """
+    from contextlib import contextmanager
+
+    from haf_fyp import api
+
+    @contextmanager
+    def _conn_cm():
+        yield MagicMock()
+
+    monkeypatch.setattr(api, "_db_conn", _conn_cm)
+    monkeypatch.setattr(api, "fetch_coverage_rows", lambda conn: [])
+    monkeypatch.setattr(api, "fetch_credibility_sources", lambda conn: {"which": "credibility"})
+    monkeypatch.setattr(api, "fetch_ranking_sources", lambda conn: {"which": "ranking"})
+    monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
+    monkeypatch.setattr(
+        api, "build_credibility_sources_report", lambda probe: {"got": probe["which"]}
+    )
+    monkeypatch.setattr(
+        api, "build_ranking_sources_report", lambda probe: {"got": probe["which"]}
+    )
+
+    report = api.metrics(MagicMock())
+
+    assert report["ranking_sources"] == {"got": "ranking"}
+    assert report["credibility_sources"] == {"got": "credibility"}
