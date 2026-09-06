@@ -208,10 +208,23 @@ def _fetch_candidates(conn) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# The last embedding-fetch failure KIND reported, so a permanently absent HiveSense
-# does not write one traceback per cycle forever. Not a cache of the answer -- the
-# fetch is retried every cycle regardless -- only a record of what has been said,
-# cleared on success so a recurrence after recovery is reported again.
+# The last embedding-fetch failure KIND reported, and WHEN it was reported, so a
+# permanently absent HiveSense does not write one traceback per cycle forever. Not a
+# cache of the answer -- the fetch is retried every cycle regardless -- only a record
+# of what has been said, cleared on success so a recurrence after recovery is
+# reported again.
+#
+# THROTTLED, NOT SUPPRESSED, and the distinction is the whole point. An earlier
+# revision logged the first occurrence of a kind and then went silent for the life of
+# the process, on the reasoning that GET /metrics carries the standing state. That is
+# only true for the failures /metrics can SEE: ranking_sources is a pg_catalog
+# privilege probe, so it reports a dropped relation or a lost grant and nothing else.
+# A runtime failure -- the stale-model dimension mismatch this deployment has already
+# hit, a malformed vector, a statement timeout -- leaves the relation present and
+# readable, so /metrics reads ranking_full / degraded:false while relevance has been
+# absent from every ranking for days, and the log said it once and never again. That
+# trades a noisy true signal for a quiet false one. Re-emitting hourly keeps a
+# standing condition visible at ~1 line/hour instead of 12, and never zero.
 #
 # The lock is defensive, NOT closing a known race: main() drives run_cycle and
 # _run_targeted_refresh sequentially on one thread, and the only other thread here is
@@ -224,6 +237,10 @@ def _fetch_candidates(conn) -> pd.DataFrame:
 # already gives for credibility._last_state: a module global that remembers what has
 # been reported makes tests order-dependent the moment one drives this path.
 _last_embedding_failure: str | None = None
+_last_embedding_failure_at: float = 0.0
+# Long enough that a permanent condition is a footnote, short enough that nobody
+# reads a day of logs without meeting it.
+EMBEDDING_RELOG_SECONDS = 3600.0
 _embedding_failure_lock = threading.Lock()
 
 
@@ -262,22 +279,35 @@ def _fetch_post_vectors_safe(conn, post_ids: list[int]) -> dict:
     the endpoint's global-feed fallback rather than getting the w_v=0 ranking this
     docstring describes -- so it is filed separately rather than changed here on the
     back of a documentation fix. Tracked as #41.
+
+    And note what GET /metrics does and does not answer here. ranking_sources is a
+    privilege probe: it sees a dropped relation or a lost grant, and nothing else. A
+    runtime failure leaves the relation readable, so /metrics reports healthy while
+    this path returns {} every cycle. That asymmetry is why the logging is throttled
+    to once an hour rather than suppressed after the first line.
     """
-    global _last_embedding_failure
+    global _last_embedding_failure, _last_embedding_failure_at
     try:
         vectors = fetch_post_vectors(conn, post_ids)
     except psycopg2.OperationalError:
         raise
     except Exception as exc:
         kind = f"{type(exc).__name__}:{getattr(exc, 'pgcode', None)}"
+        now = time.monotonic()
         with _embedding_failure_lock:
-            first_or_changed = kind != _last_embedding_failure
+            due = (
+                kind != _last_embedding_failure
+                or now - _last_embedding_failure_at >= EMBEDDING_RELOG_SECONDS
+            )
             _last_embedding_failure = kind
-        if first_or_changed:
+            if due:
+                _last_embedding_failure_at = now
+        if due:
             log.exception(
-                "embedding fetch failed — relevance weight drops to 0 for this cycle; "
-                "further identical failures will be silent, see GET /metrics "
-                "ranking_sources"
+                "embedding fetch failed — relevance weight drops to 0 for this cycle. "
+                "Identical failures are throttled to one line per hour; a lost grant "
+                "or a dropped relation also shows in GET /metrics ranking_sources, a "
+                "runtime failure does NOT"
             )
         conn.rollback()
         return {}
@@ -294,6 +324,7 @@ def _fetch_post_vectors_safe(conn, post_ids: list[int]) -> dict:
         with _embedding_failure_lock:
             recovered = _last_embedding_failure
             _last_embedding_failure = None
+            _last_embedding_failure_at = 0.0
         if recovered is not None:
             log.info("embedding fetch recovered (was %s)", recovered)
         return vectors

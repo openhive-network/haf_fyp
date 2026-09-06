@@ -88,11 +88,18 @@ _ALL_SOURCES = _BALANCE_CANDIDATES + (_REPUTATION_RELATION, _ACCOUNTS_RELATION)
 STATE_READABLE = "readable"
 STATE_UNREADABLE = "unreadable"  # exists, but this role cannot SELECT it
 STATE_ABSENT = "absent"  # not installed on this deployment
-# SELECT is held on a VIEW, which cannot be trusted the way a base table can: the
-# privilege stays true after the view owner loses access to what it reads. Reported
-# distinctly so a consumer is not told "readable" about the one case this module
-# says it cannot verify.
-STATE_READABLE_VIEW = "readable_view"
+# SELECT is held, but on a relation whose privilege answer is not the whole story:
+# a VIEW (the privilege stays true after the view's owner loses access to what it
+# reads) or a FOREIGN TABLE (has_table_privilege is a purely local check, while the
+# read traverses an FDW whose user mapping or remote grant can be gone). Reported
+# distinctly so a consumer is not told plain "readable" about a case this module
+# cannot actually verify.
+#
+# Matviews are deliberately NOT in this class: a matview holds its own data, so a
+# broken underlying grant degrades REFRESH, not SELECT. Partitioned tables are not
+# either -- privilege for a query through the parent is checked on the parent.
+STATE_READABLE_UNVERIFIED = "readable_unverified"
+_UNVERIFIABLE_RELKINDS = ("v", "f")
 
 # Overall signal states.
 STATE_UNKNOWN = "unknown"  # the probe itself failed; never means "healthy"
@@ -308,13 +315,22 @@ def _log_transition(probe: dict) -> None:
 
 def probe_relations(conn, relations: tuple) -> dict:
     """
-    Classify each (schema, name) as readable / unreadable / absent for THIS role.
+    Classify each (schema, name) as readable / readable_unverified / unreadable /
+    absent for THIS role.
 
-    The primitive behind probe_credibility_sources, exposed so the ranking-signal
-    sources (hivemind, hivesense) can be reported by GET /metrics through the same
-    catalog read and the same three states, rather than growing a second probe with
-    its own vocabulary. Answers for the CALLING role, so the endpoint (haf_fyp_user)
-    can only err conservatively against the ranker (haf_fyp_owner) -- see
+    Shares the catalog query and the state vocabulary with probe_credibility_sources
+    so the ranking-signal sources (hivemind, hivesense) are reported by GET /metrics
+    in the same terms, rather than growing a second probe with its own words. It is
+    NOT called by probe_credibility_sources: that function has its own inline copy of
+    the same read, feeding _classify's multi-candidate preference logic, which this
+    one deliberately does not have. So the two duplicate ~6 lines of row-shaping, and
+    only this one distinguishes an unverifiable relkind -- _classify collapses a
+    readable view to plain readable. Worth unifying; not on the back of a
+    documentation fix, because probe_credibility_sources' output shape is pinned by
+    tests and its preference logic is the delicate part.
+
+    Answers for the CALLING role, so the endpoint (haf_fyp_user) can only err
+    conservatively against the ranker (haf_fyp_owner) -- see
     probe_credibility_sources for why that direction is the safe one.
 
     "unreadable" is the actionable state: the relation exists but SELECT was lost,
@@ -341,11 +357,15 @@ def probe_relations(conn, relations: tuple) -> dict:
         # the view's OWNER loses SELECT on the table behind it, so "readable" is a
         # lie for views -- the one undetectable failure _classify documents, and the
         # shape of a real haf_fyp outage (db/cross_schema_grants.sql records a
-        # recreated hivemind view answering 401 on every request). Everything this
-        # function currently probes is a base table, but it is offered as the
-        # GENERAL primitive, so a view must not be reported as plainly readable.
-        if readable and relkind == 'v':
-            out[".".join(rel)] = STATE_READABLE_VIEW
+        # recreated hivemind view answering 401 on every request). A FOREIGN TABLE
+        # has the same shape for a different reason, so it is classed with views;
+        # _classify's remark that 'f' is "a physical relation, for which the
+        # privilege answer is the whole story" is not right about foreign tables.
+        # Everything this function currently probes is a base table, but it is
+        # offered as the GENERAL primitive, so neither may be called plainly
+        # readable.
+        if readable and relkind in _UNVERIFIABLE_RELKINDS:
+            out[".".join(rel)] = STATE_READABLE_UNVERIFIED
         else:
             out[".".join(rel)] = STATE_READABLE if readable else STATE_UNREADABLE
     return out

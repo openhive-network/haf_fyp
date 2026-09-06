@@ -297,7 +297,10 @@ def test_failed_ranking_probe_fails_safe():
     # A monitor writing `if body.ranking_sources.feeds_empty` reads JSON null as
     # falsy, so unknown has to present as the alarming value, not as null.
     report = build_ranking_sources_report(None)
-    assert report["state"] == "unknown"
+    # ranking_unknown, not credibility's bare "unknown": the state field must stay
+    # inside the enum this section documents, or a consumer validating against it
+    # rejects the one value meaning "I could not check".
+    assert report["state"] == "ranking_unknown"
     assert report["feeds_empty"] is True
     assert report["degraded"] is True
     assert report["personalized"] is False
@@ -319,19 +322,19 @@ def test_fetch_ranking_sources_does_not_roll_back_a_dead_connection():
     conn.rollback.assert_not_called()
 
 
-def test_readable_view_counts_as_readable_but_keeps_its_name():
+def test_readable_unverified_counts_as_readable_but_keeps_its_name():
     # Both relations are base tables today, so this is reachable only if hivemind or
     # hivesense turns one into a view. The honest answer then is "readable, but this
     # module cannot verify the view's owner still has access" -- so the booleans stay
     # calm (no page over an upstream schema change) while the per-source field keeps
     # the distinction a human needs.
     report = build_ranking_sources_report(
-        _ranking(hivemind="readable_view", hivesense="readable_view")
+        _ranking(hivemind="readable_unverified", hivesense="readable_unverified")
     )
     assert report["feeds_empty"] is False
     assert report["personalized"] is True
     assert report["degraded"] is False
-    assert report["hivemind"] == "readable_view"
+    assert report["hivemind"] == "readable_unverified"
 
 
 def test_probe_missing_a_key_does_not_raise():

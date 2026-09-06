@@ -37,7 +37,7 @@ from statistics import median
 from haf_fyp.credibility import (
     STATE_ABSENT,
     STATE_READABLE,
-    STATE_READABLE_VIEW,
+    STATE_READABLE_UNVERIFIED,
     STATE_UNKNOWN,
     STATE_UNREADABLE,
     probe_credibility_sources,
@@ -166,6 +166,10 @@ _HIVESENSE_KEY = ".".join(_HIVESENSE_RELATION)
 RANKING_STATE_FULL = "ranking_full"
 RANKING_STATE_NO_FEED = "ranking_no_feed"
 RANKING_STATE_NO_PERSONALIZATION = "ranking_no_personalization"
+# Prefixed for the same reason as its siblings. An earlier revision reused
+# credibility's bare STATE_UNKNOWN here, which put the one value a monitor must
+# not mishandle outside the enum this section documents.
+RANKING_STATE_UNKNOWN = "ranking_unknown"
 
 
 def fetch_ranking_sources(conn) -> dict | None:
@@ -207,7 +211,7 @@ def build_ranking_sources_report(probe: dict | None) -> dict:
     """
     if probe is None:
         return {
-            "state": STATE_UNKNOWN,
+            "state": RANKING_STATE_UNKNOWN,
             "hivemind": STATE_UNKNOWN,
             "hivesense": STATE_UNKNOWN,
             "feeds_empty": True,
@@ -223,7 +227,7 @@ def build_ranking_sources_report(probe: dict | None) -> dict:
     hivemind = probe.get(_HIVEMIND_KEY, STATE_UNKNOWN)
     hivesense = probe.get(_HIVESENSE_KEY, STATE_UNKNOWN)
 
-    # readable_view counts as readable for the BOOLEANS, and keeps its own name in
+    # readable_unverified counts as readable for the BOOLEANS, and keeps its own name in
     # the per-source field. Both relations probed here are base tables today, so
     # this branch is unreachable until hivemind or hivesense changes one to a view
     # -- and if that happens, the honest answer is "we can read it, but this module
@@ -231,7 +235,7 @@ def build_ranking_sources_report(probe: dict | None) -> dict:
     # over an upstream schema change that may be entirely fine; hiding the
     # distinction would claim a certainty we do not have.
     def _readable(state: str) -> bool:
-        return state in (STATE_READABLE, STATE_READABLE_VIEW)
+        return state in (STATE_READABLE, STATE_READABLE_UNVERIFIED)
 
     feeds_empty = not _readable(hivemind)
     personalized = not feeds_empty and _readable(hivesense)
@@ -255,7 +259,13 @@ def build_ranking_sources_report(probe: dict | None) -> dict:
         )
         state = RANKING_STATE_NO_FEED
     elif personalized:
-        detail = "hivemind and hivesense readable -- feeds personalized"
+        # Names the states rather than asserting "readable": one of them may be
+        # readable_unverified, and claiming plain readable there is exactly the
+        # certainty the per-source field exists to avoid.
+        detail = (
+            f"{_HIVEMIND_KEY} is {hivemind}, {_HIVESENSE_KEY} is {hivesense} "
+            "-- feeds personalized"
+        )
         state = RANKING_STATE_FULL
     else:
         detail = (
