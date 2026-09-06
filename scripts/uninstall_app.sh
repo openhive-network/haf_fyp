@@ -69,9 +69,9 @@ for arg in "$@"; do
         # and nothing else); --host is haf_block_explorer's and hivesense's. The trio
         # this MR claims parity with does not agree with itself, so accept both rather
         # than hard-failing whichever runbook the operator copied.
-        --host=*|--postgres-host=*) POSTGRES_HOST="${arg#*=}" ;;
-        --port=*|--postgres-port=*) POSTGRES_PORT="${arg#*=}" ;;
-        --user=*|--postgres-user=*) POSTGRES_USER="${arg#*=}" ;;
+        --host=*|--postgres-host=*) require_flag_value "$arg"; POSTGRES_HOST="${arg#*=}" ;;
+        --port=*|--postgres-port=*) require_flag_value "$arg"; POSTGRES_PORT="${arg#*=}" ;;
+        --user=*|--postgres-user=*) require_flag_value "$arg"; POSTGRES_USER="${arg#*=}" ;;
 
         # RECOGNISED AND REFUSED, deliberately -- not warn-and-continue like --schema,
         # and not "is not a valid option" either.

@@ -31,9 +31,9 @@ print_help() {
 # to remove, and which a module file copied from an upstream app would hit.
 for arg in "$@"; do
     case "$arg" in
-        --host=*) POSTGRES_HOST="${arg#*=}" ;;
-        --port=*) POSTGRES_PORT="${arg#*=}" ;;
-        --user=*) POSTGRES_USER="${arg#*=}" ;;
+        --host=*) require_flag_value "$arg"; POSTGRES_HOST="${arg#*=}" ;;
+        --port=*) require_flag_value "$arg"; POSTGRES_PORT="${arg#*=}" ;;
+        --user=*) require_flag_value "$arg"; POSTGRES_USER="${arg#*=}" ;;
 
         # RECOGNISED AND REFUSED, deliberately -- not warn-and-continue like --schema,
         # and not "is not a valid option" either.

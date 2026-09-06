@@ -58,9 +58,9 @@ for arg in "$@"; do
         # unknown-option error below turns a copied balance_tracker runbook into a
         # hard install failure, which under haf-fyp-setup's restart: on-failure is
         # the same crash-loop the --is_forking handling was softened to avoid.
-        --host=*|--postgres-host=*) POSTGRES_HOST="${arg#*=}" ;;
-        --port=*|--postgres-port=*) POSTGRES_PORT="${arg#*=}" ;;
-        --user=*|--postgres-user=*) POSTGRES_USER="${arg#*=}" ;;
+        --host=*|--postgres-host=*) require_flag_value "$arg"; POSTGRES_HOST="${arg#*=}" ;;
+        --port=*|--postgres-port=*) require_flag_value "$arg"; POSTGRES_PORT="${arg#*=}" ;;
+        --user=*|--postgres-user=*) require_flag_value "$arg"; POSTGRES_USER="${arg#*=}" ;;
 
         # RECOGNISED AND REFUSED, deliberately -- not warn-and-continue like --schema,
         # and not "is not a valid option" either.

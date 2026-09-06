@@ -53,6 +53,7 @@ from haf_fyp.scoring import (
     write_global_feed_cache,
     write_user_vector,
 )
+from haf_fyp.dbenv import env_or_default
 
 log = logging.getLogger(__name__)
 
@@ -112,13 +113,20 @@ _refresh_queue: queue.Queue[str] = queue.Queue()
 
 
 def _dsn() -> str:
+    # env_or_default, not os.environ.get: .get() returns its default only when the key
+    # is ABSENT, so POSTGRES_HOST= in a compose file yielded "host= " and libpq
+    # substituted the local socket -- while _connect() below retries OperationalError
+    # forever, so a mistargeted daemon never crash-loops visibly. It also DELETEs.
+    # env_or_default additionally refuses whitespace, because this string is built by
+    # concatenation: POSTGRES_HOST="x dbname=other" would silently change the database.
+    # See #40 -- the flag guard cannot see the environment channel.
     return (
-        f"host={os.environ.get('POSTGRES_HOST', 'haf')} "
-        f"port={os.environ.get('POSTGRES_PORT', '5432')} "
-        f"dbname={os.environ.get('POSTGRES_DB', 'haf_block_log')} "
+        f"host={env_or_default('POSTGRES_HOST', 'haf')} "
+        f"port={env_or_default('POSTGRES_PORT', '5432')} "
+        f"dbname={env_or_default('POSTGRES_DB', 'haf_block_log')} "
         # #14: the daemon connects as haf_fyp_owner (owns the app schema), keeping
         # its write/delete/maintenance rights off the anon-facing haf_fyp_user.
-        f"user={os.environ.get('POSTGRES_USER', 'haf_fyp_owner')} "
+        f"user={env_or_default('POSTGRES_USER', 'haf_fyp_owner')} "
         f"password={os.environ.get('POSTGRES_PASSWORD', '')}"
     )
 
