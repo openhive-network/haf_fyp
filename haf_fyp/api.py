@@ -7,7 +7,7 @@ Handles write operations and admin actions that PostgREST cannot serve:
   POST   /v1/fyp/events            — impression / engagement telemetry (batched)
   POST   /v1/fyp/admin/algorithm   — activate an algorithm version (API-key gated)
   GET    /health                   — service health check
-  GET    /metrics                  — embedding coverage (#15) + credibility sources (#8)
+  GET    /metrics                  — embedding coverage (#15) + credibility sources (#8) + ranking sources (#36)
   GET    /sync-status              — uniform HAF-app sync freshness (#16)
 
 PostgREST (port 3001) serves all read endpoints from haf_fyp_endpoints schema.
@@ -56,6 +56,7 @@ from .metrics import (
     build_ranking_sources_report,
     fetch_coverage_rows,
     fetch_credibility_sources,
+    fetch_feed_servability,
     fetch_ranking_sources,
 )
 from .sync_status import (
@@ -1037,16 +1038,30 @@ def metrics(response: Response):
     by sampling served feeds. The current UTC day is reported but never flagged —
     mid-day it reads low simply because the latest posts are not embedded yet.
 
-    ranking_sources (#36): whether hivemind and hivesense are readable, unreadable
-    or absent. This exists because the failure is otherwise INVISIBLE. Hivemind is a
-    hard dependency -- post_candidates.hive_post_id is resolved from it and both feed
+    ranking_sources (#36, #43): the state of the two apps ranking depends on, and
+    whether anything is standing between this node and a served feed.
+
+    It exists because these failures are otherwise INVISIBLE. Hivemind is a hard
+    dependency -- post_candidates.hive_post_id is resolved from it and both feed
     endpoints filter on that column -- but the resolver is exception-guarded so a
-    missing schema cannot stall block processing. The result is that a node without
-    hivemind syncs happily, raises nothing, and serves an empty feed forever.
-    feeds_empty is the field a monitor should alert on. hivesense is reported beside
-    it because its absence is a much quieter fact: relevance drops out of the score
-    entirely (weight 0, not a neutral constant), so the feed becomes community-boosted
-    trending and looks perfectly healthy.
+    missing schema cannot stall block processing. A node without it syncs happily,
+    raises nothing, and serves an empty feed forever.
+
+    ALERT ON `degraded`, not on any single field. That is a correction, not a
+    style preference: #36 shipped a `feeds_empty` boolean and #43 tried to make it
+    authoritative, and it was wrong in BOTH directions -- true on a node that was
+    serving (post_bridge_cache answers without touching hivemind), and false on a
+    node that was not (the global cache is the recency-weighted top 200, so the
+    backfill case leaves it green while per-user feeds are empty). Two separate
+    observations are reported instead, and neither is a proxy for the others:
+
+      global_feed -- whether the global feed cache holds anything, and whether any
+          of it is servable. `cached and not servable` is the failure no privilege
+          probe can see.
+      sources -- per-relation privilege states, including the two extra relations
+          the resolver joins. Diagnosis of WHY, not detection.
+
+    detail names which probe failed when one does, rather than blaming a fixed one.
 
     credibility_sources (#8): whether each foreign relation the credibility signal
     reads is readable, unreadable or absent. Probed inline — one indexed catalog
@@ -1064,7 +1079,7 @@ def metrics(response: Response):
     # _db_conn, not the inline getconn prologue: it borrows INSIDE the guarded region,
     # so a PoolError("connection pool exhausted") -- reachable with maxconn=5 and a
     # monitor polling both this and /sync-status -- is mapped to JSON here instead of
-    # escaping as a bare text/plain 500. This route also now issues three queries while
+    # escaping as a bare text/plain 500. This route also now issues four queries while
     # holding the connection, which raises the exhaustion pressure that makes it worth
     # doing. The remaining handlers still use the inline prologue (#17).
     # Headers first: the 503 below raises, and a raised HTTPException is rendered from
@@ -1077,21 +1092,30 @@ def metrics(response: Response):
     try:
         with _db_conn() as conn:
             rows = fetch_coverage_rows(conn)
-            # ORDER IS LOAD-BEARING: ranking BEFORE credibility. These share one
-            # pooled connection and one transaction (the pool is not autocommit),
-            # and fetch_credibility_sources deliberately does NOT roll back on
-            # failure -- its docstring justifies that with "/metrics issues no
-            # further statement after this", which stopped being true the moment a
-            # third read was added. Run the other way round, any credibility hiccup
-            # (statement timeout, a cancelled backend) leaves the transaction
-            # aborted, the ranking probe then fails with 25P02, and the report
-            # fails safe to feeds_empty=true -- which README.md and this route both
-            # tell operators to alert on. A catalog-read hiccup would page someone
-            # with "every feed is empty". Ranking first means only a genuine
-            # ranking-probe failure can raise that alarm; credibility inherits the
-            # aborted transaction instead, and "unknown" is already its documented
-            # fail-safe.
+            # ORDER IS LOAD-BEARING, and the rule is: BOTH ranking probes, then
+            # credibility. These share one pooled connection and one transaction
+            # (the pool is not autocommit) and none of them rolls back on failure,
+            # so whichever fails first aborts the transaction and everything after
+            # it dies with 25P02 through no fault of its own. Something has to
+            # inherit that, and the only honest choice is the section whose
+            # fail-safe is already documented as such.
+            #
+            # Grouping the two ranking reads means a fault in either degrades ONE
+            # section -- ranking -- to ranking_unknown, which is true. Credibility
+            # then inherits any abort and reports "unknown", which is its documented
+            # fail-safe. The alternatives were both tried on this branch and both
+            # lied: servability in the MIDDLE let its failure fabricate four
+            # unhealthy credibility sources (live in CI, where the stack had no
+            # global_feed_cache, and green because the assertion said !anything);
+            # servability LAST let a credibility timeout blank the servability read
+            # and page someone with ranking_unknown for a fault ranking never had.
+            #
+            # A SAVEPOINT around each probe would remove the cascade rather than
+            # choosing who absorbs it, and is the durable fix if a fourth read is
+            # ever added here. Ordering is what this MR does because it is one line
+            # and the failure it prevents was live.
             ranking_probe = fetch_ranking_sources(conn)
+            servability = fetch_feed_servability(conn)
             probe = fetch_credibility_sources(conn)
     except psycopg2.pool.PoolError as exc:
         # Monitors poll this route, so a persistently exhausted pool must not write a
@@ -1113,7 +1137,7 @@ def metrics(response: Response):
     today = datetime.now(tz=timezone.utc).date()
     report = build_coverage_report(rows, today)
     report["credibility_sources"] = build_credibility_sources_report(probe)
-    report["ranking_sources"] = build_ranking_sources_report(ranking_probe)
+    report["ranking_sources"] = build_ranking_sources_report(ranking_probe, servability)
     return report
 
 

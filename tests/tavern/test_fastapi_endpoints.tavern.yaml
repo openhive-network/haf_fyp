@@ -28,10 +28,18 @@ stages:
 ---
 test_name: FastAPI metrics returns 200 (#15 embedding coverage)
 
-# Smoke test only: the DB state depends on the integration test that ran just
-# before this in the same job, so we assert reachability / no-500, not exact
-# values. The report logic is covered deterministically by tests/unit/test_metrics.py
-# and the underlying SQL by tests/integration/test_embedding_coverage_db.py.
+# Values are a smoke test -- the DB state depends on the integration test that ran
+# just before this in the same job -- but the ranking_sources SHAPE and the
+# privilege verdicts are asserted, because this is the only lane where the catalog
+# probe runs against a real PostgreSQL (#36, #43).
+#
+# What it gates and what it does not: both probes DO run here and their sections are
+# asserted non-null, so a query that raised (and was swallowed into None) fails this
+# stage. What it cannot check is whether they return the RIGHT answer -- this stack
+# has no hivemind_app, so nothing here depends on the values.
+# tests/integration/test_servability_db.py pins the semantics against a real
+# database; an earlier revision of this comment claimed the sections were null,
+# which was simply wrong.
 stages:
   - name: GET /metrics returns 200
     request:
@@ -39,6 +47,39 @@ stages:
       method: GET
     response:
       status_code: 200
+      json:
+        embedding_coverage: !anything
+        recent_window_pct: !anything
+        suspected_hole_days: !anything
+        computed_at: !anything
+        credibility_sources: !anything
+        ranking_sources:
+          # ABSENT, not unreadable: kept apart because the remedies are opposite --
+          # install hivemind vs re-run grant_cross_schema.sh -- and an earlier
+          # revision collapsed them, which would have sent an operator to fix a
+          # grant on a node that has no hivemind at all.
+          #
+          # No `feeds_empty` here, deliberately. #36 shipped that boolean and #43
+          # tried to make it authoritative; it was wrong in BOTH directions, so the
+          # payload reports two independent observations and `degraded` is the
+          # alert field. See build_ranking_sources_report's docstring.
+          state: "ranking_no_feed"
+          degraded: true
+          # Asserted non-null, which is what this stage really gates: an absent
+          # hivemind short-circuits the state/detail choice, but the probe still
+          # runs, so a malformed query would surface as a null section (the probe
+          # swallowed an error) instead of this object. Typed rather than exact,
+          # because the row counts depend on whichever integration test ran last.
+          global_feed:
+            cached: !anybool
+            servable: !anybool
+          sources:
+            hivemind: "absent"
+            hivesense: "readable"
+            resolver_inputs:
+              hivemind_app.hive_accounts: "absent"
+              hivemind_app.hive_permlink_data: "absent"
+          detail: !anystr
       # credibility_sources is a LIVE privilege probe, so a cached answer would keep
       # reporting degraded=false after a grant is lost (or true after it is repaired),
       # defeating the point of re-probing every request. Pinned here for the same

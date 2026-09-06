@@ -6,7 +6,7 @@ BUILDER, which is fed hand-written probe dicts. Everything here tests the parts 
 mutation review found untested — the probe that produces those dicts, the fetch
 wrapper's happy path, and the failure memo in the ranker. All three were survivable
 mutations: `fetch_ranking_sources` could be replaced with `return {}` and the whole
-suite stayed green, while reporting "every feed is empty" on a healthy node.
+suite stayed green, while reporting a fault on a healthy node.
 """
 
 import io
@@ -25,10 +25,16 @@ from haf_fyp.credibility import (
     STATE_UNREADABLE,
     probe_relations,
 )
-from haf_fyp.metrics import _RANKING_SOURCES, fetch_ranking_sources
+from haf_fyp.metrics import (
+    _RANKING_SOURCES,
+    fetch_feed_servability,
+    fetch_ranking_sources,
+)
 
 HIVEMIND = ("hivemind_app", "hive_posts")
 HIVESENSE = ("hivesense_app", "posts_vectors")
+HIVE_ACCOUNTS = ("hivemind_app", "hive_accounts")
+HIVE_PERMLINKS = ("hivemind_app", "hive_permlink_data")
 
 
 def _conn(rows):
@@ -124,16 +130,20 @@ def test_empty_relations_makes_no_query():
 
 
 def test_fetch_returns_a_state_for_every_declared_source():
-    # The survivable mutation this kills: `return {}` here reports feeds_empty=true
-    # on a healthy node, i.e. a permanent false page, with every other test green.
+    # The survivable mutation this kills: `return {}` here makes every relation read
+    # unknown on a healthy node -- a permanent false fault, every other test green.
     conn = _conn([
         ("hivemind_app", "hive_posts", True, "r"),
         ("hivesense_app", "posts_vectors", True, "r"),
+        ("hivemind_app", "hive_accounts", True, "r"),
+        ("hivemind_app", "hive_permlink_data", True, "r"),
     ])
     probe = fetch_ranking_sources(conn)
     assert probe == {
         "hivemind_app.hive_posts": STATE_READABLE,
         "hivesense_app.posts_vectors": STATE_READABLE,
+        "hivemind_app.hive_accounts": STATE_READABLE,
+        "hivemind_app.hive_permlink_data": STATE_READABLE,
     }
 
 
@@ -142,11 +152,15 @@ def test_the_declared_sources_are_the_relations_the_code_actually_reads():
     # against itself. This pins the constant against the OTHER places the same two
     # relations are named, so a typo in _RANKING_SOURCES (which would report `absent`
     # for a present relation, and page forever) cannot pass.
-    assert set(_RANKING_SOURCES) == {HIVEMIND, HIVESENSE}
+    assert set(_RANKING_SOURCES) == {HIVEMIND, HIVESENSE, HIVE_ACCOUNTS, HIVE_PERMLINKS}
     embeddings_sql = io.open("haf_fyp/embeddings.py", encoding="utf-8").read()
     assert "hivesense_app.posts_vectors" in embeddings_sql
+    # All three hivemind relations the resolver joins are probed -- #36 shipped with
+    # two of them invisible, so a grant lost on either read "hivemind: readable"
+    # while nothing resolved.
     resolver_sql = io.open("db/process_posts.sql", encoding="utf-8").read()
-    assert "hivemind_app.hive_posts" in resolver_sql
+    for schema, name in (HIVEMIND, HIVE_ACCOUNTS, HIVE_PERMLINKS):
+        assert f"{schema}.{name}" in resolver_sql
 
 
 # --------------------------------------------------------------------------
@@ -187,20 +201,6 @@ def test_a_different_failure_kind_is_reported(vectors, caplog):
     assert ranker_daemon._last_embedding_failure == "ValueError:None"
 
 
-def test_same_class_different_pgcode_is_a_different_kind(vectors, caplog):
-    # The operational case the class name alone cannot see: a lost grant (42501) and
-    # a dropped relation (42P01) are BOTH psycopg2 ProgrammingError. Discriminating on
-    # the class only -- which every other test here tolerates, since they use
-    # RuntimeError vs ValueError -- would make that transition silent.
-    lost_grant = psycopg2.errors.InsufficientPrivilege("permission denied")
-    dropped = psycopg2.errors.UndefinedTable("relation does not exist")
-    assert type(lost_grant).__mro__[1] is type(dropped).__mro__[1]
-    vectors.extend([lost_grant, dropped])
-    conn = MagicMock()
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
-    ranker_daemon._fetch_post_vectors_safe(conn, [1])
-    assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
-
 
 def test_a_standing_failure_is_re_reported_after_the_throttle_window(vectors, caplog, monkeypatch):
     # Throttled, not suppressed. An earlier revision went silent for the life of the
@@ -219,6 +219,20 @@ def test_a_standing_failure_is_re_reported_after_the_throttle_window(vectors, ca
     ranker_daemon._fetch_post_vectors_safe(conn, [1])
     assert sum("embedding fetch failed" in r.message for r in caplog.records) == 1
     clock[0] += ranker_daemon.EMBEDDING_RELOG_SECONDS
+    ranker_daemon._fetch_post_vectors_safe(conn, [1])
+    assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
+
+def test_same_class_different_pgcode_is_a_different_kind(vectors, caplog):
+    # The operational case the class name alone cannot see: a lost grant (42501) and
+    # a dropped relation (42P01) are BOTH psycopg2 ProgrammingError. Discriminating on
+    # the class only -- which every other test here tolerates, since they use
+    # RuntimeError vs ValueError -- would make that transition silent.
+    lost_grant = psycopg2.errors.InsufficientPrivilege("permission denied")
+    dropped = psycopg2.errors.UndefinedTable("relation does not exist")
+    assert type(lost_grant).__mro__[1] is type(dropped).__mro__[1]
+    vectors.extend([lost_grant, dropped])
+    conn = MagicMock()
+    ranker_daemon._fetch_post_vectors_safe(conn, [1])
     ranker_daemon._fetch_post_vectors_safe(conn, [1])
     assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
 
@@ -282,9 +296,9 @@ def test_metrics_probes_ranking_before_credibility(monkeypatch):
     pool is not autocommit), and fetch_credibility_sources deliberately does not roll
     back on failure -- its docstring justifies that with "/metrics issues no further
     statement after this". Run the other way round, a credibility hiccup leaves the
-    transaction aborted, the ranking probe fails with 25P02, and the report fails safe
-    to feeds_empty=true, which README and the route both tell operators to alert on.
-    A catalog-read timeout would page someone with "every feed is empty".
+    transaction aborted, the ranking probes fail with 25P02, and the whole ranking
+    section degrades to ranking_unknown with degraded=true -- paging someone about
+    ranking health that was never actually failed to read.
 
     Nothing else pins the order, so a refactor could swap two adjacent lines and the
     only symptom would be a false page months later.
@@ -308,16 +322,38 @@ def test_metrics_probes_ranking_before_credibility(monkeypatch):
         api, "fetch_credibility_sources", lambda conn: order.append("credibility")
     )
     monkeypatch.setattr(api, "fetch_ranking_sources", lambda conn: order.append("ranking"))
+    monkeypatch.setattr(
+        api, "fetch_feed_servability", lambda conn: order.append("servability")
+    )
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
     monkeypatch.setattr(api, "build_credibility_sources_report", lambda probe: {})
-    monkeypatch.setattr(api, "build_ranking_sources_report", lambda probe: {})
+    # Positional, no defaults: production dropping an argument must fail here rather
+    # than silently pass on the stub's fallbacks.
+    monkeypatch.setattr(api, "build_ranking_sources_report", lambda probe, serv: {})
 
     api.metrics(MagicMock())
 
     assert order.index("ranking") < order.index("credibility")
-    # Both probes must receive the SAME connection, which is the premise the whole
+    # And servability LAST. None of the three rolls back on failure, so whichever
+    # fails first aborts the shared transaction and everything after it dies with
+    # 25P02 through no fault of its own. Servability reads app tables rather than
+    # just pg_catalog, so it is the likeliest to fail -- putting it in the middle is
+    # what re-opened the #57 cascade, and that was LIVE: the CI stack had no
+    # global_feed_cache, the probe raised on every run, and credibility_sources
+    # reported "unknown" for four healthy sources.
+    #
+    # This assertion exists because the fix removed its own detector. Creating the
+    # table in ci_fastapi_setup.sql is what stops the probe raising there, so the
+    # tavern stage can no longer notice a re-ordering. Nothing else would.
+    # BOTH ranking reads before credibility. Something must inherit the aborted
+    # transaction when a probe fails, and the only honest candidate is the section
+    # whose fail-safe is already documented -- credibility's "unknown". Running
+    # servability AFTER credibility made a credibility timeout blank the servability
+    # read and page someone with ranking_unknown for a fault ranking never had.
+    assert order.index("servability") < order.index("credibility")
+    # All three must receive the SAME connection, which is the premise the whole
     # ordering argument rests on -- give each its own _db_conn() block and the
-    # rationale evaporates while the order assertion above still passes.
+    # rationale evaporates while the order assertions above still pass.
     assert len(conns) == 1
     assert conns[0] is not None
 
@@ -328,8 +364,8 @@ def test_metrics_feeds_each_probe_to_its_own_builder(monkeypatch):
 
     test_metrics.py exercises the builders in isolation with hand-written dicts, and
     the ordering test above stubs them out entirely, so nothing catches the ranking
-    builder being handed the credibility probe -- which would read feeds_empty=true
-    forever, the exact false page this section was written to prevent.
+    builder being handed the credibility probe -- which would report every ranking
+    relation as unknown forever, the exact false page this section exists to prevent.
     """
     from contextlib import contextmanager
 
@@ -343,15 +379,94 @@ def test_metrics_feeds_each_probe_to_its_own_builder(monkeypatch):
     monkeypatch.setattr(api, "fetch_coverage_rows", lambda conn: [])
     monkeypatch.setattr(api, "fetch_credibility_sources", lambda conn: {"which": "credibility"})
     monkeypatch.setattr(api, "fetch_ranking_sources", lambda conn: {"which": "ranking"})
+    monkeypatch.setattr(api, "fetch_feed_servability", lambda conn: {"which": "servability"})
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
     monkeypatch.setattr(
         api, "build_credibility_sources_report", lambda probe: {"got": probe["which"]}
     )
     monkeypatch.setattr(
-        api, "build_ranking_sources_report", lambda probe: {"got": probe["which"]}
+        api,
+        "build_ranking_sources_report",
+        lambda probe, serv: {"got": probe["which"], "serv": serv["which"]},
     )
 
     report = api.metrics(MagicMock())
 
-    assert report["ranking_sources"] == {"got": "ranking"}
+    assert report["ranking_sources"] == {"got": "ranking", "serv": "servability"}
     assert report["credibility_sources"] == {"got": "credibility"}
+
+
+# --------------------------------------------------------------------------
+# fetch_feed_servability (#43) -- the outcome check
+# --------------------------------------------------------------------------
+
+
+def _servability_conn(row, boom=None):
+    conn = MagicMock()
+    cur = conn.cursor.return_value.__enter__.return_value
+    if boom is not None:
+        cur.execute.side_effect = boom
+    else:
+        cur.fetchone.return_value = row
+    return conn
+
+
+def test_servability_reports_a_serving_node():
+    assert fetch_feed_servability(_servability_conn((True, True))) == {
+        "cached": True,
+        "servable": True,
+    }
+
+
+def test_servability_distinguishes_no_cycle_from_nothing_resolving():
+    # The whole reason this returns two booleans rather than one: "empty because the
+    # ranker has not run" and "empty because nothing resolves" need different
+    # responses, and a single servable flag cannot tell them apart.
+    assert fetch_feed_servability(_servability_conn((False, False))) == {
+        "cached": False,
+        "servable": False,
+    }
+    assert fetch_feed_servability(_servability_conn((True, False))) == {
+        "cached": True,
+        "servable": False,
+    }
+
+
+def test_servability_coerces_to_real_bools():
+    # psycopg2 gives real bools, but the report's `is True` assertions and any JSON
+    # consumer deserve them regardless of what a driver hands back.
+    out = fetch_feed_servability(_servability_conn((1, 0)))
+    assert out["cached"] is True and out["servable"] is False
+
+
+def test_servability_failure_returns_none_without_rolling_back():
+    # Same contract as the two sibling probes: never take the rest of /metrics down,
+    # and never roll back a connection that may have died inside this call.
+    conn = _servability_conn(None, boom=RuntimeError("boom"))
+    assert fetch_feed_servability(conn) is None
+    conn.rollback.assert_not_called()
+
+
+def test_servability_query_names_the_relations_and_predicate_it_should():
+    """
+    A spelling check, and labelled as one.
+
+    An earlier name claimed this pinned that the probe "applies the same filter the
+    endpoints do". It cannot: the substrings match anywhere in a 2000-line schema,
+    so the endpoints could add `AND pc.in_discovery` and this would stay green. Real
+    drift detection would mean parsing the endpoint SQL, and the honest mitigation is
+    the limits section in the README plus tests/integration/test_servability_db.py,
+    which pins the query's BEHAVIOUR. Keep this for the cheap catch it does give --
+    someone editing the probe to reference a different table or predicate.
+    """
+    from haf_fyp.metrics import _SERVABILITY_SQL
+
+    assert "hive_post_id IS NOT NULL" in _SERVABILITY_SQL
+    assert "haf_fyp_app.global_feed_cache" in _SERVABILITY_SQL
+    assert "haf_fyp_app.post_candidates" in _SERVABILITY_SQL
+    # The predicate must at least still exist on the endpoint side; if it is gone
+    # entirely the probe is answering a question nobody asks any more.
+    endpoints = io.open("endpoints/endpoint_schema.sql", encoding="utf-8").read()
+    assert "hive_post_id IS NOT NULL" in endpoints
+
+

@@ -137,28 +137,58 @@ def _source(relation: str, state: str) -> dict:
         "relation": relation if relation and state != STATE_ABSENT else None,
         "state": state,
     }
-
-
-# The two foreign relations the RANKING signals read, as opposed to the
-# credibility ones. Split by consequence, not by schema:
-#   hivemind  -- HARD dependency. post_candidates.hive_post_id is resolved from it,
-#                and both feed endpoints filter on that column being non-null, so
-#                without it every feed is []. Nothing raises: the resolver is
-#                exception-guarded so a missing schema cannot stall block
-#                processing, which is correct but leaves empty feeds as the only
-#                symptom. This probe is how an operator sees it (#36).
-#   hivesense -- optional, and its absence is quieter than hivemind's but not as
-#                gentle as "cold-start ranking". compute_scores DOES zero the
-#                relevance weight, but most users never reach it: the profile and
-#                bootstrap vector builders call hivesense directly and unguarded, so
-#                a user with recent history or a community raises inside _rank_user
-#                and gets no feed_cache row, falling back to the global feed without
-#                the community boost (#41). Either way: not personalized.
+# The relations the RANKING signals read, as opposed to the credibility ones.
+#
+#   hivemind_app.hive_posts     -- the relation resolve_hivemind_post_ids writes
+#       post_candidates.hive_post_id from, and the one both feed endpoints filter
+#       on. A HARD dependency, but a quiet one: the resolver is exception-guarded
+#       so a missing schema cannot stall block processing, and nothing raises.
+#   hive_accounts, hive_permlink_data -- the other two relations the resolver
+#       joins. Lose SELECT on either and resolution stops just as dead. #36
+#       shipped with them invisible, so an operator saw "hivemind: readable" while
+#       nothing resolved. get_personalized_feed also reads hive_accounts
+#       UNGUARDED, so losing that one makes every authenticated feed request RAISE
+#       rather than return [].
+#   hivesense_app.posts_vectors -- optional. compute_scores zeroes the relevance
+#       weight without it, but most users never reach that branch: the profile and
+#       bootstrap vector builders call hivesense directly and unguarded, so a user
+#       with recent history or a community raises inside _rank_user and gets no
+#       feed_cache row at all (#41).
 _HIVEMIND_RELATION = ("hivemind_app", "hive_posts")
 _HIVESENSE_RELATION = ("hivesense_app", "posts_vectors")
-_RANKING_SOURCES = (_HIVEMIND_RELATION, _HIVESENSE_RELATION)
+_RESOLVER_RELATIONS = (
+    ("hivemind_app", "hive_accounts"),
+    ("hivemind_app", "hive_permlink_data"),
+)
+_RANKING_SOURCES = (_HIVEMIND_RELATION, _HIVESENSE_RELATION) + _RESOLVER_RELATIONS
 _HIVEMIND_KEY = ".".join(_HIVEMIND_RELATION)
 _HIVESENSE_KEY = ".".join(_HIVESENSE_RELATION)
+
+# Can the global feed serve a post right now? It catches one thing no privilege
+# probe can: the cache holds rows and not one of them resolves.
+#
+# It is NOT a proof of health, and an earlier revision of this module claimed it
+# was, twice. Three reasons, all verified in the endpoint SQL:
+#   * get_personalized_feed does NOT fall back to the global feed for a user who
+#     already has feed_cache rows -- that branch ends in its own RETURN. So a user
+#     whose cached rows are all unresolvable gets [] while this reads servable.
+#   * a post can resolve and still be dropped: get_bridge_post returns NULL for a
+#     post deleted in hivemind and the endpoint filters it out.
+#   * global_feed_cache is the recency-weighted top 200, so on a node whose older
+#     posts are unresolvable it stays servable while per-user feeds are empty.
+#     Detecting THAT needs a precomputed rollup over post_candidates, not a
+#     request-time probe -- see #43, which stays open for it.
+# Cost: 0.121 ms serving, 0.876 ms when nothing is servable (200 PK probes through
+# a nested loop). Bounded by write_global_feed_cache's 200-row cap.
+_SERVABILITY_SQL = """
+    SELECT EXISTS (SELECT 1 FROM haf_fyp_app.global_feed_cache) AS cached,
+           EXISTS (
+               SELECT 1
+                 FROM haf_fyp_app.global_feed_cache g
+                 JOIN haf_fyp_app.post_candidates p ON p.post_id = g.post_id
+                WHERE p.hive_post_id IS NOT NULL
+           ) AS servable
+"""
 
 # Prefixed, because "full" alone is already credibility.STATE_FULL's value and the
 # two enums would share a member in one payload under the same key name -- a
@@ -166,10 +196,22 @@ _HIVESENSE_KEY = ".".join(_HIVESENSE_RELATION)
 RANKING_STATE_FULL = "ranking_full"
 RANKING_STATE_NO_FEED = "ranking_no_feed"
 RANKING_STATE_NO_PERSONALIZATION = "ranking_no_personalization"
-# Prefixed for the same reason as its siblings. An earlier revision reused
-# credibility's bare STATE_UNKNOWN here, which put the one value a monitor must
-# not mishandle outside the enum this section documents.
 RANKING_STATE_UNKNOWN = "ranking_unknown"
+
+
+def _readable(state: str) -> bool:
+    """
+    True for the states that mean "this role can read it".
+
+    readable_unverified counts, and that is a deliberate judgement rather than an
+    oversight: it means the relation is a view or a foreign table, where
+    has_table_privilege is not the whole story, so we can read it but cannot verify
+    that whatever stands behind it is intact. Alarming on that would page an
+    operator over an upstream schema change that may be entirely fine; the per-source
+    field keeps the distinction for a human. Both relations probed here are base
+    tables today, so this is forward-looking.
+    """
+    return state in (STATE_READABLE, STATE_READABLE_UNVERIFIED)
 
 
 def fetch_ranking_sources(conn) -> dict | None:
@@ -185,102 +227,218 @@ def fetch_ranking_sources(conn) -> dict | None:
         return None
 
 
-def build_ranking_sources_report(probe: dict | None) -> dict:
+def fetch_feed_servability(conn) -> dict | None:
     """
-    Shape a probe_relations() result for GET /metrics (#36).
+    Ask whether the global feed can serve a post, or None if the check failed.
 
-    Separate from build_credibility_sources_report for the same reason that one is
-    separate from build_coverage_report: the existing shapes are pinned by
-    tests/unit/test_metrics.py, and keeping them apart is what makes this addition
-    provably additive.
+    Separate from the other probes because they answer different questions, and it
+    reports None rather than raising so one failure does not take GET /metrics down.
 
-    The two sources are reported with DIFFERENT severities, because they have
-    different consequences:
+    NOT independent, though: all four reads on that route share one connection and
+    one transaction and none of them rolls back, so the first to fail aborts the
+    transaction and every later one dies with 25P02 regardless. A docstring here
+    used to claim any of them could fail without the others; that was never true.
 
-      * hivemind absent or unreadable  -> feeds_empty: true. This is not a degraded
-        feed, it is no feed, and it is otherwise silent.
-      * hivesense absent               -> personalized: false, degraded: false. A
-        deliberate deployment choice, not a fault.
-      * hivesense unreadable           -> personalized: false, degraded: TRUE. The
-        relation is there and the grant was lost; grant_cross_schema.sh repairs it.
+    That is why the order is load-bearing, and this one runs SECOND of the three
+    probes -- immediately after fetch_ranking_sources and before
+    fetch_credibility_sources. Both reads that feed ranking_sources are grouped, so
+    a fault in either degrades exactly one section and degrades it truthfully;
+    credibility inherits any abort, and "unknown" is already its documented
+    fail-safe. It does NOT run last: an earlier revision put it there, which let a
+    credibility timeout blank this read and report ranking_unknown for a fault
+    ranking never had.
 
-    probe is None when the probe could not run: every boolean then fails safe
-    (feeds_empty and degraded true, personalized false) and state carries the
-    distinction for a human. A monitor writing `if body.ranking_sources.feeds_empty`
-    must never read "I could not check" as "fine".
+    Note what ordering does not buy. If THIS probe fails first, credibility still
+    reports four healthy sources as "unknown" -- ordering chooses who absorbs the
+    abort, it does not stop the cascade. A SAVEPOINT around each probe would, and
+    is the right change if a fourth read is ever added here.
     """
-    if probe is None:
-        return {
-            "state": RANKING_STATE_UNKNOWN,
-            "hivemind": STATE_UNKNOWN,
-            "hivesense": STATE_UNKNOWN,
-            "feeds_empty": True,
-            "personalized": False,
-            "degraded": True,
-            "detail": "ranking source probe failed -- state unknown",
-        }
+    try:
+        with conn.cursor() as cur:
+            cur.execute(_SERVABILITY_SQL)
+            cached, servable = cur.fetchone()
+        return {"cached": bool(cached), "servable": bool(servable)}
+    except Exception as exc:
+        # Same treatment as the sibling probes: no rollback (the pool closes or
+        # rolls back a dirty connection on putconn, and rolling back a connection
+        # that died IN this call raises outside the handler), and no exc_info,
+        # because monitors poll this route.
+        log.warning("ranking: servability check failed (%s) -- reporting unknown", exc)
+        return None
 
-    # .get, not [], and keys derived from the tuples rather than retyped: a bare
-    # index on a string literal turns a rename of _RANKING_SOURCES into a KeyError,
-    # and this builder is called OUTSIDE the route's try/except, so that KeyError
-    # would escape as a bare 500 with no JSON body and none of the no-cache headers.
-    hivemind = probe.get(_HIVEMIND_KEY, STATE_UNKNOWN)
-    hivesense = probe.get(_HIVESENSE_KEY, STATE_UNKNOWN)
 
-    # readable_unverified counts as readable for the BOOLEANS, and keeps its own name in
-    # the per-source field. Both relations probed here are base tables today, so
-    # this branch is unreachable until hivemind or hivesense changes one to a view
-    # -- and if that happens, the honest answer is "we can read it, but this module
-    # cannot verify that its owner still can". Alarming on it would page an operator
-    # over an upstream schema change that may be entirely fine; hiding the
-    # distinction would claim a certainty we do not have.
-    def _readable(state: str) -> bool:
-        return state in (STATE_READABLE, STATE_READABLE_UNVERIFIED)
+def build_ranking_sources_report(
+    probe: dict | None,
+    servability: dict | None,
+) -> dict:
+    """
+    Shape the ranking signals for GET /metrics (#36, #43).
 
-    feeds_empty = not _readable(hivemind)
-    personalized = not feeds_empty and _readable(hivesense)
-    # degraded means "a fault with a known remedy", and a total feed outage is the
-    # most degraded a node can be. An earlier revision counted only UNREADABLE, so
-    # an ABSENT hivemind reported feeds_empty with degraded false -- reproducing, in
-    # the adjacent section of the same payload, exactly the "healthy in the one state
-    # where the signal is entirely dead" misreport that credibility probes
-    # hafd.accounts to prevent. A monitor generalising `if body.*.degraded` across
-    # this response would have missed the outage.
-    degraded = (
-        feeds_empty
-        or hivemind == STATE_UNREADABLE
+    WHAT TO ALERT ON: `degraded`. Not any single boolean below.
+
+    That is a deliberate correction. #36 shipped `feeds_empty` as the alert field
+    and #43 tried to make it authoritative; three review rounds showed it cannot be,
+    in BOTH directions, so it is gone rather than left to mislead:
+
+      * it read true when the node was serving -- both endpoints serve pre-rendered
+        JSON from post_bridge_cache, so revoking SELECT on hive_posts on a warm node
+        stops resolution while every request keeps succeeding. A privilege-derived
+        "every feed returns []" was simply wrong there.
+      * it read false when the node was not serving -- the global cache is the
+        recency-weighted top 200, so the backfill case this section exists to catch
+        leaves it green while per-user feeds are empty.
+
+    So the payload now reports two INDEPENDENT observations and lets the operator
+    (and `degraded`) combine them, instead of collapsing them into one boolean that
+    is wrong at both ends:
+
+      global_feed        -- whether the global feed cache holds anything servable,
+          and whether it holds anything at all.
+      sources            -- per-relation privilege states, the diagnosis of why.
+
+    A probe that could not run reports null for its own section and sets degraded.
+    "I could not check" must never read as "fine", and JSON null is falsy.
+    """
+    sources = {
+        "hivemind": (probe or {}).get(_HIVEMIND_KEY, STATE_UNKNOWN),
+        "hivesense": (probe or {}).get(_HIVESENSE_KEY, STATE_UNKNOWN),
+        "resolver_inputs": {
+            ".".join(r): (probe or {}).get(".".join(r), STATE_UNKNOWN)
+            for r in _RESOLVER_RELATIONS
+        },
+    }
+    hivemind, hivesense = sources["hivemind"], sources["hivesense"]
+
+    # Split by what they explain: a resolution fault is caused by the hivemind
+    # relations the resolver joins, and hivesense has nothing to do with it. Naming
+    # hivesense in a resolution remedy sent the operator to the wrong grant.
+    # NOT readable, rather than == UNREADABLE. Equality tests fail OPEN on the one
+    # value that must not: `unknown` is what a probe reports when it could not
+    # answer, and an earlier revision of this chain reported state ranking_full and
+    # degraded false for it -- contradicting this module's own rule that "I could
+    # not check" never reads as fine. ABSENT belongs here too: a renamed or dropped
+    # resolver relation stops resolution exactly as dead as a revoked grant, and
+    # get_personalized_feed reads hive_accounts UNGUARDED, so authenticated requests
+    # RAISE. The remedy differs (see the detail below), the severity does not.
+    broken_resolution = [
+        name
+        for name, state in [(_HIVEMIND_KEY, hivemind)]
+        + list(sources["resolver_inputs"].items())
+        if not _readable(state)
+    ]
+    # Resolver inputs only -- hivemind itself has its own earlier branches.
+    broken_resolver_inputs = [n for n in broken_resolution if n != _HIVEMIND_KEY]
+
+    global_section = None if servability is None else {
+        "cached": servability["cached"],
+        "servable": servability["servable"],
+    }
+    # Only meaningful when the check ran. `cached and not servable` is the case no
+    # privilege probe can see: rows are there and not one of them can be served.
+    cache_unservable = bool(servability and servability["cached"] and not servability["servable"])
+    no_cycle_yet = bool(servability and not servability["cached"])
+
+    # hivesense ABSENT is the one not-readable state that is a deployment choice
+    # rather than a fault, so it is excluded here while still costing
+    # personalization below.
+    degraded = bool(
+        broken_resolution
         or hivesense == STATE_UNREADABLE
+        or cache_unservable
+        or probe is None
+        or servability is None
     )
 
-    if feeds_empty:
-        detail = (
-            f"{_HIVEMIND_KEY} is {hivemind} -- every feed returns []; "
-            "hivemind is a required dependency"
-        )
+    if probe is None or servability is None:
+        state = RANKING_STATE_UNKNOWN
+        missing = [
+            n
+            for n, v in (("sources", probe), ("global_feed", servability))
+            if v is None
+        ]
+        # Names WHICH probe failed. An earlier revision said "the servability check
+        # could not run" whichever one had actually failed, sending an operator to
+        # investigate global_feed_cache for a credibility-probe fault.
+        detail = f"could not check: {', '.join(missing)} -- ranking health is UNKNOWN"
+    elif hivemind == STATE_ABSENT:
         state = RANKING_STATE_NO_FEED
-    elif personalized:
-        # Names the states rather than asserting "readable": one of them may be
-        # readable_unverified, and claiming plain readable there is exactly the
-        # certainty the per-source field exists to avoid.
         detail = (
-            f"{_HIVEMIND_KEY} is {hivemind}, {_HIVESENSE_KEY} is {hivesense} "
-            "-- feeds personalized"
+            f"{_HIVEMIND_KEY} is absent -- hivemind is a required dependency; "
+            "install it, then run CALL haf_fyp_app.run_hive_post_id_backfill()"
         )
-        state = RANKING_STATE_FULL
-    else:
+    elif not _readable(hivemind):
+        state = RANKING_STATE_NO_FEED
+        # Names the actual state: this branch is `not readable`, which covers
+        # `unknown` (the probe could not answer) as well as a revoked grant, and
+        # telling someone to re-run grants for an unanswered probe is a wrong turn.
+        remedy = (
+            "re-run scripts/grant_cross_schema.sh"
+            if hivemind == STATE_UNREADABLE
+            else "the probe could not determine its state -- check the database"
+        )
+        outcome = (
+            "resolution has stopped"
+            if hivemind == STATE_UNREADABLE
+            else "resolution is presumed stopped"
+        )
+        detail = (
+            f"{_HIVEMIND_KEY} is {hivemind} -- {outcome}; {remedy}. "
+            "Already-rendered posts may still serve from post_bridge_cache, so this "
+            "is not necessarily a visible outage yet"
+        )
+    elif broken_resolver_inputs:
+        # Without this branch the payload reported state ranking_full with detail
+        # "global feed servable" WHILE degraded was true: health asserted in two
+        # fields and a fault in a third. get_personalized_feed reads hive_accounts
+        # UNGUARDED, so in this state every authenticated feed request is already
+        # raising, and sending the operator nowhere was the worst part.
+        state = RANKING_STATE_NO_FEED
+        # The remedy differs by WHY it is not readable, so say which.
+        states = ", ".join(
+            f"{n} is {sources['resolver_inputs'][n]}" for n in broken_resolver_inputs
+        )
+        remedy = (
+            "re-run scripts/grant_cross_schema.sh"
+            if any(
+                sources["resolver_inputs"][n] == STATE_UNREADABLE
+                for n in broken_resolver_inputs
+            )
+            else "the relation is missing -- check the hivemind install/version"
+        )
+        detail = (
+            f"{states} -- resolution has stopped; authenticated feed requests that "
+            f"read hive_accounts raise now. {remedy}"
+        )
+    elif cache_unservable:
+        state = RANKING_STATE_NO_FEED
+        detail = (
+            "global_feed_cache has rows but none resolve to a hivemind post -- the "
+            "global feed returns []"
+        )
+    elif no_cycle_yet:
+        state = RANKING_STATE_NO_FEED
+        detail = (
+            "global_feed_cache is empty -- the ranker has not completed a cycle. "
+            "Expected on a node that has just been installed"
+        )
+    elif not _readable(hivesense):
+        state = RANKING_STATE_NO_PERSONALIZATION
         detail = (
             f"{_HIVESENSE_KEY} is {hivesense} -- no personalization; per-user "
-            "ranking cannot complete and users fall back to the global feed"
+            "ranking cannot complete and users fall back to the global feed (#41)"
         )
-        state = RANKING_STATE_NO_PERSONALIZATION
+    else:
+        state = RANKING_STATE_FULL
+        detail = (
+            f"{_HIVEMIND_KEY} is {hivemind}, {_HIVESENSE_KEY} is {hivesense}, "
+            "global feed servable"
+        )
 
     return {
         "state": state,
-        "hivemind": hivemind,
-        "hivesense": hivesense,
-        "feeds_empty": feeds_empty,
-        "personalized": personalized,
         "degraded": degraded,
+        "global_feed": global_section,
+        "sources": sources,
         "detail": detail,
     }
 

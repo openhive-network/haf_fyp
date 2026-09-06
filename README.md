@@ -81,10 +81,19 @@ hived ──► sql_serializer ──► HAF PostgreSQL
   The per-block resolver only looks back **7 days** (`process_block_range.sql`), so
   every `post_candidates` row older than that keeps `hive_post_id IS NULL` forever
   and is filtered out of both feeds. This is the most likely way to hit the empty-feed
-  failure in practice, and it is the one case `GET /metrics` **cannot** see: the
-  relation is present and readable, so `ranking_sources.hivemind` reads `readable`
-  and `feeds_empty` reads `false` while every feed is in fact empty. The backfill is
-  resumable and only ever touches NULL rows, so re-running it is safe.
+  failure in practice. **`GET /metrics` cannot currently detect this**, and that is worth stating rather
+  than leaving to be discovered. A request-time probe for it turns out not to be
+  affordable: the cheap version (unresolved and older than the window) counts posts
+  *deleted on-chain*, which never resolve by design — on a healthy caught-up node
+  507 of 507 sampled unresolved rows were deletions — so it would report a permanent
+  false alarm with a remedy that cannot clear it. The correct predicate has to join
+  hivemind to exclude them, and measured **1.9 s** on the reference node, getting
+  slower as the backlog grows. Detecting it properly needs a precomputed rollup on
+  the ranker's maintenance pass, the same pattern `embedding_coverage_daily` uses;
+  [#43](https://gitlab.syncad.com/hive/haf_fyp/-/issues/43) stays open for it. Every privilege state
+  reads `readable` throughout, which is why the earlier privilege-only check could
+  not see it. The backfill is resumable and only ever touches NULL rows, so
+  re-running it is safe.
 
 ### External HAF Apps (optional)
 
@@ -164,22 +173,84 @@ Per-relation states below. `readable_unverified` is emitted only by
 | `readable_unverified` | readable, but it is a view or a foreign table, where the privilege answer is not the whole story — `has_table_privilege` on a view stays true after the view's owner loses access to what it reads, and on a foreign table it is a purely local check. Treated as healthy, flagged because it cannot be verified. `ranking_sources` only |
 | `unknown` | the probe itself failed. **Never** means healthy — every boolean in that section fails safe |
 
-Alert on `ranking_sources.feeds_empty` rather than on a state string — it collapses
-all five states into the one question you care about. But treat it as a **necessary,
-not a sufficient** condition: `feeds_empty: true` always means broken, while
-`feeds_empty: false` only means `hivemind_app.hive_posts` is readable.
+**Alert on `ranking_sources.degraded`.** Not on any single field below.
 
-What is **not** covered, and each of these produces empty feeds while `feeds_empty`
-reads `false`:
+That is a correction with some history behind it. #36 shipped a `feeds_empty`
+boolean as the alert field and #43 tried to make it authoritative; review showed it
+was wrong in *both* directions, so it is gone rather than left to mislead:
 
-* the unresolved-backfill case above — by far the likeliest one;
-* a grant lost on `hivemind_app.hive_accounts` or `hive_permlink_data`, which the
-  resolver also reads;
-* a grant lost on the hivemind views behind `get_full_post_view_by_id`, which the
-  feed render path reads.
+* it read `true` on nodes that were **serving** — both feed endpoints answer from
+  `post_bridge_cache`, so revoking `SELECT` on `hive_posts` on a warm node stops
+  resolution while every request keeps succeeding;
+* it read `false` on nodes that were **not** — `global_feed_cache` is the
+  recency-weighted top 200, so the backfill case leaves it green while older
+  per-user rows are unresolvable.
 
-Only `hivemind_app.hive_posts` and `hivesense_app.posts_vectors` are probed. If the
-feeds are empty and this section says everything is fine, check those three next.
+So the section reports two independent observations and lets `degraded` combine
+them, instead of collapsing them into one boolean that is wrong at both ends:
+
+| field | question it answers |
+|-------|--------------------|
+| `global_feed` | does the global cache hold anything (`cached`), and is any of it servable (`servable`)? `cached: true, servable: false` is a failure no privilege probe can see |
+| `sources` | per-relation privilege states — the diagnosis of *why*, not the detection |
+
+`global_feed` reading `null` means that probe could not run; `degraded` is set and `state` is `ranking_unknown`, because "I could not check"
+must never read as fine. `sources` is never null — when the catalog probe fails
+every relation reads `unknown` instead.
+
+`state` summarises, and the values want different responses:
+
+| state | meaning | do |
+|-------|---------|----|
+| `ranking_full` | nothing standing between this node and a served feed | nothing |
+| `ranking_no_feed` | hivemind absent or unreadable, a resolver input unreadable, the global cache holds nothing servable, or the ranker has not run yet | `detail` distinguishes these; only the last is expected, and it is the one that does not set `degraded` by itself |
+| `ranking_no_personalization` | hivesense absent or unreadable | optional — see above. `absent` is not a fault; `unreadable` is. Only reported when nothing more serious applies: a hivesense fault on a node whose global cache is also unservable shows up in `sources`, not in `state` |
+| `ranking_unknown` | a probe could not run | investigate; `detail` names which one. Never means healthy |
+
+A lost grant on `hive_accounts` or `hive_permlink_data` stops resolution just as
+dead as one on `hive_posts`, and #36 shipped with both invisible — an operator saw
+`hivemind: readable` while nothing resolved. They are now probed and reported under
+`sources.resolver_inputs`, with their own `state` and a `detail` naming the grant to
+repair. That case matters more than it looks: `get_personalized_feed` reads
+`hive_accounts` **unguarded**, so an authenticated feed request *raises* rather than
+returning `[]`.
+
+The per-relation states remain as the **diagnosis** rather than the detector,
+including `resolver_inputs` — the other two relations `resolve_hivemind_post_ids`
+joins.
+
+#### What this still does not catch
+
+`global_feed` is narrower than it looks, and these cases leave feeds empty or
+broken while it reads servable:
+
+* **Per-user feeds.** The check reads the *global* feed, and `get_personalized_feed`
+  does **not** fall back to the global feed for a user who already has `feed_cache`
+  rows — that branch returns on its own. A user whose cached rows are all
+  unresolvable gets `[]` while this reads healthy. In the backfill scenario
+  specifically, the 7-day window keeps recent posts resolved, so the
+  recency-weighted global cache stays servable while older per-user rows do not.
+* **The render step.** A post can resolve and still be dropped: `get_bridge_post`
+  returns NULL for a post deleted in hivemind, and the endpoint filters it out.
+* **The hivemind views** behind `get_full_post_view_by_id`. A grant lost there never
+  touches `hive_post_id`, so nothing here notices.
+
+Answering "can every user be served" would mean probing `feed_cache` per user and
+modelling the render filter. That is a larger change and is not attempted here.
+
+To check one specific user, call `/rpc/get_user_profile` for them and compare:
+**`has_feed: true` together with an empty `/rpc/get_personalized_feed` response
+means their cached rows are unresolvable.** Note it has to be that pair — `fyp` is
+built per feed entry, so an empty response carries no `fyp` object at all and
+`fyp.source` cannot be read from it. (An earlier version of this section said to
+read `fyp.source`; that state is not observable.)
+
+There is also no staleness check: a ranker that stopped days ago leaves its last
+good 200 rows in place, and they keep resolving, so `global_feed` reads servable.
+**`/sync-status` does not answer this** — it reports the HAF context advanced by the
+`haf-fyp-sync` service, which keeps running when `haf-fyp-ranker` dies. The signal
+that does move with the ranker is the top-level `computed_at` in this same
+`/metrics` payload, refreshed on the ranker's hourly maintenance pass.
 
 After installing each external app, run:
 ```bash
@@ -253,7 +324,7 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Service health check |
-| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), ranking source health (#36 — `feeds_empty` is the field to alert on) — not feed analytics |
+| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why) — not feed analytics |
 | GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
 | POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10/min per IP, 60/min total) |
 | DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5/min per IP, 30/min total) |
@@ -553,8 +624,8 @@ Before going live:
 - [ ] `FYP_ADMIN_API_KEY` set to a strong random value in `docker/.env.local`
 - [ ] **`TRUSTED_PROXY_IPS` set to the reverse proxy's address or CIDR** (or the literal `direct` if nothing fronts this app). Since #28 this also gates *when* limits are charged: with it unset the app logs an ERROR at startup and falls back to charging only after validation, because charging a request before it is validated is safe only when the bucket identifies the caller — into one shared bucket it lets a single sender 429 everybody else, which is worse than the bug #28 fixes. Rate limits key on `X-Real-IP` only from a trusted peer; unset, every caller keys on the proxy's address instead — one shared bucket for all of them, which is no per-client limit at all. The app logs a warning at startup when it is unset, and once more if a peer outside the list presents the header (which usually means the proxy was recreated with a new address and the list is now stale). Re-check it after anything that can renumber the proxy container.
 - [ ] `HAF_VERSION` pinned to a specific release tag (not `latest`)
-- [ ] **If Hivemind was installed AFTER haf_fyp started syncing: `CALL haf_fyp_app.run_hive_post_id_backfill();`** — the per-block resolver only covers a rolling 7-day window, so without this every older post stays unresolved and the feeds stay empty while `/metrics` reports healthy.
-- [ ] **Hivemind installed and synced** → `grant_cross_schema.sh` re-run. REQUIRED: without it every feed returns `[]`. Confirm with `GET /metrics` → `ranking_sources.feeds_empty` is `false`, not by assuming — and check the boolean rather than `hivemind == "readable"`, which misses the `readable_unverified` case. (Losing `SELECT` on the table does at least `RAISE WARNING` from the resolver; an absent schema — or a revoked `USAGE` on it, which makes `to_regclass` return NULL — is entirely silent.)
+- [ ] **If Hivemind was installed AFTER haf_fyp started syncing: `CALL haf_fyp_app.run_hive_post_id_backfill();`** — the per-block resolver only covers a rolling 7-day window, so without this every older post stays unresolved and the feeds stay empty. `/metrics` cannot detect this yet ([#43](https://gitlab.syncad.com/hive/haf_fyp/-/issues/43)) — run the backfill on the strength of the install order alone.
+- [ ] **Hivemind installed and synced** → `grant_cross_schema.sh` re-run. REQUIRED: with hivemind ABSENT every feed returns `[]`. (A lost *grant* on an already-running node is different — resolution stops, but already-rendered posts keep serving from `post_bridge_cache`, so the outage is delayed rather than immediate.) Confirm with `GET /metrics` → `ranking_sources.degraded` is `false`, not by assuming — alert on that rather than on `sources.hivemind == "readable"`, which misses both the `readable_unverified` case and everything the servability probe sees. (Losing `SELECT` on the table does at least `RAISE WARNING` from the resolver; an absent schema — or a revoked `USAGE` on it, which makes `to_regclass` return NULL — is entirely silent.)
 - [ ] HiveSense installed and synced → `grant_cross_schema.sh` re-run (optional; without it nobody is personalized — see [Without HiveSense there is no personalization](#without-hivesense-there-is-no-personalization-not-neutral-relevance))
 - [ ] balance_tracker installed and synced → `grant_cross_schema.sh` re-run (optional)
 - [ ] reputation_tracker installed and synced → `grant_cross_schema.sh` re-run (optional)

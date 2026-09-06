@@ -146,6 +146,33 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.post_candidates (
     hive_post_id INT
 );
 
+-- Needed by the servability check GET /metrics runs (#43). Without it that query
+-- raised UndefinedTable on every request in this lane -- which was not merely a
+-- gap in coverage: the probe swallows its exception without rolling back, so the
+-- aborted transaction took the credibility probe down with it and /metrics
+-- reported "unknown" for four sources that were fine. Creating the table is what
+-- makes the query actually execute here, which is the only place it runs against
+-- a real PostgreSQL.
+-- Mirrors db/create_tables.sql rather than a subset: a CI schema that diverges
+-- from the shipped one means the next thing touching algorithm_version or
+-- computed_at passes here and fails in production.
+CREATE TABLE IF NOT EXISTS haf_fyp_app.global_feed_cache (
+    post_id BIGINT PRIMARY KEY,
+    final_score FLOAT NOT NULL,
+    score_engagement FLOAT,
+    score_recency FLOAT,
+    score_credibility FLOAT,
+    rank INT NOT NULL,
+    algorithm_version VARCHAR(16),
+    computed_at TIMESTAMP
+);
+
+-- Deliberately NOT seeded here: the integration tests in this same job TRUNCATE
+-- post_candidates, so any rows planted at setup are gone by the time anything
+-- reads them. tests/integration/test_servability_db.py populates and asserts the
+-- states it needs, which is also the only place the servability SQL is actually
+-- exercised against a real PostgreSQL.
+
 CREATE SCHEMA IF NOT EXISTS hivesense_app;
 CREATE TABLE IF NOT EXISTS hivesense_app.posts_vectors (
     post_id INT NOT NULL,
