@@ -268,6 +268,7 @@ def test_the_count_is_capped_so_the_cost_cannot_grow_with_the_backlog(conn):
     assert fetch_resolution_backlog(conn) == {
         "backlog": _BACKLOG_PROBE_LIMIT,
         "capped": True,
+        "window_days": 7,
     }
 
 
