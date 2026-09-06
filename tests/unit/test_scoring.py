@@ -650,3 +650,50 @@ class TestHiveSenseUnavailableDegradesInsteadOfRaising:
         )
         with pytest.raises(psycopg2.OperationalError):
             bootstrap_vector_from_communities(self._Conn([(7,)]), {123}, {})
+
+
+class TestStoredVectorDoesNotDefeatColdStart:
+    """
+    #41's real target: a node where HiveSense DEGRADED, not one that never had it.
+
+    Step 2 of the bootstrap ladder reads a STORED vector from
+    haf_fyp_app.user_profile_vectors, which HiveSense cannot affect. So every
+    previously-ranked user still has `user_vector is not None` after HiveSense goes
+    away -- and compute_scores used to test only that, leaving w_v at 0.40 while
+    compute_semantic_relevance returned a constant 0.5 for every post (it has its
+    own `or not post_vectors` test). Relevance as a neutral constant at FULL weight
+    is precisely what #36 established is wrong, and guarding the call sites widened
+    the population reaching it, because those users previously raised at step 1.
+    """
+
+    def test_a_stored_vector_with_no_post_embeddings_drops_relevance(self):
+        stored = np.ones(1024, dtype=np.float32)
+        df = compute_scores(
+            _candidates(2), post_vectors={}, user_vector=stored,
+            author_credibility={}, subscribed_communities=set(),
+            engaged_communities=set(), algorithm_weights={},
+        )
+        # Cold-start renormalisation: the three remaining weights sum to 1.0, so no
+        # score can carry the +0.2 floor a full-weight neutral relevance would add.
+        assert (df["final_score"] <= 1.0).all()
+        recomputed = (
+            0.5 * df["score_recency"] + (0.2 / 0.6) * df["score_engagement"]
+            + (0.1 / 0.6) * df["score_credibility"]
+        )
+        assert np.allclose(df["final_score"], recomputed, atol=1e-6)
+
+    def test_a_stored_vector_WITH_embeddings_still_uses_relevance(self):
+        # The guard must not fire when relevance IS computable, or every node loses
+        # personalization.
+        stored = np.ones(1024, dtype=np.float32)
+        vectors = {1: np.ones(1024, dtype=np.float32), 2: np.ones(1024, dtype=np.float32)}
+        df = compute_scores(
+            _candidates(2), post_vectors=vectors, user_vector=stored,
+            author_credibility={}, subscribed_communities=set(),
+            engaged_communities=set(), algorithm_weights={},
+        )
+        recomputed = (
+            0.5 * df["score_recency"] + (0.2 / 0.6) * df["score_engagement"]
+            + (0.1 / 0.6) * df["score_credibility"]
+        )
+        assert not np.allclose(df["final_score"], recomputed, atol=1e-6)

@@ -127,7 +127,7 @@ def build_user_profile_vector(
         # Guarded (#41): an unavailable HiveSense yields {}, this returns None,
         # and compute_scores takes its cold-start branch -- instead of raising
         # inside _rank_user and leaving the user with no feed_cache row at all.
-        vectors.update(fetch_post_vectors_safe(conn, missing))
+        vectors.update(fetch_post_vectors_safe(conn, missing, scope="user-profile"))
 
     weighted: list[np.ndarray] = []
     total_w = 0.0
@@ -189,7 +189,7 @@ def bootstrap_vector_from_communities(
         # Guarded (#41): an unavailable HiveSense yields {}, this returns None,
         # and compute_scores takes its cold-start branch -- instead of raising
         # inside _rank_user and leaving the user with no feed_cache row at all.
-        vectors.update(fetch_post_vectors_safe(conn, missing))
+        vectors.update(fetch_post_vectors_safe(conn, missing, scope="community-bootstrap"))
 
     vecs = [vectors[pid] for pid in post_ids if pid in vectors]
     if not vecs:
@@ -358,7 +358,21 @@ def compute_scores(
     boost_sub = algorithm_weights.get("community_boost", 0.20)
     boost_eng = algorithm_weights.get("community_boost_engaged", 0.10)
 
-    if user_vector is None:
+    # `or not post_vectors` is the half that was missing, and it is the half that
+    # matters on a node where HiveSense DEGRADED rather than never existed (#41).
+    #
+    # Relevance needs BOTH a user vector and post embeddings. Testing only the user
+    # vector meant a user with a STORED vector -- step 2 of the ladder reads
+    # haf_fyp_app.user_profile_vectors, which HiveSense cannot affect -- skipped this
+    # branch entirely: w_v stayed at 0.40 while compute_semantic_relevance returned a
+    # constant 0.5 for every post, because it has its own `or not post_vectors` test.
+    # That is relevance-as-a-neutral-constant at full weight, which is exactly the
+    # outcome #36 established is wrong, and #41 widened the population reaching it:
+    # those users used to raise at step 1 instead of getting here.
+    #
+    # Dropping the weight is right whenever relevance cannot be computed, whatever
+    # the reason. The two conditions now match compute_semantic_relevance's.
+    if user_vector is None or not post_vectors:
         total = w_r + w_e + w_c
         w_v, w_r, w_e, w_c = 0.0, w_r / total, w_e / total, w_c / total
 

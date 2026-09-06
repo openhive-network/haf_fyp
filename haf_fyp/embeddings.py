@@ -187,15 +187,23 @@ def fetch_user_interactions(
 # Reset by the autouse fixture in tests/unit/conftest.py, for the reason that fixture
 # already gives for credibility._last_state: a module global that remembers what has
 # been reported makes tests order-dependent the moment one drives this path.
-_last_embedding_failure: str | None = None
-_last_embedding_failure_at: float = 0.0
+# Keyed by (scope, kind). Two reasons, both learned the hard way:
+#
+#   * ONE memo shared by every call site thrashed. The bulk candidate fetch and the
+#     per-user builders fail independently -- a 5000-id fetch can time out while a
+#     small per-user list succeeds -- so a success on one path cleared the other's
+#     memo and the next cycle logged a fresh traceback. Per cycle, forever: NOISIER
+#     than the per-site behaviour it replaced.
+#   * comparing against a single previous kind is defeated by two coexisting causes
+#     alternating, which re-arms the "first occurrence" line every time.
+_last_embedding_failure: dict[tuple[str, str], float] = {}
 # Long enough that a permanent condition is a footnote, short enough that nobody
 # reads a day of logs without meeting it.
 EMBEDDING_RELOG_SECONDS = 3600.0
 _embedding_failure_lock = threading.Lock()
 
 
-def fetch_post_vectors_safe(conn, post_ids: list[int]) -> dict:
+def fetch_post_vectors_safe(conn, post_ids: list[int], scope: str = "candidates") -> dict:
     """
     Fetch semantic embeddings, degrading gracefully on failure.
 
@@ -221,7 +229,7 @@ def fetch_post_vectors_safe(conn, post_ids: list[int]) -> dict:
     a recurrence after recovery is reported again. GET /metrics reports the standing
     state.
 
-    Used by ALL THREE call sites (#41). It used to guard only the candidate fetch
+    Used by all FOUR call sites (#41). It used to guard only the candidate fetch
     in the ranker; build_user_profile_vector and bootstrap_vector_from_communities
     called fetch_post_vectors directly, so on a HiveSense-less node every user with
     interaction history or a community raised inside _rank_user, got NO feed_cache
@@ -240,7 +248,6 @@ def fetch_post_vectors_safe(conn, post_ids: list[int]) -> dict:
     this path returns {} every cycle. That asymmetry is why the logging is throttled
     to once an hour rather than suppressed after the first line.
     """
-    global _last_embedding_failure, _last_embedding_failure_at
     try:
         vectors = fetch_post_vectors(conn, post_ids)
     except psycopg2.OperationalError:
@@ -249,19 +256,17 @@ def fetch_post_vectors_safe(conn, post_ids: list[int]) -> dict:
         kind = f"{type(exc).__name__}:{getattr(exc, 'pgcode', None)}"
         now = time.monotonic()
         with _embedding_failure_lock:
-            due = (
-                kind != _last_embedding_failure
-                or now - _last_embedding_failure_at >= EMBEDDING_RELOG_SECONDS
-            )
-            _last_embedding_failure = kind
+            last = _last_embedding_failure.get((scope, kind))
+            due = last is None or now - last >= EMBEDDING_RELOG_SECONDS
             if due:
-                _last_embedding_failure_at = now
+                _last_embedding_failure[(scope, kind)] = now
         if due:
             log.exception(
-                "embedding fetch failed — relevance weight drops to 0 for this cycle. "
-                "Identical failures are throttled to one line per hour; a lost grant "
-                "or a dropped relation also shows in GET /metrics ranking_sources, a "
-                "runtime failure does NOT"
+                "embedding fetch failed for %s — relevance weight drops to 0. "
+                "Further failures of this kind are throttled to one line per hour; a "
+                "lost grant or a dropped relation also shows in GET /metrics "
+                "ranking_sources, a runtime failure does NOT",
+                scope,
             )
         conn.rollback()
         return {}
@@ -275,10 +280,15 @@ def fetch_post_vectors_safe(conn, post_ids: list[int]) -> dict:
         # by memoising the full CURRENT state including healthy ones; the equivalent
         # here is to forget the failure once it stops happening, and to say so when
         # it does -- an operator who saw the first line needs to see it end.
+        # Clears only THIS scope, which is the half a shared memo got wrong: a
+        # per-user fetch succeeding says nothing about the bulk candidate fetch, and
+        # clearing on its behalf re-armed the first-occurrence line every cycle.
         with _embedding_failure_lock:
-            recovered = _last_embedding_failure
-            _last_embedding_failure = None
-            _last_embedding_failure_at = 0.0
-        if recovered is not None:
-            log.info("embedding fetch recovered (was %s)", recovered)
+            recovered = sorted(k for (sc, k) in _last_embedding_failure if sc == scope)
+            for key in [k for k in _last_embedding_failure if k[0] == scope]:
+                del _last_embedding_failure[key]
+        if recovered:
+            log.info(
+                "embedding fetch recovered for %s (was %s)", scope, ", ".join(recovered)
+            )
         return vectors

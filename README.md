@@ -125,7 +125,7 @@ Until #41 that was not what happened. `build_user_profile_vector` and
 `bootstrap_vector_from_communities` called HiveSense directly and unguarded, so any
 user with recent interaction history or a community raised inside the per-user
 ranking; the ranker rolled back and wrote **no row at all** for them, and the
-endpoint served them the global feed *without* the boost. All three call sites now
+endpoint served them the global feed *without* the boost. All four call sites now
 share one guard, so an unavailable HiveSense degrades to the cold-start branch the
 design always intended.
 
@@ -133,6 +133,16 @@ So a node without HiveSense serves a working "For You" page ordered by recency,
 engagement quality and author credibility, with community boosting intact. What it
 does not do is order by what a user actually reads — two users with the same
 communities get the same feed.
+
+**What you will see in the logs.** Not much, deliberately. An earlier version of
+this app wrote a full traceback per affected user per ranking cycle — up to
+`MAX_USERS_PER_CYCLE` (default 200) every `CYCLE_SECONDS` (300), indefinitely, which
+buried real incidents. Failures are now throttled per *kind*: the first occurrence,
+each new kind, and one line per hour while a condition persists, with a "recovered"
+line when a cycle completes cleanly. The embedding fetch throttles separately per
+call site, so a failing bulk fetch and a failing per-user fetch are two conditions
+rather than one flapping between them. `run_cycle` and the force-refresh path each
+report a failure count regardless, so a throttled condition is never invisible.
 
 HiveSense needs a GPU to compute embeddings at a useful rate, so "just run HiveSense
 as well" is a real operational cost rather than a checkbox. Running haf_fyp without
@@ -454,11 +464,21 @@ All weights are stored in `haf_fyp_app.algorithm_versions` and activated via `PO
 4. Average embedding of top posts in declared interests (`POST /v1/fyp/interests`)
 5. No vector — cold-start weights applied (no relevance signal)
 
-Without HiveSense, steps 1, 3 and 4 find nothing and the ladder falls through to
-step 5 for every user — which is what it is for. (Before #41 those steps *raised*
-instead of falling through, so the affected users got no cached feed at all; all
-three call sites now share one guard.) See
+Without HiveSense, steps 1, 3 and 4 find nothing. Step 2 is different: it reads a
+**stored** vector from `haf_fyp_app.user_profile_vectors`, a haf_fyp-local table
+HiveSense cannot affect, so a node that once had HiveSense still has one for every
+previously-ranked user.
+
+That used to matter. `compute_scores` dropped the relevance weight only when the
+user vector was `None`, so those users kept `w_v = 0.40` while relevance was a flat
+0.5 for every post — neutral relevance at *full weight*, the thing this section's
+title says does not happen. It now drops the weight whenever relevance cannot be
+computed at all, which is the case with no post embeddings regardless of what is
+stored. See
 [Without HiveSense there is no personalization](#without-hivesense-there-is-no-personalization-not-neutral-relevance).
+
+(Before #41, steps 1, 3 and 4 *raised* rather than finding nothing, so affected
+users got no cached feed at all; all four call sites now share one guard.)
 
 ## Database Schema
 

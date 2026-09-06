@@ -414,28 +414,48 @@ def _evict_unsubscribed(conn, usernames: list[str]) -> set[str]:
 # one line per hour while it persists. The username is deliberately NOT part of the
 # key -- keying on it would put the flood straight back, since the whole point is
 # that one cause hits every user.
-_last_rank_failure: str | None = None
-_last_rank_failure_at: float = 0.0
+# Keyed BY KIND, not "the last kind seen". Comparing against a single previous kind
+# is defeated by two coexisting causes: with one corrupt user raising ValueError and
+# the rest hitting a timeout, the sequence A,B,A,B differs from its predecessor every
+# time and the full 200-traceback flood returns unchanged. A dict throttles each kind
+# on its own clock.
+_rank_failure_seen: dict[str, float] = {}
 RANK_FAILURE_RELOG_SECONDS = 3600.0
 _rank_failure_lock = threading.Lock()
 
 
+def _clear_user_failure_memo() -> None:
+    """
+    Announce the end of a standing per-user failure, and re-arm the first-line log.
+
+    Deliberately NOT called on each successful user, which is where the obvious
+    symmetry with the embedding memo breaks down. Users succeed and fail
+    interleaved, so clearing per success would re-arm the "first occurrence" line
+    for the very next failure and reinstate the flood this throttle removes -- with
+    100 failing and 100 succeeding, that is 100 tracebacks again.
+
+    A CYCLE that completes with no failures is the honest signal that the condition
+    has ended, so the clear happens there.
+    """
+    with _rank_failure_lock:
+        recovered = sorted(_rank_failure_seen)
+        _rank_failure_seen.clear()
+    if recovered:
+        log.info("per-user ranking recovered (was %s)", ", ".join(recovered))
+
+
 def _log_user_failure(username: str, exc: BaseException) -> None:
-    global _last_rank_failure, _last_rank_failure_at
     kind = f"{type(exc).__name__}:{getattr(exc, 'pgcode', None)}"
     now = time.monotonic()
     with _rank_failure_lock:
-        due = (
-            kind != _last_rank_failure
-            or now - _last_rank_failure_at >= RANK_FAILURE_RELOG_SECONDS
-        )
-        _last_rank_failure = kind
+        last = _rank_failure_seen.get(kind)
+        due = last is None or now - last >= RANK_FAILURE_RELOG_SECONDS
         if due:
-            _last_rank_failure_at = now
+            _rank_failure_seen[kind] = now
     if due:
         log.exception(
-            "failed to rank user %s -- skipping. Identical failures are throttled to "
-            "one line per hour; the per-cycle count is in the summary below",
+            "failed to rank user %s -- skipping. Further failures of this kind are "
+            "throttled to one line per hour",
             username,
         )
 
@@ -492,7 +512,7 @@ def run_cycle(conn) -> None:
     log.info("scoring %d candidates (algo %s)", len(candidates), algo_version)
 
     post_ids = candidates["post_id"].tolist()
-    post_vectors = fetch_post_vectors_safe(conn, post_ids)
+    post_vectors = fetch_post_vectors_safe(conn, post_ids, scope="candidates")
     log.info(
         "embeddings available for %d / %d candidates", len(post_vectors), len(post_ids)
     )
@@ -568,6 +588,10 @@ def run_cycle(conn) -> None:
             "refreshed personalized feeds for %d/%d cached users (%d failed)",
             processed, len(users), failed,
         )
+        # A clean cycle is what ends a standing failure -- see the docstring for why
+        # this is not done per successful user.
+        if not failed:
+            _clear_user_failure_memo()
 
 
 def _run_targeted_refresh(conn, usernames: set[str]) -> None:
@@ -616,9 +640,11 @@ def _run_targeted_refresh(conn, usernames: set[str]) -> None:
         return
 
     post_ids = candidates["post_id"].tolist()
-    post_vectors = fetch_post_vectors_safe(conn, post_ids)
+    post_vectors = fetch_post_vectors_safe(conn, post_ids, scope="candidates")
     authors = candidates["author"].unique().tolist()
     author_credibility = _fetch_author_credibility_safe(conn, authors)
+
+    failed = 0
 
     for username in targets:
         try:
@@ -628,10 +654,17 @@ def _run_targeted_refresh(conn, usernames: set[str]) -> None:
             raise
         except Exception as exc:
             conn.rollback()
+            failed += 1
             # Same throttle and the same memo as the scheduled cycle: a standing
             # condition breaks the force-refresh path too, and this one fires on a
             # Redis signal rather than a 5-minute clock, so it is unbounded in rate.
             _log_user_failure(username, exc)
+
+    if failed:
+        # Without this a throttled failure on THIS path is completely silent: unlike
+        # run_cycle it has no per-cycle summary, so the hourly line was the only
+        # signal and between those lines nothing at all was emitted.
+        log.warning("force-refresh: %d/%d user(s) failed", failed, len(targets))
 
 
 def _run_feed_events_maintenance(conn) -> None:

@@ -178,7 +178,7 @@ def test_targeted_refresh_still_ranks_a_genuine_member(monkeypatch):
     monkeypatch.setattr(rd, "_fetch_algorithm", lambda _c: ("1.0.0", {}))
     monkeypatch.setattr(rd, "_fetch_candidates", lambda _c: pd.DataFrame(
         {"post_id": [1], "author": ["a"]}))
-    monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda _c, _p: {})
+    monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
     monkeypatch.setattr(rd, "_rank_user", lambda *a, **k: ranked.append(a[1]))
 
@@ -227,7 +227,7 @@ def test_reconciliation_runs_once_per_batch_not_once_per_user(monkeypatch):
     monkeypatch.setattr(rd, "_fetch_algorithm", lambda _c: ("1.0.0", {}))
     monkeypatch.setattr(rd, "_fetch_candidates", lambda _c: pd.DataFrame(
         {"post_id": [1], "author": ["a"]}))
-    monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda _c, _p: {})
+    monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
     monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)
     monkeypatch.setattr(rd, "compute_scores", lambda **k: pd.DataFrame())
@@ -301,7 +301,7 @@ def test_cycle_is_topped_up_after_eviction_rather_than_running_short(monkeypatch
     monkeypatch.setattr(rd, "_fetch_algorithm", lambda _c: ("1.0.0", {}))
     monkeypatch.setattr(rd, "_fetch_candidates", lambda _c: pd.DataFrame(
         {"post_id": [1], "author": ["a"]}))
-    monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda _c, _p: {})
+    monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
     monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)
     monkeypatch.setattr(rd, "compute_scores", lambda **k: pd.DataFrame())

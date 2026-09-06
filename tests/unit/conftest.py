@@ -45,12 +45,8 @@ def _reset_embedding_failure_state():
     # suite rather than of the ranker tests.
     from haf_fyp import embeddings, ranker_daemon
 
-    embeddings._last_embedding_failure = None
-    embeddings._last_embedding_failure_at = 0.0
-    ranker_daemon._last_rank_failure = None
-    ranker_daemon._last_rank_failure_at = 0.0
+    embeddings._last_embedding_failure.clear()
+    ranker_daemon._rank_failure_seen.clear()
     yield
-    embeddings._last_embedding_failure = None
-    embeddings._last_embedding_failure_at = 0.0
-    ranker_daemon._last_rank_failure = None
-    ranker_daemon._last_rank_failure_at = 0.0
+    embeddings._last_embedding_failure.clear()
+    ranker_daemon._rank_failure_seen.clear()
