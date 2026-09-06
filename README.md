@@ -164,22 +164,31 @@ Per-relation states below. `readable_unverified` is emitted only by
 | `readable_unverified` | readable, but it is a view or a foreign table, where the privilege answer is not the whole story — `has_table_privilege` on a view stays true after the view's owner loses access to what it reads, and on a foreign table it is a purely local check. Treated as healthy, flagged because it cannot be verified. `ranking_sources` only |
 | `unknown` | the probe itself failed. **Never** means healthy — every boolean in that section fails safe |
 
-Alert on `ranking_sources.feeds_empty` rather than on a state string — it collapses
-all five states into the one question you care about. But treat it as a **necessary,
-not a sufficient** condition: `feeds_empty: true` always means broken, while
-`feeds_empty: false` only means `hivemind_app.hive_posts` is readable.
+**Alert on `ranking_sources.feeds_empty`.** It is answered by outcome, not by
+inference: the check asks whether at least one cached global-feed post still resolves
+to a hivemind post — the exact filter both feed endpoints apply — so it is true
+whenever the node cannot serve, regardless of cause. Two `EXISTS` in one round trip,
+measured at 0.12 ms on a node with 25M candidates.
 
-What is **not** covered, and each of these produces empty feeds while `feeds_empty`
-reads `false`:
+`feeds_empty_reason` says why, and the four values want different responses:
 
-* the unresolved-backfill case above — by far the likeliest one;
-* a grant lost on `hivemind_app.hive_accounts` or `hive_permlink_data`, which the
-  resolver also reads;
-* a grant lost on the hivemind views behind `get_full_post_view_by_id`, which the
-  feed render path reads.
+| reason | meaning | do |
+|--------|---------|----|
+| `serving` | at least one post is servable | nothing |
+| `no_global_feed_cache` | the ranker has not completed a cycle | wait; expected on a fresh install. **Does not set `degraded`** |
+| `cached_posts_do_not_resolve` | posts are cached and none resolve — **the hivemind failure** | run the backfill, or repair the grant `detail` names |
+| `unknown` | the check itself could not run | investigate; `degraded` is set, but `feeds_empty` is not claimed, so a transient query failure does not page you with a false outage |
 
-Only `hivemind_app.hive_posts` and `hivesense_app.posts_vectors` are probed. If the
-feeds are empty and this section says everything is fine, check those three next.
+`cached_posts_do_not_resolve` is the one that used to be invisible. An unresolved
+backfill, a lost grant on `hive_accounts` or `hive_permlink_data`, and a lost grant
+on the hivemind views behind `get_full_post_view_by_id` all read as `readable` to a
+privilege probe while every feed is empty; all three now surface here, and `detail`
+distinguishes the lost-grant case from the needs-a-backfill case.
+
+The per-relation states remain, as the **diagnosis** rather than the detector —
+including `resolver_inputs`, the other two relations `resolve_hivemind_post_ids`
+joins. Still not probed: the hivemind views behind `get_full_post_view_by_id`. A
+grant lost there is caught by `feeds_empty` but is not named by any state field.
 
 After installing each external app, run:
 ```bash
@@ -253,7 +262,7 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Service health check |
-| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), ranking source health (#36 — `feeds_empty` is the field to alert on) — not feed analytics |
+| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), ranking source health and servability (#36, #43 — `feeds_empty` is the field to alert on, `feeds_empty_reason` says why) — not feed analytics |
 | GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
 | POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10/min per IP, 60/min total) |
 | DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5/min per IP, 30/min total) |

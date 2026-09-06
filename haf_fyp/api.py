@@ -56,6 +56,7 @@ from .metrics import (
     build_ranking_sources_report,
     fetch_coverage_rows,
     fetch_credibility_sources,
+    fetch_feed_servability,
     fetch_ranking_sources,
 )
 from .sync_status import (
@@ -1031,8 +1032,17 @@ def metrics(response: Response):
     by sampling served feeds. The current UTC day is reported but never flagged —
     mid-day it reads low simply because the latest posts are not embedded yet.
 
-    ranking_sources (#36): whether hivemind and hivesense are readable, unreadable
-    or absent. This exists because the failure is otherwise INVISIBLE. Hivemind is a
+    ranking_sources (#36, #43): whether this node can serve a post at all, and if
+    not, why. feeds_empty is answered by the OUTCOME -- does at least one cached
+    global-feed row resolve to a hivemind post, the exact filter the feed endpoints
+    apply -- rather than inferred from privileges, which only ever gave a necessary
+    condition. feeds_empty_reason separates a node whose ranker has not run yet
+    (expected, does not page) from one whose cached posts do not resolve (the
+    hivemind failure: an unresolved backfill, or a lost grant on any of the three
+    relations the resolver joins). The per-relation privilege states remain, as the
+    diagnosis of WHY rather than the detector.
+
+    The relations are reported as readable, unreadable This exists because the failure is otherwise INVISIBLE. Hivemind is a
     hard dependency -- post_candidates.hive_post_id is resolved from it and both feed
     endpoints filter on that column -- but the resolver is exception-guarded so a
     missing schema cannot stall block processing. The result is that a node without
@@ -1086,6 +1096,7 @@ def metrics(response: Response):
             # aborted transaction instead, and "unknown" is already its documented
             # fail-safe.
             ranking_probe = fetch_ranking_sources(conn)
+            servability = fetch_feed_servability(conn)
             probe = fetch_credibility_sources(conn)
     except psycopg2.pool.PoolError as exc:
         # Monitors poll this route, so a persistently exhausted pool must not write a
@@ -1107,7 +1118,7 @@ def metrics(response: Response):
     today = datetime.now(tz=timezone.utc).date()
     report = build_coverage_report(rows, today)
     report["credibility_sources"] = build_credibility_sources_report(probe)
-    report["ranking_sources"] = build_ranking_sources_report(ranking_probe)
+    report["ranking_sources"] = build_ranking_sources_report(ranking_probe, servability)
     return report
 
 

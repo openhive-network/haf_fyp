@@ -28,10 +28,14 @@ stages:
 ---
 test_name: FastAPI metrics returns 200 (#15 embedding coverage)
 
-# Smoke test only: the DB state depends on the integration test that ran just
-# before this in the same job, so we assert reachability / no-500, not exact
-# values. The report logic is covered deterministically by tests/unit/test_metrics.py
-# and the underlying SQL by tests/integration/test_embedding_coverage_db.py.
+# Values are a smoke test -- the DB state depends on the integration test that ran
+# just before this in the same job -- but the ranking_sources SHAPE is asserted,
+# because this is the only lane that runs that code against a real PostgreSQL
+# (#43). tests/unit/test_metrics.py covers the report logic deterministically from
+# hand-built probe dicts; what it cannot cover is that the catalog probe and the
+# servability query actually execute and return what the builder expects. This
+# stack has hivesense_app.posts_vectors and no hivemind_app, so the assertions
+# below are the states that combination genuinely produces.
 stages:
   - name: GET /metrics returns 200
     request:
@@ -39,6 +43,27 @@ stages:
       method: GET
     response:
       status_code: 200
+      json:
+        embedding_coverage: !anything
+        recent_window_pct: !anything
+        suspected_hole_days: !anything
+        computed_at: !anything
+        credibility_sources: !anything
+        ranking_sources:
+          # hivemind_app does not exist in this stack, so this is the empty-feed
+          # verdict -- which is exactly the state an operator most needs reported
+          # correctly, and the one #36 shipped unable to see.
+          state: "ranking_no_feed"
+          feeds_empty: true
+          feeds_empty_reason: "hivemind_unreadable"
+          personalized: false
+          degraded: true
+          hivemind: "absent"
+          hivesense: "readable"
+          resolver_inputs:
+            hivemind_app.hive_accounts: "absent"
+            hivemind_app.hive_permlink_data: "absent"
+          detail: !anystr
       # credibility_sources is a LIVE privilege probe, so a cached answer would keep
       # reporting degraded=false after a grant is lost (or true after it is repaired),
       # defeating the point of re-probing every request. Pinned here for the same

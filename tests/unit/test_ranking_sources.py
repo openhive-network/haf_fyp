@@ -25,10 +25,16 @@ from haf_fyp.credibility import (
     STATE_UNREADABLE,
     probe_relations,
 )
-from haf_fyp.metrics import _RANKING_SOURCES, fetch_ranking_sources
+from haf_fyp.metrics import (
+    _RANKING_SOURCES,
+    fetch_feed_servability,
+    fetch_ranking_sources,
+)
 
 HIVEMIND = ("hivemind_app", "hive_posts")
 HIVESENSE = ("hivesense_app", "posts_vectors")
+HIVE_ACCOUNTS = ("hivemind_app", "hive_accounts")
+HIVE_PERMLINKS = ("hivemind_app", "hive_permlink_data")
 
 
 def _conn(rows):
@@ -129,11 +135,15 @@ def test_fetch_returns_a_state_for_every_declared_source():
     conn = _conn([
         ("hivemind_app", "hive_posts", True, "r"),
         ("hivesense_app", "posts_vectors", True, "r"),
+        ("hivemind_app", "hive_accounts", True, "r"),
+        ("hivemind_app", "hive_permlink_data", True, "r"),
     ])
     probe = fetch_ranking_sources(conn)
     assert probe == {
         "hivemind_app.hive_posts": STATE_READABLE,
         "hivesense_app.posts_vectors": STATE_READABLE,
+        "hivemind_app.hive_accounts": STATE_READABLE,
+        "hivemind_app.hive_permlink_data": STATE_READABLE,
     }
 
 
@@ -142,11 +152,15 @@ def test_the_declared_sources_are_the_relations_the_code_actually_reads():
     # against itself. This pins the constant against the OTHER places the same two
     # relations are named, so a typo in _RANKING_SOURCES (which would report `absent`
     # for a present relation, and page forever) cannot pass.
-    assert set(_RANKING_SOURCES) == {HIVEMIND, HIVESENSE}
+    assert set(_RANKING_SOURCES) == {HIVEMIND, HIVESENSE, HIVE_ACCOUNTS, HIVE_PERMLINKS}
     embeddings_sql = io.open("haf_fyp/embeddings.py", encoding="utf-8").read()
     assert "hivesense_app.posts_vectors" in embeddings_sql
+    # All three hivemind relations the resolver joins are probed -- #36 shipped with
+    # two of them invisible, so a grant lost on either read "hivemind: readable"
+    # while nothing resolved.
     resolver_sql = io.open("db/process_posts.sql", encoding="utf-8").read()
-    assert "hivemind_app.hive_posts" in resolver_sql
+    for schema, name in (HIVEMIND, HIVE_ACCOUNTS, HIVE_PERMLINKS):
+        assert f"{schema}.{name}" in resolver_sql
 
 
 # --------------------------------------------------------------------------
@@ -308,9 +322,12 @@ def test_metrics_probes_ranking_before_credibility(monkeypatch):
         api, "fetch_credibility_sources", lambda conn: order.append("credibility")
     )
     monkeypatch.setattr(api, "fetch_ranking_sources", lambda conn: order.append("ranking"))
+    monkeypatch.setattr(
+        api, "fetch_feed_servability", lambda conn: order.append("servability")
+    )
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
     monkeypatch.setattr(api, "build_credibility_sources_report", lambda probe: {})
-    monkeypatch.setattr(api, "build_ranking_sources_report", lambda probe: {})
+    monkeypatch.setattr(api, "build_ranking_sources_report", lambda probe, serv=None: {})
 
     api.metrics(MagicMock())
 
@@ -343,15 +360,82 @@ def test_metrics_feeds_each_probe_to_its_own_builder(monkeypatch):
     monkeypatch.setattr(api, "fetch_coverage_rows", lambda conn: [])
     monkeypatch.setattr(api, "fetch_credibility_sources", lambda conn: {"which": "credibility"})
     monkeypatch.setattr(api, "fetch_ranking_sources", lambda conn: {"which": "ranking"})
+    monkeypatch.setattr(api, "fetch_feed_servability", lambda conn: {"which": "servability"})
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
     monkeypatch.setattr(
         api, "build_credibility_sources_report", lambda probe: {"got": probe["which"]}
     )
     monkeypatch.setattr(
-        api, "build_ranking_sources_report", lambda probe: {"got": probe["which"]}
+        api,
+        "build_ranking_sources_report",
+        lambda probe, serv: {"got": probe["which"], "serv": serv["which"]},
     )
 
     report = api.metrics(MagicMock())
 
-    assert report["ranking_sources"] == {"got": "ranking"}
+    assert report["ranking_sources"] == {"got": "ranking", "serv": "servability"}
     assert report["credibility_sources"] == {"got": "credibility"}
+
+
+# --------------------------------------------------------------------------
+# fetch_feed_servability (#43) -- the outcome check
+# --------------------------------------------------------------------------
+
+
+def _servability_conn(row, boom=None):
+    conn = MagicMock()
+    cur = conn.cursor.return_value.__enter__.return_value
+    if boom is not None:
+        cur.execute.side_effect = boom
+    else:
+        cur.fetchone.return_value = row
+    return conn
+
+
+def test_servability_reports_a_serving_node():
+    assert fetch_feed_servability(_servability_conn((True, True))) == {
+        "cached": True,
+        "servable": True,
+    }
+
+
+def test_servability_distinguishes_no_cycle_from_nothing_resolving():
+    # The whole reason this returns two booleans rather than one: "empty because the
+    # ranker has not run" and "empty because nothing resolves" need different
+    # responses, and a single servable flag cannot tell them apart.
+    assert fetch_feed_servability(_servability_conn((False, False))) == {
+        "cached": False,
+        "servable": False,
+    }
+    assert fetch_feed_servability(_servability_conn((True, False))) == {
+        "cached": True,
+        "servable": False,
+    }
+
+
+def test_servability_coerces_to_real_bools():
+    # psycopg2 gives real bools, but the report's `is True` assertions and any JSON
+    # consumer deserve them regardless of what a driver hands back.
+    out = fetch_feed_servability(_servability_conn((1, 0)))
+    assert out["cached"] is True and out["servable"] is False
+
+
+def test_servability_failure_returns_none_without_rolling_back():
+    # Same contract as the two sibling probes: never take the rest of /metrics down,
+    # and never roll back a connection that may have died inside this call.
+    conn = _servability_conn(None, boom=RuntimeError("boom"))
+    assert fetch_feed_servability(conn) is None
+    conn.rollback.assert_not_called()
+
+
+def test_servability_query_applies_the_same_filter_the_endpoints_do():
+    # The check is only meaningful if it asks the endpoints' question. Both feed
+    # endpoints select `pc.hive_post_id IS NOT NULL` joined to post_candidates; if
+    # this query ever drifts from that, it stops answering "can we serve".
+    from haf_fyp.metrics import _SERVABILITY_SQL
+
+    endpoints = io.open("endpoints/endpoint_schema.sql", encoding="utf-8").read()
+    assert "hive_post_id IS NOT NULL" in _SERVABILITY_SQL
+    assert "hive_post_id IS NOT NULL" in endpoints
+    assert "haf_fyp_app.global_feed_cache" in _SERVABILITY_SQL
+    assert "haf_fyp_app.post_candidates" in _SERVABILITY_SQL
