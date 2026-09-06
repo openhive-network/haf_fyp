@@ -29,13 +29,18 @@ stages:
 test_name: FastAPI metrics returns 200 (#15 embedding coverage)
 
 # Values are a smoke test -- the DB state depends on the integration test that ran
-# just before this in the same job -- but the ranking_sources SHAPE is asserted,
-# because this is the only lane that runs that code against a real PostgreSQL
-# (#43). tests/unit/test_metrics.py covers the report logic deterministically from
-# hand-built probe dicts; what it cannot cover is that the catalog probe and the
-# servability query actually execute and return what the builder expects. This
-# stack has hivesense_app.posts_vectors and no hivemind_app, so the assertions
-# below are the states that combination genuinely produces.
+# just before this in the same job -- but the ranking_sources SHAPE and the
+# privilege verdicts are asserted, because this is the only lane where the catalog
+# probe runs against a real PostgreSQL (#36, #43).
+#
+# What this stage does NOT gate, stated so nobody assumes otherwise: the
+# servability query. This stack has no hivemind_app, so `not _readable(hivemind)`
+# decides feeds_empty before servability is ever consulted -- a malformed
+# servability query would be swallowed and every field below would be unchanged.
+# tests/integration/test_servability_db.py is what exercises that SQL for real.
+#
+# hivesense_app.posts_vectors exists and hivemind_app does not, so the verdict
+# below is the empty-feed one -- which is the state that most needs to be right.
 stages:
   - name: GET /metrics returns 200
     request:
@@ -50,12 +55,13 @@ stages:
         computed_at: !anything
         credibility_sources: !anything
         ranking_sources:
-          # hivemind_app does not exist in this stack, so this is the empty-feed
-          # verdict -- which is exactly the state an operator most needs reported
-          # correctly, and the one #36 shipped unable to see.
+          # ABSENT, not unreadable: the two are kept apart because the remedies are
+          # opposite -- install hivemind vs re-run grant_cross_schema.sh -- and an
+          # earlier revision collapsed them into "hivemind_unreadable", which would
+          # have sent an operator to fix a grant on a node that has no hivemind.
           state: "ranking_no_feed"
           feeds_empty: true
-          feeds_empty_reason: "hivemind_unreadable"
+          feeds_empty_reason: "hivemind_absent"
           personalized: false
           degraded: true
           hivemind: "absent"

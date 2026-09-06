@@ -259,6 +259,10 @@ def test_absent_hivemind_reports_empty_feeds():
     # The headline case. Not "degraded ranking" -- no content at all, and silent.
     report = build_ranking_sources_report(_ranking(hivemind="absent"), SERVING)
     assert report["state"] == "ranking_no_feed"
+    # absent, NOT unreadable: opposite remedies (install hivemind vs re-grant), and
+    # collapsing them sent operators to grant_cross_schema.sh on a node with no
+    # hivemind at all.
+    assert report["feeds_empty_reason"] == "hivemind_absent"
     assert report["feeds_empty"] is True
     assert report["personalized"] is False
     # degraded TRUE even though nothing is misconfigured -- absent is a valid state
@@ -424,6 +428,13 @@ def test_a_failed_servability_check_is_degraded_but_does_not_claim_empty():
     assert report["feeds_empty"] is False
     assert report["feeds_empty_reason"] == "unknown"
     assert report["degraded"] is True
+    # And it must NOT present as healthy. An earlier cut fell through to the
+    # personalized branch and reported state ranking_full with detail "feeds
+    # personalized" -- for a node nobody could check. The sibling probe-failed path
+    # has a test against exactly that wording; this one reintroduced it.
+    assert report["state"] == "ranking_unknown"
+    assert "UNKNOWN" in report["detail"]
+    assert "personalized" not in report["detail"].replace("feeds personalized", "")
 
 
 def test_unreadable_hivemind_beats_a_servable_looking_cache():
@@ -432,6 +443,7 @@ def test_unreadable_hivemind_beats_a_servable_looking_cache():
     report = build_ranking_sources_report(_ranking(hivemind="unreadable"), SERVING)
     assert report["feeds_empty"] is True
     assert report["feeds_empty_reason"] == "hivemind_unreadable"
+    assert "grant" not in report["detail"] or "required dependency" in report["detail"]
 
 
 def test_resolver_inputs_are_reported_and_drive_degraded():

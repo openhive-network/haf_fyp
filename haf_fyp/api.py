@@ -1032,25 +1032,34 @@ def metrics(response: Response):
     by sampling served feeds. The current UTC day is reported but never flagged —
     mid-day it reads low simply because the latest posts are not embedded yet.
 
-    ranking_sources (#36, #43): whether this node can serve a post at all, and if
-    not, why. feeds_empty is answered by the OUTCOME -- does at least one cached
-    global-feed row resolve to a hivemind post, the exact filter the feed endpoints
-    apply -- rather than inferred from privileges, which only ever gave a necessary
-    condition. feeds_empty_reason separates a node whose ranker has not run yet
-    (expected, does not page) from one whose cached posts do not resolve (the
-    hivemind failure: an unresolved backfill, or a lost grant on any of the three
-    relations the resolver joins). The per-relation privilege states remain, as the
-    diagnosis of WHY rather than the detector.
+    ranking_sources (#36, #43): whether this node can serve a post, and if not, why.
 
-    The relations are reported as readable, unreadable This exists because the failure is otherwise INVISIBLE. Hivemind is a
-    hard dependency -- post_candidates.hive_post_id is resolved from it and both feed
+    It exists because the failure is otherwise INVISIBLE. Hivemind is a hard
+    dependency -- post_candidates.hive_post_id is resolved from it and both feed
     endpoints filter on that column -- but the resolver is exception-guarded so a
-    missing schema cannot stall block processing. The result is that a node without
-    hivemind syncs happily, raises nothing, and serves an empty feed forever.
-    feeds_empty is the field a monitor should alert on. hivesense is reported beside
-    it because its absence is a much quieter fact: relevance drops out of the score
-    entirely (weight 0, not a neutral constant), so the feed becomes community-boosted
-    trending and looks perfectly healthy.
+    missing schema cannot stall block processing. A node without hivemind syncs
+    happily, raises nothing, and serves an empty feed forever.
+
+    feeds_empty is the field to alert on, and feeds_empty_reason says which of five
+    situations it is: hivemind absent, hivemind unreadable, the ranker not having
+    completed a cycle (expected on a fresh install -- the one empty state that does
+    not set degraded by itself), cached posts that do not resolve (the real failure:
+    an unresolved backfill, or a lost grant on one of the three relations the
+    resolver joins), or unknown when the check could not run.
+
+    Read feeds_empty asymmetrically. TRUE is reliable -- the node cannot serve.
+    FALSE means the GLOBAL feed can serve, which is weaker than it sounds:
+    get_personalized_feed does not fall back to the global feed for a user who
+    already has feed_cache rows, so those users can get [] while this reads healthy,
+    and a post can pass the resolution filter and still be dropped when
+    get_bridge_post returns NULL. This is a detector for one previously invisible
+    failure, not a proof of health (#43).
+
+    The per-relation privilege states remain as the diagnosis of WHY, including
+    resolver_inputs, the other two relations resolve_hivemind_post_ids joins.
+    hivesense is reported beside them because its absence is a quieter fact:
+    relevance drops out of the score entirely (weight 0, not a neutral constant),
+    and most users then raise inside _rank_user and get no cached feed at all (#41).
 
     credibility_sources (#8): whether each foreign relation the credibility signal
     reads is readable, unreadable or absent. Probed inline — one indexed catalog
@@ -1096,8 +1105,20 @@ def metrics(response: Response):
             # aborted transaction instead, and "unknown" is already its documented
             # fail-safe.
             ranking_probe = fetch_ranking_sources(conn)
-            servability = fetch_feed_servability(conn)
             probe = fetch_credibility_sources(conn)
+            # LAST, deliberately. All of these share one connection and one
+            # transaction, and none of them rolls back on failure (each explains
+            # why in its own docstring) -- so whichever probe fails first aborts
+            # the transaction and everything after it dies with 25P02 through no
+            # fault of its own. Being last means a servability failure cannot
+            # invent a fault in the other two, and its own dependency is the
+            # heaviest: it reads app tables, not just pg_catalog, so it is the
+            # most likely of the three to hit a missing relation or a timeout.
+            # (This is the same cascade #57 ordered around; inserting a third
+            # read in the middle re-opened it, and it was live -- the CI stack has
+            # no global_feed_cache, so this probe raised on every run and
+            # credibility_sources reported "unknown" for four healthy sources.)
+            servability = fetch_feed_servability(conn)
     except psycopg2.pool.PoolError as exc:
         # Monitors poll this route, so a persistently exhausted pool must not write a
         # traceback per scrape. Same treatment /sync-status gives the identical error,
