@@ -332,9 +332,9 @@ def test_metrics_probes_ranking_before_credibility(monkeypatch):
     )
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
     monkeypatch.setattr(api, "build_credibility_sources_report", lambda probe: {})
-    monkeypatch.setattr(
-        api, "build_ranking_sources_report", lambda probe, serv=None, backlog=None: {}
-    )
+    # Positional, no defaults: production dropping an argument must fail here rather
+    # than silently pass on the stub's fallbacks.
+    monkeypatch.setattr(api, "build_ranking_sources_report", lambda probe, serv, backlog: {})
 
     api.metrics(MagicMock())
 
@@ -352,6 +352,11 @@ def test_metrics_probes_ranking_before_credibility(monkeypatch):
     # tavern stage can no longer notice a re-ordering. Nothing else would.
     assert order.index("servability") > order.index("credibility")
     assert order.index("backlog") > order.index("credibility")
+    # And the #43 detector before the secondary signal. They share the aborted-
+    # transaction fate, so if servability raises first -- and it is the likelier of
+    # the two, reading global_feed_cache -- the backlog probe dies with 25P02 and
+    # the report blames it for a fault it never had.
+    assert order.index("backlog") < order.index("servability")
     # All three must receive the SAME connection, which is the premise the whole
     # ordering argument rests on -- give each its own _db_conn() block and the
     # rationale evaporates while the order assertions above still pass.
@@ -457,6 +462,41 @@ def test_servability_failure_returns_none_without_rolling_back():
     conn.rollback.assert_not_called()
 
 
+def test_the_backlog_query_stays_bounded_and_uses_the_block_clock():
+    """
+    Two properties the mocked wrapper tests cannot see, both load-bearing.
+
+    The LIMIT is the entire reason this query is viable: unbounded, the same count
+    measured 898 ms on the reference node and grew with the backlog, i.e. slowest
+    exactly when a monitor is polling hardest. Deleting it -- or widening it --
+    leaves every other test green, because the wrapper's arithmetic is unchanged.
+
+    And the threshold must come from sync_status(), the head BLOCK time, not from
+    now(). post_candidates.created_at is block time; comparing it to wall clock made
+    the probe report a backlog on any node whose head lags by more than the window,
+    telling an operator to run a backfill on a node that was working correctly.
+    """
+    from haf_fyp.metrics import _BACKLOG_PROBE_LIMIT, _BACKLOG_SQL
+
+    assert f"LIMIT {_BACKLOG_PROBE_LIMIT + 1}" in _BACKLOG_SQL
+    assert "haf_fyp_app.sync_status()" in _BACKLOG_SQL
+    assert "now()" not in _BACKLOG_SQL
+    assert "hive_post_id IS NULL" in _BACKLOG_SQL
+
+
+def test_the_probe_window_matches_the_resolver_that_produces_the_backlog():
+    """
+    _RESOLVER_WINDOW_DAYS and the interval in db/process_block_range.sql are two
+    literals in two languages with nothing binding them. Widen the SQL without this
+    constant and the probe goes blind; narrow it and the probe goes noisy. The old
+    test pinned the constant against itself.
+    """
+    from haf_fyp.metrics import _RESOLVER_WINDOW_DAYS
+
+    resolver = io.open("db/process_block_range.sql", encoding="utf-8").read()
+    assert f"INTERVAL '{_RESOLVER_WINDOW_DAYS} days'" in resolver
+
+
 def test_servability_query_names_the_relations_and_predicate_it_should():
     """
     A spelling check, and labelled as one.
@@ -465,7 +505,7 @@ def test_servability_query_names_the_relations_and_predicate_it_should():
     endpoints do". It cannot: the substrings match anywhere in a 2000-line schema,
     so the endpoints could add `AND pc.in_discovery` and this would stay green. Real
     drift detection would mean parsing the endpoint SQL, and the honest mitigation is
-    the limits section in the README plus tests/integration/test_servability_db.py,
+    the limits section in the README plus tests/integration/test_ranking_probes_db.py,
     which pins the query's BEHAVIOUR. Keep this for the cheap catch it does give --
     someone editing the probe to reference a different table or predicate.
     """
@@ -496,11 +536,19 @@ def _backlog_conn(found, boom=None):
 
 
 def test_no_backlog():
-    assert fetch_resolution_backlog(_backlog_conn(0)) == {"backlog": 0, "capped": False}
+    assert fetch_resolution_backlog(_backlog_conn(0)) == {
+        "backlog": 0,
+        "capped": False,
+        "window_days": 7,
+    }
 
 
 def test_an_exact_count_below_the_cap_is_reported_exactly():
-    assert fetch_resolution_backlog(_backlog_conn(37)) == {"backlog": 37, "capped": True is False}
+    assert fetch_resolution_backlog(_backlog_conn(37)) == {
+        "backlog": 37,
+        "capped": False,
+        "window_days": 7,
+    }
 
 
 def test_the_count_is_capped_and_flagged():
@@ -508,12 +556,20 @@ def test_the_count_is_capped_and_flagged():
     # than the cap" without counting the rest -- which is the whole reason the probe
     # is constant-time regardless of how bad the backlog is.
     out = fetch_resolution_backlog(_backlog_conn(_BACKLOG_PROBE_LIMIT + 1))
-    assert out == {"backlog": _BACKLOG_PROBE_LIMIT, "capped": True}
+    assert out == {
+        "backlog": _BACKLOG_PROBE_LIMIT,
+        "capped": True,
+        "window_days": 7,
+    }
 
 
 def test_exactly_the_cap_is_not_flagged_as_more():
     out = fetch_resolution_backlog(_backlog_conn(_BACKLOG_PROBE_LIMIT))
-    assert out == {"backlog": _BACKLOG_PROBE_LIMIT, "capped": False}
+    assert out == {
+        "backlog": _BACKLOG_PROBE_LIMIT,
+        "capped": False,
+        "window_days": 7,
+    }
 
 
 def test_a_failed_backlog_probe_returns_none_without_rolling_back():
@@ -543,3 +599,10 @@ def test_a_valid_window_is_interpolated_into_the_interval():
     fetch_resolution_backlog(conn, window_days=30)
     sql = conn.cursor.return_value.__enter__.return_value.execute.call_args[0][0]
     assert "interval '30 days'" in sql
+
+
+def test_the_reported_window_is_the_one_actually_used():
+    # The report stamps whatever this returns. It used to stamp the default constant
+    # regardless, so a non-default call would have reported a window it did not use.
+    out = fetch_resolution_backlog(_backlog_conn(0), window_days=30)
+    assert out["window_days"] == 30

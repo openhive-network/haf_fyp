@@ -161,7 +161,7 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.global_feed_cache (
 
 -- Deliberately NOT seeded here: the integration tests in this same job TRUNCATE
 -- post_candidates, so any rows planted at setup are gone by the time anything
--- reads them. tests/integration/test_servability_db.py populates and asserts the
+-- reads them. tests/integration/test_ranking_probes_db.py populates and asserts the
 -- states it needs, which is also the only place the servability SQL is actually
 -- exercised against a real PostgreSQL.
 

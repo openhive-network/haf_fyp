@@ -169,11 +169,20 @@ def test_the_query_does_not_depend_on_search_path(conn):
 # --------------------------------------------------------------------------
 
 
+# The CI stub's head block is 5,000,000 at 2016-09-15 (tests/haf_stub.sql) while the
+# wall clock is a decade later, so this lane IS the lagging-node case the probe has to
+# get right. Fixtures are therefore expressed relative to the head BLOCK time, which
+# is the clock post_candidates.created_at and the resolver both use.
 def _candidate(cur, post_id, *, days_ago, hive_post_id):
     cur.execute(
         """
         INSERT INTO haf_fyp_app.post_candidates (post_id, created_at, hive_post_id)
-        VALUES (%s, now() - make_interval(days => %s), %s)
+        VALUES (
+            %s,
+            (SELECT last_block_time FROM haf_fyp_app.sync_status())
+                - make_interval(days => %s),
+            %s
+        )
         """,
         (post_id, days_ago, hive_post_id),
     )
@@ -236,3 +245,37 @@ def test_the_count_is_capped_so_the_cost_cannot_grow_with_the_backlog(conn):
         "backlog": _BACKLOG_PROBE_LIMIT,
         "capped": True,
     }
+
+
+def test_wall_clock_old_posts_are_not_a_backlog_when_the_node_lags(conn):
+    """
+    The regression test for the bug this probe shipped with.
+
+    An earlier revision compared created_at against now(). post_candidates.created_at
+    is BLOCK time and the resolver's window is head_block_time - 7 days, so on any
+    node whose head lags wall clock by more than the window -- one replaying history,
+    or one recovering from an outage -- every unresolved row looked ancient and the
+    probe reported a backlog on a node that was working correctly, telling the
+    operator to run a backfill it did not need.
+
+    This lane reproduces that exactly: the stub's head block is 2016 and the wall
+    clock is a decade later. These rows are recent in BLOCK time (inside the
+    resolver's window, so it will retry them next batch) while being years old by
+    wall clock. Under the old query they counted; under the correct one they do not.
+    """
+    with conn.cursor() as cur:
+        _candidate(cur, 1, days_ago=1, hive_post_id=None)
+        _candidate(cur, 2, days_ago=3, hive_post_id=None)
+    assert fetch_resolution_backlog(conn) == {
+        "backlog": 0,
+        "capped": False,
+        "window_days": 7,
+    }
+
+
+def test_the_threshold_follows_the_head_block_not_the_wall_clock(conn):
+    # The other direction: rows genuinely past the window in BLOCK time do count,
+    # even though by wall clock they are no older than the ones above.
+    with conn.cursor() as cur:
+        _candidate(cur, 1, days_ago=8, hive_post_id=None)
+    assert fetch_resolution_backlog(conn)["backlog"] == 1

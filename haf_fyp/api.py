@@ -1098,18 +1098,21 @@ def metrics(response: Response):
             # further statement after this", which stopped being true the moment a
             # third read was added. Run the other way round, any credibility hiccup
             # (statement timeout, a cancelled backend) leaves the transaction
-            # aborted, the ranking probe then fails with 25P02, and the report
-            # fails safe to feeds_empty=true -- which README.md and this route both
-            # tell operators to alert on. A catalog-read hiccup would page someone
-            # with "every feed is empty". Ranking first means only a genuine
+            # aborted, the ranking probe then fails with 25P02, and the whole
+            # ranking section degrades to ranking_unknown with degraded=true -- so a
+            # credibility hiccup would page someone about ranking health it never
+            # actually failed to read. Ranking first means only a genuine
             # ranking-probe failure can raise that alarm; credibility inherits the
             # aborted transaction instead, and "unknown" is already its documented
-            # fail-safe.
+            # fail-safe. (This paragraph used to justify itself with feeds_empty,
+            # a field #43 removed; the cascade is the same, the consequence is now
+            # a false ranking_unknown rather than a false "every feed is empty".)
             ranking_probe = fetch_ranking_sources(conn)
             probe = fetch_credibility_sources(conn)
-            # LAST, deliberately. All of these share one connection and one
-            # transaction, and none of them rolls back on failure (each explains
-            # why in its own docstring) -- so whichever probe fails first aborts
+            # Ordering among the app-table probes is load-bearing too. All of
+            # these share one connection and one transaction, and none of them
+            # rolls back on failure (each explains why in its own docstring) --
+            # so whichever probe fails first aborts
             # the transaction and everything after it dies with 25P02 through no
             # fault of its own. Being last means a servability failure cannot
             # invent a fault in the other two, and its own dependency is the
@@ -1119,8 +1122,15 @@ def metrics(response: Response):
             # read in the middle re-opened it, and it was live -- the CI stack has
             # no global_feed_cache, so this probe raised on every run and
             # credibility_sources reported "unknown" for four healthy sources.)
-            servability = fetch_feed_servability(conn)
+            # Backlog BEFORE servability: both read app tables on the shared,
+            # never-rolled-back transaction, so whichever fails first takes the rest
+            # with it (25P02). Servability is the one most likely to fail -- a role
+            # that has lost SELECT on global_feed_cache is the probe's most
+            # plausible production fault -- and it is the SECONDARY signal, so it
+            # must not be able to take out the #43 detector and have the report
+            # blame the backlog probe for a fault it never had.
             backlog = fetch_resolution_backlog(conn)
+            servability = fetch_feed_servability(conn)
     except psycopg2.pool.PoolError as exc:
         # Monitors poll this route, so a persistently exhausted pool must not write a
         # traceback per scrape. Same treatment /sync-status gives the identical error,

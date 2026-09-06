@@ -190,13 +190,37 @@ _HIVESENSE_KEY = ".".join(_HIVESENSE_RELATION)
 #
 # It answers "is there a backlog", not "how big" -- which is the question that has
 # an action attached to it, and the only one that can be asked cheaply.
+#
+# _RESOLVER_WINDOW_DAYS below must equal the interval in
+# db/process_block_range.sql. They are two literals in two languages with nothing
+# binding them, so tests/unit/test_ranking_sources.py reads that file and asserts
+# they agree -- widen one without the other and this probe goes blind or noisy.
 _BACKLOG_PROBE_LIMIT = 1000
+# The threshold is derived from BLOCK time, not wall clock, and that distinction is
+# the whole correctness of this probe.
+#
+# post_candidates.created_at is block time, and the resolver's window is
+# `_block_time - INTERVAL '7 days'` where _block_time is the head block's
+# created_at (db/process_block_range.sql). An earlier revision compared against
+# now() instead. Since block head <= now(), that made the probe's set a strict
+# SUPERSET of the true one -- harmless on a caught-up node and badly wrong on any
+# other. A node replaying history with its head at 2020, or one that fell behind
+# after an outage, has recent-in-block-time posts that the resolver WILL retry next
+# batch; wall clock puts them years past the window, so the probe reported a backlog
+# and told the operator to run a backfill on a node that was working correctly.
+#
+# sync_status() is the same head block the resolver reads, is STABLE SECURITY
+# DEFINER, and is already granted to haf_fyp_user (db/sync_status.sql) -- so this
+# needs no new privilege. It is an uncorrelated scalar subquery, evaluated once.
+# A NULL head time (nothing processed yet) makes the comparison NULL, so the probe
+# reports no backlog, which is right: nothing has been ingested to be behind on.
 _BACKLOG_SQL = f"""
     SELECT count(*) FROM (
         SELECT 1
           FROM haf_fyp_app.post_candidates
          WHERE hive_post_id IS NULL
-           AND created_at < now() - interval '{{window}} days'
+           AND created_at < (SELECT last_block_time FROM haf_fyp_app.sync_status())
+                            - interval '{{window}} days'
          LIMIT {_BACKLOG_PROBE_LIMIT + 1}
     ) t
 """
@@ -283,6 +307,11 @@ def fetch_resolution_backlog(conn, window_days: int = _RESOLVER_WINDOW_DAYS) -> 
         return {
             "backlog": min(found, _BACKLOG_PROBE_LIMIT),
             "capped": found > _BACKLOG_PROBE_LIMIT,
+            # Returned rather than assumed by the caller. The report used to stamp
+            # _RESOLVER_WINDOW_DAYS unconditionally, so a non-default call would
+            # have reported a window it did not use -- a structural lie waiting for
+            # the first caller to pass the argument.
+            "window_days": int(window_days),
         }
     except Exception as exc:
         log.warning("ranking: backlog probe failed (%s) -- reporting unknown", exc)
@@ -293,9 +322,15 @@ def fetch_feed_servability(conn) -> dict | None:
     """
     Ask whether the global feed can serve a post, or None if the check failed.
 
-    Deliberately separate from the other two: they answer different questions and
-    any of them can fail without the others, so a monitor still gets the parts that
-    worked.
+    Separate from the other probes because they answer different questions, and it
+    reports None rather than raising so one failure does not take GET /metrics down.
+
+    NOT independent, though: all four probes share one connection and one
+    transaction and none of them rolls back, so the first to fail aborts the
+    transaction and every later one dies with 25P02 regardless. That is why the
+    order in the route is load-bearing and why this one -- the secondary signal, and
+    the likeliest to fail -- runs after the #43 detector. A docstring here used to
+    claim any of them could fail without the others; that was never true.
     """
     try:
         with conn.cursor() as cur:
@@ -356,19 +391,24 @@ def build_ranking_sources_report(
     }
     hivemind, hivesense = sources["hivemind"], sources["hivesense"]
 
-    unreadable_sources = [
+    # Split by what they explain. A backlog is caused by the RESOLUTION path, so
+    # only those relations belong in its remedy -- naming hivesense there both sent
+    # the operator to the wrong grant and suppressed the backfill instruction, which
+    # was the right one.
+    unreadable_resolution = [
         name
-        for name, state in (
-            [(_HIVEMIND_KEY, hivemind), (_HIVESENSE_KEY, hivesense)]
-            + list(sources["resolver_inputs"].items())
-        )
+        for name, state in [(_HIVEMIND_KEY, hivemind)]
+        + list(sources["resolver_inputs"].items())
         if state == STATE_UNREADABLE
     ]
+    unreadable_sources = unreadable_resolution + (
+        [_HIVESENSE_KEY] if hivesense == STATE_UNREADABLE else []
+    )
 
     backlog_section = None if backlog is None else {
         "posts": backlog["backlog"],
         "at_least": backlog["capped"],
-        "window_days": _RESOLVER_WINDOW_DAYS,
+        "window_days": backlog["window_days"],
     }
     has_backlog = bool(backlog and backlog["backlog"] > 0)
 
@@ -395,7 +435,12 @@ def build_ranking_sources_report(
         state = RANKING_STATE_UNKNOWN
         missing = [
             n
-            for n, v in (("sources", probe), ("global_feed", servability), ("backlog", backlog))
+            for n, v in (
+                ("sources", probe),
+                ("global_feed", servability),
+                # The payload KEY, so an operator can grep for what detail names.
+                ("unresolved_backlog", backlog),
+            )
             if v is None
         ]
         # Names WHICH probe failed. An earlier revision said "the servability check
@@ -419,11 +464,11 @@ def build_ranking_sources_report(
         state = RANKING_STATE_UNRESOLVED_BACKLOG
         n = f"at least {backlog['backlog']}" if backlog["capped"] else str(backlog["backlog"])
         detail = (
-            f"{n} posts older than {_RESOLVER_WINDOW_DAYS} days are unresolved and "
+            f"{n} posts older than {backlog['window_days']} days are unresolved and "
             "the per-block resolver will never reach them. "
             + (
-                f"check SELECT on {', '.join(unreadable_sources)}"
-                if unreadable_sources
+                f"check SELECT on {', '.join(unreadable_resolution)}"
+                if unreadable_resolution
                 else "run CALL haf_fyp_app.run_hive_post_id_backfill()"
             )
         )
@@ -438,6 +483,20 @@ def build_ranking_sources_report(
         detail = (
             "global_feed_cache is empty -- the ranker has not completed a cycle. "
             "Expected on a node that has just been installed"
+        )
+    elif unreadable_resolution:
+        # Reached when a resolver input is unreadable but no backlog has accrued yet
+        # -- a revocation newer than the resolver window. Without this branch the
+        # payload reported state ranking_full with detail "no unresolved backlog,
+        # global feed servable" WHILE degraded was true: health asserted in two
+        # fields and a fault in a third. get_personalized_feed reads hive_accounts
+        # UNGUARDED, so in this state every authenticated feed request is already
+        # raising, and sending the operator nowhere was the worst part.
+        state = RANKING_STATE_NO_FEED
+        detail = (
+            f"{', '.join(unreadable_resolution)} unreadable -- resolution has "
+            "stopped and a backlog will accrue; authenticated feed requests that "
+            "read hive_accounts raise now. Re-run scripts/grant_cross_schema.sh"
         )
     elif not _readable(hivesense):
         state = RANKING_STATE_NO_PERSONALIZATION

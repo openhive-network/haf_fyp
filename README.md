@@ -82,8 +82,12 @@ hived ──► sql_serializer ──► HAF PostgreSQL
   every `post_candidates` row older than that keeps `hive_post_id IS NULL` forever
   and is filtered out of both feeds. This is the most likely way to hit the empty-feed
   failure in practice. Since #43 `GET /metrics` detects it directly:
-  `ranking_sources.unresolved_backlog.posts` counts the posts past the resolver's
-  window and `state` reads `ranking_unresolved_backlog`. Every privilege state
+  `state` reads `ranking_unresolved_backlog` and
+  `unresolved_backlog.posts` reports how many are past the resolver's window —
+  capped at 1000, with `at_least: true` when it hits the cap, which it will in this
+  scenario. It is a bounded probe, not a census: "how many" cannot be asked cheaply
+  on a 25M-row table, and "is there a backlog" is the question with an action
+  attached. Every privilege state
   reads `readable` throughout, which is why the earlier privilege-only check could
   not see it. The backfill is resumable and only ever touches NULL rows, so
   re-running it is safe.
@@ -184,12 +188,14 @@ them, instead of collapsing them into one boolean that is wrong at both ends:
 
 | field | question it answers |
 |-------|--------------------|
-| `unresolved_backlog` | are there posts the resolver will never revisit? **The #43 signal.** `posts` is capped, `at_least: true` meaning "at least that many" |
+| `unresolved_backlog` | are there posts the resolver will never revisit? **The #43 signal.** `posts` is capped at 1000 with `at_least: true` when it hits the cap; `window_days` echoes the resolver window the probe used |
 | `global_feed` | does the global cache hold anything (`cached`), and is any of it servable (`servable`)? `cached: true, servable: false` is a failure no privilege probe can see |
 | `sources` | per-relation privilege states — the diagnosis of *why*, not the detection |
 
-Any section reading `null` means that probe could not run; `degraded` is set and
-`state` is `ranking_unknown`, because "I could not check" must never read as fine.
+`unresolved_backlog` or `global_feed` reading `null` means that probe could not
+run; `degraded` is set and `state` is `ranking_unknown`, because "I could not check"
+must never read as fine. `sources` is never null — when the catalog probe fails
+every relation reads `unknown` instead.
 
 `state` summarises, and the values want different responses:
 
@@ -198,13 +204,16 @@ Any section reading `null` means that probe could not run; `degraded` is set and
 | `ranking_full` | nothing standing between this node and a served feed | nothing |
 | `ranking_unresolved_backlog` | posts past the resolver's window will never resolve — **the #43 case** | run `CALL haf_fyp_app.run_hive_post_id_backfill();`, or repair the grant `detail` names |
 | `ranking_no_feed` | hivemind absent or unreadable, or the global cache holds nothing servable, or the ranker has not run yet | `detail` distinguishes these; only the last is expected, and it is the one that does not set `degraded` by itself |
-| `ranking_no_personalization` | hivesense absent or unreadable | optional — see above. `absent` is not a fault; `unreadable` is |
+| `ranking_no_personalization` | hivesense absent or unreadable | optional — see above. `absent` is not a fault; `unreadable` is. Only reported when nothing more serious applies: a hivesense fault on a node that also has a backlog shows up in `sources`, not in `state` |
 | `ranking_unknown` | a probe could not run | investigate; `detail` names which one. Never means healthy |
 
-`ranking_unresolved_backlog` is the one that used to be invisible: an unresolved
-backfill, or a lost grant on `hive_accounts` or `hive_permlink_data`, both read as
-`readable` to a privilege probe while every feed is empty. `detail` distinguishes
-those two, because the remedies differ — re-grant, versus run the backfill.
+`ranking_unresolved_backlog` is the one that used to be invisible. An unresolved
+backfill leaves every privilege reading `readable` while feeds empty out, and
+nothing before #43 could see it. A lost grant on `hive_accounts` or
+`hive_permlink_data` produces the same backlog, and since this branch also probes
+those two it is now named directly under `sources.resolver_inputs` rather than
+inferred. `detail` distinguishes them, because the remedies differ — re-grant,
+versus run the backfill.
 
 The per-relation states remain as the **diagnosis** rather than the detector,
 including `resolver_inputs` — the other two relations `resolve_hivemind_post_ids`
@@ -228,14 +237,21 @@ feeds empty or broken while it reads servable:
   touches `hive_post_id`, so nothing here notices.
 
 Answering "can every user be served" would mean probing `feed_cache` per user and
-modelling the render filter. That is a larger change and is not attempted here; the
-practical check for a specific user is to call `/rpc/get_personalized_feed` for them
-and look at `fyp.source` — `personalized` with an empty list means their cached rows
-are unresolvable.
+modelling the render filter. That is a larger change and is not attempted here.
+
+To check one specific user, call `/rpc/get_user_profile` for them and compare:
+**`has_feed: true` together with an empty `/rpc/get_personalized_feed` response
+means their cached rows are unresolvable.** Note it has to be that pair — `fyp` is
+built per feed entry, so an empty response carries no `fyp` object at all and
+`fyp.source` cannot be read from it. (An earlier version of this section said to
+read `fyp.source`; that state is not observable.)
 
 There is also no staleness check: a ranker that stopped days ago leaves its last
 good 200 rows in place, and they keep resolving, so `global_feed` reads servable.
-`/sync-status` is the endpoint that answers freshness.
+**`/sync-status` does not answer this** — it reports the HAF context advanced by the
+`haf-fyp-sync` service, which keeps running when `haf-fyp-ranker` dies. The signal
+that does move with the ranker is `embedding_coverage.computed_at` in this same
+`/metrics` payload, refreshed on the ranker's hourly maintenance pass.
 
 After installing each external app, run:
 ```bash
@@ -609,8 +625,8 @@ Before going live:
 - [ ] `FYP_ADMIN_API_KEY` set to a strong random value in `docker/.env.local`
 - [ ] **`TRUSTED_PROXY_IPS` set to the reverse proxy's address or CIDR** (or the literal `direct` if nothing fronts this app). Since #28 this also gates *when* limits are charged: with it unset the app logs an ERROR at startup and falls back to charging only after validation, because charging a request before it is validated is safe only when the bucket identifies the caller — into one shared bucket it lets a single sender 429 everybody else, which is worse than the bug #28 fixes. Rate limits key on `X-Real-IP` only from a trusted peer; unset, every caller keys on the proxy's address instead — one shared bucket for all of them, which is no per-client limit at all. The app logs a warning at startup when it is unset, and once more if a peer outside the list presents the header (which usually means the proxy was recreated with a new address and the list is now stale). Re-check it after anything that can renumber the proxy container.
 - [ ] `HAF_VERSION` pinned to a specific release tag (not `latest`)
-- [ ] **If Hivemind was installed AFTER haf_fyp started syncing: `CALL haf_fyp_app.run_hive_post_id_backfill();`** — the per-block resolver only covers a rolling 7-day window, so without this every older post stays unresolved and the feeds stay empty. `/metrics` reports it as `ranking_sources.state: ranking_unresolved_backlog` with a count.
-- [ ] **Hivemind installed and synced** → `grant_cross_schema.sh` re-run. REQUIRED: without it every feed returns `[]`. Confirm with `GET /metrics` → `ranking_sources.degraded` is `false`, not by assuming — alert on that rather than on `sources.hivemind == "readable"`, which misses both the `readable_unverified` case and everything the two data probes see. (Losing `SELECT` on the table does at least `RAISE WARNING` from the resolver; an absent schema — or a revoked `USAGE` on it, which makes `to_regclass` return NULL — is entirely silent.)
+- [ ] **If Hivemind was installed AFTER haf_fyp started syncing: `CALL haf_fyp_app.run_hive_post_id_backfill();`** — the per-block resolver only covers a rolling 7-day window, so without this every older post stays unresolved and the feeds stay empty. `/metrics` reports it as `ranking_sources.state: ranking_unresolved_backlog` (with a capped count).
+- [ ] **Hivemind installed and synced** → `grant_cross_schema.sh` re-run. REQUIRED: with hivemind ABSENT every feed returns `[]`. (A lost *grant* on an already-running node is different — resolution stops, but already-rendered posts keep serving from `post_bridge_cache`, so the outage is delayed rather than immediate.) Confirm with `GET /metrics` → `ranking_sources.degraded` is `false`, not by assuming — alert on that rather than on `sources.hivemind == "readable"`, which misses both the `readable_unverified` case and everything the two data probes see. (Losing `SELECT` on the table does at least `RAISE WARNING` from the resolver; an absent schema — or a revoked `USAGE` on it, which makes `to_regclass` return NULL — is entirely silent.)
 - [ ] HiveSense installed and synced → `grant_cross_schema.sh` re-run (optional; without it nobody is personalized — see [Without HiveSense there is no personalization](#without-hivesense-there-is-no-personalization-not-neutral-relevance))
 - [ ] balance_tracker installed and synced → `grant_cross_schema.sh` re-run (optional)
 - [ ] reputation_tracker installed and synced → `grant_cross_schema.sh` re-run (optional)

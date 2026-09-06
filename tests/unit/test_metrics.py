@@ -231,8 +231,8 @@ def _sources(hivemind="readable", hivesense="readable", resolver="readable"):
 SERVING = {"cached": True, "servable": True}
 NO_CYCLE_YET = {"cached": False, "servable": False}
 NOTHING_RESOLVES = {"cached": True, "servable": False}
-NO_BACKLOG = {"backlog": 0, "capped": False}
-BIG_BACKLOG = {"backlog": 1000, "capped": True}
+NO_BACKLOG = {"backlog": 0, "capped": False, "window_days": 7}
+BIG_BACKLOG = {"backlog": 1000, "capped": True, "window_days": 7}
 
 
 def _report(sources=None, servability=SERVING, backlog=NO_BACKLOG):
@@ -281,7 +281,7 @@ def test_a_backlog_with_a_lost_grant_names_the_grant_not_the_backfill():
 
 
 def test_an_exact_small_backlog_is_reported_without_at_least():
-    report = _report(backlog={"backlog": 12, "capped": False})
+    report = _report(backlog={"backlog": 12, "capped": False, "window_days": 7})
     assert report["unresolved_backlog"] == {"posts": 12, "at_least": False, "window_days": 7}
     assert "12 posts" in report["detail"]
     assert "at least" not in report["detail"]
