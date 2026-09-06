@@ -155,6 +155,7 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.post_candidates (
 -- a real PostgreSQL. Only the two columns the check touches.
 CREATE TABLE IF NOT EXISTS haf_fyp_app.global_feed_cache (
     post_id BIGINT PRIMARY KEY,
+    final_score FLOAT NOT NULL,
     rank INT NOT NULL
 );
 

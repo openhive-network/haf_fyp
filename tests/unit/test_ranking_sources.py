@@ -26,9 +26,11 @@ from haf_fyp.credibility import (
     probe_relations,
 )
 from haf_fyp.metrics import (
+    _BACKLOG_PROBE_LIMIT,
     _RANKING_SOURCES,
     fetch_feed_servability,
     fetch_ranking_sources,
+    fetch_resolution_backlog,
 )
 
 HIVEMIND = ("hivemind_app", "hive_posts")
@@ -325,16 +327,34 @@ def test_metrics_probes_ranking_before_credibility(monkeypatch):
     monkeypatch.setattr(
         api, "fetch_feed_servability", lambda conn: order.append("servability")
     )
+    monkeypatch.setattr(
+        api, "fetch_resolution_backlog", lambda conn: order.append("backlog")
+    )
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
     monkeypatch.setattr(api, "build_credibility_sources_report", lambda probe: {})
-    monkeypatch.setattr(api, "build_ranking_sources_report", lambda probe, serv=None: {})
+    monkeypatch.setattr(
+        api, "build_ranking_sources_report", lambda probe, serv=None, backlog=None: {}
+    )
 
     api.metrics(MagicMock())
 
     assert order.index("ranking") < order.index("credibility")
-    # Both probes must receive the SAME connection, which is the premise the whole
+    # And servability LAST. None of the three rolls back on failure, so whichever
+    # fails first aborts the shared transaction and everything after it dies with
+    # 25P02 through no fault of its own. Servability reads app tables rather than
+    # just pg_catalog, so it is the likeliest to fail -- putting it in the middle is
+    # what re-opened the #57 cascade, and that was LIVE: the CI stack had no
+    # global_feed_cache, the probe raised on every run, and credibility_sources
+    # reported "unknown" for four healthy sources.
+    #
+    # This assertion exists because the fix removed its own detector. Creating the
+    # table in ci_fastapi_setup.sql is what stops the probe raising there, so the
+    # tavern stage can no longer notice a re-ordering. Nothing else would.
+    assert order.index("servability") > order.index("credibility")
+    assert order.index("backlog") > order.index("credibility")
+    # All three must receive the SAME connection, which is the premise the whole
     # ordering argument rests on -- give each its own _db_conn() block and the
-    # rationale evaporates while the order assertion above still passes.
+    # rationale evaporates while the order assertions above still pass.
     assert len(conns) == 1
     assert conns[0] is not None
 
@@ -361,6 +381,7 @@ def test_metrics_feeds_each_probe_to_its_own_builder(monkeypatch):
     monkeypatch.setattr(api, "fetch_credibility_sources", lambda conn: {"which": "credibility"})
     monkeypatch.setattr(api, "fetch_ranking_sources", lambda conn: {"which": "ranking"})
     monkeypatch.setattr(api, "fetch_feed_servability", lambda conn: {"which": "servability"})
+    monkeypatch.setattr(api, "fetch_resolution_backlog", lambda conn: {"which": "backlog"})
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
     monkeypatch.setattr(
         api, "build_credibility_sources_report", lambda probe: {"got": probe["which"]}
@@ -368,12 +389,20 @@ def test_metrics_feeds_each_probe_to_its_own_builder(monkeypatch):
     monkeypatch.setattr(
         api,
         "build_ranking_sources_report",
-        lambda probe, serv: {"got": probe["which"], "serv": serv["which"]},
+        lambda probe, serv, backlog: {
+            "got": probe["which"],
+            "serv": serv["which"],
+            "backlog": backlog["which"],
+        },
     )
 
     report = api.metrics(MagicMock())
 
-    assert report["ranking_sources"] == {"got": "ranking", "serv": "servability"}
+    assert report["ranking_sources"] == {
+        "got": "ranking",
+        "serv": "servability",
+        "backlog": "backlog",
+    }
     assert report["credibility_sources"] == {"got": "credibility"}
 
 
@@ -428,14 +457,89 @@ def test_servability_failure_returns_none_without_rolling_back():
     conn.rollback.assert_not_called()
 
 
-def test_servability_query_applies_the_same_filter_the_endpoints_do():
-    # The check is only meaningful if it asks the endpoints' question. Both feed
-    # endpoints select `pc.hive_post_id IS NOT NULL` joined to post_candidates; if
-    # this query ever drifts from that, it stops answering "can we serve".
+def test_servability_query_names_the_relations_and_predicate_it_should():
+    """
+    A spelling check, and labelled as one.
+
+    An earlier name claimed this pinned that the probe "applies the same filter the
+    endpoints do". It cannot: the substrings match anywhere in a 2000-line schema,
+    so the endpoints could add `AND pc.in_discovery` and this would stay green. Real
+    drift detection would mean parsing the endpoint SQL, and the honest mitigation is
+    the limits section in the README plus tests/integration/test_servability_db.py,
+    which pins the query's BEHAVIOUR. Keep this for the cheap catch it does give --
+    someone editing the probe to reference a different table or predicate.
+    """
     from haf_fyp.metrics import _SERVABILITY_SQL
 
-    endpoints = io.open("endpoints/endpoint_schema.sql", encoding="utf-8").read()
     assert "hive_post_id IS NOT NULL" in _SERVABILITY_SQL
-    assert "hive_post_id IS NOT NULL" in endpoints
     assert "haf_fyp_app.global_feed_cache" in _SERVABILITY_SQL
     assert "haf_fyp_app.post_candidates" in _SERVABILITY_SQL
+    # The predicate must at least still exist on the endpoint side; if it is gone
+    # entirely the probe is answering a question nobody asks any more.
+    endpoints = io.open("endpoints/endpoint_schema.sql", encoding="utf-8").read()
+    assert "hive_post_id IS NOT NULL" in endpoints
+
+
+# --------------------------------------------------------------------------
+# fetch_resolution_backlog (#43) -- the detector
+# --------------------------------------------------------------------------
+
+
+def _backlog_conn(found, boom=None):
+    conn = MagicMock()
+    cur = conn.cursor.return_value.__enter__.return_value
+    if boom is not None:
+        cur.execute.side_effect = boom
+    else:
+        cur.fetchone.return_value = (found,)
+    return conn
+
+
+def test_no_backlog():
+    assert fetch_resolution_backlog(_backlog_conn(0)) == {"backlog": 0, "capped": False}
+
+
+def test_an_exact_count_below_the_cap_is_reported_exactly():
+    assert fetch_resolution_backlog(_backlog_conn(37)) == {"backlog": 37, "capped": True is False}
+
+
+def test_the_count_is_capped_and_flagged():
+    # The query asks for LIMIT+1 so it can distinguish "exactly the cap" from "more
+    # than the cap" without counting the rest -- which is the whole reason the probe
+    # is constant-time regardless of how bad the backlog is.
+    out = fetch_resolution_backlog(_backlog_conn(_BACKLOG_PROBE_LIMIT + 1))
+    assert out == {"backlog": _BACKLOG_PROBE_LIMIT, "capped": True}
+
+
+def test_exactly_the_cap_is_not_flagged_as_more():
+    out = fetch_resolution_backlog(_backlog_conn(_BACKLOG_PROBE_LIMIT))
+    assert out == {"backlog": _BACKLOG_PROBE_LIMIT, "capped": False}
+
+
+def test_a_failed_backlog_probe_returns_none_without_rolling_back():
+    conn = _backlog_conn(None, boom=RuntimeError("boom"))
+    assert fetch_resolution_backlog(conn) is None
+    conn.rollback.assert_not_called()
+
+
+def test_a_non_integer_window_never_reaches_the_database():
+    """
+    The window is formatted into the SQL, not bound as a parameter -- an interval
+    literal cannot be parameterised -- so int() is the guard.
+
+    It REJECTS rather than sanitises, which is the stronger outcome: the query is
+    never executed at all, and the failure surfaces as "unknown" like any other
+    probe failure. An earlier version of this test asserted that a hostile string
+    was interpolated safely, which asserted the weaker behaviour and failed against
+    the better one.
+    """
+    conn = _backlog_conn(0)
+    assert fetch_resolution_backlog(conn, window_days="7; DROP TABLE x") is None
+    conn.cursor.return_value.__enter__.return_value.execute.assert_not_called()
+
+
+def test_a_valid_window_is_interpolated_into_the_interval():
+    conn = _backlog_conn(0)
+    fetch_resolution_backlog(conn, window_days=30)
+    sql = conn.cursor.return_value.__enter__.return_value.execute.call_args[0][0]
+    assert "interval '30 days'" in sql

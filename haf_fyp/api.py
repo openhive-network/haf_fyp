@@ -58,6 +58,7 @@ from .metrics import (
     fetch_credibility_sources,
     fetch_feed_servability,
     fetch_ranking_sources,
+    fetch_resolution_backlog,
 )
 from .sync_status import (
     ContextNotFound,
@@ -1032,36 +1033,36 @@ def metrics(response: Response):
     by sampling served feeds. The current UTC day is reported but never flagged —
     mid-day it reads low simply because the latest posts are not embedded yet.
 
-    ranking_sources (#36, #43): whether this node can serve a post, and if not, why.
+    ranking_sources (#36, #43): the state of the two apps ranking depends on, and
+    whether anything is standing between this node and a served feed.
 
-    It exists because the failure is otherwise INVISIBLE. Hivemind is a hard
+    It exists because these failures are otherwise INVISIBLE. Hivemind is a hard
     dependency -- post_candidates.hive_post_id is resolved from it and both feed
     endpoints filter on that column -- but the resolver is exception-guarded so a
-    missing schema cannot stall block processing. A node without hivemind syncs
-    happily, raises nothing, and serves an empty feed forever.
+    missing schema cannot stall block processing. A node without it syncs happily,
+    raises nothing, and serves an empty feed forever.
 
-    feeds_empty is the field to alert on, and feeds_empty_reason says which of five
-    situations it is: hivemind absent, hivemind unreadable, the ranker not having
-    completed a cycle (expected on a fresh install -- the one empty state that does
-    not set degraded by itself), cached posts that do not resolve (the real failure:
-    an unresolved backfill, or a lost grant on one of the three relations the
-    resolver joins), or unknown when the check could not run.
+    ALERT ON `degraded`, not on any single field. That is a correction, not a
+    style preference: #36 shipped a `feeds_empty` boolean and #43 tried to make it
+    authoritative, and it was wrong in BOTH directions -- true on a node that was
+    serving (post_bridge_cache answers without touching hivemind), and false on a
+    node that was not (the global cache is the recency-weighted top 200, so the
+    backfill case leaves it green while per-user feeds are empty). Three separate
+    observations are reported instead, and none of them is a proxy for the others:
 
-    Read feeds_empty asymmetrically. TRUE is reliable -- the node cannot serve.
-    FALSE means the GLOBAL feed can serve, which is weaker than it sounds:
-    get_personalized_feed does not fall back to the global feed for a user who
-    already has feed_cache rows, so those users can get [] while this reads healthy,
-    and a post can pass the resolution filter and still be dropped when
-    get_bridge_post returns NULL. This is a detector for one previously invisible
-    failure, not a proof of health (#43).
+      unresolved_backlog -- posts past the resolver's 7-day window, which it will
+          never revisit. This is what detects the case #43 was filed for: hivemind
+          installed after haf_fyp, backfill never run. Bounded probe, so the cost
+          does not grow with the backlog. null if it could not run.
+      global_feed -- whether the global feed cache holds anything, and whether any
+          of it is servable. `cached and not servable` is the failure no privilege
+          probe can see.
+      sources -- per-relation privilege states, including the two extra relations
+          the resolver joins. Diagnosis of WHY, not detection.
 
-    The per-relation privilege states remain as the diagnosis of WHY, including
-    resolver_inputs, the other two relations resolve_hivemind_post_ids joins.
-    hivesense is reported beside them because its absence is a quieter fact:
-    relevance drops out of the score entirely (weight 0, not a neutral constant),
-    and most users then raise inside _rank_user and get no cached feed at all (#41).
+    detail names which probe failed when one does, rather than blaming a fixed one.
 
-    credibility_sources (#8): whether each foreign relation the credibility signal
+        credibility_sources (#8): whether each foreign relation the credibility signal
     reads is readable, unreadable or absent. Probed inline — one indexed catalog
     read, and unlike the coverage rollup it cannot go stale. "unreadable" means the
     relation exists but this role has lost SELECT on it, which is a repairable
@@ -1119,6 +1120,7 @@ def metrics(response: Response):
             # no global_feed_cache, so this probe raised on every run and
             # credibility_sources reported "unknown" for four healthy sources.)
             servability = fetch_feed_servability(conn)
+            backlog = fetch_resolution_backlog(conn)
     except psycopg2.pool.PoolError as exc:
         # Monitors poll this route, so a persistently exhausted pool must not write a
         # traceback per scrape. Same treatment /sync-status gives the identical error,
@@ -1139,7 +1141,9 @@ def metrics(response: Response):
     today = datetime.now(tz=timezone.utc).date()
     report = build_coverage_report(rows, today)
     report["credibility_sources"] = build_credibility_sources_report(probe)
-    report["ranking_sources"] = build_ranking_sources_report(ranking_probe, servability)
+    report["ranking_sources"] = build_ranking_sources_report(
+        ranking_probe, servability, backlog
+    )
     return report
 
 
