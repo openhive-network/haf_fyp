@@ -234,12 +234,24 @@ def fetch_feed_servability(conn) -> dict | None:
     Separate from the other probes because they answer different questions, and it
     reports None rather than raising so one failure does not take GET /metrics down.
 
-    NOT independent, though: all four probes share one connection and one
-    transaction and none of them rolls back, so the first to fail aborts the
-    transaction and every later one dies with 25P02 regardless. That is why the
-    order in the route is load-bearing and why this one -- the secondary signal, and
-    the likeliest to fail -- runs last. A docstring here used to
-    claim any of them could fail without the others; that was never true.
+    NOT independent, though: all four reads on that route share one connection and
+    one transaction and none of them rolls back, so the first to fail aborts the
+    transaction and every later one dies with 25P02 regardless. A docstring here
+    used to claim any of them could fail without the others; that was never true.
+
+    That is why the order is load-bearing, and this one runs SECOND of the three
+    probes -- immediately after fetch_ranking_sources and before
+    fetch_credibility_sources. Both reads that feed ranking_sources are grouped, so
+    a fault in either degrades exactly one section and degrades it truthfully;
+    credibility inherits any abort, and "unknown" is already its documented
+    fail-safe. It does NOT run last: an earlier revision put it there, which let a
+    credibility timeout blank this read and report ranking_unknown for a fault
+    ranking never had.
+
+    Note what ordering does not buy. If THIS probe fails first, credibility still
+    reports four healthy sources as "unknown" -- ordering chooses who absorbs the
+    abort, it does not stop the cascade. A SAVEPOINT around each probe would, and
+    is the right change if a fourth read is ever added here.
     """
     try:
         with conn.cursor() as cur:
@@ -364,8 +376,13 @@ def build_ranking_sources_report(
             if hivemind == STATE_UNREADABLE
             else "the probe could not determine its state -- check the database"
         )
+        outcome = (
+            "resolution has stopped"
+            if hivemind == STATE_UNREADABLE
+            else "resolution is presumed stopped"
+        )
         detail = (
-            f"{_HIVEMIND_KEY} is {hivemind} -- resolution has stopped; {remedy}. "
+            f"{_HIVEMIND_KEY} is {hivemind} -- {outcome}; {remedy}. "
             "Already-rendered posts may still serve from post_bridge_cache, so this "
             "is not necessarily a visible outage yet"
         )

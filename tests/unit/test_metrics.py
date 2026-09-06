@@ -253,9 +253,6 @@ def test_shape_and_healthy_node():
     assert report["degraded"] is False
 
 
-
-
-
 def test_hivemind_absent_and_unreadable_are_different_verdicts():
     # Opposite remedies: install it, versus re-run grant_cross_schema.sh. An earlier
     # revision collapsed them and sent operators to fix a grant on a node with no
@@ -323,6 +320,11 @@ def test_resolver_inputs_are_reported_and_degrade():
     [
         (None, SERVING, "sources"),
         (_sources(), None, "global_feed"),
+        # Both None is the likeliest real shape now that the two ranking reads are
+        # adjacent: whichever fails first aborts the transaction and the other dies
+        # with 25P02. The detail must name both rather than picking one.
+        (None, None, "sources"),
+        (None, None, "global_feed"),
     ],
 )
 def test_a_failed_probe_names_itself_and_fails_safe(probe, servability, missing):
@@ -339,8 +341,6 @@ def test_a_failed_probe_names_itself_and_fails_safe(probe, servability, missing)
     assert report["state"] == "ranking_unknown"
     assert report["degraded"] is True
     assert missing in report["detail"]
-
-
 
 
 def test_a_failed_sources_probe_reports_unknown_states_not_absent():
