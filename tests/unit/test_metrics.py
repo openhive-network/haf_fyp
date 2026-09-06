@@ -10,6 +10,7 @@ from haf_fyp.metrics import (
     build_credibility_sources_report,
     build_ranking_sources_report,
     fetch_credibility_sources,
+    fetch_ranking_sources,
 )
 
 TODAY = date(2026, 7, 27)
@@ -318,19 +319,28 @@ def test_resolver_inputs_are_reported_and_degrade():
 
 
 @pytest.mark.parametrize(
-    "kwargs,missing",
+    "probe,servability,missing",
     [
-        ({"sources": None, "servability": None}, "global_feed"),
+        (None, SERVING, "sources"),
+        (_sources(), None, "global_feed"),
     ],
 )
-def test_a_failed_probe_names_itself_and_fails_safe(kwargs, missing):
-    # "I could not check" must never read as fine, and it must not blame the wrong
-    # subsystem -- an earlier revision always said "the servability check", sending
-    # an operator to global_feed_cache for an unrelated fault.
-    report = _report(**kwargs)
+def test_a_failed_probe_names_itself_and_fails_safe(probe, servability, missing):
+    """
+    Calls the builder DIRECTLY, both ways round.
+
+    The previous version went through the _report helper, whose `sources=None`
+    means "use the healthy default" -- so the probe-failed case never reached the
+    builder at all and the whole point of the fix (naming WHICH probe failed,
+    rather than blaming a fixed one) was unpinned. Hardcoding the detail string
+    passed every test.
+    """
+    report = build_ranking_sources_report(probe, servability)
     assert report["state"] == "ranking_unknown"
     assert report["degraded"] is True
     assert missing in report["detail"]
+
+
 
 
 def test_a_failed_sources_probe_reports_unknown_states_not_absent():
@@ -416,3 +426,25 @@ def test_hivesense_absent_stays_a_choice_not_a_fault():
     report = _report(_sources(hivesense="absent"))
     assert report["state"] == "ranking_no_personalization"
     assert report["degraded"] is False
+
+
+def test_fetch_ranking_sources_swallows_a_failed_probe():
+    conn = MagicMock()
+    conn.cursor.side_effect = RuntimeError("boom")
+    assert fetch_ranking_sources(conn) is None
+
+
+def test_fetch_ranking_sources_does_not_roll_back_a_dead_connection():
+    conn = MagicMock()
+    conn.cursor.side_effect = RuntimeError("connection already closed")
+    conn.rollback.side_effect = AssertionError("must not roll back a dead connection")
+    assert fetch_ranking_sources(conn) is None
+    conn.rollback.assert_not_called()
+
+
+def test_full_state_detail_names_both_sources():
+    # The healthy detail was unasserted: blanking it, or swapping it with the
+    # probe-failed text, left the suite green.
+    report = _report()
+    assert "hivemind" in report["detail"] and "hivesense" in report["detail"]
+    assert "servable" in report["detail"]

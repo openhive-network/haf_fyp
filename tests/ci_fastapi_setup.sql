@@ -152,7 +152,7 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.post_candidates (
 -- aborted transaction took the credibility probe down with it and /metrics
 -- reported "unknown" for four sources that were fine. Creating the table is what
 -- makes the query actually execute here, which is the only place it runs against
--- a real PostgreSQL. Only the two columns the check touches.
+-- a real PostgreSQL.
 -- Mirrors db/create_tables.sql rather than a subset: a CI schema that diverges
 -- from the shipped one means the next thing touching algorithm_version or
 -- computed_at passes here and fails in production.

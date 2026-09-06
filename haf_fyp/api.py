@@ -1057,7 +1057,7 @@ def metrics(response: Response):
 
     detail names which probe failed when one does, rather than blaming a fixed one.
 
-        credibility_sources (#8): whether each foreign relation the credibility signal
+    credibility_sources (#8): whether each foreign relation the credibility signal
     reads is readable, unreadable or absent. Probed inline — one indexed catalog
     read, and unlike the coverage rollup it cannot go stale. "unreadable" means the
     relation exists but this role has lost SELECT on it, which is a repairable
@@ -1086,38 +1086,31 @@ def metrics(response: Response):
     try:
         with _db_conn() as conn:
             rows = fetch_coverage_rows(conn)
-            # ORDER IS LOAD-BEARING: ranking BEFORE credibility. These share one
-            # pooled connection and one transaction (the pool is not autocommit),
-            # and fetch_credibility_sources deliberately does NOT roll back on
-            # failure -- its docstring justifies that with "/metrics issues no
-            # further statement after this", which stopped being true the moment a
-            # third read was added. Run the other way round, any credibility hiccup
-            # (statement timeout, a cancelled backend) leaves the transaction
-            # aborted, the ranking probe then fails with 25P02, and the whole
-            # ranking section degrades to ranking_unknown with degraded=true -- so a
-            # credibility hiccup would page someone about ranking health it never
-            # actually failed to read. Ranking first means only a genuine
-            # ranking-probe failure can raise that alarm; credibility inherits the
-            # aborted transaction instead, and "unknown" is already its documented
-            # fail-safe. (This paragraph used to justify itself with feeds_empty,
-            # a field #43 removed; the cascade is the same, the consequence is now
-            # a false ranking_unknown rather than a false "every feed is empty".)
+            # ORDER IS LOAD-BEARING, and the rule is: BOTH ranking probes, then
+            # credibility. These share one pooled connection and one transaction
+            # (the pool is not autocommit) and none of them rolls back on failure,
+            # so whichever fails first aborts the transaction and everything after
+            # it dies with 25P02 through no fault of its own. Something has to
+            # inherit that, and the only honest choice is the section whose
+            # fail-safe is already documented as such.
+            #
+            # Grouping the two ranking reads means a fault in either degrades ONE
+            # section -- ranking -- to ranking_unknown, which is true. Credibility
+            # then inherits any abort and reports "unknown", which is its documented
+            # fail-safe. The alternatives were both tried on this branch and both
+            # lied: servability in the MIDDLE let its failure fabricate four
+            # unhealthy credibility sources (live in CI, where the stack had no
+            # global_feed_cache, and green because the assertion said !anything);
+            # servability LAST let a credibility timeout blank the servability read
+            # and page someone with ranking_unknown for a fault ranking never had.
+            #
+            # A SAVEPOINT around each probe would remove the cascade rather than
+            # choosing who absorbs it, and is the durable fix if a fourth read is
+            # ever added here. Ordering is what this MR does because it is one line
+            # and the failure it prevents was live.
             ranking_probe = fetch_ranking_sources(conn)
-            probe = fetch_credibility_sources(conn)
-            # Ordering among the app-table probes is load-bearing too. All of
-            # these share one connection and one transaction, and none of them
-            # rolls back on failure (each explains why in its own docstring) --
-            # so whichever probe fails first aborts
-            # the transaction and everything after it dies with 25P02 through no
-            # fault of its own. Being last means a servability failure cannot
-            # invent a fault in the other two, and its own dependency is the
-            # heaviest: it reads app tables, not just pg_catalog, so it is the
-            # most likely of the three to hit a missing relation or a timeout.
-            # (This is the same cascade #57 ordered around; inserting a third
-            # read in the middle re-opened it, and it was live -- the CI stack has
-            # no global_feed_cache, so this probe raised on every run and
-            # credibility_sources reported "unknown" for four healthy sources.)
             servability = fetch_feed_servability(conn)
+            probe = fetch_credibility_sources(conn)
     except psycopg2.pool.PoolError as exc:
         # Monitors poll this route, so a persistently exhausted pool must not write a
         # traceback per scrape. Same treatment /sync-status gives the identical error,

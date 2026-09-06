@@ -249,7 +249,7 @@ There is also no staleness check: a ranker that stopped days ago leaves its last
 good 200 rows in place, and they keep resolving, so `global_feed` reads servable.
 **`/sync-status` does not answer this** — it reports the HAF context advanced by the
 `haf-fyp-sync` service, which keeps running when `haf-fyp-ranker` dies. The signal
-that does move with the ranker is `embedding_coverage.computed_at` in this same
+that does move with the ranker is the top-level `computed_at` in this same
 `/metrics` payload, refreshed on the ranker's hourly maintenance pass.
 
 After installing each external app, run:

@@ -160,18 +160,3 @@ def test_the_query_does_not_depend_on_search_path(conn):
             cur.execute(f"SET search_path TO {original}")
 
 
-def _candidate(cur, post_id, *, days_ago, hive_post_id):
-    cur.execute(
-        """
-        INSERT INTO haf_fyp_app.post_candidates (post_id, created_at, hive_post_id)
-        VALUES (
-            %s,
-            (SELECT last_block_time FROM haf_fyp_app.sync_status())
-                - make_interval(days => %s),
-            %s
-        )
-        """,
-        (post_id, days_ago, hive_post_id),
-    )
-
-

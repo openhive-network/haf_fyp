@@ -356,10 +356,18 @@ def build_ranking_sources_report(
         )
     elif not _readable(hivemind):
         state = RANKING_STATE_NO_FEED
+        # Names the actual state: this branch is `not readable`, which covers
+        # `unknown` (the probe could not answer) as well as a revoked grant, and
+        # telling someone to re-run grants for an unanswered probe is a wrong turn.
+        remedy = (
+            "re-run scripts/grant_cross_schema.sh"
+            if hivemind == STATE_UNREADABLE
+            else "the probe could not determine its state -- check the database"
+        )
         detail = (
-            f"{_HIVEMIND_KEY} is unreadable -- resolution has stopped; re-run "
-            "scripts/grant_cross_schema.sh. Already-rendered posts may still serve "
-            "from post_bridge_cache, so this is not necessarily a visible outage yet"
+            f"{_HIVEMIND_KEY} is {hivemind} -- resolution has stopped; {remedy}. "
+            "Already-rendered posts may still serve from post_bridge_cache, so this "
+            "is not necessarily a visible outage yet"
         )
     elif broken_resolver_inputs:
         # Without this branch the payload reported state ranking_full with detail

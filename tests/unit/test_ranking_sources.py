@@ -6,7 +6,7 @@ BUILDER, which is fed hand-written probe dicts. Everything here tests the parts 
 mutation review found untested — the probe that produces those dicts, the fetch
 wrapper's happy path, and the failure memo in the ranker. All three were survivable
 mutations: `fetch_ranking_sources` could be replaced with `return {}` and the whole
-suite stayed green, while reporting "every feed is empty" on a healthy node.
+suite stayed green, while reporting a fault on a healthy node.
 """
 
 import io
@@ -130,8 +130,8 @@ def test_empty_relations_makes_no_query():
 
 
 def test_fetch_returns_a_state_for_every_declared_source():
-    # The survivable mutation this kills: `return {}` here reports feeds_empty=true
-    # on a healthy node, i.e. a permanent false page, with every other test green.
+    # The survivable mutation this kills: `return {}` here makes every relation read
+    # unknown on a healthy node -- a permanent false fault, every other test green.
     conn = _conn([
         ("hivemind_app", "hive_posts", True, "r"),
         ("hivesense_app", "posts_vectors", True, "r"),
@@ -296,9 +296,9 @@ def test_metrics_probes_ranking_before_credibility(monkeypatch):
     pool is not autocommit), and fetch_credibility_sources deliberately does not roll
     back on failure -- its docstring justifies that with "/metrics issues no further
     statement after this". Run the other way round, a credibility hiccup leaves the
-    transaction aborted, the ranking probe fails with 25P02, and the report fails safe
-    to feeds_empty=true, which README and the route both tell operators to alert on.
-    A catalog-read timeout would page someone with "every feed is empty".
+    transaction aborted, the ranking probes fail with 25P02, and the whole ranking
+    section degrades to ranking_unknown with degraded=true -- paging someone about
+    ranking health that was never actually failed to read.
 
     Nothing else pins the order, so a refactor could swap two adjacent lines and the
     only symptom would be a false page months later.
@@ -345,7 +345,12 @@ def test_metrics_probes_ranking_before_credibility(monkeypatch):
     # This assertion exists because the fix removed its own detector. Creating the
     # table in ci_fastapi_setup.sql is what stops the probe raising there, so the
     # tavern stage can no longer notice a re-ordering. Nothing else would.
-    assert order.index("servability") > order.index("credibility")
+    # BOTH ranking reads before credibility. Something must inherit the aborted
+    # transaction when a probe fails, and the only honest candidate is the section
+    # whose fail-safe is already documented -- credibility's "unknown". Running
+    # servability AFTER credibility made a credibility timeout blank the servability
+    # read and page someone with ranking_unknown for a fault ranking never had.
+    assert order.index("servability") < order.index("credibility")
     # All three must receive the SAME connection, which is the premise the whole
     # ordering argument rests on -- give each its own _db_conn() block and the
     # rationale evaporates while the order assertions above still pass.
@@ -359,8 +364,8 @@ def test_metrics_feeds_each_probe_to_its_own_builder(monkeypatch):
 
     test_metrics.py exercises the builders in isolation with hand-written dicts, and
     the ordering test above stubs them out entirely, so nothing catches the ranking
-    builder being handed the credibility probe -- which would read feeds_empty=true
-    forever, the exact false page this section was written to prevent.
+    builder being handed the credibility probe -- which would report every ranking
+    relation as unknown forever, the exact false page this section exists to prevent.
     """
     from contextlib import contextmanager
 
