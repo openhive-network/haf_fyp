@@ -22,7 +22,12 @@ echo "==> Tearing down any previous run..."
 ${COMPOSE} down -v --remove-orphans 2>/dev/null || true
 
 echo "==> Starting CI test stack (detached)..."
-${COMPOSE} up --detach
+# --build, because THIS is the local entry point the compose header names. Without it
+# compose only builds when the derived image is absent, so after the first run an edit
+# to endpoints/rewrite_rules.conf or Dockerfile.rewriter is silently ignored and the
+# rewriter stages go green on the OLD rules -- the exact failure they exist to catch.
+# (It was first added to .gitlab-ci.yml, where dind caches nothing and it does nothing.)
+${COMPOSE} up --detach --build
 
 echo "==> Waiting for Tavern tests to complete..."
 ${COMPOSE} wait tavern

@@ -139,13 +139,18 @@ services:
     environment:
       POSTGREST_HOST: postgrest
       POSTGREST_PORT: 3000
+      # Without this the entrypoint writes `# rewrite_log off;` and the access log
+      # prints the ORIGINAL request line, not the rewritten target -- so `logs
+      # rewriter` in CI shows the status code the tavern stage already reported and
+      # cannot separate "the rule is wrong" from "the function is broken".
+      REWRITE_LOG: "on"
     depends_on:
       - postgrest
 
   tavern:
     image: python:3.12-slim
     command: >
-      sh -c "pip install tavern -q &&
+      sh -c "pip install tavern==3.6.3 -q &&
              pytest /tests/tavern/test_endpoints.tavern.yaml /tests/tavern/rewriter/ --tb=short -v"
     volumes:
       - ../tests/tavern:/tests/tavern:ro
