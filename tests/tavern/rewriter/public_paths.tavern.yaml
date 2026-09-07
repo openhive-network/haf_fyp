@@ -1,0 +1,355 @@
+---
+# EVERY RULE IN endpoints/rewrite_rules.conf GETS ITS OWN DOCUMENT.
+#
+# Not one document with all the stages: tavern aborts a document at its first failing
+# stage, so a single file would report one broken rule and never request the others. The
+# first revision of this lane did exactly that -- a stage-3 error meant stages 4-11 were
+# never sent, and a regenerated conf breaking three rules would have cost three
+# fix-and-rerun cycles to discover. One document per rule makes each independently
+# reported at no extra runtime.
+#
+# WHY status_code: 200 IS NOT ENOUGH. Six of the eleven functions behind these rules take
+# no arguments and answer 200 to a bare GET, so 200-only stages leave those rules freely
+# permutable with a green suite. Every stage therefore carries a DISCRIMINATOR that only
+# its intended target satisfies, and each is a SHAPE assertion -- it holds on an empty
+# result set, so nothing here depends on the ranker having run or on fixture rows
+# existing.
+#
+# Discriminator kinds:
+#   * select=<column>  -- PostgREST vertical filtering. A column the target does not
+#     return is 42703 -> 400. Also works against SCALAR-returning functions: select= on a
+#     text/json/jsonb return is 42703 too, so these bite even when the mis-target has no
+#     columns at all.
+#   * a unique PARAMETER -- PostgREST resolves an RPC by its named argument set, so an
+#     argument the target does not declare is PGRST202 -> 404.
+#   * a NEGATIVE select -- asserting a column the target does NOT have is rejected. Used
+#     where a positive probe cannot separate two candidates.
+#
+# NO COLUMN IS ASSUMED UNIQUE WITHOUT CHECKING. An earlier revision claimed "each column
+# is returned by exactly one function"; that was false -- `version` is returned by
+# get_health, get_algorithm AND list_algorithm_versions, and the resulting stage let
+# /v1/fyp/algorithm be repointed at get_health with the whole suite green. Uniqueness
+# below was taken from pg_get_function_result for all eleven functions, and the one
+# non-unique case is handled with two probes rather than one.
+
+test_name: rewrite rule - /health
+
+includes:
+  - !include ../common.yaml
+
+stages:
+  - name: /health reaches get_health
+    # last_processed_block is returned by get_health alone.
+    request:
+      url: "{rewriter_url}/health"
+      method: GET
+      params: {select: "last_processed_block"}
+    response: {status_code: 200}
+
+  - name: /health is anchored - a suffix does not reach it
+    request: {url: "{rewriter_url}/healthXYZ", method: GET}
+    response: {status_code: 404}
+
+  - name: /health is anchored at the front - a prefix does not reach it
+    # Doc-wide: every rule is ^...$ and a dropped LEADING ^ is as invisible to a suffix
+    # probe as a dropped trailing $ is to a positive one.
+    request: {url: "{rewriter_url}/prefix/health", method: GET}
+    response: {status_code: 404}
+
+---
+test_name: rewrite rule - /version
+
+includes:
+  - !include ../common.yaml
+
+stages:
+  - name: /version reaches get_version
+    # get_version is the only text-returning function in the schema; every other
+    # no-argument endpoint returns an object or an array, so the scalar type
+    # discriminates on its own.
+    request: {url: "{rewriter_url}/version", method: GET}
+    response:
+      status_code: 200
+      verify_response_with:
+        function: tavern.helpers:validate_content
+        extra_kwargs:
+          comparisons:
+            - {jmespath: "type(@)", operator: "eq", expected: "string"}
+
+  - name: /version is anchored - a suffix does not reach it
+    request: {url: "{rewriter_url}/versionXYZ", method: GET}
+    response: {status_code: 404}
+
+---
+test_name: rewrite rule - /sync-status
+
+includes:
+  - !include ../common.yaml
+
+stages:
+  - name: /sync-status reaches get_sync_status
+    # SHAPE only, deliberately. test_endpoints.tavern.yaml:225 already pins the fixture
+    # VALUES (5000000 / 2016-09-15T19:47:21) through the rewriter; repeating them here
+    # would duplicate that stage and contradict this file's own rule about data
+    # assertions. The two keys together are returned by no other endpoint.
+    request: {url: "{rewriter_url}/sync-status", method: GET}
+    response:
+      status_code: 200
+      verify_response_with:
+        function: tavern.helpers:validate_content
+        extra_kwargs:
+          comparisons:
+            - {jmespath: "type(last_block_num)", operator: "eq", expected: "number"}
+            - {jmespath: "type(last_block_time)", operator: "eq", expected: "string"}
+
+  - name: /sync-status is anchored - a suffix does not reach it
+    request: {url: "{rewriter_url}/sync-statusXYZ", method: GET}
+    response: {status_code: 404}
+
+---
+test_name: rewrite rule - /v1/fyp/algorithms
+
+includes:
+  - !include ../common.yaml
+
+stages:
+  - name: /v1/fyp/algorithms reaches list_algorithm_versions
+    # is_active is returned by list_algorithm_versions alone.
+    request:
+      url: "{rewriter_url}/v1/fyp/algorithms"
+      method: GET
+      params: {select: "is_active"}
+    response: {status_code: 200}
+
+  - name: /v1/fyp/algorithms is anchored - a suffix does not reach it
+    request: {url: "{rewriter_url}/v1/fyp/algorithmsXYZ", method: GET}
+    response: {status_code: 404}
+
+---
+test_name: rewrite rule - /v1/fyp/algorithm
+
+includes:
+  - !include ../common.yaml
+
+# THE HARDEST RULE IN THE FILE, and the one an earlier revision got wrong.
+#
+# get_algorithm's columns (version, description, weights, deployed_at) are a strict
+# SUBSET of list_algorithm_versions' (those plus is_active), and both take no arguments,
+# so no single positive probe separates them. That much the earlier revision had right.
+#
+# What it missed: get_health ALSO returns a `version` column and ALSO rejects is_active.
+# So `select=version -> 200` plus `select=is_active -> 400` narrows to
+# {get_algorithm, get_health}, not to get_algorithm -- and repointing this rule at
+# get_health shipped green, serving {"status":"ok",...} where the active algorithm
+# belongs. Measured on the live rewriter:
+#
+#     /health?select=version    -> 200        same as this rule's positive probe
+#     /health?select=is_active  -> 400        same as this rule's negative probe
+#
+# deployed_at is the column that closes it: returned by get_algorithm and
+# list_algorithm_versions, and by neither get_health nor anything else. Combined with the
+# is_active rejection it identifies get_algorithm uniquely.
+#
+#     /v1/fyp/algorithm?select=deployed_at -> 200
+#     /health?select=deployed_at           -> 400
+
+stages:
+  - name: /v1/fyp/algorithm answers with a column get_algorithm returns
+    request:
+      url: "{rewriter_url}/v1/fyp/algorithm"
+      method: GET
+      params: {select: "version"}
+    response: {status_code: 200}
+
+  - name: /v1/fyp/algorithm is not get_health - deployed_at is accepted
+    request:
+      url: "{rewriter_url}/v1/fyp/algorithm"
+      method: GET
+      params: {select: "deployed_at"}
+    response: {status_code: 200}
+
+  - name: /v1/fyp/algorithm is not list_algorithm_versions - is_active is rejected
+    request:
+      url: "{rewriter_url}/v1/fyp/algorithm"
+      method: GET
+      params: {select: "is_active"}
+    response: {status_code: 400}
+
+  - name: /v1/fyp/algorithm is anchored - a suffix does not reach it
+    # This is the probe an earlier revision claimed to have and did not. It asserted that
+    # /v1/fyp/algorithms still answers 200, reasoning that a de-anchored
+    # ^/v1/fyp/algorithm would swallow it. It cannot: `algorithms` is generated BEFORE
+    # `algorithm` and nginx rewrite/break is first-match-wins, so that stage passed under
+    # the mutation it named and required a compound de-anchor-AND-reorder to fail. A
+    # suffixed request on THIS path is the probe that actually discriminates -- with the
+    # anchor gone it becomes /rpc/get_algorithm and answers 200.
+    request: {url: "{rewriter_url}/v1/fyp/algorithmXYZ", method: GET}
+    response: {status_code: 404}
+
+---
+test_name: rewrite rule - /v1/fyp/global
+
+includes:
+  - !include ../common.yaml
+
+stages:
+  - name: /v1/fyp/global reaches get_global_feed
+    # community_id is declared by get_global_feed alone. get_personalized_feed -- the
+    # plausible mis-target, since both return a jsonb feed -- does not declare it, so a
+    # repointed rule is PGRST202 -> 404 rather than a 200 with the wrong feed.
+    request:
+      url: "{rewriter_url}/v1/fyp/global"
+      method: GET
+      params: {page-size: "1", community_id: "1"}
+    response: {status_code: 200}
+
+  - name: /v1/fyp/global is anchored - a suffix does not reach it
+    request: {url: "{rewriter_url}/v1/fyp/globalXYZ", method: GET}
+    response: {status_code: 404}
+
+---
+test_name: rewrite rule - /v1/fyp/feed-metrics
+
+includes:
+  - !include ../common.yaml
+
+stages:
+  - name: /v1/fyp/feed-metrics reaches get_feed_metrics
+    # `source` is declared by get_feed_metrics alone.
+    request:
+      url: "{rewriter_url}/v1/fyp/feed-metrics"
+      method: GET
+      params: {source: "global"}
+    response: {status_code: 200}
+
+  - name: /v1/fyp/feed-metrics is anchored - a suffix does not reach it
+    request: {url: "{rewriter_url}/v1/fyp/feed-metricsXYZ", method: GET}
+    response: {status_code: 404}
+
+---
+test_name: rewrite rule - /v1/fyp/profile/<username>
+
+includes:
+  - !include ../common.yaml
+
+stages:
+  - name: /v1/fyp/profile/<username> reaches get_user_profile
+    # posts_sampled is returned by get_user_profile alone. The username is deliberately
+    # absent from the fixture: this asserts ROUTING, and the function returns exactly one
+    # row even for an account with no profile.
+    request:
+      url: "{rewriter_url}/v1/fyp/profile/nonexistent-routing-probe"
+      method: GET
+      params: {select: "posts_sampled"}
+    response: {status_code: 200}
+
+  - name: /v1/fyp/profile is anchored - a suffix does not reach it
+    request: {url: "{rewriter_url}/v1/fyp/profileXYZ", method: GET}
+    response: {status_code: 404}
+
+  - name: the username capture does not span a slash
+    # ([^/]+) rather than (.+). Widening it is a plausible single edit in a generated
+    # file, and no positive probe would notice: /profile/a/b would answer 200 for the
+    # username "a/b". nginx replaces the WHOLE URI on a rewrite, so a widened capture
+    # silently swallows the extra segment rather than 404ing.
+    request: {url: "{rewriter_url}/v1/fyp/profile/nonexistent-routing-probe/extra", method: GET}
+    response: {status_code: 404}
+
+---
+test_name: rewrite rule - /v1/fyp/feed/<username>
+
+includes:
+  - !include ../common.yaml
+
+stages:
+  - name: /v1/fyp/feed/<username> reaches get_personalized_feed
+    # username + truncate_body together are declared by no other function: get_global_feed
+    # has truncate_body but not username; get_user_profile and get_score_explanation have
+    # username but not truncate_body.
+    request:
+      url: "{rewriter_url}/v1/fyp/feed/nonexistent-routing-probe"
+      method: GET
+      params: {page-size: "1", truncate_body: "1"}
+    response: {status_code: 200}
+
+  - name: /v1/fyp/feed is anchored - a suffix does not reach it
+    request: {url: "{rewriter_url}/v1/fyp/feedXYZ", method: GET}
+    response: {status_code: 404}
+
+  - name: the username capture does not span a slash
+    request: {url: "{rewriter_url}/v1/fyp/feed/nonexistent-routing-probe/extra", method: GET}
+    response: {status_code: 404}
+
+---
+test_name: rewrite rule - /v1/fyp/explain/<username>/<post_id>
+
+includes:
+  - !include ../common.yaml
+
+stages:
+  - name: /v1/fyp/explain/<username>/<post_id> reaches get_score_explanation
+    # score_credibility is returned by get_score_explanation alone. Both path segments
+    # must survive as separate captures ($1 and $2).
+    #
+    # A TRANSPOSED rule (username=$2&post_id=$1) is caught, but by a type accident rather
+    # than by design: post_id is BIGINT, so it fails the cast with 22P02. That only holds
+    # while this probe's username is non-numeric -- keep it non-numeric.
+    request:
+      url: "{rewriter_url}/v1/fyp/explain/nonexistent-routing-probe/1"
+      method: GET
+      params: {select: "score_credibility"}
+    response: {status_code: 200}
+
+  - name: /v1/fyp/explain is anchored - a trailing segment does not reach it
+    request:
+      url: "{rewriter_url}/v1/fyp/explain/nonexistent-routing-probe/1/extra"
+      method: GET
+    response: {status_code: 404}
+
+---
+test_name: rewrite rule - the OpenAPI spec root
+
+includes:
+  - !include ../common.yaml
+
+# `rewrite ^/$ / break;` exists solely to shield / from the catch-all below it. Delete it,
+# or move it below the catch-all, and / becomes /rpc/ -> 404: the published API document
+# -- the artefact the whole generator pipeline exists to produce, and the first thing a
+# third party fetches -- stops being served, with every other stage green.
+#
+# Discriminated on CONTENT rather than status, so a repoint at some other 200-answering
+# function is caught too.
+
+stages:
+  - name: / serves the OpenAPI document and is not proxied to a function
+    request: {url: "{rewriter_url}/", method: GET}
+    response:
+      status_code: 200
+      verify_response_with:
+        function: tavern.helpers:validate_content
+        extra_kwargs:
+          comparisons:
+            - {jmespath: "type(openapi)", operator: "eq", expected: "string"}
+
+---
+test_name: rewrite rule - the catch-all
+
+includes:
+  - !include ../common.yaml
+
+# `rewrite ^/(.*)$ /rpc/$1 break;` is the last rule and is load-bearing: README.md
+# documents `<anything else> -> /rpc/<anything else>`, and /get_health answers 200 through
+# the rewriter today while bare PostgREST 404s the same path.
+#
+# The anchor probes elsewhere in this file CANNOT stand in for this. They assert 404 on
+# suffixed paths, and those 404 with or without the catch-all -- PGRST202 through it,
+# 42P01 without it, same status either way. So deleting the catch-all left the entire
+# earlier revision of this lane green. A POSITIVE probe is the only thing that pins it.
+
+stages:
+  - name: an unmapped function name is forwarded to /rpc/
+    request:
+      url: "{rewriter_url}/get_health"
+      method: GET
+      params: {select: "last_processed_block"}
+    response: {status_code: 200}
