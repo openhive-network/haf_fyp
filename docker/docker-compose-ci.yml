@@ -121,6 +121,12 @@ services:
       PGRST_DB_URI: "postgres://postgres:postgres@postgres/haf_block_log"
       PGRST_DB_SCHEMA: "haf_fyp_endpoints"
       PGRST_DB_ANON_ROLE: "haf_fyp_user"
+      # The deployment sets this (PGRST_DB_ROOT_SPEC=root on haf-haf-fyp-postgrest-1)
+      # and CI did not, so GET / served PostgREST's own auto-generated Swagger here
+      # while serving haf_fyp_endpoints.root()'s OpenAPI document in production --
+      # and root(), a shipped endpoint, was exercised by nothing. Without it the
+      # `^/$` rewrite rule cannot be tested for what it actually does.
+      PGRST_DB_ROOT_SPEC: "root"
       PGRST_DB_POOL: "5"
     depends_on:
       setup:
