@@ -211,6 +211,13 @@ python-tests:
     # the bash harness does -- a silent skip would put the compose file, and the
     # profile that keeps the destructive teardown from running on `up`, back to
     # uncovered.
+    # git: tests/unit/test_openapi_drift_gate.py drives the openapi-drift job's real
+    # drift check against throwaway repositories, so it needs a real git -- the whole
+    # point is that the gate's pass/fail is exercised rather than paraphrased.
+    # python:3.11-slim does not ship one. That module FAILS rather than skips when git
+    # is missing under CI, for the same reason the bash harness does: a silent skip
+    # would put the gate itself back to uncovered.
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git >/dev/null
     - pip install -r requirements.txt pytest pytest-cov httpx pyyaml -q
     - PYTHONPATH=. pytest tests/unit/ -v --cov=haf_fyp --cov-report=term-missing --cov-fail-under=40
   rules:

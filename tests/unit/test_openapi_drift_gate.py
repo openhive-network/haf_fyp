@@ -14,6 +14,7 @@ covered here is the part that decides pass from fail.
 """
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -25,6 +26,24 @@ try:
     import yaml
 except ImportError:  # pragma: no cover - depends on the environment, not the code
     yaml = None
+
+
+def require_git():
+    """The rule shell_harness.require_bash applies to bash, applied to git.
+
+    These tests drive real `git status` semantics -- that it exits 0 whether clean or
+    dirty, and that it sees untracked files where `git diff` does not. Stubbing that out
+    would test a paraphrase of the gate rather than the gate. Skipping in CI would be a
+    hole: the four behavioural tests would silently stop running and the pipeline would
+    stay green with the gate uncovered, which is the exact shape #45 exists to close.
+    """
+    found = shutil.which("git")
+    if found:
+        return found
+    if os.environ.get("CI"):
+        pytest.fail("git is unavailable, so the openapi-drift gate tests cannot run in CI")
+    pytest.skip("git is required to exercise the drift gate")
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _require_yaml():
@@ -60,14 +79,15 @@ def _drift_block() -> str:
 
 def _repo(tmp_path: Path) -> Path:
     """A minimal git repo with a tracked endpoints/ directory."""
-    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.email", "t@t"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True)
+    git = require_git()
+    subprocess.run([git, "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run([git, "config", "user.email", "t@t"], cwd=tmp_path, check=True)
+    subprocess.run([git, "config", "user.name", "t"], cwd=tmp_path, check=True)
     (tmp_path / "endpoints").mkdir()
     (tmp_path / "endpoints" / "endpoint_schema.sql").write_text("original\n", encoding="utf-8")
     (tmp_path / "endpoints" / "rewrite_rules.conf").write_text("rules\n", encoding="utf-8")
-    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "commit", "-qm", "init"], cwd=tmp_path, check=True)
+    subprocess.run([git, "add", "-A"], cwd=tmp_path, check=True)
+    subprocess.run([git, "commit", "-qm", "init"], cwd=tmp_path, check=True)
     return tmp_path
 
 
