@@ -765,7 +765,10 @@ DECLARE
             "name": "community_id",
             "required": false,
             "schema": {
-              "type": "integer",
+              "type": [
+                "integer",
+                "null"
+              ],
               "default": null
             },
             "description": "Filter results to a specific community (optional)"
@@ -971,7 +974,10 @@ DECLARE
             "required": false,
             "schema": {
               "x-sql-datatype": "DATE",
-              "type": "string",
+              "type": [
+                "string",
+                "null"
+              ],
               "format": "date",
               "default": null
             },
@@ -983,7 +989,10 @@ DECLARE
             "required": false,
             "schema": {
               "x-sql-datatype": "DATE",
-              "type": "string",
+              "type": [
+                "string",
+                "null"
+              ],
               "format": "date",
               "default": null
             },
@@ -994,7 +1003,10 @@ DECLARE
             "name": "algorithm_version",
             "required": false,
             "schema": {
-              "type": "string",
+              "type": [
+                "string",
+                "null"
+              ],
               "default": null
             },
             "description": "Filter to one algorithm version (optional)"
@@ -1004,7 +1016,10 @@ DECLARE
             "name": "source",
             "required": false,
             "schema": {
-              "type": "string",
+              "type": [
+                "string",
+                "null"
+              ],
               "default": null
             },
             "description": "Filter to 'personalized' or 'global' (optional)"
@@ -1724,7 +1739,7 @@ $$;
         name: community_id
         required: false
         schema:
-          type: integer
+          type: [integer, 'null']
           default: null
         description: Filter results to a specific community (optional)
       - in: query
@@ -2050,7 +2065,7 @@ $$;
         required: false
         schema:
           x-sql-datatype: DATE
-          type: string
+          type: [string, 'null']
           format: date
           default: null
         description: Inclusive start date (YYYY-MM-DD). Default 30 days ago.
@@ -2059,7 +2074,7 @@ $$;
         required: false
         schema:
           x-sql-datatype: DATE
-          type: string
+          type: [string, 'null']
           format: date
           default: null
         description: Inclusive end date (YYYY-MM-DD). Default today.
@@ -2067,14 +2082,14 @@ $$;
         name: algorithm_version
         required: false
         schema:
-          type: string
+          type: [string, 'null']
           default: null
         description: Filter to one algorithm version (optional)
       - in: query
         name: source
         required: false
         schema:
-          type: string
+          type: [string, 'null']
           default: null
         description: Filter to 'personalized' or 'global' (optional)
     responses:
