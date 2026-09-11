@@ -95,6 +95,109 @@ compose-validate:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
+openapi-drift:
+  stage: lint
+  image: python:3.12-slim
+  variables:
+    # Pinned, for the reason sql-lint pins sqlfluff and shell-lint pins shellcheck: an
+    # unpinned tool means a drifting build can fail unchanged code. scripts/openapi_rewrite.sh
+    # defaults to COMMON_CI_REF=develop, so without this the job would fetch a NEW generator
+    # on every run and an upstream edit to process_openapi.py would turn this pipeline red
+    # with no change in this repo. Same SHA hive/haf_stats pins; verified to reproduce the
+    # committed endpoints/ byte-for-byte.
+    #
+    # The script's own default stays "develop" for local runs, so a developer regenerating
+    # by hand can still produce output this job rejects. They agree today; if they diverge,
+    # bump both together.
+    COMMON_CI_REF: "96889a650b3f45244cecc4bb3f250af439a71900"
+  script:
+    # endpoints/endpoint_schema.sql's embedded spec and endpoints/rewrite_rules.conf are
+    # GENERATED from the /** openapi:paths */ annotations, by a script a developer is
+    # expected to remember to run ("Run this after adding or changing endpoint
+    # annotations, then commit the result"). Nothing enforced it, so an annotation edit
+    # without a regeneration -- or a hand-edit of either generated file -- shipped
+    # silently, and the spec served at / could advertise a path the rewriter does not
+    # route: a third party reads the spec, requests the path, gets a 404, and every job
+    # in the pipeline is green. (#45)
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl >/dev/null
+    - bash scripts/openapi_rewrite.sh
+    # Assert the pathspec below still resolves: see the note in that block.
+    - git ls-files --error-unmatch endpoints/endpoint_schema.sql endpoints/rewrite_rules.conf >/dev/null
+    - |
+      # git status, not `git diff`: diff ignores UNTRACKED files. Today the generator can
+      # only ever rewrite two already-tracked paths, so that arm is belt-and-braces rather
+      # than load-bearing -- but it costs nothing and stops being theoretical the moment a
+      # generated artefact is added. --porcelain is stable output by contract.
+      #
+      # The pathspec scopes this to endpoints/. Note a pathspec matching NOTHING also
+      # yields empty output and a pass, so the ls-files check above asserts the two files
+      # still exist under that path; without it, renaming endpoints/ would leave this job
+      # reporting success forever. The script's leftovers (scripts/process_openapi.py,
+      # scripts/openapi_out/, a repo-root rewrite_rules.conf) are outside the pathspec;
+      # openapi_out/ and the root conf are removed by the script, process_openapi.py is
+      # gitignored and deliberately kept.
+      #
+      # `git status --porcelain` exits 0 whether the tree is clean or dirty -- drift is
+      # signalled by non-empty OUTPUT, never by the exit code. (`git diff --exit-code` is
+      # the command with the 0/1/>=128 taxonomy; it is not used here because it ignores
+      # untracked files.) So a non-zero status from THIS command is only ever a real git
+      # failure -- dubious ownership, a GIT_STRATEGY override -- and reporting it as
+      # "endpoints/ is not what the generator produces" would print an EMPTY diff and send
+      # the author off to regenerate a file that was already correct.
+      # `if ! changed=$(...)`, not a separate $? test: gitlab-runner emits `set -eo pipefail`
+      # at the top of the job script, so a failing command substitution in a plain
+      # assignment kills the shell before $? is ever read.
+      if ! changed="$(git status --porcelain -- endpoints/)"; then
+        echo "ERROR: git failed -- this is a runner problem, not drift."
+        exit 1
+      fi
+      if [ -n "$changed" ]; then
+        echo "ERROR: endpoints/ is not what scripts/openapi_rewrite.sh generates."
+        echo "Run it locally and commit the result."
+        echo "$changed"
+        git --no-pager diff -- endpoints/
+        exit 1
+      fi
+    - echo "endpoints/ matches the generator."
+    # Generator fidelity is not the same as spec conformance, and this repo proved it: the
+    # committed document reproduced its annotations exactly and this step still rejected
+    # it. Five optional query parameters carried `default: null` against a scalar `type`.
+    #
+    # Be precise about what that violated, because it is not the meta-schema: OpenAPI 3.1
+    # defers to JSON Schema 2020-12, where `default` is an ANNOTATION and is only
+    # RECOMMENDED to validate against its own schema -- the official 3.1 meta-schema
+    # accepts those five. It is openapi-spec-validator that enforces the stricter OpenAPI
+    # 3.0 rule ("this value MUST conform to the defined type") against 3.1 documents. We
+    # obey it rather than carry an exception, because the nullable union is what the
+    # document should have said anyway, and is what endpoint_schema.sql already documents
+    # as this repo's rule ("["string", "null"], not `nullable: true`").
+    #
+    # A diff check alone stays green on all of it. Validate what we actually serve.
+    # Pinned for the same reason as the generator above: a validator release that adds or
+    # tightens an OpenAPI 3.1 rule would fail this pipeline with no repo change.
+    - pip install openapi-spec-validator==0.9.0 -q
+    - |
+      python - <<'PYEOF'
+      import re, sys, json
+      from openapi_spec_validator import OpenAPIV31SpecValidator
+      src = open("endpoints/endpoint_schema.sql", encoding="utf-8").read()
+      m = re.search(r"openapi json = \$\$(.*?)\$\$;", src, re.S)
+      if not m:
+          sys.exit("could not extract the embedded OpenAPI blob")
+      errs = list(OpenAPIV31SpecValidator(json.loads(m.group(1))).iter_errors())
+      for e in errs:
+          # e.absolute_path is [] for a default-value failure -- the validator reports it
+          # against the sub-schema, not the document -- so json_path alone names nothing
+          # useful. Print the schema too, or the author gets five identical lines.
+          print("INVALID:", e.json_path, list(e.absolute_schema_path), "-", e.message)
+          print("         schema:", e.schema)
+      sys.exit(1 if errs else 0)
+      PYEOF
+    - echo "served OpenAPI document is valid."
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
 python-tests:
   extends: .python-cache
   stage: test
@@ -108,6 +211,13 @@ python-tests:
     # the bash harness does -- a silent skip would put the compose file, and the
     # profile that keeps the destructive teardown from running on `up`, back to
     # uncovered.
+    # git: tests/unit/test_openapi_drift_gate.py drives the openapi-drift job's real
+    # drift check against throwaway repositories, so it needs a real git -- the whole
+    # point is that the gate's pass/fail is exercised rather than paraphrased.
+    # python:3.11-slim does not ship one. That module FAILS rather than skips when git
+    # is missing under CI, for the same reason the bash harness does: a silent skip
+    # would put the gate itself back to uncovered.
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git >/dev/null
     - pip install -r requirements.txt pytest pytest-cov httpx pyyaml -q
     - PYTHONPATH=. pytest tests/unit/ -v --cov=haf_fyp --cov-report=term-missing --cov-fail-under=40
   rules:
