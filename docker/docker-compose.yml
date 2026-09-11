@@ -212,8 +212,12 @@ services:
   postgrest:
     image: postgrest/postgrest:${POSTGREST_VERSION}
     restart: unless-stopped
+    # Moved off 3001, which the rewriter now owns. PostgREST stays published so the raw
+    # /rpc/ surface is still reachable for debugging -- the rewriter cannot serve it,
+    # because its generated catch-all (`rewrite ^/(.*)$ /rpc/$1`) would turn
+    # /rpc/get_health into /rpc/rpc/get_health.
     ports:
-      - "${API_PORT:-3001}:3000"
+      - "${POSTGREST_HOST_PORT:-3000}:3000"
     environment:
       PGRST_DB_URI:                "postgres://haf_fyp_user@haf/haf_block_log"
       PGRST_DB_SCHEMA:             "haf_fyp_endpoints"
@@ -224,6 +228,38 @@ services:
     depends_on:
       haf-fyp-setup:
         condition: service_completed_successfully
+
+  # The public read API. Without this service `docker compose up` served bare PostgREST,
+  # so every /v1/fyp/... path this repo documents -- in the README tables, in the OpenAPI
+  # annotations, and in the spec served at / -- 404'd on the stack an operator actually
+  # runs. Dockerfile.rewriter existed and CI published the image; nothing ran it. (#38)
+  haf-fyp-rewriter:
+    image: ${HAF_FYP_REWRITER_IMAGE:-${HAF_FYP_REWRITER_REGISTRY:-registry.gitlab.syncad.com/hive}/haf_fyp/rewriter:${HAF_FYP_REWRITER_VERSION:-latest}}
+    build:
+      context: ..
+      dockerfile: Dockerfile.rewriter
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-3001}:80"
+    environment:
+      # NOT the image default. docker/rewriter_entrypoint.sh defaults POSTGREST_HOST to
+      # `haf-fyp-postgrest`, the name a haf_api_node deployment uses; this compose file
+      # names the service plain `postgrest`, so the default resolves to nothing here and
+      # every request would 502. The entrypoint comment says so explicitly: "Whoever adds
+      # one must set POSTGREST_HOST: postgrest, or rename the service to match."
+      POSTGREST_HOST: "${POSTGREST_HOST:-postgrest}"
+      POSTGREST_PORT: "${POSTGREST_PORT:-3000}"
+    healthcheck:
+      # The image serves /health on :81, a second server block separate from the :80
+      # proxy, so this probes the container without going through PostgREST.
+      test: ["CMD-SHELL", "wget --timeout=2 -nv -t1 --spider 127.0.0.1:81/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 10
+    depends_on:
+      postgrest:
+        condition: service_started
 
   redis:
     image: redis:7-alpine

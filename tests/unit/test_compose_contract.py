@@ -179,3 +179,183 @@ def test_no_inverted_pipeline_assertions_in_ci():
         and "#" not in line.split("!")[0]
     ]
     assert not offenders, f"inverted-pipeline assertions cannot fail a job: {offenders}"
+
+
+# --- published ports: uniqueness AND ownership (#38) --------------------------------
+#
+# `docker compose up` served bare PostgREST until #38, so every /v1/fyp/... path this
+# repo documents 404'd on the shipped stack. Adding the rewriter fixes that; these guard
+# the fix, because two different single-character edits silently undo it.
+#
+# Ported from hive/haf_stats' equivalent (!86, its #61), which is the same defect in the
+# sibling app. Two lessons from there are load-bearing here:
+#
+#  - `docker compose config` performs NO host-port uniqueness check. A file with two
+#    services on the same port validates cleanly and fails only at `up`, on whichever
+#    service loses the race.
+#  - docker/.env is TRACKED and compose auto-loads it, so a value there OVERRIDES the
+#    ${VAR:-default} in the compose file. Checking only the defaults reports no collision
+#    on a stack that cannot start.
+#
+# A uniqueness check alone is not enough: swapping the rewriter and PostgREST keeps every
+# port unique while putting the raw /rpc/ surface back on the documented URL -- exactly
+# the state #38 describes. So ownership is asserted too, host AND container half: the
+# rewriter's public server is :80 and its :81 is a health stub that answers everything,
+# so forwarding 3001 to :81 would publish an unconditional 204 as the front door with the
+# host map unchanged.
+ENV_FILE = ROOT / "docker" / ".env"
+CI_COMPOSE = ROOT / "docker" / "docker-compose-ci.yml"
+REWRITER = "haf-fyp-rewriter"
+POSTGREST = "postgrest"
+
+# 5432 is deliberately absent: it is a plain literal here, and pinning a port an operator
+# may legitimately move turns a legal change into a test failure.
+PORT_OWNERS = {"3000": (POSTGREST, "3000"), "3001": (REWRITER, "80")}
+
+_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-([^{}]*)\}")
+
+
+def _read_env(path: Path) -> dict:
+    """Parse a .env the way compose does, not the way a first draft assumed.
+
+    `export API_PORT=3001`, `API_PORT="3001"`, `API_PORT=3001 # front door` and the
+    COMBINATION of the last two are all compose-legal and all set the port. Mishandling
+    any of them reports no collision on a file that cannot start.
+    """
+    env = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip().lstrip("﻿")
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if value[:1] in ("'", '"'):
+            # Quoted: the closing quote ends the value; anything after it is a comment.
+            # Handling this only when the quote is the LAST character missed
+            # `API_PORT="3001" # front door` entirely.
+            close = value.find(value[0], 1)
+            value = value[1:close] if close != -1 else value[1:]
+        else:
+            value = value.split(" #", 1)[0].strip()
+        env[key.strip()] = value
+    return env
+
+
+def _resolve(text, env: dict) -> str:
+    """Expand ${VAR:-default} with compose's semantics.
+
+    `:-` falls back when the variable is unset OR EMPTY. `env.get(name, default)` gets
+    the empty case wrong, and an empty value is what someone leaves behind when they
+    blank a line out rather than deleting it.
+    """
+    out, passes = str(text), 0
+    while "${" in out and passes < 10:                # ${A:-${B:-3001}} nests
+        out = _VAR.sub(lambda m: env.get(m.group(1)) or m.group(2), out)
+        passes += 1
+    assert "$" not in out, (
+        f"unresolved variable in {text!r}. Only ${{VAR:-default}} is handled -- give it a "
+        f"default, or teach _resolve the form you need.")
+    return out
+
+
+def _ports(spec, env: dict):
+    """(host, container) for one `ports:` entry, in every form compose accepts.
+
+    A mis-parsed entry is silent: it yields a key that collides with nothing. The
+    container half matters as much as the host half -- moving the rewriter's target from
+    :80 to :81 publishes the health stub, an unconditional 204, as the front door, while
+    every host port stays exactly where it was.
+    """
+    if isinstance(spec, dict):                        # long form
+        host = _resolve(spec.get("published", ""), env).split("/")[0]
+        return host, _resolve(spec.get("target", ""), env)
+    text = _resolve(spec, env).split("/")[0]          # drop a /tcp suffix
+    parts = text.split(":")
+    if len(parts) == 1:
+        return "", parts[0]                           # `- "80"` is a CONTAINER port
+    host, container = parts[-2], parts[-1]
+    assert re.fullmatch(r"\d+(-\d+)?", host), f"unparsed host port {host!r} in {spec!r}"
+    return host, container
+
+
+def _expand(host: str) -> list:
+    lo, _, hi = host.partition("-")
+    if not hi:
+        return [lo]
+    lo_n, hi_n = int(lo), int(hi)
+    assert lo_n <= hi_n, f"reversed port range {host!r}"
+    # A wide range would otherwise render thousands of entries into the assertion
+    # message, burying the diagnosis in the CI log.
+    assert hi_n - lo_n <= 64, f"port range {host!r} is too wide to check meaningfully"
+    return [str(n) for n in range(lo_n, hi_n + 1)]
+
+
+def _published(doc: dict, env: dict) -> dict:
+    seen = {}
+    for name, svc in doc["services"].items():
+        for spec in (svc or {}).get("ports", []) or []:
+            host, _container = _ports(spec, env)
+            if not host:
+                continue
+            for port in _expand(host):
+                assert port not in seen, (
+                    f"{name} and {seen[port]} both publish host port {port}. "
+                    f"`docker compose up -d` fails with `port is already allocated` and "
+                    f"whichever service loses the race never starts.")
+                seen[port] = name
+    return seen
+
+
+def _check_ports(doc: dict, env: dict, lane: str):
+    seen = _published(doc, env)
+    targets = {}
+    for name, svc in doc["services"].items():
+        for spec in (svc or {}).get("ports", []) or []:
+            host, container = _ports(spec, env)
+            if host:
+                targets[host] = container
+    for port, (owner, container) in PORT_OWNERS.items():
+        assert seen.get(port) == owner, (
+            f"[{lane}] host port {port} is published by {seen.get(port)}, not {owner}. "
+            f"3001 is the base URL the README documents and must reach the rewriter; "
+            f"swapping these keeps every port unique and silently restores the bug.")
+        assert targets.get(port) == container, (
+            f"[{lane}] host port {port} forwards to container port {targets.get(port)}, "
+            f"not {container}. The published port then connects to nothing, or -- for "
+            f"the rewriter's :81 -- to the health stub that answers everything.")
+
+
+def test_no_two_services_publish_the_same_host_port():
+    """The failure this catches is invisible to `docker compose config`."""
+    yaml_mod = _require_yaml()
+    env = _read_env(ENV_FILE)
+    for path in (COMPOSE, CI_COMPOSE):
+        doc = yaml_mod.safe_load(path.read_text(encoding="utf-8"))
+        _published(doc, env)
+
+
+def test_documented_ports_reach_the_right_service():
+    """3001 is the base URL the README documents and must reach the rewriter."""
+    yaml_mod = _require_yaml()
+    env = _read_env(ENV_FILE)
+    doc = yaml_mod.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    _check_ports(doc, env, "docker-compose.yml")
+
+
+def test_rewriter_overrides_the_image_default_postgrest_host():
+    """docker/rewriter_entrypoint.sh defaults POSTGREST_HOST to `haf-fyp-postgrest`, the
+    name a haf_api_node deployment uses. This compose file names the service plain
+    `postgrest`, so the default resolves to nothing and every request 502s. The entrypoint
+    says so in a comment; nothing enforced it until the service existed to enforce it on.
+    """
+    yaml_mod = _require_yaml()
+    doc = yaml_mod.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    env = (doc["services"][REWRITER].get("environment") or {})
+    assert "POSTGREST_HOST" in env, (
+        "haf-fyp-rewriter must set POSTGREST_HOST; the image default does not resolve here"
+    )
+    assert POSTGREST in str(env["POSTGREST_HOST"]), (
+        f"POSTGREST_HOST must point at the `{POSTGREST}` service, got {env['POSTGREST_HOST']!r}"
+    )

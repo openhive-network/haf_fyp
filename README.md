@@ -25,7 +25,7 @@ hived ──► sql_serializer ──► HAF PostgreSQL
                                    │
                              feed_cache
                                    │
-                    PostgREST (port 3001) + FastAPI (port 3002)
+         rewriter (port 3001) -> PostgREST  +  FastAPI (port 3002)
 ```
 
 ## Stack
@@ -291,11 +291,14 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml up --bu
 
 # 3. Start the full stack
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml up \
-  haf-fyp-sync haf-fyp-ranker haf-fyp-api postgrest redis
+  haf-fyp-sync haf-fyp-ranker haf-fyp-api postgrest haf-fyp-rewriter redis
 
 # 4. Smoke test
-curl http://localhost:3001/rpc/get_health
-curl http://localhost:3001/rpc/get_algorithm
+curl http://localhost:3001/health
+curl http://localhost:3001/v1/fyp/algorithm
+#    Raw PostgREST stays on 3000 for debugging; it is NOT reachable through the
+#    rewriter, whose generated catch-all rewrites /rpc/x to /rpc/rpc/x.
+curl http://localhost:3000/rpc/get_health
 
 # 5. After installing Hivemind (required) / HiveSense / btracker / reptracker
 #    — grant cross-schema access
@@ -305,9 +308,9 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml run --r
 
 ## API Endpoints
 
-All read endpoints are served by PostgREST on port 3001. The FastAPI overlay on port 3002 handles write operations and admin actions.
+All read endpoints are served through the **rewriter on port 3001**, which maps the clean paths onto PostgREST's `/rpc/` calls. That is the documented, supported surface and the one `haf_api_node` consumes. PostgREST itself is published on port 3000 for debugging. The FastAPI overlay on port 3002 handles write operations and admin actions.
 
-### PostgREST (port 3001)
+### Read API (rewriter, port 3001)
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -508,7 +511,7 @@ haf-fyp-uninstall  # removes the app from the database — profile "haf-fyp-unin
                    # starts on a plain `up` (Dockerfile.sql)
 haf-fyp-ranker     # Python ranking daemon, 5-minute cycles (Dockerfile.python)
 haf-fyp-api        # FastAPI overlay on port 3002 (Dockerfile.python)
-postgrest          # PostgREST on port 3001
+postgrest          # PostgREST on port 3000 (raw /rpc/, for debugging)
 redis              # pub/sub for force-refresh signals
 ```
 
@@ -702,7 +705,9 @@ unchanged and every key expires with its window.
 
 ```bash
 # PostgREST must be running
-API_URL=http://localhost:3001 tavern-ci tests/tavern/test_endpoints.tavern.yaml
+# This suite drives the raw /rpc/ surface, so point it at PostgREST (3000), not the
+# rewriter (3001). tests/tavern/rewriter/ is the suite that exercises the clean paths.
+API_URL=http://localhost:3000 tavern-ci tests/tavern/test_endpoints.tavern.yaml
 ```
 
 ## SQL Linting

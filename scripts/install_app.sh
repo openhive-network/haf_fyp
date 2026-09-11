@@ -207,6 +207,34 @@ BEGIN
 END
 \$\$;"
 
+#    pgvector. db/create_tables.sql declares `interest_vector vector(1024)`, so the
+#    extension is a hard prerequisite -- but it was documented only in comments here and
+#    in the README, and nothing checked it. haf_api_node never creates it (`git grep -i
+#    pgvector` on develop: no hits); today it arrives with HiveSense.
+#
+#    Without it the install got as far as step 3 and died on `type "vector" does not
+#    exist`, AFTER roles and the schema had been created, then crash-looped under
+#    `restart: on-failure`. It does recover -- every DDL is IF NOT EXISTS, so creating
+#    the extension and re-running works -- but the operator had to infer that from a
+#    loop. Checked here, before any mutation, like the context-owner check above.
+#
+#    Deliberately not `CREATE EXTENSION`: that needs superuser, this script runs as
+#    haf_admin, and silently installing an extension into someone else's cluster is not
+#    this installer's call.
+psql_cmd -v ON_ERROR_STOP=on -c "
+DO \$\$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN
+        RAISE EXCEPTION
+            'pgvector is not installed on this database. haf_fyp stores interest '
+            'vectors as vector(1024), so installation would fail partway through, '
+            'after creating roles and the schema. Run: CREATE EXTENSION IF NOT '
+            'EXISTS vector; as a superuser, then re-run this script. Nothing has '
+            'been modified.';
+    END IF;
+END
+\$\$;"
+
 log "Installing haf_fyp schema..."
 
 # 1. Roles (must run as haf_admin)
