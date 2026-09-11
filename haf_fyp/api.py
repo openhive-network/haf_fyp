@@ -18,6 +18,7 @@ Redis pub/sub signals the ranker for on-demand feed refresh after interest updat
 from __future__ import annotations
 
 import functools
+import hmac
 import inspect
 import math
 import ipaddress
@@ -803,7 +804,46 @@ async def lifespan(app: FastAPI):
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="haf_fyp", version="1.0.0", lifespan=lifespan)
+# ---------------------------------------------------------------------------
+# INTERACTIVE DOCS ARE OFF BY DEFAULT (#39).
+#
+# This app is the ADMIN surface: on a node it is served under /haf-fyp-admin/,
+# and its routes include POST /v1/fyp/admin/algorithm. FastAPI's defaults would
+# publish /docs, /redoc and /openapi.json on every node that runs it, which
+# hands an unauthenticated visitor a ready-made request builder for the admin
+# endpoint, an enumeration of every route, and a Swagger UI that pulls its
+# assets from cdn.jsdelivr.net -- a third-party dependency on the request path
+# of an admin console.
+#
+# None of that is a hole by itself: the endpoint is API-key gated and rate
+# limited. It is disclosure and convenience-for-an-attacker, and there is no
+# reason a public node should offer it.
+#
+# Set HAF_FYP_ENABLE_DOCS=true for local development to get them back. The flag
+# is read once at import, like every other setting here -- flipping it needs a
+# restart, which is correct for something that changes the published surface.
+#
+# openapi_url is gated with the other two deliberately. Leaving it on would keep
+# the machine-readable route list public, which is the half that actually helps
+# an attacker; and FastAPI's Swagger UI fetches it, so docs cannot work without
+# it. Nothing in CI or tests reads it (verified by grep across .gitlab-ci.yml,
+# tests/ and scripts/), so turning it off breaks no lane.
+# ---------------------------------------------------------------------------
+_DOCS_ENABLED = os.environ.get("HAF_FYP_ENABLE_DOCS", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+app = FastAPI(
+    title="haf_fyp",
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url="/docs" if _DOCS_ENABLED else None,
+    redoc_url="/redoc" if _DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if _DOCS_ENABLED else None,
+)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(RateLimitBeforeValidationMiddleware)
@@ -991,7 +1031,7 @@ def _publish_refresh(username: str) -> None:
     """Fire-and-forget Redis signal so the ranker can refresh immediately."""
     try:
         r = redis_lib.Redis(
-            host=os.environ.get("REDIS_HOST", "redis"),
+            host=os.environ.get("REDIS_HOST", "haf-fyp-redis"),
             port=int(os.environ.get("REDIS_PORT", "6379")),
             decode_responses=True,
             socket_connect_timeout=1,
@@ -1602,7 +1642,20 @@ def activate_algorithm(
     variable. The ranker will pick up the new weights on its next cycle.
     """
     admin_key = os.environ.get("ADMIN_API_KEY", "")
-    if not admin_key or x_admin_key != admin_key:
+    # compare_digest, not `!=` (#39). A plain string compare returns at the first
+    # differing byte, so its timing is a prefix oracle: an attacker who can measure
+    # it recovers the key one byte at a time instead of guessing it whole. The
+    # 5/minute per-IP limit dominates that signal today, which is why this is low
+    # severity -- but the constant-time compare is free, and the limit is not the
+    # thing that should be carrying this.
+    #
+    # ENCODE FIRST. hmac.compare_digest raises TypeError on a str containing
+    # non-ASCII -- and x_admin_key is an attacker-controlled header, so passing the
+    # str form directly turns `X-Admin-Key: é` into an uncaught 500 instead of a
+    # 403. Comparing UTF-8 bytes is defined for every input.
+    if not admin_key or not hmac.compare_digest(
+        x_admin_key.encode("utf-8"), admin_key.encode("utf-8")
+    ):
         # Charged on the FAILURE branch only. Every guess is a failed comparison, so
         # the ceiling still bounds brute force at 30/minute -- but the holder of the
         # correct key never spends it, which is what stops six addresses of wrong

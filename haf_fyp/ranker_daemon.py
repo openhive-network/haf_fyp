@@ -151,7 +151,7 @@ def _redis_subscriber(refresh_q: "queue.Queue[str]") -> None:
     while True:
         try:
             r = redis_lib.Redis(
-                host=os.environ.get("REDIS_HOST", "redis"),
+                host=os.environ.get("REDIS_HOST", "haf-fyp-redis"),
                 port=int(os.environ.get("REDIS_PORT", "6379")),
                 decode_responses=True,
                 socket_connect_timeout=5,
