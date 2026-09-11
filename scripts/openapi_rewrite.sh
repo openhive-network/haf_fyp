@@ -11,11 +11,33 @@ SCRIPTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENDPOINTS_DIR="${SCRIPTDIR}/../endpoints"
 OUTPUT_DIR="${SCRIPTDIR}/openapi_out"
 
-COMMON_CI_REF="${COMMON_CI_REF:-develop}"
+# PINNED, not "develop": the generator is fetched at run time, so a moving ref means
+# the same annotations can produce different artifacts on different days with nothing
+# to signal it.
+#
+# This default MUST match COMMON_CI_REF in .gitlab-ci.yml's openapi-drift job, which
+# pins the same SHA. It only applies to a developer running the script by hand, and the
+# whole point is that they regenerate with the generator CI validates against -- an
+# earlier revision of this line defaulted to "develop", which let local and CI drift
+# apart silently, which is the divergence this comment exists to prevent.
+COMMON_CI_REF="${COMMON_CI_REF:-96889a650b3f45244cecc4bb3f250af439a71900}"
 COMMON_CI_URL="https://gitlab.syncad.com/hive/common-ci-configuration/-/raw/${COMMON_CI_REF}"
 PROCESS_OPENAPI="${SCRIPTDIR}/process_openapi.py"
+OFFLINE="${COMMON_CI_OFFLINE:-0}"
 
-if [[ ! -f "${PROCESS_OPENAPI}" ]]; then
+# Always re-fetch. Skipping when the file already exists (it is gitignored, so it
+# survives every checkout) meant a stale cached helper from whatever ref the developer
+# first ran silently produced different artifacts than a colleague's -- the same class
+# of drift the pin above prevents, one level down. It also made COMMON_CI_REF a no-op
+# on any machine that had already run this script once.
+if [[ "${OFFLINE}" == "1" ]]; then
+    if [[ ! -f "${PROCESS_OPENAPI}" ]]; then
+        echo "ERROR: COMMON_CI_OFFLINE=1 but ${PROCESS_OPENAPI} has never been downloaded." >&2
+        echo "       Run once with network access first." >&2
+        exit 1
+    fi
+    echo "Using cached process_openapi.py (COMMON_CI_OFFLINE=1) -- ref not verified."
+else
     echo "Fetching process_openapi.py from common-ci-configuration (ref: ${COMMON_CI_REF})..."
     curl -fsSL "${COMMON_CI_URL}/haf-app-tools/python/process_openapi.py" -o "${PROCESS_OPENAPI}"
 fi

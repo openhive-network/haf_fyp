@@ -121,18 +121,29 @@ openapi-drift:
     # in the pipeline is green. (#45)
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl >/dev/null
     - bash scripts/openapi_rewrite.sh
+    # Assert the pathspec below still resolves: see the note in that block.
+    - git ls-files --error-unmatch endpoints/endpoint_schema.sql endpoints/rewrite_rules.conf >/dev/null
     - |
-      # git status, not `git diff`: diff ignores UNTRACKED files, so a new endpoint whose
-      # generated artefact was never `git add`ed would slip through. --porcelain is stable
-      # output by contract. The pathspec scopes this to endpoints/; the script's own
-      # leftovers (scripts/process_openapi.py, scripts/openapi_out/) are gitignored and
-      # removed by the script itself.
+      # git status, not `git diff`: diff ignores UNTRACKED files. Today the generator can
+      # only ever rewrite two already-tracked paths, so that arm is belt-and-braces rather
+      # than load-bearing -- but it costs nothing and stops being theoretical the moment a
+      # generated artefact is added. --porcelain is stable output by contract.
       #
-      # Capture the status explicitly rather than `if ! git ...`: git exits 0 (clean),
-      # 1 (differs) and >=128 on ERROR, and treating them alike turns a runner-side git
-      # problem (dubious-ownership, a GIT_STRATEGY override) into "endpoints/ is not what
-      # the generator produces" followed by an EMPTY diff, sending the author off to
-      # regenerate a file that was already correct.
+      # The pathspec scopes this to endpoints/. Note a pathspec matching NOTHING also
+      # yields empty output and a pass, so the ls-files check above asserts the two files
+      # still exist under that path; without it, renaming endpoints/ would leave this job
+      # reporting success forever. The script's leftovers (scripts/process_openapi.py,
+      # scripts/openapi_out/, a repo-root rewrite_rules.conf) are outside the pathspec;
+      # openapi_out/ and the root conf are removed by the script, process_openapi.py is
+      # gitignored and deliberately kept.
+      #
+      # `git status --porcelain` exits 0 whether the tree is clean or dirty -- drift is
+      # signalled by non-empty OUTPUT, never by the exit code. (`git diff --exit-code` is
+      # the command with the 0/1/>=128 taxonomy; it is not used here because it ignores
+      # untracked files.) So a non-zero status from THIS command is only ever a real git
+      # failure -- dubious ownership, a GIT_STRATEGY override -- and reporting it as
+      # "endpoints/ is not what the generator produces" would print an EMPTY diff and send
+      # the author off to regenerate a file that was already correct.
       # `if ! changed=$(...)`, not a separate $? test: gitlab-runner emits `set -eo pipefail`
       # at the top of the job script, so a failing command substitution in a plain
       # assignment kills the shell before $? is ever read.
@@ -148,12 +159,20 @@ openapi-drift:
         exit 1
       fi
     - echo "endpoints/ matches the generator."
-    # Generator fidelity is not the same as spec validity, and this repo proved it: the
-    # committed spec reproduced its annotations exactly and was still INVALID under
-    # OpenAPI 3.1 -- five optional query parameters carried `default: null` against a
-    # scalar `type`, which JSON Schema rejects because the default must validate against
-    # the schema it belongs to. A diff check alone stays green on that. Validate what we
-    # actually serve.
+    # Generator fidelity is not the same as spec conformance, and this repo proved it: the
+    # committed document reproduced its annotations exactly and this step still rejected
+    # it. Five optional query parameters carried `default: null` against a scalar `type`.
+    #
+    # Be precise about what that violated, because it is not the meta-schema: OpenAPI 3.1
+    # defers to JSON Schema 2020-12, where `default` is an ANNOTATION and is only
+    # RECOMMENDED to validate against its own schema -- the official 3.1 meta-schema
+    # accepts those five. It is openapi-spec-validator that enforces the stricter OpenAPI
+    # 3.0 rule ("this value MUST conform to the defined type") against 3.1 documents. We
+    # obey it rather than carry an exception, because the nullable union is what the
+    # document should have said anyway, and is what endpoint_schema.sql already documents
+    # as this repo's rule ("["string", "null"], not `nullable: true`").
+    #
+    # A diff check alone stays green on all of it. Validate what we actually serve.
     # Pinned for the same reason as the generator above: a validator release that adds or
     # tightens an OpenAPI 3.1 rule would fail this pipeline with no repo change.
     - pip install openapi-spec-validator==0.9.0 -q
@@ -167,7 +186,11 @@ openapi-drift:
           sys.exit("could not extract the embedded OpenAPI blob")
       errs = list(OpenAPIV31SpecValidator(json.loads(m.group(1))).iter_errors())
       for e in errs:
-          print("INVALID:", list(e.absolute_path), "-", str(e)[:200])
+          # e.absolute_path is [] for a default-value failure -- the validator reports it
+          # against the sub-schema, not the document -- so json_path alone names nothing
+          # useful. Print the schema too, or the author gets five identical lines.
+          print("INVALID:", e.json_path, list(e.absolute_schema_path), "-", e.message)
+          print("         schema:", e.schema)
       sys.exit(1 if errs else 0)
       PYEOF
     - echo "served OpenAPI document is valid."

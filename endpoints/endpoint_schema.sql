@@ -49,8 +49,7 @@ schemas:
         type: number
         description: Composite ranking score [0, 1]
       score_relevance:
-        type: number
-        nullable: true
+        type: [number, 'null']
         description: Semantic relevance to the user's interest vector (null in the global feed)
       score_recency:
         type: number
@@ -61,8 +60,7 @@ schemas:
       community_boost_applied:
         type: boolean
       boost_source:
-        type: string
-        nullable: true
+        type: [string, 'null']
         description: Which tier applied the community boost - 'subscribed', 'engaged', or null
       post_id:
         type: string
@@ -72,8 +70,7 @@ schemas:
           Number would lose precision and break the telemetry join; echo it back
           verbatim in POST /v1/fyp/events.
       algorithm_version:
-        type: string
-        nullable: true
+        type: [string, 'null']
         description: Ranking algorithm version that produced this entry, for A/B analysis. Global-sourced entries carry it too (#23); null only for entries written before that change.
  */
 
@@ -103,8 +100,7 @@ schemas:
       category:
         type: string
       community:
-        type: string
-        nullable: true
+        type: [string, 'null']
       created:
         type: string
         format: date-time
@@ -260,8 +256,10 @@ DECLARE
             "description": "Composite ranking score [0, 1]"
           },
           "score_relevance": {
-            "type": "number",
-            "nullable": true,
+            "type": [
+              "number",
+              "null"
+            ],
             "description": "Semantic relevance to the user's interest vector (null in the global feed)"
           },
           "score_recency": {
@@ -277,8 +275,10 @@ DECLARE
             "type": "boolean"
           },
           "boost_source": {
-            "type": "string",
-            "nullable": true,
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "Which tier applied the community boost - 'subscribed', 'engaged', or null"
           },
           "post_id": {
@@ -286,8 +286,10 @@ DECLARE
             "description": "Internal post id (joins feed_events.post_id). Serialized as a STRING because the id exceeds JavaScript's 2^53 safe-integer limit - a JS Number would lose precision and break the telemetry join; echo it back verbatim in POST /v1/fyp/events."
           },
           "algorithm_version": {
-            "type": "string",
-            "nullable": true,
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "Ranking algorithm version that produced this entry, for A/B analysis. Global-sourced entries carry it too (#23); null only for entries written before that change."
           }
         }
@@ -313,8 +315,10 @@ DECLARE
             "type": "string"
           },
           "community": {
-            "type": "string",
-            "nullable": true
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "created": {
             "type": "string",
@@ -932,8 +936,10 @@ DECLARE
                         "type": "boolean"
                       },
                       "boost_source": {
-                        "type": "string",
-                        "nullable": true,
+                        "type": [
+                          "string",
+                          "null"
+                        ],
                         "description": "Which tier applied the community boost - 'subscribed', 'engaged', or null"
                       },
                       "rank": {
@@ -1058,22 +1064,30 @@ DECLARE
                         "type": "integer"
                       },
                       "engagement_rate": {
-                        "type": "number",
-                        "nullable": true,
+                        "type": [
+                          "number",
+                          "null"
+                        ],
                         "description": "actions (vote+comment+reblog+follow) / impressions"
                       },
                       "open_rate": {
-                        "type": "number",
-                        "nullable": true,
+                        "type": [
+                          "number",
+                          "null"
+                        ],
                         "description": "opens / impressions (closest to a click-through)"
                       },
                       "avg_dwell_ms": {
-                        "type": "number",
-                        "nullable": true
+                        "type": [
+                          "number",
+                          "null"
+                        ]
                       },
                       "avg_watch_ms": {
-                        "type": "number",
-                        "nullable": true
+                        "type": [
+                          "number",
+                          "null"
+                        ]
                       }
                     }
                   }
@@ -1989,8 +2003,7 @@ $$;
                   community_boost_applied:
                     type: boolean
                   boost_source:
-                    type: string
-                    nullable: true
+                    type: [string, 'null']
                     description: Which tier applied the community boost - 'subscribed', 'engaged', or null
                   rank:
                     type: integer
@@ -2118,19 +2131,15 @@ $$;
                   videos:
                     type: integer
                   engagement_rate:
-                    type: number
-                    nullable: true
+                    type: [number, 'null']
                     description: actions (vote+comment+reblog+follow) / impressions
                   open_rate:
-                    type: number
-                    nullable: true
+                    type: [number, 'null']
                     description: opens / impressions (closest to a click-through)
                   avg_dwell_ms:
-                    type: number
-                    nullable: true
+                    type: [number, 'null']
                   avg_watch_ms:
-                    type: number
-                    nullable: true
+                    type: [number, 'null']
  */
 -- openapi-generated-code-begin
 DROP FUNCTION IF EXISTS haf_fyp_endpoints.get_feed_metrics;
