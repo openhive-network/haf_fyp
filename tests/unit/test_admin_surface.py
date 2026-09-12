@@ -216,7 +216,7 @@ def test_the_secret_is_the_second_argument():
 
 
 def test_nothing_else_in_the_endpoint_compares_the_key():
-    """Kills the 'fast reject' mutant, which is how this fix gets undone in practice.
+    """Kills the INLINE 'fast reject' mutant -- and only the inline one.
 
     Adding
 
@@ -224,9 +224,20 @@ def test_nothing_else_in_the_endpoint_compares_the_key():
             raise HTTPException(403, ...)
 
     AHEAD of the constant-time compare restores the prefix oracle while leaving
-    compare_digest untouched -- every other test in this file still passes. A review
-    demonstrated exactly that. So: no ==/!= anywhere in this function may reference
-    either key.
+    compare_digest untouched, and a review demonstrated that every other test in this
+    file still passed. So: no ==/!= inside this function may reference either key.
+
+    KNOWN LIMIT, stated rather than implied. This walks only activate_algorithm's own
+    AST, so the same oracle moved into a helper --
+
+        def _prefix_ok(a, b): return a[:4] == b[:4]
+        if admin_key and not _prefix_ok(x_admin_key, admin_key): ...
+
+    -- is NOT caught here, and a review confirmed it passes the whole suite. Widening
+    the scan does not fix that: the helper's parameters are named a/b, so there is no
+    token to match on. Catching it needs a timing test or a taint analysis, neither of
+    which belongs in a unit suite. This test raises the cost of the careless version;
+    it does not make the property unfalsifiable.
     """
     keys = {"x_admin_key", "admin_key"}
     for node in ast.walk(_activate_node()):
@@ -238,6 +249,39 @@ def test_nothing_else_in_the_endpoint_compares_the_key():
             f"{node.lineno} -- that reintroduces the timing oracle regardless of "
             "what compare_digest does"
         )
+
+
+def test_the_configured_key_comes_from_the_environment():
+    """Kills the total-bypass mutant that leaves the compare itself untouched.
+
+        admin_key = os.environ.get("ADMIN_API_KEY", "") or x_admin_key
+
+    authenticates ANY key when ADMIN_API_KEY is unset, while every assertion about
+    compare_digest above still holds. A review found it passed all 25 tests here (it is
+    caught by test_ratelimit_ordering.py, but nothing in this file saw it). So pin the
+    provenance: admin_key must be assigned exactly os.environ.get("ADMIN_API_KEY", ...)
+    and nothing else.
+    """
+    assigns = [
+        node
+        for node in ast.walk(_activate_node())
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == "admin_key" for t in node.targets
+        )
+    ]
+    assert len(assigns) == 1, f"admin_key is assigned {len(assigns)} times, expected 1"
+    value = assigns[0].value
+    assert isinstance(value, ast.Call), (
+        f"admin_key is not a plain os.environ.get(...) call: {ast.dump(value)}"
+    )
+    assert isinstance(value.func, ast.Attribute) and value.func.attr == "get", (
+        "admin_key must come straight from os.environ.get"
+    )
+    first = value.args[0] if value.args else None
+    assert isinstance(first, ast.Constant) and first.value == "ADMIN_API_KEY", (
+        f"admin_key reads {first!r}, not ADMIN_API_KEY"
+    )
 
 
 def test_neither_codec_raises_on_the_input_that_breaks_the_other():

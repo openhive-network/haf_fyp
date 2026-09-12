@@ -716,9 +716,20 @@ next to the service rather than enforcing it. It also loses a merge -- if anothe
 file in the same project declares a service of the same name, that file's `command`
 can win and this one is dropped silently. The rename is what protects the limiter;
 the flag documents why, and starts mattering the day someone sets a ceiling.
-`REDIS_HOST` and `REDIS_URL` are interpolated (`${REDIS_URL:-redis://haf-fyp-redis:6379}`),
-so pointing this at an instance you manage yourself is a `.env` entry -- keep the
-policy there.
+**Pointing this at your own instance takes THREE entries, not one**, because the two
+clients are separate and read different variables:
+
+| variable | used by | what it drives |
+|---|---|---|
+| `REDIS_URL` | the limiter's storage | rate limiting only |
+| `REDIS_HOST` | `_publish_refresh`, `_redis_subscriber` | pub/sub only |
+| `REDIS_PORT` | the same two call sites | pub/sub port only |
+
+All three are interpolated in the compose file, so they are `.env` entries — but set
+only `REDIS_URL` and rate limiting moves while **pub/sub stays on `haf-fyp-redis:6379`**,
+which is silent by construction: `_publish_refresh` wraps its call in
+`except Exception: pass`. Set all three, and keep the `noeviction` policy on whatever
+you point them at.
 
 **Deploying a change to this file's limits:** `requirements.txt` is part of the image,
 so use `up -d --build haf-fyp-api`, not a bare `up -d`, which silently reuses the cached
@@ -726,6 +737,17 @@ image. `haf-fyp-ranker` builds from the same `Dockerfile.python`, so a plain
 `docker compose build` restarts it mid-cycle — rebuild the api service by name if that
 matters. Nothing needs ordering and a rollback strands nothing: bucket identities are
 unchanged and every key expires with its window.
+
+⚠️ **The upgrade that renamed `redis` to `haf-fyp-redis` is the exception to every
+sentence above.** Recreate `haf-fyp-api` **and** `haf-fyp-ranker` together, and pass
+`--remove-orphans`. Renaming a compose service does not rename the running container:
+the old one is orphaned and keeps the `redis` network alias, so a per-service
+`up -d --build haf-fyp-api` leaves the ranker resolving `redis` while the api publishes
+to `haf-fyp-redis`. Force-refresh then stops working **with no error on either side**
+— the publish succeeds into an instance nobody subscribes to, and its
+`except Exception: pass` would swallow a failure anyway — until the ranker's next
+5-minute cycle picks the work up regardless. The orphan also still mounts
+`redis_data`, so two `redis-server` processes share one `/data` until it is removed.
 
 ## Development Phases
 

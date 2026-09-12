@@ -164,6 +164,7 @@ services:
       POSTGRES_USER: haf_fyp_owner
       POSTGRES_DB:   haf_block_log
       REDIS_HOST:    ${REDIS_HOST:-haf-fyp-redis}
+      REDIS_PORT:    ${REDIS_PORT:-6379}
       REDIS_URL:     ${REDIS_URL:-redis://haf-fyp-redis:6379}
     depends_on:
       haf-fyp-setup:
@@ -196,7 +197,16 @@ services:
       POSTGRES_USER: haf_fyp_user
       POSTGRES_DB:   haf_block_log
       REDIS_HOST:    ${REDIS_HOST:-haf-fyp-redis}
+      REDIS_PORT:    ${REDIS_PORT:-6379}
       REDIS_URL:     ${REDIS_URL:-redis://haf-fyp-redis:6379}
+      # FORWARDED DELIBERATELY. api.py reads HAF_FYP_ENABLE_DOCS at import to decide
+      # whether /docs, /redoc and /openapi.json exist, and the README tells operators
+      # to set it for local development -- but compose passes NOTHING into a container
+      # that is not named here. Without this line the documented escape hatch silently
+      # does nothing: putting it in .env.local sets it for INTERPOLATION only, the
+      # container starts with docs off, and the developer gets 404s with no
+      # explanation. Empty default so the production behaviour is unchanged.
+      HAF_FYP_ENABLE_DOCS: ${HAF_FYP_ENABLE_DOCS:-}
       ADMIN_API_KEY: "${FYP_ADMIN_API_KEY}"
       # TRUSTED Hive RPC for interest-write signature verification. Defaults to
       # the local hived; never a public API (a hostile node can forge posting
