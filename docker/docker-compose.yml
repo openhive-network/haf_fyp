@@ -222,6 +222,11 @@ services:
       PGRST_DB_URI:                "postgres://haf_fyp_user@haf/haf_block_log"
       PGRST_DB_SCHEMA:             "haf_fyp_endpoints"
       PGRST_DB_ANON_ROLE:          "haf_fyp_user"
+      # Serve haf_fyp_endpoints.root()'s OpenAPI document at /, matching the deployment
+      # and docker-compose-ci.yml. Without it the rewriter's `^/$` rule returns
+      # PostgREST's auto-generated swagger, which advertises the /rpc/ surface that this
+      # port cannot serve.
+      PGRST_DB_ROOT_SPEC:          "root"
       PGRST_DB_POOL:               "20"
       PGRST_DB_POOL_TIMEOUT:       "10"
       PGRST_SERVER_TIMING_ENABLED: "true"
@@ -229,12 +234,20 @@ services:
       haf-fyp-setup:
         condition: service_completed_successfully
 
+  # OPERATIONAL NOTE: after substitution the template is a literal
+  # `proxy_pass http://postgrest:3000` with no `resolver`, so nginx resolves that name
+  # ONCE at startup and caches the IP for the process lifetime. Recreating `postgrest`
+  # (an image bump, --force-recreate) gives it a new IP and this container then serves
+  # 502 on every request -- while still reporting HEALTHY, because the :81 probe is an
+  # unconditional 204 that never touches the upstream. Restart the rewriter after
+  # anything that recreates postgrest.
+  #
   # The public read API. Without this service `docker compose up` served bare PostgREST,
   # so every /v1/fyp/... path this repo documents -- in the README tables, in the OpenAPI
   # annotations, and in the spec served at / -- 404'd on the stack an operator actually
   # runs. Dockerfile.rewriter existed and CI published the image; nothing ran it. (#38)
-  haf-fyp-rewriter:
-    image: ${HAF_FYP_REWRITER_IMAGE:-${HAF_FYP_REWRITER_REGISTRY:-registry.gitlab.syncad.com/hive}/haf_fyp/rewriter:${HAF_FYP_REWRITER_VERSION:-latest}}
+  haf-fyp-postgrest-rewriter:
+    image: ${HAF_FYP_REWRITER_IMAGE:-${HAF_FYP_REWRITER_REGISTRY:-registry.gitlab.syncad.com/hive}/haf_fyp/postgrest-rewriter:${HAF_FYP_REWRITER_VERSION:-develop}}
     build:
       context: ..
       dockerfile: Dockerfile.rewriter

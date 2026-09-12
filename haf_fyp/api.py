@@ -10,7 +10,8 @@ Handles write operations and admin actions that PostgREST cannot serve:
   GET    /metrics                  — embedding coverage (#15) + credibility sources (#8) + ranking sources (#36)
   GET    /sync-status              — uniform HAF-app sync freshness (#16)
 
-PostgREST (port 3001) serves all read endpoints from haf_fyp_endpoints schema.
+The rewriter (port 3001) serves the read endpoints, proxying to PostgREST (port 3000,
+haf_fyp_endpoints schema).
 Redis pub/sub signals the ranker for on-demand feed refresh after interest updates.
 """
 

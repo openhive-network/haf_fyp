@@ -794,3 +794,45 @@ def test_both_python_services_route_through_the_same_helper(monkeypatch):
     assert "host=haf " in dsn, f"ranker fell through to {dsn!r}"
     assert kwargs["dbname"] == "haf_block_log"
     assert "dbname=haf_block_log " in dsn
+
+
+def test_pgvector_is_checked_before_anything_is_created(bash, tmp_path):
+    """#38: without pgvector the install reached step 3 and died on `type "vector" does
+    not exist` -- after roles and the schema existed -- then crash-looped. The guard is
+    only worth anything if it runs BEFORE the first mutation, so assert the ordering, not
+    merely the presence.
+
+    It probes to_regtype('vector'), not a pg_extension row: an extension in a schema this
+    connection cannot resolve has a row and still fails at step 3, which is the exact
+    failure the guard exists to prevent.
+    """
+    _, sql_log, _ = run_install_full_stub(bash, tmp_path)
+    log = sql_log.read_text()
+    assert "to_regtype('vector')" in log, "the pgvector precondition was never issued"
+    assert "pg_extension" not in log.split("to_regtype('vector')")[0], (
+        "the guard must not be preceded by an extension-presence probe standing in for it"
+    )
+    first_mutation = log.find("builtin_roles")
+    guard = log.find("to_regtype('vector')")
+    if first_mutation != -1:
+        assert guard < first_mutation, (
+            "the pgvector guard runs AFTER the first DDL; a refusal would leave a "
+            "half-installed database, which is what #38 reported"
+        )
+
+
+def test_pgvector_guard_creates_it_when_superuser_and_refuses_otherwise(bash, tmp_path):
+    """The branch matters: an earlier revision refused unconditionally, on the false
+    premise that haf_admin is not a superuser. HAF creates it as one, and hivesense's
+    installer relies on that to create this very extension plus plpython3u.
+    """
+    _, sql_log, _ = run_install_full_stub(bash, tmp_path)
+    log = sql_log.read_text()
+    assert "current_setting('is_superuser')" in log, (
+        "the guard must branch on superuser rather than refusing unconditionally"
+    )
+    assert "CREATE EXTENSION IF NOT EXISTS vector" in log
+    assert "duplicate_object" in log, (
+        "CREATE EXTENSION IF NOT EXISTS is not concurrency-safe; a simultaneous "
+        "HiveSense install can win the race and raise on pg_extension_name_index"
+    )

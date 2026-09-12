@@ -205,7 +205,7 @@ def test_no_inverted_pipeline_assertions_in_ci():
 # host map unchanged.
 ENV_FILE = ROOT / "docker" / ".env"
 CI_COMPOSE = ROOT / "docker" / "docker-compose-ci.yml"
-REWRITER = "haf-fyp-rewriter"
+REWRITER = "haf-fyp-postgrest-rewriter"
 POSTGREST = "postgrest"
 
 # 5432 is deliberately absent: it is a plain literal here, and pinning a port an operator
@@ -352,10 +352,28 @@ def test_rewriter_overrides_the_image_default_postgrest_host():
     """
     yaml_mod = _require_yaml()
     doc = yaml_mod.safe_load(COMPOSE.read_text(encoding="utf-8"))
-    env = (doc["services"][REWRITER].get("environment") or {})
-    assert "POSTGREST_HOST" in env, (
-        "haf-fyp-rewriter must set POSTGREST_HOST; the image default does not resolve here"
+    env_file = _read_env(ENV_FILE)
+    svc = doc["services"][REWRITER].get("environment") or {}
+    assert "POSTGREST_HOST" in svc, (
+        f"{REWRITER} must set POSTGREST_HOST; the image default does not resolve here"
     )
-    assert POSTGREST in str(env["POSTGREST_HOST"]), (
-        f"POSTGREST_HOST must point at the `{POSTGREST}` service, got {env['POSTGREST_HOST']!r}"
+    host = _resolve(str(svc["POSTGREST_HOST"]), env_file)
+    # An earlier revision asserted `POSTGREST in host`, a SUBSTRING test -- and the image
+    # default it exists to reject, `haf-fyp-postgrest`, CONTAINS `postgrest`. It passed on
+    # the exact regression it was named after. Compare exactly, and assert the name is a
+    # service in this file: that is the real invariant and it survives a rename of either.
+    assert host == POSTGREST, (
+        f"POSTGREST_HOST must be `{POSTGREST}`, got {host!r}. The image default "
+        f"(`haf-fyp-postgrest`) resolves to nothing here: every request 502s."
+    )
+    assert host in doc["services"], (
+        f"POSTGREST_HOST={host!r} is not a service in this compose file"
+    )
+
+    # The upstream PORT is equally load-bearing and was asserted nowhere: pointing it at a
+    # dead port 502s every /v1/fyp/* path while the container still reports healthy.
+    port = _resolve(str(svc.get("POSTGREST_PORT", "")), env_file)
+    _, container = _ports(doc["services"][POSTGREST]["ports"][0], env_file)
+    assert port == container, (
+        f"POSTGREST_PORT is {port!r} but `{POSTGREST}` listens on {container!r}"
     )
