@@ -274,7 +274,6 @@ services:
       postgrest:
         condition: service_started
 
-
   # NAMED haf-fyp-redis, NOT redis (#39).
   #
   # haf_api_node's jussi.yaml already defines a service called `redis`, and an

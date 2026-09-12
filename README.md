@@ -291,7 +291,8 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml up --bu
 
 # 3. Start the full stack
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml up \
-  haf-fyp-sync haf-fyp-ranker haf-fyp-api postgrest haf-fyp-postgrest-rewriter \n  haf-fyp-redis
+  haf-fyp-sync haf-fyp-ranker haf-fyp-api postgrest \
+  haf-fyp-postgrest-rewriter haf-fyp-redis
 
 # 4. Smoke test
 curl http://localhost:3001/health

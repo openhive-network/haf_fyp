@@ -315,8 +315,12 @@ def test_nothing_still_points_at_the_old_service_name():
     """A rename that misses a reference is worse than no rename."""
     import yaml
 
-    compose = API_SRC.parent.parent / "docker" / "docker-compose.yml"
+    from tests.unit.test_compose_contract import _read_env, _resolve
+
+    root = API_SRC.parent.parent
+    compose = root / "docker" / "docker-compose.yml"
     doc = yaml.safe_load(io.open(compose, encoding="utf-8"))
+    dotenv = _read_env(root / "docker" / ".env")
 
     for name, svc in doc["services"].items():
         env = svc.get("environment") or {}
@@ -327,15 +331,22 @@ def test_nothing_still_points_at_the_old_service_name():
             env = dict(
                 item.split("=", 1) for item in env if isinstance(item, str) and "=" in item
             )
-        host = env.get("REDIS_HOST", "")
-        url = env.get("REDIS_URL", "")
-        # Values are interpolated (${REDIS_HOST:-haf-fyp-redis}), so check the
-        # DEFAULT inside the expansion too -- that is what an operator who sets
-        # nothing actually gets.
-        assert "redis" != host.strip("${}").split(":-")[-1], (
-            f"{name}: REDIS_HOST still defaults to `redis`"
+        # RESOLVE THROUGH docker/.env, do not just read the compose default.
+        #
+        # !64 made these `${REDIS_HOST:-haf-fyp-redis}`, and docker/.env is TRACKED in
+        # this repo -- a REDIS_HOST=redis line there would beat the default and point
+        # the limiter straight back at jussi'''s allkeys-lru instance, with the compose
+        # file still reading correctly. test_compose_contract.py already knows this
+        # trap (it is why _read_env exists and why it resolves ports through it), so
+        # reuse its helpers rather than checking the literal text.
+        host = _resolve(env.get("REDIS_HOST", ""), dotenv)
+        url = _resolve(env.get("REDIS_URL", ""), dotenv)
+        assert host != "redis", (
+            f"{name}: REDIS_HOST resolves to `redis` -- that is jussi'''s service"
         )
-        assert "//redis:" not in url, f"{name}: REDIS_URL still points at `redis`"
+        assert "//redis:" not in url, (
+            f"{name}: REDIS_URL resolves to `redis` -- that is jussi'''s service"
+        )
         assert "redis" not in (svc.get("depends_on") or {}), (
             f"{name}: depends_on still names `redis`"
         )
