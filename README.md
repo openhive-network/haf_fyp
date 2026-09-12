@@ -39,7 +39,7 @@ hived ──► sql_serializer ──► HAF PostgreSQL
 | `haf_fyp.ranker_daemon` | Python scoring and feed cache writer |
 | `haf_fyp.api` | FastAPI overlay (rate limiting, interests, explainer, admin) |
 | PostgREST | Auto-generated REST API |
-| Redis (`haf-fyp-redis`) | Pub/sub for on-demand feed refresh, and rate-limit storage. Must not evict — see [Redis coupling](#rate-limiting) |
+| Redis (`haf-fyp-redis`) | Pub/sub for on-demand feed refresh, and rate-limit storage. Must not evict — see [Operating the rate limits](#operating-the-rate-limits) |
 
 ## Prerequisites
 
@@ -706,9 +706,18 @@ instance.** Both matter for anyone running this as a module of `haf_api_node`, w
 so a generically-named service silently becomes jussi's instance. That one runs
 `--maxmemory 8G --maxmemory-policy allkeys-lru`, and under `allkeys-lru` the limiter's
 buckets are evicted under memory pressure rather than expiring on their TTL — rate
-limits stop holding, with no error raised anywhere. The shipped compose sets
-`--maxmemory-policy noeviction` explicitly for that reason (it is also redis' default);
-if you point `REDIS_URL` at an instance you manage yourself, keep that policy.
+limits stop holding, with no error raised anywhere. The shipped compose states
+`--maxmemory-policy noeviction` on the service for that reason.
+
+Be clear about what that flag does and does not do: it is redis' own default, and a
+policy without a `maxmemory` ceiling never fires, so it **declares** the requirement
+next to the service rather than enforcing it. It also loses a merge -- if another
+file in the same project declares a service of the same name, that file's `command`
+can win and this one is dropped silently. The rename is what protects the limiter;
+the flag documents why, and starts mattering the day someone sets a ceiling.
+`REDIS_HOST` and `REDIS_URL` are interpolated (`${REDIS_URL:-redis://haf-fyp-redis:6379}`),
+so pointing this at an instance you manage yourself is a `.env` entry -- keep the
+policy there.
 
 **Deploying a change to this file's limits:** `requirements.txt` is part of the image,
 so use `up -d --build haf-fyp-api`, not a bare `up -d`, which silently reuses the cached

@@ -11,18 +11,23 @@ Two hardening items, neither exploitable alone, both cheap:
   2. The admin key was compared with `!=`, which returns at the first differing
      byte and is therefore a timing oracle.
 
-THE TRAP IN FIXING (2), which these tests exist to keep fixed: hmac.compare_digest
-raises TypeError on a str containing non-ASCII. x_admin_key is an attacker-supplied
-header, so the obvious one-line swap turns `X-Admin-Key: e` with an accent into an
-uncaught 500 -- a worse bug than the one being fixed, and one no ASCII-only test
-would ever catch. Both operands are encoded to UTF-8 for that reason.
+THE TRAP IN FIXING (2), which these tests exist to keep fixed: compare_digest needs
+bytes, and "just encode both as UTF-8" is wrong on BOTH operands.
+
+  * the header is latin-1 per the ASGI spec, so UTF-8-encoding it double-encodes a
+    non-ASCII key and it can never match;
+  * os.environ decodes with surrogateescape, so an ADMIN_API_KEY whose bytes are not
+    valid UTF-8 raises UnicodeEncodeError -- an uncaught 500 on every request,
+    including one carrying the CORRECT key.
+
+An earlier revision of this MR shipped the all-UTF-8 form and its 19 tests did not
+catch the second half; these pin both codecs and the argument order.
 """
 
 import ast
 import hmac
 import importlib
 import io
-import os
 from pathlib import Path
 
 import pytest
@@ -111,15 +116,77 @@ def test_the_admin_key_is_compared_in_constant_time():
     assert "x_admin_key != admin_key" not in body, "the plain compare is back"
 
 
-def test_both_operands_are_encoded_before_comparison():
-    """The non-ASCII trap. Without .encode() on BOTH sides this is a 500 path."""
+def _compare_call() -> str:
     body = _activate_source()
     call = body[body.index("hmac.compare_digest") :]
-    call = call[: call.index("):") + 2]
+    return call[: call.index("):") + 2]
+
+
+def test_both_operands_are_encoded_before_comparison():
+    """The non-ASCII trap. Without .encode() on BOTH sides this is a 500 path."""
+    call = _compare_call()
     assert call.count(".encode(") == 2, (
         "compare_digest must receive bytes for both operands -- a str with non-ASCII "
         f"raises TypeError. Got: {call!r}"
     )
+
+
+def test_each_operand_uses_the_codec_that_cannot_raise_for_it():
+    """Encoding both as UTF-8 is wrong twice, and an earlier revision did exactly that.
+
+    The header is latin-1 per the ASGI spec, so UTF-8-encoding it double-encodes a
+    non-ASCII key and it can never match. The env value carries surrogateescape'd
+    bytes when ADMIN_API_KEY is not valid UTF-8, and plain .encode("utf-8") raises
+    UnicodeEncodeError there -- an uncaught 500 on every request, including one
+    bearing the CORRECT key, raised before the ceiling is charged.
+    """
+    call = _compare_call()
+    assert 'x_admin_key.encode("latin-1")' in call, (
+        "the header operand must be latin-1-encoded to recover the bytes the client "
+        f"actually sent. Got: {call!r}"
+    )
+    assert 'admin_key.encode("utf-8", "surrogateescape")' in call, (
+        "the env operand must use surrogateescape; plain utf-8 raises on a key whose "
+        f"bytes are not valid UTF-8. Got: {call!r}"
+    )
+
+
+def test_neither_codec_raises_on_the_input_that_breaks_the_other():
+    """Behavioural companion to the source check above.
+
+    Pins both halves of the trap so a future 'simplification' to one codec fails
+    here rather than in production.
+    """
+    # env side: what os.environ yields for a key generated from raw bytes
+    surrogate_key = "key\udcff"
+    with pytest.raises(UnicodeEncodeError):
+        surrogate_key.encode("utf-8")
+    assert surrogate_key.encode("utf-8", "surrogateescape") == b"key\xff"
+
+    # header side: ASGI latin-1-decodes, so this is what a UTF-8 client byte becomes
+    header_str = "\u00e9".encode("utf-8").decode("latin-1")
+    assert all(ord(c) <= 255 for c in header_str), "latin-1 encode can never raise"
+    assert header_str.encode("latin-1") == "\u00e9".encode("utf-8")
+
+    # and the pair now actually matches, which the all-UTF-8 form did not
+    assert hmac.compare_digest(
+        header_str.encode("latin-1"), "\u00e9".encode("utf-8", "surrogateescape")
+    )
+    assert not hmac.compare_digest(
+        header_str.encode("utf-8"), "\u00e9".encode("utf-8")
+    )
+
+
+def test_the_secret_is_the_second_argument():
+    """Argument order is load-bearing: CPython's _tscmp loops over len(b).
+
+    With the secret second the loop length is fixed; reversed, it would be a length
+    oracle on attacker-controlled input.
+    """
+    call = _compare_call()
+    first = call.index("x_admin_key.encode")
+    second = call.index("admin_key.encode(\"utf-8\", \"surrogateescape\")")
+    assert first < second, f"attacker input must come first. Got: {call!r}"
 
 
 def test_compare_digest_would_raise_on_the_unencoded_header():
@@ -157,9 +224,19 @@ def test_the_redis_service_is_not_named_redis():
     )
     assert "haf-fyp-redis" in services
 
+    # The EFFECTIVE policy, not merely the substring: redis takes the LAST
+    # --maxmemory-policy flag, so `--maxmemory-policy noeviction --maxmemory-policy
+    # allkeys-lru` would satisfy a substring check while evicting.
     command = services["haf-fyp-redis"].get("command", "")
-    assert "noeviction" in command, (
-        "the limiter's storage must not evict; state the policy explicitly"
+    parts = command.split() if isinstance(command, str) else list(command)
+    policies = [
+        parts[i + 1]
+        for i, tok in enumerate(parts)
+        if tok == "--maxmemory-policy" and i + 1 < len(parts)
+    ]
+    assert policies, "no --maxmemory-policy declared on the limiter's storage"
+    assert policies[-1] == "noeviction", (
+        f"effective policy is {policies[-1]!r}; the limiter's buckets must not be evicted"
     )
 
 
@@ -172,11 +249,38 @@ def test_nothing_still_points_at_the_old_service_name():
 
     for name, svc in doc["services"].items():
         env = svc.get("environment") or {}
-        if isinstance(env, dict):
-            host = env.get("REDIS_HOST")
-            url = env.get("REDIS_URL", "")
-            assert host != "redis", f"{name}: REDIS_HOST still points at `redis`"
-            assert "//redis:" not in url, f"{name}: REDIS_URL still points at `redis`"
+        # Normalise BOTH compose spellings. An earlier revision checked only the
+        # mapping form, so converting the block to list syntax would have made this
+        # assertion vacuous instead of failing.
+        if isinstance(env, list):
+            env = dict(
+                item.split("=", 1) for item in env if isinstance(item, str) and "=" in item
+            )
+        host = env.get("REDIS_HOST", "")
+        url = env.get("REDIS_URL", "")
+        # Values are interpolated (${REDIS_HOST:-haf-fyp-redis}), so check the
+        # DEFAULT inside the expansion too -- that is what an operator who sets
+        # nothing actually gets.
+        assert "redis" != host.strip("${}").split(":-")[-1], (
+            f"{name}: REDIS_HOST still defaults to `redis`"
+        )
+        assert "//redis:" not in url, f"{name}: REDIS_URL still points at `redis`"
         assert "redis" not in (svc.get("depends_on") or {}), (
             f"{name}: depends_on still names `redis`"
+        )
+
+
+def test_the_code_defaults_follow_the_service_rename():
+    """compose sets REDIS_HOST explicitly, so only the defaults guard a bare run.
+
+    Without this, reverting either default leaves code and compose disagreeing while
+    the whole suite stays green.
+    """
+    for mod in ("api.py", "ranker_daemon.py"):
+        src = io.open(API_SRC.parent / mod, encoding="utf-8").read()
+        assert 'os.environ.get("REDIS_HOST", "redis")' not in src, (
+            f"{mod}: REDIS_HOST default still points at the old service name"
+        )
+        assert 'os.environ.get("REDIS_HOST", "haf-fyp-redis")' in src, (
+            f"{mod}: REDIS_HOST default does not follow the rename"
         )

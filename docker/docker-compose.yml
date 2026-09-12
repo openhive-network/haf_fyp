@@ -163,8 +163,8 @@ services:
       # PostgREST + FastAPI api run as.
       POSTGRES_USER: haf_fyp_owner
       POSTGRES_DB:   haf_block_log
-      REDIS_HOST:    haf-fyp-redis
-      REDIS_URL:     redis://haf-fyp-redis:6379
+      REDIS_HOST:    ${REDIS_HOST:-haf-fyp-redis}
+      REDIS_URL:     ${REDIS_URL:-redis://haf-fyp-redis:6379}
     depends_on:
       haf-fyp-setup:
         condition: service_completed_successfully
@@ -195,8 +195,8 @@ services:
       POSTGRES_HOST: haf
       POSTGRES_USER: haf_fyp_user
       POSTGRES_DB:   haf_block_log
-      REDIS_HOST:    haf-fyp-redis
-      REDIS_URL:     redis://haf-fyp-redis:6379
+      REDIS_HOST:    ${REDIS_HOST:-haf-fyp-redis}
+      REDIS_URL:     ${REDIS_URL:-redis://haf-fyp-redis:6379}
       ADMIN_API_KEY: "${FYP_ADMIN_API_KEY}"
       # TRUSTED Hive RPC for interest-write signature verification. Defaults to
       # the local hived; never a public API (a hostile node can forge posting
@@ -291,10 +291,20 @@ services:
   # with no error anywhere. A limiter that fails open silently is worse than one
   # that fails loudly.
   #
-  # The policy below is redis' own default and is set explicitly so the
-  # requirement is executable rather than a sentence in the README. If a
-  # deployment ever gives this instance a maxmemory ceiling, noeviction is what
-  # keeps the limiter honest.
+  # WHAT THE POLICY BELOW IS AND IS NOT. It is redis' own default, and a
+  # maxmemory-policy without a maxmemory ceiling never fires -- so it DECLARES the
+  # requirement next to the service, it does not enforce it. It would also lose the
+  # very merge it describes: the other file's `command` can win and this line be
+  # dropped with no warning. The RENAME is the control here; this flag is the
+  # statement of intent, and it starts mattering the day a deployment sets a
+  # ceiling.
+  #
+  # SCOPE LIMIT, stated rather than hidden: `haf` (line 13) and `postgrest` are
+  # generic names with the same collision exposure, and `haf` is the worse one --
+  # compose CONCATENATES `ports:`, so merging with haf_api_node's haf_base.yaml
+  # would publish this file's 5432 on the node's host. Renaming them is a larger
+  # change with its own compatibility surface and belongs in its own MR; filed
+  # separately so this one stays reviewable.
   haf-fyp-redis:
     image: redis:7-alpine
     command: redis-server --maxmemory-policy noeviction

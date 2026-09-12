@@ -1643,18 +1643,39 @@ def activate_algorithm(
     """
     admin_key = os.environ.get("ADMIN_API_KEY", "")
     # compare_digest, not `!=` (#39). A plain string compare returns at the first
-    # differing byte, so its timing is a prefix oracle: an attacker who can measure
-    # it recovers the key one byte at a time instead of guessing it whole. The
-    # 5/minute per-IP limit dominates that signal today, which is why this is low
-    # severity -- but the constant-time compare is free, and the limit is not the
-    # thing that should be carrying this.
+    # differing byte, so its timing is a prefix oracle. The 5/minute per-IP limit
+    # dominates that signal today -- this is hygiene, not a fix for a live hole --
+    # but the constant-time compare is free and the limit should not be carrying it.
     #
-    # ENCODE FIRST. hmac.compare_digest raises TypeError on a str containing
-    # non-ASCII -- and x_admin_key is an attacker-controlled header, so passing the
-    # str form directly turns `X-Admin-Key: é` into an uncaught 500 instead of a
-    # 403. Comparing UTF-8 bytes is defined for every input.
+    # ARGUMENT ORDER IS LOAD-BEARING: attacker's input first, secret second.
+    # CPython's _tscmp loops over len(b), the SECOND argument, so with the secret
+    # there the loop length is fixed and the attacker's own input length is not a
+    # timing signal. Reversed, this would be a length oracle on attacker-controlled
+    # input. Do not swap these.
+    #
+    # THE TWO CODECS ARE DELIBERATE, AND NEITHER CAN RAISE. compare_digest rejects
+    # a str containing non-ASCII with TypeError, so both operands must be bytes --
+    # but "encode both as UTF-8" is wrong twice over, and an earlier revision of
+    # this fix shipped exactly that:
+    #
+    #   * x_admin_key comes from ASGI, where header values are latin-1-decoded per
+    #     spec. A client sending the UTF-8 bytes of a non-ASCII key arrives here as
+    #     mojibake, so .encode("utf-8") DOUBLE-encodes it and it can never match.
+    #     .encode("latin-1") recovers the exact bytes the client put on the wire,
+    #     and cannot fail: latin-1 decoding only ever produces codepoints 0-255.
+    #
+    #   * admin_key comes from os.environ, which decodes with surrogateescape. An
+    #     ADMIN_API_KEY whose bytes are not valid UTF-8 -- a key generated straight
+    #     from /dev/urandom rather than base64 -- becomes a str holding lone
+    #     surrogates, and plain .encode("utf-8") raises UnicodeEncodeError. That is
+    #     an uncaught 500 on EVERY request including one bearing the correct key,
+    #     raised before the ceiling is charged. surrogateescape recovers the
+    #     original bytes instead.
+    #
+    # Comparing the two byte strings is then what it should have been all along:
+    # the bytes the client sent against the bytes the operator configured.
     if not admin_key or not hmac.compare_digest(
-        x_admin_key.encode("utf-8"), admin_key.encode("utf-8")
+        x_admin_key.encode("latin-1"), admin_key.encode("utf-8", "surrogateescape")
     ):
         # Charged on the FAILURE branch only. Every guess is a failed comparison, so
         # the ceiling still bounds brute force at 30/minute -- but the holder of the
