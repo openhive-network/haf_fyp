@@ -31,6 +31,7 @@ import io
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
 from haf_fyp import api
 
@@ -45,9 +46,12 @@ API_SRC = Path(api.__file__)
 def test_docs_are_off_by_default():
     """No HAF_FYP_ENABLE_DOCS in the environment -> all three URLs are None.
 
-    Asserted on the app object rather than through TestClient because building a
-    client runs the lifespan, which opens a connection pool this suite has no
-    database for.
+    An earlier revision justified avoiding TestClient here by claiming it "runs the
+    lifespan, which opens a connection pool this suite has no database for". That is
+    false: Starlette starts the lifespan only on __enter__, so a bare TestClient(app)
+    opens nothing -- which is exactly why test_ratelimit_ordering.py uses one. The
+    request-level test below does that, and is the stronger of the two; this one
+    stays because it names the specific regression (someone dropping the kwargs).
     """
     assert api._DOCS_ENABLED is False, (
         "the test environment sets HAF_FYP_ENABLE_DOCS; this test asserts the default"
@@ -62,6 +66,22 @@ def test_no_docs_routes_are_registered_by_default():
     paths = {getattr(r, "path", None) for r in api.app.routes}
     for gone in ("/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"):
         assert gone not in paths, f"{gone} is still routed with docs disabled"
+
+
+def test_the_docs_paths_are_not_reachable_by_request():
+    """Reachability, which the route-table check above cannot actually answer.
+
+    A Mount("/debug", FastAPI()) contributes the path "/debug", not "/debug/docs",
+    so a sub-app with its own docs would pass the route-table assertion and still
+    serve them. Asking the app is the only way to know.
+
+    No context manager: Starlette runs the lifespan on __enter__ only, so this opens
+    no connection pool (same pattern as test_ratelimit_ordering.py).
+    """
+    client = TestClient(api.app)
+    for path in ("/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"):
+        assert client.get(path).status_code == 404, f"{path} is still served"
+    assert api._pool is None, "constructing the client should not have opened a pool"
 
 
 @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on", " true "])
@@ -97,37 +117,65 @@ def test_anything_else_leaves_docs_off(monkeypatch, value):
 # ---------------------------------------------------------------------------
 
 
-def _activate_source() -> str:
+def _activate_node() -> ast.FunctionDef:
+    """The activate_algorithm FUNCTION NODE, not its source text.
+
+    Text matching was the first version of these tests and it did not hold up: a
+    review mutated the code and found `"hmac.compare_digest" in source` passes on
+    the COMMENT alone, because ast.get_source_segment returns comments and the
+    comment above the call names the function. Everything below inspects nodes.
+    """
     src = io.open(API_SRC, encoding="utf-8").read()
-    tree = ast.parse(src)
-    for node in ast.walk(tree):
+    for node in ast.walk(ast.parse(src)):
         if isinstance(node, ast.FunctionDef) and node.name == "activate_algorithm":
-            return ast.get_source_segment(src, node) or ""
+            return node
     raise AssertionError("activate_algorithm not found in haf_fyp/api.py")
 
 
+def _compare_digest_call() -> ast.Call:
+    for node in ast.walk(_activate_node()):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "compare_digest"
+        ):
+            return node
+    raise AssertionError("activate_algorithm does not call hmac.compare_digest")
+
+
+def _encode_target(arg: ast.AST) -> tuple[str, list[str]]:
+    """('x_admin_key', ['latin-1']) for `x_admin_key.encode("latin-1")`."""
+    assert isinstance(arg, ast.Call) and isinstance(arg.func, ast.Attribute), (
+        f"operand is not an .encode() call: {ast.dump(arg)}"
+    )
+    assert arg.func.attr == "encode", f"operand calls .{arg.func.attr}(), not .encode()"
+    assert isinstance(arg.func.value, ast.Name), "operand is not a plain name"
+    return arg.func.value.id, [
+        a.value for a in arg.args if isinstance(a, ast.Constant)
+    ]
+
+
 def test_the_admin_key_is_compared_in_constant_time():
-    """A `!=` here is a prefix oracle; assert the constant-time compare by source.
+    """There is a real hmac.compare_digest CALL, not merely the words in a comment."""
+    call = _compare_digest_call()
+    assert isinstance(call.func, ast.Attribute) and call.func.attr == "compare_digest"
 
-    Source-level because the branch itself needs a database to reach.
+
+def test_the_two_operands_are_the_header_and_the_configured_key():
+    """Kills the mutant that compares the header against ITSELF.
+
+    `compare_digest(x_admin_key.encode(), x_admin_key.encode())` is constant-time,
+    encodes both operands, and authenticates EVERY key. A review found it survived
+    the first version of this file.
     """
-    body = _activate_source()
-    assert "hmac.compare_digest" in body, "admin key compare is not constant-time"
-    assert "x_admin_key != admin_key" not in body, "the plain compare is back"
-
-
-def _compare_call() -> str:
-    body = _activate_source()
-    call = body[body.index("hmac.compare_digest") :]
-    return call[: call.index("):") + 2]
-
-
-def test_both_operands_are_encoded_before_comparison():
-    """The non-ASCII trap. Without .encode() on BOTH sides this is a 500 path."""
-    call = _compare_call()
-    assert call.count(".encode(") == 2, (
-        "compare_digest must receive bytes for both operands -- a str with non-ASCII "
-        f"raises TypeError. Got: {call!r}"
+    call = _compare_digest_call()
+    assert len(call.args) == 2, f"expected two operands, got {len(call.args)}"
+    first, _ = _encode_target(call.args[0])
+    second, _ = _encode_target(call.args[1])
+    assert first == "x_admin_key", f"first operand is {first!r}, not the header"
+    assert second == "admin_key", (
+        f"second operand is {second!r}, not the configured key -- comparing the "
+        "header against itself would authenticate everything"
     )
 
 
@@ -139,36 +187,71 @@ def test_each_operand_uses_the_codec_that_cannot_raise_for_it():
     bytes when ADMIN_API_KEY is not valid UTF-8, and plain .encode("utf-8") raises
     UnicodeEncodeError there -- an uncaught 500 on every request, including one
     bearing the CORRECT key, raised before the ceiling is charged.
+
+    Asserts the codec by VALUE, so utf-16 or ascii fails here rather than passing an
+    "is something encoded?" check.
     """
-    call = _compare_call()
-    assert 'x_admin_key.encode("latin-1")' in call, (
-        "the header operand must be latin-1-encoded to recover the bytes the client "
-        f"actually sent. Got: {call!r}"
+    call = _compare_digest_call()
+    _, header_codecs = _encode_target(call.args[0])
+    _, env_codecs = _encode_target(call.args[1])
+    assert header_codecs == ["latin-1"], (
+        f"header operand encodes with {header_codecs}; latin-1 is what recovers the "
+        "bytes the client actually sent, and it cannot fail"
     )
-    assert 'admin_key.encode("utf-8", "surrogateescape")' in call, (
-        "the env operand must use surrogateescape; plain utf-8 raises on a key whose "
-        f"bytes are not valid UTF-8. Got: {call!r}"
+    assert env_codecs == ["utf-8", "surrogateescape"], (
+        f"env operand encodes with {env_codecs}; surrogateescape is what stops a "
+        "non-UTF-8 ADMIN_API_KEY raising UnicodeEncodeError"
     )
+
+
+def test_the_secret_is_the_second_argument():
+    """CPython's _tscmp loops over len(b), so the secret must be the second operand.
+
+    Reversed, the loop length follows attacker-controlled input and becomes a length
+    oracle. Enforced by the operand assertion above; stated separately so the reason
+    is not lost if that test is ever rewritten.
+    """
+    call = _compare_digest_call()
+    assert _encode_target(call.args[1])[0] == "admin_key"
+
+
+def test_nothing_else_in_the_endpoint_compares_the_key():
+    """Kills the 'fast reject' mutant, which is how this fix gets undone in practice.
+
+    Adding
+
+        if admin_key and x_admin_key[:4] != admin_key[:4]:
+            raise HTTPException(403, ...)
+
+    AHEAD of the constant-time compare restores the prefix oracle while leaving
+    compare_digest untouched -- every other test in this file still passes. A review
+    demonstrated exactly that. So: no ==/!= anywhere in this function may reference
+    either key.
+    """
+    keys = {"x_admin_key", "admin_key"}
+    for node in ast.walk(_activate_node()):
+        if not isinstance(node, ast.Compare):
+            continue
+        names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+        assert not (names & keys), (
+            "the admin key is compared with a plain operator at line "
+            f"{node.lineno} -- that reintroduces the timing oracle regardless of "
+            "what compare_digest does"
+        )
 
 
 def test_neither_codec_raises_on_the_input_that_breaks_the_other():
-    """Behavioural companion to the source check above.
-
-    Pins both halves of the trap so a future 'simplification' to one codec fails
-    here rather than in production.
-    """
-    # env side: what os.environ yields for a key generated from raw bytes
-    surrogate_key = "key\udcff"
+    """Behavioural companion to the source checks above."""
+    surrogate_key = "key\udcff"          # what os.environ yields for raw-byte keys
     with pytest.raises(UnicodeEncodeError):
         surrogate_key.encode("utf-8")
     assert surrogate_key.encode("utf-8", "surrogateescape") == b"key\xff"
 
-    # header side: ASGI latin-1-decodes, so this is what a UTF-8 client byte becomes
-    header_str = "\u00e9".encode("utf-8").decode("latin-1")
+    header_str = "\u00e9".encode("utf-8").decode("latin-1")   # ASGI latin-1-decodes
     assert all(ord(c) <= 255 for c in header_str), "latin-1 encode can never raise"
     assert header_str.encode("latin-1") == "\u00e9".encode("utf-8")
 
-    # and the pair now actually matches, which the all-UTF-8 form did not
+    # the pair now matches, which the all-UTF-8 form did not
     assert hmac.compare_digest(
         header_str.encode("latin-1"), "\u00e9".encode("utf-8", "surrogateescape")
     )
@@ -177,29 +260,15 @@ def test_neither_codec_raises_on_the_input_that_breaks_the_other():
     )
 
 
-def test_the_secret_is_the_second_argument():
-    """Argument order is load-bearing: CPython's _tscmp loops over len(b).
-
-    With the secret second the loop length is fixed; reversed, it would be a length
-    oracle on attacker-controlled input.
-    """
-    call = _compare_call()
-    first = call.index("x_admin_key.encode")
-    second = call.index("admin_key.encode(\"utf-8\", \"surrogateescape\")")
-    assert first < second, f"attacker input must come first. Got: {call!r}"
-
-
 def test_compare_digest_would_raise_on_the_unencoded_header():
-    """Pin the behaviour the encoding defends against, so the reason stays visible.
+    """Pin the upstream behaviour the encoding defends against.
 
-    If a future Python stops raising here, this test failing is the signal to
-    revisit the comment in api.py -- not to drop the encoding.
+    If a future Python stops raising here, this failing is the signal to revisit the
+    comment in api.py -- not to drop the encoding.
     """
     with pytest.raises(TypeError):
-        hmac.compare_digest("secreté", "secret")
-
-    # encoded, the same inputs compare cleanly and simply return False
-    assert hmac.compare_digest("secreté".encode(), b"secret") is False
+        hmac.compare_digest("secret\u00e9", "secret")
+    assert hmac.compare_digest("secret\u00e9".encode(), b"secret") is False
 
 
 # ---------------------------------------------------------------------------
@@ -229,11 +298,13 @@ def test_the_redis_service_is_not_named_redis():
     # allkeys-lru` would satisfy a substring check while evicting.
     command = services["haf-fyp-redis"].get("command", "")
     parts = command.split() if isinstance(command, str) else list(command)
-    policies = [
-        parts[i + 1]
-        for i, tok in enumerate(parts)
-        if tok == "--maxmemory-policy" and i + 1 < len(parts)
-    ]
+    policies = []
+    for i, tok in enumerate(parts):
+        # both spellings: `--maxmemory-policy noeviction` and `--maxmemory-policy=noeviction`
+        if tok == "--maxmemory-policy" and i + 1 < len(parts):
+            policies.append(parts[i + 1])
+        elif tok.startswith("--maxmemory-policy="):
+            policies.append(tok.split("=", 1)[1])
     assert policies, "no --maxmemory-policy declared on the limiter's storage"
     assert policies[-1] == "noeviction", (
         f"effective policy is {policies[-1]!r}; the limiter's buckets must not be evicted"
