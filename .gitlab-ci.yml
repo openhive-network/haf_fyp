@@ -305,7 +305,7 @@ postgrest-tests:
     # Turns "some path 404'd" into "that rule rewrote to X". `|| true` because
     # after_script runs under set -e: if the build failed the service has no
     # container, and a non-zero here would skip the `down -v` below.
-    - docker compose -f docker/docker-compose-ci.yml logs rewriter || true
+    - docker compose -f docker/docker-compose-ci.yml logs haf-fyp-postgrest-rewriter || true
     - docker compose -f docker/docker-compose-ci.yml down -v
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"

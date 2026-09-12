@@ -39,7 +39,7 @@ hived ──► sql_serializer ──► HAF PostgreSQL
 | `haf_fyp.ranker_daemon` | Python scoring and feed cache writer |
 | `haf_fyp.api` | FastAPI overlay (rate limiting, interests, explainer, admin) |
 | PostgREST | Auto-generated REST API |
-| Redis | Pub/sub for on-demand feed refresh |
+| Redis (`haf-fyp-redis`) | Pub/sub for on-demand feed refresh, and rate-limit storage. Must not evict — see [Operating the rate limits](#operating-the-rate-limits) |
 
 ## Prerequisites
 
@@ -291,7 +291,8 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml up --bu
 
 # 3. Start the full stack
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml up \
-  haf-fyp-sync haf-fyp-ranker haf-fyp-api postgrest haf-fyp-rewriter redis
+  haf-fyp-sync haf-fyp-ranker haf-fyp-api postgrest \
+  haf-fyp-postgrest-rewriter haf-fyp-redis
 
 # 4. Smoke test
 curl http://localhost:3001/health
@@ -356,6 +357,13 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 | DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5/min per IP, 30/min total) |
 | POST | `/v1/fyp/events` | Impression / engagement telemetry batch (120/min per IP, 600/min total) |
 | POST | `/v1/fyp/admin/algorithm` | Activate an algorithm version, `X-Admin-Key` required (5/min per IP; 30/min total, charged only on a wrong key) |
+
+**Interactive docs are disabled by default.** FastAPI would otherwise publish `/docs`,
+`/redoc` and `/openapi.json` on this app — which is the admin surface, served under
+`/haf-fyp-admin/` on a node. That would advertise a ready-made request builder for the
+admin endpoint above and load Swagger UI from `cdn.jsdelivr.net`. Set
+`HAF_FYP_ENABLE_DOCS=true` to get them back for local development; the value is read
+once at import, so it takes a restart.
 
 The two metrics endpoints are unrelated and answer different questions. This one, on the
 FastAPI overlay, is the *operational* read — embedding coverage, credibility source
@@ -533,7 +541,7 @@ haf-fyp-ranker     # Python ranking daemon, 5-minute cycles (Dockerfile.python)
 haf-fyp-api        # FastAPI overlay on port 3002 (Dockerfile.python)
 postgrest          # PostgREST on port 3000 (raw /rpc/, for debugging)
 haf-fyp-postgrest-rewriter  # public read API on port 3001 (clean /v1/fyp/... paths)
-redis              # pub/sub for force-refresh signals
+haf-fyp-redis      # pub/sub for force-refresh signals + rate-limit buckets
 ```
 
 ### The SQL image's verbs
@@ -693,12 +701,53 @@ increments on *every* checked request including ones it then rejects, so a flood
 unauthenticated `/v1/fyp/events` is Redis write traffic. `MAX_REQUEST_BODY_BYTES`
 (default 256 KiB) and the per-IP limits are what bound it.
 
+**The Redis service is named `haf-fyp-redis`, and it must not be an evicting
+instance.** Both matter for anyone running this as a module of `haf_api_node`, whose
+`jussi.yaml` already defines a service called `redis`: compose merges services by name,
+so a generically-named service silently becomes jussi's instance. That one runs
+`--maxmemory 8G --maxmemory-policy allkeys-lru`, and under `allkeys-lru` the limiter's
+buckets are evicted under memory pressure rather than expiring on their TTL — rate
+limits stop holding, with no error raised anywhere. The shipped compose states
+`--maxmemory-policy noeviction` on the service for that reason.
+
+Be clear about what that flag does and does not do: it is redis' own default, and a
+policy without a `maxmemory` ceiling never fires, so it **declares** the requirement
+next to the service rather than enforcing it. It also loses a merge -- if another
+file in the same project declares a service of the same name, that file's `command`
+can win and this one is dropped silently. The rename is what protects the limiter;
+the flag documents why, and starts mattering the day someone sets a ceiling.
+**Pointing this at your own instance takes THREE entries, not one**, because the two
+clients are separate and read different variables:
+
+| variable | used by | what it drives |
+|---|---|---|
+| `REDIS_URL` | the limiter's storage | rate limiting only |
+| `REDIS_HOST` | `_publish_refresh`, `_redis_subscriber` | pub/sub only |
+| `REDIS_PORT` | the same two call sites | pub/sub port only |
+
+All three are interpolated in the compose file, so they are `.env` entries — but set
+only `REDIS_URL` and rate limiting moves while **pub/sub stays on `haf-fyp-redis:6379`**,
+which is silent by construction: `_publish_refresh` wraps its call in
+`except Exception: pass`. Set all three, and keep the `noeviction` policy on whatever
+you point them at.
+
 **Deploying a change to this file's limits:** `requirements.txt` is part of the image,
 so use `up -d --build haf-fyp-api`, not a bare `up -d`, which silently reuses the cached
 image. `haf-fyp-ranker` builds from the same `Dockerfile.python`, so a plain
 `docker compose build` restarts it mid-cycle — rebuild the api service by name if that
 matters. Nothing needs ordering and a rollback strands nothing: bucket identities are
 unchanged and every key expires with its window.
+
+⚠️ **The upgrade that renamed `redis` to `haf-fyp-redis` is the exception to every
+sentence above.** Recreate `haf-fyp-api` **and** `haf-fyp-ranker` together, and pass
+`--remove-orphans`. Renaming a compose service does not rename the running container:
+the old one is orphaned and keeps the `redis` network alias, so a per-service
+`up -d --build haf-fyp-api` leaves the ranker resolving `redis` while the api publishes
+to `haf-fyp-redis`. Force-refresh then stops working **with no error on either side**
+— the publish succeeds into an instance nobody subscribes to, and its
+`except Exception: pass` would swallow a failure anyway — until the ranker's next
+5-minute cycle picks the work up regardless. The orphan also still mounts
+`redis_data`, so two `redis-server` processes share one `/data` until it is removed.
 
 ## Development Phases
 
