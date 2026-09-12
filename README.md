@@ -25,7 +25,7 @@ hived ──► sql_serializer ──► HAF PostgreSQL
                                    │
                              feed_cache
                                    │
-                    PostgREST (port 3001) + FastAPI (port 3002)
+         rewriter (port 3001) -> PostgREST  +  FastAPI (port 3002)
 ```
 
 ## Stack
@@ -291,11 +291,14 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml up --bu
 
 # 3. Start the full stack
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml up \
-  haf-fyp-sync haf-fyp-ranker haf-fyp-api postgrest redis
+  haf-fyp-sync haf-fyp-ranker haf-fyp-api postgrest haf-fyp-rewriter redis
 
 # 4. Smoke test
-curl http://localhost:3001/rpc/get_health
-curl http://localhost:3001/rpc/get_algorithm
+curl http://localhost:3001/health
+curl http://localhost:3001/v1/fyp/algorithm
+#    Raw PostgREST stays on 3000 for debugging; it is NOT reachable through the
+#    rewriter, whose generated catch-all rewrites /rpc/x to /rpc/rpc/x.
+curl http://localhost:3000/rpc/get_health
 
 # 5. After installing Hivemind (required) / HiveSense / btracker / reptracker
 #    — grant cross-schema access
@@ -303,23 +306,42 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml run --r
   /app/scripts/grant_cross_schema.sh
 ```
 
+> **Upgrading from before #38:** the published ports changed. `/rpc/...` moved from 3001
+> to **3000**, and 3001 now serves the clean `/v1/fyp/...` paths through the rewriter.
+> A stale `:3001/rpc/x` call returns a PostgREST 404 body rather than a connection error,
+> so it reads as "the endpoint was removed" — it moved.
+
 ## API Endpoints
 
-All read endpoints are served by PostgREST on port 3001. The FastAPI overlay on port 3002 handles write operations and admin actions.
+All read endpoints are served through the **rewriter on port 3001**, which maps the clean paths onto PostgREST's `/rpc/` calls. That is the documented, supported surface and the one `haf_api_node` consumes. PostgREST itself is published on port 3000 for debugging. The FastAPI overlay on port 3002 handles write operations and admin actions.
 
-### PostgREST (port 3001)
+### Read API (rewriter, port 3001)
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/rpc/get_health` | App status and last processed block |
-| GET | `/rpc/get_sync_status` | HAF context head + its UTC timestamp — **the endpoint to monitor** (#34) |
-| GET | `/rpc/get_algorithm` | Active algorithm version and weights |
-| GET | `/rpc/list_algorithm_versions` | All registered algorithm versions |
-| GET | `/rpc/get_personalized_feed?username=alice&limit=20` | Ranked feed for a user |
-| GET | `/rpc/get_global_feed?limit=20` | Unauthenticated global feed |
-| GET | `/rpc/get_user_profile?username=alice` | User vector status and top communities |
-| GET | `/rpc/get_score_explanation?username=alice&post_id=123` | Per-signal score breakdown |
-| GET | `/rpc/get_feed_metrics` | Feed performance analytics per algorithm version (#13) — product metrics, not service health |
+These are the supported paths, and the ones `haf_api_node` consumes. The `/rpc/` column
+is the PostgREST function each maps onto — it is what appears in logs and `EXPLAIN`
+output, and it is reachable directly on **port 3000**, not through the rewriter (see
+below).
+
+| Method | Path (port 3001) | maps to | Description |
+|--------|------------------|---------|-------------|
+| GET | `/health` | `/rpc/get_health` | App status and last processed block |
+| GET | `/sync-status` | `/rpc/get_sync_status` | HAF context head + its UTC timestamp — **the endpoint to monitor** (#34) |
+| GET | `/version` | `/rpc/get_version` | Build version of the running app |
+| GET | `/v1/fyp/algorithm` | `/rpc/get_algorithm` | Active algorithm version and weights |
+| GET | `/v1/fyp/algorithms` | `/rpc/list_algorithm_versions` | All registered algorithm versions |
+| GET | `/v1/fyp/feed/{username}?page-size=20` | `/rpc/get_personalized_feed` | Ranked feed for a user |
+| GET | `/v1/fyp/global?page-size=20` | `/rpc/get_global_feed` | Unauthenticated global feed |
+| GET | `/v1/fyp/profile/{username}` | `/rpc/get_user_profile` | User vector status and top communities |
+| GET | `/v1/fyp/explain/{username}/{post_id}` | `/rpc/get_score_explanation` | Per-signal score breakdown |
+| GET | `/v1/fyp/feed-metrics` | `/rpc/get_feed_metrics` | Feed performance analytics per algorithm version (#13) — product metrics, not service health |
+
+### Raw PostgREST (port 3000, debugging)
+
+The `/rpc/...` paths above answer directly on port 3000. They are **not** reachable through
+the rewriter: its generated catch-all (`rewrite ^/(.*)$ /rpc/$1`) would turn
+`/rpc/get_health` into `/rpc/rpc/get_health`. Before #38 the shipped stack published this
+surface on 3001 and served no clean paths at all; it now publishes the clean paths on 3001
+and this one on 3000.
 
 Every feed entry carries a nested `fyp.source` field — `personalized` when the user has a precomputed personalized feed, or `global` when `get_personalized_feed` serves the cold-start global fallback (it is uniform across all entries in one response). A client can therefore tell directly from a feed call whether the user is getting their own ranked feed or the global fallback, without a separate `get_user_profile` lookup (`has_feed`).
 
@@ -356,7 +378,8 @@ they have different failure modes, and only this one carries a timestamp.
 503 while HAF is in massive sync.
 
 Since #34 it is served from **both** surfaces, and **the PostgREST one is what you
-should monitor**: `http://<app>-postgrest-rewriter:80/sync-status`, the standard probe
+should monitor**: `http://<app>-postgrest-rewriter:80/sync-status (the reference stack names this service
+`haf-fyp-postgrest-rewriter` to match)`, the standard probe
 URL haf_api_node's per-app backends use. It exercises the real request path (rewriter
 -> postgrest -> postgres), so a wedged postgrest or rewriter shows up; the FastAPI copy
 on port 3002 bypasses both and cannot see either. Point `*_HEALTH_URL` at the rewriter.
@@ -508,7 +531,8 @@ haf-fyp-uninstall  # removes the app from the database — profile "haf-fyp-unin
                    # starts on a plain `up` (Dockerfile.sql)
 haf-fyp-ranker     # Python ranking daemon, 5-minute cycles (Dockerfile.python)
 haf-fyp-api        # FastAPI overlay on port 3002 (Dockerfile.python)
-postgrest          # PostgREST on port 3001
+postgrest          # PostgREST on port 3000 (raw /rpc/, for debugging)
+haf-fyp-postgrest-rewriter  # public read API on port 3001 (clean /v1/fyp/... paths)
 redis              # pub/sub for force-refresh signals
 ```
 
@@ -702,7 +726,9 @@ unchanged and every key expires with its window.
 
 ```bash
 # PostgREST must be running
-API_URL=http://localhost:3001 tavern-ci tests/tavern/test_endpoints.tavern.yaml
+# This suite drives the raw /rpc/ surface, so point it at PostgREST (3000), not the
+# rewriter (3001). tests/tavern/rewriter/ is the suite that exercises the clean paths.
+API_URL=http://localhost:3000 tavern-ci tests/tavern/test_endpoints.tavern.yaml
 ```
 
 ## SQL Linting

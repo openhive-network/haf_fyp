@@ -138,7 +138,7 @@ services:
   # it after the catch-all, or typo'ing its target all leave the suite green while
   # HAProxy marks the backend DOWN. Verified: all three mutations pass CI without
   # this service.
-  rewriter:
+  haf-fyp-postgrest-rewriter:
     build:
       context: ..
       dockerfile: Dockerfile.rewriter
@@ -163,8 +163,8 @@ services:
     environment:
       API_URL: "http://postgrest:3000"
       # The public path an operator (and HAProxy) actually requests.
-      REWRITER_URL: "http://rewriter"
+      REWRITER_URL: "http://haf-fyp-postgrest-rewriter"
       FASTAPI_URL: "http://localhost:9999"
     depends_on:
       - postgrest
-      - rewriter
+      - haf-fyp-postgrest-rewriter

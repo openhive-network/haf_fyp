@@ -207,6 +207,73 @@ BEGIN
 END
 \$\$;"
 
+#    pgvector. db/create_tables.sql declares `interest_vector vector(1024)`, so the type
+#    is a hard prerequisite -- but it was documented only in comments here and in the
+#    README, and nothing checked it. Without it the install reached step 3 and died on
+#    `type "vector" does not exist` AFTER roles and the schema existed, then crash-looped
+#    under `restart: on-failure`.
+#
+#    Checked on to_regtype('vector'), NOT on a pg_extension row: those differ. An
+#    extension installed into a schema this connection cannot resolve (not on
+#    search_path, or no USAGE) has a pg_extension row and still fails at step 3 -- the
+#    exact failure this guard exists to prevent, with a false all-clear in the log.
+#    db/create_tables.sql sets no role and no search_path, so the type resolves in the
+#    same session, role and search_path as this probe.
+#
+#    Creates it when this connection is a superuser. An earlier revision refused instead,
+#    on the stated grounds that "this runs as haf_admin, which is not a superuser" -- that
+#    is false. HAF creates haf_admin AS a superuser, and the sibling app with the same
+#    prerequisite relies on it: hivesense's install_app.sh runs `CREATE EXTENSION IF NOT
+#    EXISTS vector` and `plpython3u` on this same connection, and plpython3u is untrusted,
+#    so there is no non-superuser path to it. Refusing here would have left the operator
+#    in the crash loop, reading a message telling them to run, as a superuser, the one
+#    statement the connection had just declined to run.
+psql_cmd -v ON_ERROR_STOP=on -c "
+DO \$\$
+DECLARE __schema name;
+BEGIN
+    IF to_regtype('vector') IS NOT NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT n.nspname INTO __schema
+    FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+    WHERE e.extname = 'vector';
+
+    IF __schema IS NOT NULL THEN
+        RAISE EXCEPTION
+            'pgvector is installed in schema %, which this connection (%) cannot '
+            'resolve: search_path is %. db/create_tables.sql declares '
+            'interest_vector vector(1024) unqualified, so the install would still '
+            'fail at step 3. Nothing has been modified.',
+            __schema, current_user, current_setting('search_path');
+    END IF;
+
+    IF current_setting('is_superuser') = 'on' THEN
+        BEGIN
+            EXECUTE 'CREATE EXTENSION IF NOT EXISTS vector';
+        EXCEPTION WHEN duplicate_object OR unique_violation THEN
+            -- CREATE EXTENSION IF NOT EXISTS is not concurrency-safe: a HiveSense
+            -- install running against the same database at the same moment can win
+            -- the race and leave us with a duplicate-key error on
+            -- pg_extension_name_index. Either way the extension now exists.
+            NULL;
+        END;
+        RAISE NOTICE 'pgvector was missing; created it. HiveSense creates the same '
+                     'extension on the same connection.';
+        RETURN;
+    END IF;
+
+    RAISE EXCEPTION
+        'pgvector is not installed in database %, and % is not a superuser, so this '
+        'script cannot create it. haf_fyp stores interest vectors as vector(1024), so '
+        'the install would fail at step 3 after creating roles and the schema. In '
+        'database %, as a superuser, run:  CREATE EXTENSION IF NOT EXISTS vector;  '
+        '-- or install HiveSense, which creates it. Nothing has been modified.',
+        current_database(), current_user, current_database();
+END
+\$\$;"
+
 log "Installing haf_fyp schema..."
 
 # 1. Roles (must run as haf_admin)

@@ -239,7 +239,7 @@ fastapi-tests:
     POSTGRES_PORT: "5432"
     POSTGRES_PASSWORD: ""
     ADMIN_API_KEY: ""
-    API_URL: "http://localhost:3001"
+    API_URL: "http://localhost:3000"
     FASTAPI_URL: "http://localhost:3002"
     # Makes the tavern lane key rate limits on each stage's X-Real-IP rather than on
     # the one loopback peer they all share. Since #28 the per-IP limit is charged
