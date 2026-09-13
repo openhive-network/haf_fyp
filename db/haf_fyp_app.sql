@@ -132,7 +132,7 @@ RETURNS void
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    _stages hive.application_stages;
+    _stages hafd.application_stages;
     _app_block int;
     _ctx_block int;
 BEGIN
@@ -150,8 +150,8 @@ BEGIN
     IF NOT hive.app_context_exists('haf_fyp') THEN
         _stages := ARRAY[
             hive.stage('MASSIVE_PROCESSING', 101, 10000, '20 seconds'),
-            hive.live_stage()
-        ]::hive.application_stages;
+            hafd.live_stage()
+        ]::hafd.application_stages;
         PERFORM hive.app_create_context(
             _name   => 'haf_fyp'::hafd.context_name,
             _schema => 'haf_fyp_app',
