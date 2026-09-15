@@ -165,8 +165,8 @@ log "Starting block processing loop..."
 # base image) runs the registered haf_fyp_app.process_blocks per delivered
 # range and idles on its own connection between blocks: the backend shows idle
 # in pg_stat_activity, notifications are consumed, and no transaction spans a
-# wait. hive.app_next_iteration also withholds blocks that hivemind (and
-# hivesense, when present) has not committed - see db/register_app.sql.
+# wait. hive.app_next_iteration also withholds blocks that hivemind has not
+# committed - see db/register_app.sql.
 #
 # exec'd directly so it is PID 1 and receives SIGTERM itself; a bash parent
 # swallows the signal until docker's kill (learned on reputation_tracker!223).
@@ -175,13 +175,37 @@ log "Starting block processing loop..."
 # contract), so the driver's own container-clock marker is disabled with an
 # empty --startup-marker.
 #
-# HAF_FYP_USE_LEGACY_LOOP=true forces the eternal CALL main() loop (also used
-# automatically when the driver or the registry is unavailable).
+# HAF_FYP_USE_LEGACY_LOOP=true forces the eternal CALL main() loop. The same
+# fallback is taken automatically when the driver is not on PATH or when the
+# HAF this node talks to has no application registry.
+#
+# The registry probe is NOT optional. The psql base image has shipped the driver
+# since 14-3 (common-ci-configuration!386), so `command -v` alone would always
+# succeed, and the driver's first act is `SELECT ... FROM hafd.applications`
+# with no handler for a missing table: on a HAF that predates haf#341 (1.28.x)
+# it exits non-zero before its first range, and because it is exec'd as PID 1
+# under `restart: unless-stopped` that is an indefinite crash loop that the
+# healthcheck's 72h start_period never surfaces. db/register_app.sql already
+# warns and skips registration on such a HAF; this is the matching half.
+registry_has_haf_fyp() {
+    # Two statements, not one: PostgreSQL resolves every relation at plan time,
+    # so a single query that names hafd.applications errors on a HAF without
+    # it whatever to_regclass() says. Any psql failure counts as "not ready".
+    [ "$(psql_cmd -Atq -c "SELECT to_regclass('hafd.applications') IS NOT NULL" 2>/dev/null || true)" = "t" ] || return 1
+    [ "$(psql_cmd -Atq -c "SELECT EXISTS (SELECT 1 FROM hafd.applications WHERE name = 'haf_fyp')" 2>/dev/null || true)" = "t" ]
+}
+
 if command -v haf_app_driver.py >/dev/null 2>&1 \
    && [ "${HAF_FYP_USE_LEGACY_LOOP:-false}" != "true" ]; then
-    exec haf_app_driver.py --app=haf_fyp \
-        --postgres-url="postgresql://${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}?application_name=haf_fyp_block_processing" \
-        --startup-marker=
+    if registry_has_haf_fyp; then
+        log "haf_fyp is registered in the HAF application registry; running haf_app_driver.py"
+        exec haf_app_driver.py --app=haf_fyp \
+            --postgres-url="postgresql://${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}?application_name=haf_fyp_block_processing" \
+            --startup-marker=
+    fi
+    log "WARNING: haf_app_driver.py is on PATH but haf_fyp is not in the HAF application registry"
+    log "         (HAF older than haf#341, or db/register_app.sql skipped it); falling back to"
+    log "         the legacy CALL main() loop"
 fi
 
 log "haf_app_driver.py not used, falling back to the legacy CALL main() loop"

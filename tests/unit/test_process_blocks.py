@@ -40,10 +40,25 @@ def bash():
     return require_bash()
 
 
-def make_psql(tmp_path) -> Path:
-    """A stub psql: answers `SELECT now()`, records every -c, and never blocks."""
+def make_psql(tmp_path, registry: str = "t") -> Path:
+    """A stub psql: answers `SELECT now()` and the two application-registry
+    probes, records every -c, and never blocks.
+
+    registry: what the probes see -- "t" (hafd.applications exists and lists
+    haf_fyp, the registry-era HAF), "f" (registry present, haf_fyp not in it),
+    "absent" (no hafd.applications: a pre-haf#341 HAF), or "error" (psql itself
+    fails on the probe, e.g. a permissions problem)."""
     stub_bin(tmp_path)
     logfile = tmp_path / "sql.log"
+    if registry == "error":
+        probe = '  *"hafd.applications"*) echo "psql: stub failure" >&2; exit 1 ;;\n'
+    else:
+        table = "f" if registry == "absent" else "t"
+        row = "t" if registry == "t" else "f"
+        probe = (
+            f'  *"to_regclass(\'hafd.applications\')"*) printf "%s" {table} ;;\n'
+            f'  *"FROM hafd.applications"*) printf "%s" {row} ;;\n'
+        )
     write_exec(
         tmp_path / "bin" / "psql",
         "#!/bin/sh\n"
@@ -56,6 +71,7 @@ def make_psql(tmp_path) -> Path:
         f'printf "%s\\n" "$*" >> "{(tmp_path / "argv.log").as_posix()}"\n'
         'case "$cmd" in\n'
         f'  *"now()"*) printf "%s" {STUB_NOW!r} ;;\n'
+        + probe +
         "esac\n"
         "exit 0\n",
     )
@@ -300,3 +316,57 @@ def test_legacy_loop_can_be_forced(bash, tmp_path):
             extra_env={"HAF_FYP_USE_LEGACY_LOOP": "true"})
     assert not argv_log.exists()
     assert "CALL haf_fyp_app.main('haf_fyp');" in sql.read_text()
+
+
+# --- the registry probe: the driver must not be exec'd against a HAF that cannot run it
+
+def test_the_driver_needs_the_registry_not_just_the_binary(bash, tmp_path):
+    """The psql base image ships haf_app_driver.py since 14-3, so the binary is
+    always present; what decides is whether THIS HAF has the application
+    registry with haf_fyp in it. Against a pre-haf#341 HAF the driver would
+    exit before its first range and, as PID 1 under restart: unless-stopped,
+    crash-loop -- so the script has to fall back to CALL main() itself."""
+    sql = make_psql(tmp_path, registry="absent")
+    argv_log = make_driver_stub(tmp_path)
+    r = run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not argv_log.exists()
+    assert "CALL haf_fyp_app.main('haf_fyp');" in sql.read_text()
+    assert "not in the HAF application registry" in r.stdout + r.stderr
+
+
+def test_an_unregistered_app_falls_back_too(bash, tmp_path):
+    """Registry present but haf_fyp not in it (register_app.sql skipped, or an
+    install that predates it): same fallback, for the same reason -- the driver
+    raises SystemExit on an unregistered application."""
+    sql = make_psql(tmp_path, registry="f")
+    argv_log = make_driver_stub(tmp_path)
+    run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    assert not argv_log.exists()
+    assert "CALL haf_fyp_app.main('haf_fyp');" in sql.read_text()
+
+
+def test_a_failing_probe_counts_as_not_registered(bash, tmp_path):
+    """A psql failure on the probe (permissions, transient error) must not be
+    fatal under `set -e`, and must not be read as "registered" either: the
+    conservative answer is the legacy loop, which works on every HAF."""
+    sql = make_psql(tmp_path, registry="error")
+    argv_log = make_driver_stub(tmp_path)
+    r = run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not argv_log.exists()
+    assert "CALL haf_fyp_app.main('haf_fyp');" in sql.read_text()
+
+
+def test_the_probe_names_the_relation_in_a_statement_of_its_own(bash, tmp_path):
+    """PostgreSQL resolves relations at plan time, so a single statement that
+    mentions hafd.applications fails on a HAF without it regardless of any
+    to_regclass() guard in the same query. The existence check and the row
+    lookup must therefore be separate statements."""
+    sql = make_psql(tmp_path, registry="t")
+    make_driver_stub(tmp_path)
+    run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    statements = [c for c in sql.read_text().split("---\n") if "hafd.applications" in c]
+    assert len(statements) == 2, statements
+    assert "FROM hafd.applications" not in statements[0]
+    assert "to_regclass" not in statements[1]

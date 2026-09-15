@@ -86,10 +86,7 @@ compose-validate:
   image: docker:24
   variables:
     HAF_REGISTRY: "registry.example.com"
-    # Not "latest": hive/haf:latest dates from January and predates the
-    # application registry (hive.app_register, haf#341) that register_app.sql
-    # and the block-processing driver use. Pin a registry-era develop image.
-    HAF_VERSION: "d26f14cc"
+    HAF_VERSION: "latest"
     POSTGREST_VERSION: "latest"
     FYP_ADMIN_API_KEY: "dummy"
   script:
