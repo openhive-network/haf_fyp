@@ -1,4 +1,4 @@
-FROM registry.gitlab.syncad.com/hive/common-ci-configuration/psql:14-2
+FROM registry.gitlab.syncad.com/hive/common-ci-configuration/psql:14-3
 
 WORKDIR /app
 

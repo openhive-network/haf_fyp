@@ -40,10 +40,25 @@ def bash():
     return require_bash()
 
 
-def make_psql(tmp_path) -> Path:
-    """A stub psql: answers `SELECT now()`, records every -c, and never blocks."""
+def make_psql(tmp_path, registry: str = "t") -> Path:
+    """A stub psql: answers `SELECT now()` and the two application-registry
+    probes, records every -c, and never blocks.
+
+    registry: what the probes see -- "t" (hafd.applications exists and lists
+    haf_fyp, the registry-era HAF), "f" (registry present, haf_fyp not in it),
+    "absent" (no hafd.applications: a pre-haf#341 HAF), or "error" (psql itself
+    fails on the probe, e.g. a permissions problem)."""
     stub_bin(tmp_path)
     logfile = tmp_path / "sql.log"
+    if registry == "error":
+        probe = '  *"hafd.applications"*) echo "psql: stub failure" >&2; exit 1 ;;\n'
+    else:
+        table = "f" if registry == "absent" else "t"
+        row = "t" if registry == "t" else "f"
+        probe = (
+            f'  *"to_regclass(\'hafd.applications\')"*) printf "%s" {table} ;;\n'
+            f'  *"FROM hafd.applications"*) printf "%s" {row} ;;\n'
+        )
     write_exec(
         tmp_path / "bin" / "psql",
         "#!/bin/sh\n"
@@ -56,6 +71,7 @@ def make_psql(tmp_path) -> Path:
         f'printf "%s\\n" "$*" >> "{(tmp_path / "argv.log").as_posix()}"\n'
         'case "$cmd" in\n'
         f'  *"now()"*) printf "%s" {STUB_NOW!r} ;;\n'
+        + probe +
         "esac\n"
         "exit 0\n",
     )
@@ -213,3 +229,144 @@ def test_the_startup_write_is_atomic(bash, tmp_path):
     assert not any(
         'SELECT now()::timestamp" > "${STARTUP_TIME_FILE}"' in line for line in body
     )
+
+
+# --- the block-processing driver (haf#341) ----------------------------------------
+#
+# When haf_app_driver.py (shipped in the psql base image) is on PATH, the script
+# execs it instead of the eternal CALL main() loop. None of the tests above stub
+# it, so they exercise - deliberately - the legacy fallback that a driverless
+# environment (old image, this test host) gets.
+
+def make_driver_stub(tmp_path) -> Path:
+    """A stub haf_app_driver.py that records its argv and the startup file's
+    content at exec time, then exits instead of looping forever."""
+    argv_log = tmp_path / "driver_argv.log"
+    write_exec(
+        tmp_path / "bin" / "haf_app_driver.py",
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >> "{argv_log.as_posix()}"\n'
+        f'cat "${{HAF_FYP_STARTUP_TIME_FILE:-/tmp/block_processing_startup_time.txt}}" >> "{(tmp_path / "marker_at_exec.log").as_posix()}" 2>/dev/null\n'
+        "exit 0\n",
+    )
+    return argv_log
+
+
+def run_env(bash, tmp_path, *args: str, startup_file=None, extra_env=None):
+    env = clean_env(stub_bin(tmp_path))
+    if startup_file is not None:
+        env["HAF_FYP_STARTUP_TIME_FILE"] = str(startup_file)
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        [bash, str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=TIMEOUT
+    )
+
+
+def test_the_driver_is_used_when_available(bash, tmp_path):
+    """With the driver on PATH the script execs it for the registered application
+    (context name, matching db/register_app.sql) instead of CALL main()."""
+    sql = make_psql(tmp_path)
+    argv_log = make_driver_stub(tmp_path)
+    r = run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    assert r.returncode == 0, r.stdout + r.stderr
+    argv = argv_log.read_text()
+    assert "--app=haf_fyp" in argv
+    assert "CALL haf_fyp_app.main" not in sql.read_text()
+
+
+def test_the_driver_gets_the_connection_flags(bash, tmp_path):
+    """--host/--port/--user must reach the driver's connection URL, the same
+    silent-discard concern the psql-argv tests above guard for the legacy path."""
+    make_psql(tmp_path)
+    argv_log = make_driver_stub(tmp_path)
+    run_env(bash, tmp_path, "--host=elsewhere", "--port=6543", "--user=someone_else",
+            startup_file=tmp_path / "startup.txt")
+    argv = argv_log.read_text()
+    assert "postgresql://someone_else@elsewhere:6543/" in argv
+
+
+def test_the_driver_does_not_write_its_own_startup_marker(bash, tmp_path):
+    """The healthcheck compares against the DATABASE clock; the script writes that
+    marker itself before exec'ing the driver, and disables the driver's own
+    container-clock marker with an empty --startup-marker."""
+    make_psql(tmp_path)
+    argv_log = make_driver_stub(tmp_path)
+    run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    assert "--startup-marker=" in argv_log.read_text().split()
+
+
+def test_the_marker_is_written_before_the_driver_runs(bash, tmp_path):
+    """Same ordering contract as the legacy loop: the driver never returns in
+    production, so a marker written after the exec would never exist. The stub
+    snapshots the marker file at exec time."""
+    make_psql(tmp_path)
+    make_driver_stub(tmp_path)
+    run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    assert (tmp_path / "marker_at_exec.log").read_text().strip() == STUB_NOW
+
+
+def test_legacy_loop_can_be_forced(bash, tmp_path):
+    """HAF_FYP_USE_LEGACY_LOOP=true keeps the eternal CALL main() loop even when
+    the driver is available - the operator escape hatch while the driver path
+    is new."""
+    sql = make_psql(tmp_path)
+    argv_log = make_driver_stub(tmp_path)
+    run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt",
+            extra_env={"HAF_FYP_USE_LEGACY_LOOP": "true"})
+    assert not argv_log.exists()
+    assert "CALL haf_fyp_app.main('haf_fyp');" in sql.read_text()
+
+
+# --- the registry probe: the driver must not be exec'd against a HAF that cannot run it
+
+def test_the_driver_needs_the_registry_not_just_the_binary(bash, tmp_path):
+    """The psql base image ships haf_app_driver.py since 14-3, so the binary is
+    always present; what decides is whether THIS HAF has the application
+    registry with haf_fyp in it. Against a pre-haf#341 HAF the driver would
+    exit before its first range and, as PID 1 under restart: unless-stopped,
+    crash-loop -- so the script has to fall back to CALL main() itself."""
+    sql = make_psql(tmp_path, registry="absent")
+    argv_log = make_driver_stub(tmp_path)
+    r = run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not argv_log.exists()
+    assert "CALL haf_fyp_app.main('haf_fyp');" in sql.read_text()
+    assert "not in the HAF application registry" in r.stdout + r.stderr
+
+
+def test_an_unregistered_app_falls_back_too(bash, tmp_path):
+    """Registry present but haf_fyp not in it (register_app.sql skipped, or an
+    install that predates it): same fallback, for the same reason -- the driver
+    raises SystemExit on an unregistered application."""
+    sql = make_psql(tmp_path, registry="f")
+    argv_log = make_driver_stub(tmp_path)
+    run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    assert not argv_log.exists()
+    assert "CALL haf_fyp_app.main('haf_fyp');" in sql.read_text()
+
+
+def test_a_failing_probe_counts_as_not_registered(bash, tmp_path):
+    """A psql failure on the probe (permissions, transient error) must not be
+    fatal under `set -e`, and must not be read as "registered" either: the
+    conservative answer is the legacy loop, which works on every HAF."""
+    sql = make_psql(tmp_path, registry="error")
+    argv_log = make_driver_stub(tmp_path)
+    r = run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not argv_log.exists()
+    assert "CALL haf_fyp_app.main('haf_fyp');" in sql.read_text()
+
+
+def test_the_probe_names_the_relation_in_a_statement_of_its_own(bash, tmp_path):
+    """PostgreSQL resolves relations at plan time, so a single statement that
+    mentions hafd.applications fails on a HAF without it regardless of any
+    to_regclass() guard in the same query. The existence check and the row
+    lookup must therefore be separate statements."""
+    sql = make_psql(tmp_path, registry="t")
+    make_driver_stub(tmp_path)
+    run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    statements = [c for c in sql.read_text().split("---\n") if "hafd.applications" in c]
+    assert len(statements) == 2, statements
+    assert "FROM hafd.applications" not in statements[0]
+    assert "to_regclass" not in statements[1]
