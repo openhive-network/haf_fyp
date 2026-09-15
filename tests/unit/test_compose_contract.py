@@ -206,7 +206,7 @@ def test_no_inverted_pipeline_assertions_in_ci():
 ENV_FILE = ROOT / "docker" / ".env"
 CI_COMPOSE = ROOT / "docker" / "docker-compose-ci.yml"
 REWRITER = "haf-fyp-postgrest-rewriter"
-POSTGREST = "postgrest"
+POSTGREST = "haf-fyp-postgrest"
 
 # 5432 is deliberately absent: it is a plain literal here, and pinning a port an operator
 # may legitimately move turns a legal change into a test failure.
@@ -347,7 +347,8 @@ def test_documented_ports_reach_the_right_service():
 def test_rewriter_overrides_the_image_default_postgrest_host():
     """docker/rewriter_entrypoint.sh defaults POSTGREST_HOST to `haf-fyp-postgrest`, the
     name a haf_api_node deployment uses. This compose file names the service plain
-    `postgrest`, so the default resolves to nothing and every request 502s. The entrypoint
+    the service plain `postgrest`, so the default resolved to nothing. #48 renamed it,
+    so the two now agree -- and this asserts they keep agreeing. The entrypoint
     says so in a comment; nothing enforced it until the service existed to enforce it on.
     """
     yaml_mod = _require_yaml()
@@ -376,4 +377,75 @@ def test_rewriter_overrides_the_image_default_postgrest_host():
     _, container = _ports(doc["services"][POSTGREST]["ports"][0], env_file)
     assert port == container, (
         f"POSTGREST_PORT is {port!r} but `{POSTGREST}` listens on {container!r}"
+    )
+
+
+# --- service naming: nothing generic may reappear (#48) -----------------------------
+#
+# haf_api_node's compose.yml is `include:` of its own per-app module yamls into ONE
+# project. Services sharing a name across included files MERGE silently, and `ports:`
+# CONCATENATE -- which is how a generic name here becomes "the node's HAF PostgreSQL is
+# published on the host". This file is not composed into a node (see the header of
+# docker/docker-compose.yml), so the exposure is latent rather than live; the point of
+# this test is that it stays latent by decision rather than by luck.
+#
+# `redis` was renamed in !64 for exactly this reason, `postgrest` in !48. Both were
+# spotted by a human reading the file. This is the part that does not rely on that.
+GENERIC_NAME_EXEMPTIONS = {
+    # Named to MATCH haf_api_node's own service, deliberately: it is what makes
+    # `POSTGRES_HOST: haf` correct in both this stack and a node module, so the app's
+    # config is portable between them. Renaming would break that parallel and buy nothing
+    # while this file is never merged. Documented at length in the compose header.
+    "haf",
+}
+
+
+def test_no_service_carries_a_generic_name():
+    """Every service must be app-scoped, or an explicitly reasoned exemption."""
+    yaml_mod = _require_yaml()
+    for path in (COMPOSE, CI_COMPOSE):
+        doc = yaml_mod.safe_load(path.read_text(encoding="utf-8"))
+        offenders = [
+            name for name in doc["services"]
+            if not name.startswith("haf-fyp-")
+            and name not in GENERIC_NAME_EXEMPTIONS
+            and path is COMPOSE          # the CI lane is never composed into a node
+        ]
+        assert not offenders, (
+            f"{path.name}: {offenders} are generic names. Services sharing a name across "
+            f"haf_api_node's `include:`d files merge silently and their `ports:` "
+            f"concatenate. Prefix with `haf-fyp-`, or add to GENERIC_NAME_EXEMPTIONS "
+            f"with the reason -- do not add it silently."
+        )
+
+
+def test_rewriter_upstream_agrees_with_the_image_default():
+    """The compose override and docker/rewriter_entrypoint.sh's default must name the
+    same service, and it must exist.
+
+    Before #48 they disagreed: the entrypoint defaulted to `haf-fyp-postgrest` while the
+    service was plain `postgrest`, so !65 had to override it. Nothing held the two files
+    to each other -- which is the shape that produced the bug, a value correct in one
+    file and wrong in the other with no single place showing both.
+    """
+    yaml_mod = _require_yaml()
+    doc = yaml_mod.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    entrypoint = (ROOT / "docker" / "rewriter_entrypoint.sh").read_text(encoding="utf-8")
+
+    m = re.search(r'POSTGREST_HOST="\$\{POSTGREST_HOST:-([^}]+)\}"', entrypoint)
+    assert m, "could not read the POSTGREST_HOST default out of rewriter_entrypoint.sh"
+    image_default = m.group(1)
+
+    assert image_default in doc["services"], (
+        f"rewriter_entrypoint.sh defaults POSTGREST_HOST to {image_default!r}, which is "
+        f"not a service in {COMPOSE.name}: a stack relying on the default would 502."
+    )
+    compose_value = _resolve(
+        str((doc["services"][REWRITER].get("environment") or {})["POSTGREST_HOST"]),
+        _read_env(ENV_FILE),
+    )
+    assert compose_value == image_default, (
+        f"compose sets POSTGREST_HOST={compose_value!r} but the image defaults to "
+        f"{image_default!r}. They may both be right, but nothing would tell you which "
+        f"one a deployment is using -- keep them equal."
     )

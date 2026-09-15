@@ -236,7 +236,7 @@ assert_no_active_sessions() {
         report_active_sessions | while read -r line; do log "         ${line}"; done
         log "       Stop everything that talks to haf_fyp first, e.g.:"
         log "           docker compose -f docker/docker-compose.yml stop \\"
-        log "               haf-fyp-sync haf-fyp-ranker haf-fyp-api postgrest"
+        log "               haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest"
         log "       then re-run this script."
         exit 1
     fi

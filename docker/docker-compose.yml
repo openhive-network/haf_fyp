@@ -1,13 +1,45 @@
 version: "3.8"
 
 # Full production stack:
-#   haf                — HAF PostgreSQL node (hived + sql_serializer)
-#   haf-fyp-setup      — One-time schema installation (runs as haf_admin)
-#   haf-fyp-sync       — Infinite block-processing loop (PL/pgSQL main())
-#   haf-fyp-ranker     — Python ranking daemon (5-minute cycles)
-#   haf-fyp-api        — FastAPI overlay (rate limiting, force-refresh, explainer)
-#   postgrest          — Auto-generated REST API over haf_fyp_endpoints schema
-#   haf-fyp-redis      — Pub/sub for force-refresh signals, and rate-limit storage
+#   haf                        — HAF PostgreSQL node (hived + sql_serializer)
+#   haf-fyp-setup              — One-time schema installation (runs as haf_admin)
+#   haf-fyp-sync               — Infinite block-processing loop (PL/pgSQL main())
+#   haf-fyp-ranker             — Python ranking daemon (5-minute cycles)
+#   haf-fyp-api                — FastAPI overlay (rate limiting, force-refresh, explainer)
+#   haf-fyp-postgrest          — Auto-generated REST API over haf_fyp_endpoints schema
+#   haf-fyp-postgrest-rewriter — Public read API: clean /v1/fyp/... paths (#38)
+#   haf-fyp-redis              — Pub/sub for force-refresh signals, and rate-limit storage
+#
+# ─────────────────────────────────────────────────────────────────────────────────────
+# THIS FILE IS THE STANDALONE STACK. IT IS NOT COMPOSED INTO A NODE. (#48)
+#
+# haf_api_node's compose.yml is `name: ${PROJECT_NAME}` plus an `include:` of its OWN
+# per-app module yamls — haf_stats.yaml, hivesense.yaml, and so on. Each module declares
+# its own prefixed services and points POSTGRES_HOST at the node's `haf`. No app repo's
+# docker-compose.yml is ever included, and haf_fyp's node module lives outside this repo.
+#
+# That distinction is load-bearing, because services sharing a name across `include`d
+# files MERGE into one service with no error and no warning, and `ports:` CONCATENATE.
+# If this file were ever included, its `haf` would merge with haf_base.yaml's and add
+# "5432:5432" to it — publishing the node's HAF PostgreSQL on the host.
+#
+# So: every service here carries the `haf-fyp-` prefix, and the two that do not are
+# deliberate:
+#
+#   haf        — named to MATCH haf_api_node's service, not by accident. It is what makes
+#                POSTGRES_HOST: haf correct in both this stack and a node module, so the
+#                app's own config is portable between them. Renaming it here would break
+#                that parallel and buy nothing, given this file is never merged.
+#   volumes    — haf_datadir / redis_data are generic and merge the same way. Left as-is
+#                because renaming a volume orphans its data rather than moving it, which
+#                is a deploy decision, not a text edit — and unreachable while this file
+#                is not composed. tests/unit/test_compose_contract.py pins the naming rule
+#                so a NEW generic service cannot appear without the decision being revisited.
+#
+# No `networks:` key is declared, so services land on the project's implicit default
+# network and resolve each other by name — correct for a standalone stack. Upstream module
+# files declare `networks: [haf-network]` because they DO share a node network.
+# ─────────────────────────────────────────────────────────────────────────────────────
 
 services:
   haf:
@@ -219,7 +251,7 @@ services:
         condition: service_started
     restart: unless-stopped
 
-  postgrest:
+  haf-fyp-postgrest:
     image: postgrest/postgrest:${POSTGREST_VERSION}
     restart: unless-stopped
     # Moved off 3001, which the rewriter now owns. PostgREST stays published so the raw
@@ -265,12 +297,13 @@ services:
     ports:
       - "${API_PORT:-3001}:80"
     environment:
-      # NOT the image default. docker/rewriter_entrypoint.sh defaults POSTGREST_HOST to
-      # `haf-fyp-postgrest`, the name a haf_api_node deployment uses; this compose file
-      # names the service plain `postgrest`, so the default resolves to nothing here and
-      # every request would 502. The entrypoint comment says so explicitly: "Whoever adds
-      # one must set POSTGREST_HOST: postgrest, or rename the service to match."
-      POSTGREST_HOST: "${POSTGREST_HOST:-postgrest}"
+      # Now AGREES with the image default. docker/rewriter_entrypoint.sh defaults
+      # POSTGREST_HOST to `haf-fyp-postgrest`; until #48 this file named the service plain
+      # `postgrest`, so the default resolved to nothing here and !65 had to override it.
+      # The entrypoint's own comment offered the alternative -- "or rename the service to
+      # match" -- and that is what #48 did. Kept explicit rather than deleted so a future
+      # change to the image default cannot silently move this stack's upstream.
+      POSTGREST_HOST: "${POSTGREST_HOST:-haf-fyp-postgrest}"
       POSTGREST_PORT: "${POSTGREST_PORT:-3000}"
     healthcheck:
       # The image serves /health on :81, a second server block separate from the :80
@@ -281,7 +314,7 @@ services:
       start_period: 30s
       retries: 10
     depends_on:
-      postgrest:
+      haf-fyp-postgrest:
         condition: service_started
 
   # NAMED haf-fyp-redis, NOT redis (#39).

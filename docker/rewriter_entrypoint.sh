@@ -17,12 +17,12 @@ fi
 # bind-mounted config for this image without also setting POSTGREST_HOST would
 # get 502 on first boot.
 #
-# NOTE the asymmetry, because "matching haf_stats" is NOT the reason: haf_stats
-# defaults to its own docker/docker-compose.yml service name (haf-stats-api),
-# whereas THIS repo's compose names the service plain "postgrest". So this default
-# is correct for the deployment and wrong for the reference stack -- which is
-# harmless only because that stack defines no rewriter service at all. Whoever adds
-# one must set POSTGREST_HOST: postgrest, or rename the service to match.
+# The asymmetry this comment used to describe is GONE: the reference stack named its
+# service plain "postgrest", so this default was right for a deployment and wrong for
+# that stack. #48 took the second of the two options offered here and renamed the
+# service to haf-fyp-postgrest, so the default is now correct in BOTH. docker-compose.yml
+# still sets POSTGREST_HOST explicitly -- agreeing with this default rather than
+# overriding it -- so that changing this line cannot silently move that stack's upstream.
 POSTGREST_HOST="${POSTGREST_HOST:-haf-fyp-postgrest}"
 POSTGREST_PORT="${POSTGREST_PORT:-3000}"
 

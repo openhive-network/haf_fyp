@@ -291,7 +291,7 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml up --bu
 
 # 3. Start the full stack
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml up \
-  haf-fyp-sync haf-fyp-ranker haf-fyp-api postgrest \
+  haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest \
   haf-fyp-postgrest-rewriter haf-fyp-redis
 
 # 4. Smoke test
@@ -539,10 +539,22 @@ haf-fyp-uninstall  # removes the app from the database — profile "haf-fyp-unin
                    # starts on a plain `up` (Dockerfile.sql)
 haf-fyp-ranker     # Python ranking daemon, 5-minute cycles (Dockerfile.python)
 haf-fyp-api        # FastAPI overlay on port 3002 (Dockerfile.python)
-postgrest          # PostgREST on port 3000 (raw /rpc/, for debugging)
-haf-fyp-postgrest-rewriter  # public read API on port 3001 (clean /v1/fyp/... paths)
+haf-fyp-postgrest  # PostgREST on port 3000 (raw /rpc/, for debugging)
+haf-fyp-postgrest-rewriter
+                   # public read API on port 3001 (clean /v1/fyp/... paths)
 haf-fyp-redis      # pub/sub for force-refresh signals + rate-limit buckets
+haf                # the HAF node itself. The ONE service without the app prefix, and
+                   # deliberately so: it matches haf_api_node's own service name, which
+                   # is what makes `POSTGRES_HOST: haf` correct both here and in a node
+                   # module. See the header of docker/docker-compose.yml (#48).
 ```
+
+Every other service carries the `haf-fyp-` prefix. That is not cosmetic: `haf_api_node`
+composes its apps by `include:`-ing per-app module yamls into one project, and services
+sharing a name across those files merge silently while their `ports:` concatenate. This
+file is never one of those includes — the node runs haf_fyp from a module yaml that lives
+outside this repo — but the prefix keeps the exposure latent by decision rather than by
+luck, and `tests/unit/test_compose_contract.py` pins it.
 
 ### The SQL image's verbs
 
@@ -643,7 +655,7 @@ context had already been removed. The script refuses while any such session exis
 
 ```bash
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
-  stop haf-fyp-sync haf-fyp-ranker haf-fyp-api postgrest
+  stop haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
   run --rm haf-fyp-uninstall
 ```
