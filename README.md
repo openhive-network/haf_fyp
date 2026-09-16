@@ -312,6 +312,24 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml run --r
 > A stale `:3001/rpc/x` call returns a PostgREST 404 body rather than a connection error,
 > so it reads as "the endpoint was removed" — it moved.
 
+> **Upgrading from before #48:** the `postgrest` service is now `haf-fyp-postgrest`.
+> Renaming a compose service does not rename its running container: the old one is
+> orphaned and keeps host port 3000, so step 3 fails with `port is already allocated`, the
+> recreated rewriter never starts, and 3001 stops serving. Remove the orphan once, with the
+> same service list:
+>
+> ```bash
+> docker compose --env-file docker/.env.local -f docker/docker-compose.yml up -d \
+>   --remove-orphans haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest \
+>   haf-fyp-postgrest-rewriter haf-fyp-redis
+> ```
+>
+> `stop postgrest` now fails with `no such service`, and neither `stop` nor a plain `down`
+> reaches the orphan — which can keep PostgREST's sessions open as `haf_fyp_user`, so the
+> uninstall script's session check refuses. If `docker/.env.local` sets
+> `POSTGREST_HOST=postgrest`, delete that line: the rewriter would proxy to the orphan, and
+> once the orphan is gone, fail to start.
+
 ## API Endpoints
 
 All read endpoints are served through the **rewriter on port 3001**, which maps the clean paths onto PostgREST's `/rpc/` calls. That is the documented, supported surface and the one `haf_api_node` consumes. PostgREST itself is published on port 3000 for debugging. The FastAPI overlay on port 3002 handles write operations and admin actions.
@@ -549,12 +567,16 @@ haf                # the HAF node itself. The ONE service without the app prefix
                    # module. See the header of docker/docker-compose.yml (#48).
 ```
 
-Every other service carries the `haf-fyp-` prefix. That is not cosmetic: `haf_api_node`
-composes its apps by `include:`-ing per-app module yamls into one project, and services
-sharing a name across those files merge silently while their `ports:` concatenate. This
-file is never one of those includes — the node runs haf_fyp from a module yaml that lives
-outside this repo — but the prefix keeps the exposure latent by decision rather than by
-luck, and `tests/unit/test_compose_contract.py` pins it.
+Every other service carries the `haf-fyp-` prefix. That is not cosmetic: services sharing
+a name across compose files are combined. Layered with `-f`, the later file silently wins
+the image, healthcheck and same-target mounts while `ports:` concatenate; `include:`d,
+Compose v5 merges them silently too (v2.20.3–v2.40.3 refuse with an error). A
+`haf_api_node` never combines this file with its own — it runs apps from module yamls, and
+haf_fyp's lives outside this repo — so the exposure is latent, and the prefix keeps it
+latent by decision rather than by luck. **Never combine this file with a node's compose
+files:** its `haf` would replace the node's HAF image and datadir mount. The header of
+`docker/docker-compose.yml` has the measurements, and `tests/unit/test_compose_contract.py`
+pins the naming rule.
 
 ### The SQL image's verbs
 
@@ -714,9 +736,10 @@ unauthenticated `/v1/fyp/events` is Redis write traffic. `MAX_REQUEST_BODY_BYTES
 (default 256 KiB) and the per-IP limits are what bound it.
 
 **The Redis service is named `haf-fyp-redis`, and it must not be an evicting
-instance.** Both matter for anyone running this as a module of `haf_api_node`, whose
-`jussi.yaml` already defines a service called `redis`: compose merges services by name,
-so a generically-named service silently becomes jussi's instance. That one runs
+instance.** Both matter wherever haf_fyp runs on a `haf_api_node`, whose `jussi.yaml`
+already defines a service called `redis`: services sharing a name across compose files
+are combined, so a generically-named Redis in a haf_fyp module file silently becomes
+jussi's instance. That one runs
 `--maxmemory 8G --maxmemory-policy allkeys-lru`, and under `allkeys-lru` the limiter's
 buckets are evicted under memory pressure rather than expiring on their TTL — rate
 limits stop holding, with no error raised anywhere. The shipped compose states

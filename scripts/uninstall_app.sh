@@ -165,7 +165,7 @@ wait_for_postgres
 # ---------------------------------------------------------------------------
 # 1. Refuse while anything is connected as a haf_fyp role.
 # ---------------------------------------------------------------------------
-# Not just the block processor. haf-fyp-ranker, haf-fyp-api and postgrest all hold
+# Not just the block processor. haf-fyp-ranker, haf-fyp-api and haf-fyp-postgrest all hold
 # sessions against these schemas, and DROP SCHEMA ... CASCADE needs an
 # AccessExclusiveLock -- with any of them live, step 4 does not fail, it BLOCKS,
 # after the context has already been removed.
@@ -237,7 +237,9 @@ assert_no_active_sessions() {
         log "       Stop everything that talks to haf_fyp first, e.g.:"
         log "           docker compose -f docker/docker-compose.yml stop \\"
         log "               haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest"
-        log "       then re-run this script."
+        log "       then re-run this script. A container orphaned by a service rename"
+        log "       (plain postgrest, before #48) is not reached by stop: find it with"
+        log "       docker ps and remove it with docker rm -f."
         exit 1
     fi
 }
