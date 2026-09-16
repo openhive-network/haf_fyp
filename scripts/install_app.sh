@@ -520,7 +520,8 @@ else
     log "         at build time, so exporting it and re-running is NOT enough -- a plain"
     log "         'up' reuses the existing image. Rebuild:"
     log "         GIT_HASH=\$(git rev-parse --short=8 HEAD) docker compose \\"
-    log "             -f docker/docker-compose.yml up --build haf-fyp-setup"
+    log "             --env-file docker/.env.local -f docker/docker-compose.yml \\"
+    log "             up --build haf-fyp-setup"
 fi
 
 psql_cmd -v git_hash="${GIT_HASH:-}" -f "${SCRIPT_DIR}/../scripts/set_version.sql"

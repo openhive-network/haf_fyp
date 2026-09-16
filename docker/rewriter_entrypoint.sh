@@ -14,15 +14,18 @@ fi
 
 # Defaults to the service name a haf_api_node deployment uses. The old default,
 # "postgrest", resolves to nothing there, so an operator who swapped the
-# bind-mounted config for this image without also setting POSTGREST_HOST would
-# get 502 on first boot.
+# bind-mounted config for this image without also setting POSTGREST_HOST would get
+# no rewriter at all: the template's upstream is a literal with no `resolver`, so
+# nginx resolves it while parsing the config and openresty exits with
+# "[emerg] host not found in upstream".
 #
-# NOTE the asymmetry, because "matching haf_stats" is NOT the reason: haf_stats
-# defaults to its own docker/docker-compose.yml service name (haf-stats-api),
-# whereas THIS repo's compose names the service plain "postgrest". So this default
-# is correct for the deployment and wrong for the reference stack -- which is
-# harmless only because that stack defines no rewriter service at all. Whoever adds
-# one must set POSTGREST_HOST: postgrest, or rename the service to match.
+# "Matching haf_stats" is NOT the reason for this name: haf_stats' entrypoint defaults
+# to its own docker/docker-compose.yml service name (haf-stats-api), which its node
+# module must override. Here the default also names the service in THIS repo's
+# docker-compose.yml -- since #48 renamed that service from plain "postgrest" to
+# haf-fyp-postgrest -- so one default is right for both a node and the reference
+# stack. docker-compose.yml still sets POSTGREST_HOST explicitly, agreeing with this
+# line, so that changing it cannot silently move that stack's upstream.
 POSTGREST_HOST="${POSTGREST_HOST:-haf-fyp-postgrest}"
 POSTGREST_PORT="${POSTGREST_PORT:-3000}"
 

@@ -165,7 +165,7 @@ wait_for_postgres
 # ---------------------------------------------------------------------------
 # 1. Refuse while anything is connected as a haf_fyp role.
 # ---------------------------------------------------------------------------
-# Not just the block processor. haf-fyp-ranker, haf-fyp-api and postgrest all hold
+# Not just the block processor. haf-fyp-ranker, haf-fyp-api and haf-fyp-postgrest all hold
 # sessions against these schemas, and DROP SCHEMA ... CASCADE needs an
 # AccessExclusiveLock -- with any of them live, step 4 does not fail, it BLOCKS,
 # after the context has already been removed.
@@ -235,9 +235,12 @@ assert_no_active_sessions() {
         log "ERROR: ${_active} session(s) are still connected as a haf_fyp role:"
         report_active_sessions | while read -r line; do log "         ${line}"; done
         log "       Stop everything that talks to haf_fyp first, e.g.:"
-        log "           docker compose -f docker/docker-compose.yml stop \\"
-        log "               haf-fyp-sync haf-fyp-ranker haf-fyp-api postgrest"
-        log "       then re-run this script."
+        log "           docker compose --env-file docker/.env.local \\"
+        log "               -f docker/docker-compose.yml stop \\"
+        log "               haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest"
+        log "       then re-run this script. On a stack upgraded across #48, an old"
+        log "       postgrest container is not reached by stop: remove it as step 2 of"
+        log "       'Upgrading from before #48' in README.md does."
         exit 1
     fi
 }

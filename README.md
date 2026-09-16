@@ -258,8 +258,8 @@ that does move with the ranker is the top-level `computed_at` in this same
 
 After installing each external app, run:
 ```bash
-docker compose -f docker/docker-compose.yml run --rm haf-fyp-setup \
-  /app/scripts/grant_cross_schema.sh
+docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
+  run --rm haf-fyp-setup /app/scripts/grant_cross_schema.sh
 ```
 
 ## Quick Start
@@ -291,7 +291,7 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml up --bu
 
 # 3. Start the full stack
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml up \
-  haf-fyp-sync haf-fyp-ranker haf-fyp-api postgrest \
+  haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest \
   haf-fyp-postgrest-rewriter haf-fyp-redis
 
 # 4. Smoke test
@@ -311,6 +311,52 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml run --r
 > to **3000**, and 3001 now serves the clean `/v1/fyp/...` paths through the rewriter.
 > A stale `:3001/rpc/x` call returns a PostgREST 404 body rather than a connection error,
 > so it reads as "the endpoint was removed" — it moved.
+
+> **Upgrading from before #48:** the `postgrest` service is now `haf-fyp-postgrest`.
+> Renaming a compose service does not rename its running container: the old one is
+> orphaned and keeps host port 3000, so a plain quick-start step 3 fails with `port is
+> already allocated`. It leaves the new PostgREST created but not running, and usually the
+> rewriter too, so 3001 is down. Stopping the renamed services does not reach the orphan,
+> and neither does a plain `down` — so it can also keep PostgREST's sessions open as
+> `haf_fyp_user`, and the uninstall script refuses.
+>
+> 1. If `docker/.env.local` sets `POSTGREST_HOST=postgrest`, delete that line.
+> 2. Remove the old `postgrest` container, and the two containers the rename affects.
+>    3001 is down from here (already, if step 3 failed) until step 3's PostgREST is up.
+>
+>    ```bash
+>    project=$(docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
+>      config | sed -n 's/^name: //p' | tr -d '"')
+>    docker ps -aq --filter "label=com.docker.compose.project=$project" \
+>      --filter label=com.docker.compose.service=postgrest | xargs -r docker rm -f
+>    docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
+>      rm -sf haf-fyp-postgrest haf-fyp-postgrest-rewriter
+>    ```
+>
+>    The first command matches the old container by this stack's project and service
+>    labels, so nothing else is touched. **Not** `--remove-orphans`: that removes the
+>    containers of every service this file does not define, and every exited `run`
+>    container, across the whole project. The default project name here is just the
+>    directory, `docker`. The `rm -sf` matters most after a failed
+>    step 3. Retrying `up` over the half-created PostgREST exits 0 but starts it with **no
+>    network**, so the rewriter cannot resolve it. It also forces the rewriter to be
+>    recreated, and so to resolve its upstream afresh.
+> 3. Start the stack with quick-start step 3's service list (add `--build` if the same
+>    pull changed anything else — see quick-start step 2). Like step 3, this re-runs
+>    `haf-fyp-setup`, and PostgREST starts only once it finishes:
+>
+>    ```bash
+>    docker compose --env-file docker/.env.local -f docker/docker-compose.yml up -d \
+>      haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest \
+>      haf-fyp-postgrest-rewriter haf-fyp-redis
+>    ```
+>
+> 4. Smoke-test through the rewriter. `/health` on 3001 goes to PostgREST
+>    (`/rpc/get_health`), and `-f` makes an error status a non-zero exit:
+>
+>    ```bash
+>    curl -fsS http://localhost:3001/health
+>    ```
 
 ## API Endpoints
 
@@ -536,13 +582,31 @@ haf_fyp_endpoints
 haf-fyp-setup      # one-shot DDL install + cross-schema grants (Dockerfile.sql)
 haf-fyp-sync       # PL/pgSQL block loop (Dockerfile.sql)
 haf-fyp-uninstall  # removes the app from the database — profile "haf-fyp-uninstall",
-                   # starts on a plain `up` (Dockerfile.sql)
+                   # never starts on a plain `up` (Dockerfile.sql)
 haf-fyp-ranker     # Python ranking daemon, 5-minute cycles (Dockerfile.python)
 haf-fyp-api        # FastAPI overlay on port 3002 (Dockerfile.python)
-postgrest          # PostgREST on port 3000 (raw /rpc/, for debugging)
-haf-fyp-postgrest-rewriter  # public read API on port 3001 (clean /v1/fyp/... paths)
+haf-fyp-postgrest  # PostgREST on port 3000 (raw /rpc/, for debugging)
+haf-fyp-postgrest-rewriter
+                   # public read API on port 3001 (clean /v1/fyp/... paths)
 haf-fyp-redis      # pub/sub for force-refresh signals + rate-limit buckets
+haf                # the HAF node itself. The ONE service without the app prefix, and
+                   # deliberately so: it matches haf_api_node's own service name, which
+                   # is what makes `POSTGRES_HOST: haf` correct both here and in a node
+                   # module. See the header of docker/docker-compose.yml (#48).
 ```
+
+Every other service carries the `haf-fyp-` prefix. That is not cosmetic: compose
+identifies a service by project and name, so a same-named service from another file is not
+a second service. Run under a node's project name, this file's `haf` **recreates** the
+node's HAF container from this file's definition. Layered with `-f` after the node's
+files, it overrides the node's image, healthcheck and datadir mount (most Compose versions
+do this silently).
+`include:`d, Compose v5 merges it silently too. A `haf_api_node` never does any of this
+with this file — it runs apps from module yamls, and haf_fyp's lives outside this repo —
+so the exposure is latent, and the prefix keeps it latent by decision rather than by luck.
+**Never combine this file with a node's compose files, and never run it under a node's
+project name.** The header of `docker/docker-compose.yml` has the measured versions, and
+`tests/unit/test_compose_contract.py` pins the naming rule.
 
 ### The SQL image's verbs
 
@@ -643,10 +707,17 @@ context had already been removed. The script refuses while any such session exis
 
 ```bash
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
-  stop haf-fyp-sync haf-fyp-ranker haf-fyp-api postgrest
+  stop haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
   run --rm haf-fyp-uninstall
 ```
+
+Keep `--env-file` on the `run` as well as the `stop`. `run` recreates any dependency whose
+configuration differs. So if `.env.local` changes `HAF_REGISTRY` or `HAF_VERSION` — and
+the quick start tells production to pin `HAF_VERSION` — leaving it off recreates `haf`
+from `docker/.env`'s values just before the teardown. On a stack upgraded across #48 whose old `postgrest` container is
+still running, `stop` cannot reach it. Remove it first, as step 2 of *Upgrading from
+before #48* above does.
 
 The profile keeps it out of a plain `up`, and is namespaced `haf-fyp-uninstall` so
 `COMPOSE_PROFILES` cannot collide with another app's teardown on a shared node.
@@ -702,9 +773,12 @@ unauthenticated `/v1/fyp/events` is Redis write traffic. `MAX_REQUEST_BODY_BYTES
 (default 256 KiB) and the per-IP limits are what bound it.
 
 **The Redis service is named `haf-fyp-redis`, and it must not be an evicting
-instance.** Both matter for anyone running this as a module of `haf_api_node`, whose
-`jussi.yaml` already defines a service called `redis`: compose merges services by name,
-so a generically-named service silently becomes jussi's instance. That one runs
+instance.** Both matter wherever haf_fyp runs on a `haf_api_node` that runs jussi, whose
+`jussi.yaml` (included when `JSONRPC_API_SERVER_NAME=jussi`) defines a service called
+`redis`. A same-named service is not a second service: under the node's shared project
+name, whichever file was applied last recreates the one container, so a generically-named
+Redis in a haf_fyp module file would silently become jussi's instance, or replace it.
+Jussi's runs
 `--maxmemory 8G --maxmemory-policy allkeys-lru`, and under `allkeys-lru` the limiter's
 buckets are evicted under memory pressure rather than expiring on their TTL — rate
 limits stop holding, with no error raised anywhere. The shipped compose states
@@ -739,8 +813,10 @@ matters. Nothing needs ordering and a rollback strands nothing: bucket identitie
 unchanged and every key expires with its window.
 
 ⚠️ **The upgrade that renamed `redis` to `haf-fyp-redis` is the exception to every
-sentence above.** Recreate `haf-fyp-api` **and** `haf-fyp-ranker` together, and pass
-`--remove-orphans`. Renaming a compose service does not rename the running container:
+sentence above.** Recreate `haf-fyp-api` **and** `haf-fyp-ranker` together, after removing
+the old `redis` container the way step 2 of *Upgrading from before #48* removes the old
+`postgrest` (service label `redis` instead). Not `--remove-orphans`, which reaches far
+more than that one container. Renaming a compose service does not rename the running container:
 the old one is orphaned and keeps the `redis` network alias, so a per-service
 `up -d --build haf-fyp-api` leaves the ranker resolving `redis` while the api publishes
 to `haf-fyp-redis`. Force-refresh then stops working **with no error on either side**

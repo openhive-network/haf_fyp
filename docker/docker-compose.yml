@@ -1,13 +1,70 @@
 version: "3.8"
 
 # Full production stack:
-#   haf                — HAF PostgreSQL node (hived + sql_serializer)
-#   haf-fyp-setup      — One-time schema installation (runs as haf_admin)
-#   haf-fyp-sync       — Infinite block-processing loop (PL/pgSQL main())
-#   haf-fyp-ranker     — Python ranking daemon (5-minute cycles)
-#   haf-fyp-api        — FastAPI overlay (rate limiting, force-refresh, explainer)
-#   postgrest          — Auto-generated REST API over haf_fyp_endpoints schema
-#   haf-fyp-redis      — Pub/sub for force-refresh signals, and rate-limit storage
+#   haf                        — HAF PostgreSQL node (hived + sql_serializer)
+#   haf-fyp-setup              — One-time schema installation (runs as haf_admin)
+#   haf-fyp-sync               — Infinite block-processing loop (PL/pgSQL main())
+#   haf-fyp-ranker             — Python ranking daemon (5-minute cycles)
+#   haf-fyp-api                — FastAPI overlay (rate limiting, force-refresh, explainer)
+#   haf-fyp-postgrest          — Auto-generated REST API over haf_fyp_endpoints schema
+#   haf-fyp-postgrest-rewriter — Public read API: clean /v1/fyp/... paths (#38)
+#   haf-fyp-redis              — Pub/sub for force-refresh signals, and rate-limit storage
+#
+# ─────────────────────────────────────────────────────────────────────────────────────
+# THIS FILE IS THE STANDALONE STACK. (#48) NEVER COMBINE IT WITH A NODE'S COMPOSE FILES,
+# AND NEVER RUN IT UNDER A NODE'S PROJECT NAME.
+#
+# A haf_api_node runs apps from module yamls, not from an app repo's docker-compose.yml.
+# Upstream's compose.yml is `name: ${PROJECT_NAME}` plus an `include:` of its own module
+# files — on develop, e.g. haf_stats.yaml: haf-stats-* services, POSTGRES_HOST: haf — and
+# no app repo's compose file appears in it on develop or master. haf_fyp has no upstream
+# module: the node that runs it keeps a private module file OUTSIDE `include:` and runs
+# it on its own under the node's project name (`docker compose -p haf -f <module>`).
+#
+# The distinction is load-bearing, because compose identifies a service by project and
+# name: a same-named service from another file is not a second service. Measured with
+# this file's `haf` against haf_api_node's (develop):
+#
+#   -p <node's project> -f <this file>   the node's `haf` container is RECREATED from
+#                                        this file's definition — its image, its ports,
+#                                        an empty project volume for the datadir.
+#   -f compose.yml -f <this file>        merged: the later file wins image, healthcheck
+#                                        and same-target mounts (the datadir bind becomes
+#                                        an EMPTY named volume), and 5432 is published.
+#                                        Silent on every version measured from v2.21.0 to
+#                                        v5.5.1, except v2.24.0–v2.24.5, which refuse.
+#   include: [..., <this file>]          refused on every v2 measured (v2.20.0–v2.40.3:
+#                                        "defines conflicting service" before v2.24,
+#                                        "conflicts with imported resource" from it);
+#                                        merged silently on v5.0.0–v5.5.1, adding 5432
+#                                        and a restart policy to the node's `haf`.
+#
+# So: every service here carries the `haf-fyp-` prefix, and the exceptions are deliberate:
+#
+#   haf        — named to MATCH haf_api_node's service. It is what makes POSTGRES_HOST: haf
+#                correct in both this stack and a node module, so the app's config is
+#                portable between them. Renaming it would NOT make any of the above safe.
+#                Layered, a renamed service is simply added: a SECOND, empty HAF, with
+#                every haf-fyp-* service that connects to PostgreSQL pointed at it. Under
+#                the node's project name, the prefix protects nothing either — this
+#                file's haf-fyp-* services would recreate the node's same-named haf_fyp
+#                containers and add the rest alongside. And renaming has an upgrade
+#                hazard of its own: the running
+#                `haf` container is orphaned, not renamed, while the new service mounts
+#                the same haf_datadir volume.
+#   volumes    — haf_datadir / redis_data are generic and combine the same way. Renaming a
+#                key alone creates a new, empty project-prefixed volume and orphans the old
+#                one with the data in it; keeping the data needs a pinned `name:` or a
+#                migration. A deploy decision, not a text edit.
+#
+# tests/unit/test_compose_contract.py pins both rules, so a NEW generic service or volume
+# cannot appear without this being revisited.
+#
+# No `networks:` key is declared, so services land on the project's implicit default
+# network and resolve each other by name — correct for a standalone stack. Upstream app
+# modules such as haf_stats.yaml declare `networks: [haf-network]` because they DO share a
+# node network.
+# ─────────────────────────────────────────────────────────────────────────────────────
 
 services:
   haf:
@@ -106,8 +163,16 @@ services:
   # Removes haf_fyp from the database: HAF context, both schemas (CASCADE), both
   # roles. Behind a profile, so `docker compose up` never starts it.
   #
-  #     docker compose -f docker/docker-compose.yml   #         stop haf-fyp-sync haf-fyp-ranker haf-fyp-api postgrest
-  #     docker compose -f docker/docker-compose.yml run --rm haf-fyp-uninstall
+  #     docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
+  #         stop haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest
+  #     docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
+  #         run --rm haf-fyp-uninstall
+  #
+  # --env-file on BOTH: `run` recreates a dependency whose config differs, so if .env.local
+  # pins HAF_VERSION/HAF_REGISTRY, leaving it off recreates `haf` from docker/.env just
+  # before the teardown. A pre-#48 `postgrest`
+  # container is not reached by `stop`; README "Upgrading from before #48" step 2
+  # removes it (by label -- not --remove-orphans, which removes far more).
   #
   # USE `run --rm`, NOT `--profile haf-fyp-uninstall up`. Upstream documents the `up`
   # form and it is safe THERE because upstream puts every app service behind a profile
@@ -219,7 +284,7 @@ services:
         condition: service_started
     restart: unless-stopped
 
-  postgrest:
+  haf-fyp-postgrest:
     image: postgrest/postgrest:${POSTGREST_VERSION}
     restart: unless-stopped
     # Moved off 3001, which the rewriter now owns. PostgREST stays published so the raw
@@ -245,12 +310,15 @@ services:
         condition: service_completed_successfully
 
   # OPERATIONAL NOTE: after substitution the template is a literal
-  # `proxy_pass http://postgrest:3000` with no `resolver`, so nginx resolves that name
-  # ONCE at startup and caches the IP for the process lifetime. Recreating `postgrest`
-  # (an image bump, --force-recreate) gives it a new IP and this container then serves
-  # 502 on every request -- while still reporting HEALTHY, because the :81 probe is an
-  # unconditional 204 that never touches the upstream. Restart the rewriter after
-  # anything that recreates postgrest.
+  # `proxy_pass http://haf-fyp-postgrest:3000` with no `resolver`, so nginx resolves that
+  # name ONCE at startup and caches the IP for the process lifetime. Recreating
+  # `haf-fyp-postgrest` (an image bump, --force-recreate) can give it a new IP -- Docker
+  # often hands the same address back, so this may keep working by accident -- and when
+  # it does change, this container fails every request -- a 502 once the connect to the stale address
+  # fails, or a timeout to a client that gives up sooner -- while still reporting HEALTHY,
+  # because the :81 probe is an
+  # unconditional 204 that never touches the upstream. Restart the rewriter after anything
+  # that recreates haf-fyp-postgrest.
   #
   # The public read API. Without this service `docker compose up` served bare PostgREST,
   # so every /v1/fyp/... path this repo documents -- in the README tables, in the OpenAPI
@@ -265,12 +333,13 @@ services:
     ports:
       - "${API_PORT:-3001}:80"
     environment:
-      # NOT the image default. docker/rewriter_entrypoint.sh defaults POSTGREST_HOST to
-      # `haf-fyp-postgrest`, the name a haf_api_node deployment uses; this compose file
-      # names the service plain `postgrest`, so the default resolves to nothing here and
-      # every request would 502. The entrypoint comment says so explicitly: "Whoever adds
-      # one must set POSTGREST_HOST: postgrest, or rename the service to match."
-      POSTGREST_HOST: "${POSTGREST_HOST:-postgrest}"
+      # Now AGREES with the image default. docker/rewriter_entrypoint.sh defaults
+      # POSTGREST_HOST to `haf-fyp-postgrest`; until #48 this file named the service plain
+      # `postgrest`, so the default resolved to nothing here and !65 had to override it.
+      # The entrypoint's own comment offered the alternative -- "or rename the service to
+      # match" -- and that is what #48 did. Kept explicit rather than deleted so a future
+      # change to the image default cannot silently move this stack's upstream.
+      POSTGREST_HOST: "${POSTGREST_HOST:-haf-fyp-postgrest}"
       POSTGREST_PORT: "${POSTGREST_PORT:-3000}"
     healthcheck:
       # The image serves /health on :81, a second server block separate from the :80
@@ -281,15 +350,15 @@ services:
       start_period: 30s
       retries: 10
     depends_on:
-      postgrest:
+      haf-fyp-postgrest:
         condition: service_started
 
   # NAMED haf-fyp-redis, NOT redis (#39).
   #
-  # haf_api_node's jussi.yaml already defines a service called `redis`, and an
-  # operator running this app as a module of that stack composes the two files
-  # together. Two services of the same name are one service after the merge, so
-  # the generic name would have silently pointed this app at jussi's instance.
+  # haf_api_node's jussi.yaml (included when the node runs jussi) defines a service
+  # called `redis`. Combine this file with a node's -- which the header forbids, and
+  # explains -- and two services of the same name become one, so the generic name would
+  # have silently pointed this app at jussi's instance.
   #
   # That is not merely sharing -- jussi runs it as
   #     redis-server --maxmemory ${JUSSI_REDIS_MAX_MEMORY:-8G} --maxmemory-policy allkeys-lru
@@ -308,12 +377,8 @@ services:
   # statement of intent, and it starts mattering the day a deployment sets a
   # ceiling.
   #
-  # SCOPE LIMIT, stated rather than hidden: `haf` (line 13) and `postgrest` are
-  # generic names with the same collision exposure, and `haf` is the worse one --
-  # compose CONCATENATES `ports:`, so merging with haf_api_node's haf_base.yaml
-  # would publish this file's 5432 on the node's host. Renaming them is a larger
-  # change with its own compatibility surface and belongs in its own MR; filed
-  # separately so this one stays reviewable.
+  # The two generic names this left behind were settled by #48: `postgrest` is now
+  # `haf-fyp-postgrest`, and `haf` keeps its name deliberately -- see the header.
   haf-fyp-redis:
     image: redis:7-alpine
     command: redis-server --maxmemory-policy noeviction
