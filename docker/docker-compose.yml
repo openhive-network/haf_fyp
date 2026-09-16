@@ -168,8 +168,9 @@ services:
   #     docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
   #         run --rm haf-fyp-uninstall
   #
-  # --env-file on BOTH: `run` recreates a dependency whose config differs, so without it
-  # `haf` is recreated from docker/.env just before the teardown. A pre-#48 `postgrest`
+  # --env-file on BOTH: `run` recreates a dependency whose config differs, so if .env.local
+  # pins HAF_VERSION/HAF_REGISTRY, leaving it off recreates `haf` from docker/.env just
+  # before the teardown. A pre-#48 `postgrest`
   # container is not reached by `stop`; README "Upgrading from before #48" step 2
   # removes it (by label -- not --remove-orphans, which removes far more).
   #

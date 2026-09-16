@@ -258,8 +258,8 @@ that does move with the ranker is the top-level `computed_at` in this same
 
 After installing each external app, run:
 ```bash
-docker compose -f docker/docker-compose.yml run --rm haf-fyp-setup \
-  /app/scripts/grant_cross_schema.sh
+docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
+  run --rm haf-fyp-setup /app/scripts/grant_cross_schema.sh
 ```
 
 ## Quick Start
@@ -315,17 +315,18 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml run --r
 > **Upgrading from before #48:** the `postgrest` service is now `haf-fyp-postgrest`.
 > Renaming a compose service does not rename its running container: the old one is
 > orphaned and keeps host port 3000, so a plain quick-start step 3 fails with `port is
-> already allocated` and leaves the new PostgREST half-created. Stopping the renamed
-> services does not reach the orphan, and neither does a plain `down` — so it can also keep
-> PostgREST's sessions open as `haf_fyp_user`, and the uninstall script refuses.
+> already allocated`. It leaves the new PostgREST created but not running, and usually the
+> rewriter too, so 3001 is down. Stopping the renamed services does not reach the orphan,
+> and neither does a plain `down` — so it can also keep PostgREST's sessions open as
+> `haf_fyp_user`, and the uninstall script refuses.
 >
 > 1. If `docker/.env.local` sets `POSTGREST_HOST=postgrest`, delete that line.
 > 2. Remove the old `postgrest` container, and the two containers the rename affects.
->    3001 is down from here until step 3's PostgREST is up.
+>    3001 is down from here (already, if step 3 failed) until step 3's PostgREST is up.
 >
 >    ```bash
 >    project=$(docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
->      config | sed -n 's/^name: //p')
+>      config | sed -n 's/^name: //p' | tr -d '"')
 >    docker ps -aq --filter "label=com.docker.compose.project=$project" \
 >      --filter label=com.docker.compose.service=postgrest | xargs -r docker rm -f
 >    docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
@@ -333,9 +334,10 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml run --r
 >    ```
 >
 >    The first command matches the old container by this stack's project and service
->    labels, so nothing else is touched. **Not** `--remove-orphans`: that removes every
->    container of the project that this file does not define, and the default project
->    name here is just the directory, `docker`. The `rm -sf` matters most after a failed
+>    labels, so nothing else is touched. **Not** `--remove-orphans`: that removes the
+>    containers of every service this file does not define, and every exited `run`
+>    container, across the whole project. The default project name here is just the
+>    directory, `docker`. The `rm -sf` matters most after a failed
 >    step 3. Retrying `up` over the half-created PostgREST exits 0 but starts it with **no
 >    network**, so the rewriter cannot resolve it. It also forces the rewriter to be
 >    recreated, and so to resolve its upstream afresh.
@@ -711,8 +713,9 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
 ```
 
 Keep `--env-file` on the `run` as well as the `stop`. `run` recreates any dependency whose
-configuration differs, so without it `haf` is recreated from `docker/.env`'s values just
-before the teardown. On a stack upgraded across #48 whose old `postgrest` container is
+configuration differs. So if `.env.local` changes `HAF_REGISTRY` or `HAF_VERSION` — and
+the quick start tells production to pin `HAF_VERSION` — leaving it off recreates `haf`
+from `docker/.env`'s values just before the teardown. On a stack upgraded across #48 whose old `postgrest` container is
 still running, `stop` cannot reach it. Remove it first, as step 2 of *Upgrading from
 before #48* above does.
 
@@ -810,8 +813,10 @@ matters. Nothing needs ordering and a rollback strands nothing: bucket identitie
 unchanged and every key expires with its window.
 
 ⚠️ **The upgrade that renamed `redis` to `haf-fyp-redis` is the exception to every
-sentence above.** Recreate `haf-fyp-api` **and** `haf-fyp-ranker` together, and pass
-`--remove-orphans`. Renaming a compose service does not rename the running container:
+sentence above.** Recreate `haf-fyp-api` **and** `haf-fyp-ranker` together, after removing
+the old `redis` container the way step 2 of *Upgrading from before #48* removes the old
+`postgrest` (service label `redis` instead). Not `--remove-orphans`, which reaches far
+more than that one container. Renaming a compose service does not rename the running container:
 the old one is orphaned and keeps the `redis` network alias, so a per-service
 `up -d --build haf-fyp-api` leaves the ranker resolving `redis` while the api publishes
 to `haf-fyp-redis`. Force-refresh then stops working **with no error on either side**
