@@ -401,7 +401,8 @@ def test_rewriter_proxies_to_the_postgrest_service_on_its_port():
 #
 # docker/rewriter_entrypoint.sh defaults POSTGREST_HOST. Both compose files set it
 # explicitly, so NO CI lane ever runs that default -- the first place a wrong one would
-# surface is a 502 on a haf_api_node deployment that leaves the variable unset.
+# surface is a haf_api_node deployment that leaves the variable unset, where the rewriter
+# either never starts (a host that does not resolve) or proxies to the wrong service.
 ENTRYPOINT = ROOT / "docker" / "rewriter_entrypoint.sh"
 TEMPLATE = ROOT / "docker" / "haf_fyp_nginx.conf.template"
 DOCKERFILE_REWRITER = ROOT / "Dockerfile.rewriter"
@@ -431,25 +432,39 @@ def image_default_upstream(tmp_path_factory) -> tuple:
     shutil.copyfile(TEMPLATE, root / "nginx" / "conf" / "nginx.conf.template")
     write_exec(root / "bin" / "openresty", '#!/bin/sh\necho "openresty-exec $*"\n')
 
+    # Relative, run from `root`: the script's paths are unquoted, so substituting an
+    # absolute temp root split it wherever the path held a space.
     staged = root / "entrypoint.sh"
     with open(staged, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(ENTRYPOINT.read_text(encoding="utf-8").replace(OPENRESTY, root.as_posix()))
+        handle.write(ENTRYPOINT.read_text(encoding="utf-8").replace(OPENRESTY, "."))
 
     env = clean_env()
     for name in ("POSTGREST_HOST", "POSTGREST_PORT", "REWRITE_LOG"):
         env.pop(name, None)
-    r = subprocess.run([bash, str(staged)], env=env, capture_output=True, text=True,
-                       timeout=10)
-    assert r.returncode == 0 and "openresty-exec" in r.stdout, (
-        f"the entrypoint did not reach its openresty exec (rc={r.returncode}); did the "
-        f"image paths under {OPENRESTY} change?\nstdout: {r.stdout}\nstderr: {r.stderr}"
+    r = subprocess.run([bash, "entrypoint.sh"], cwd=root, env=env, capture_output=True,
+                       text=True, timeout=10)
+    streams = f"\nstdout: {r.stdout}\nstderr: {r.stderr}"
+    # Exactly this invocation, not merely "openresty ran": without `daemon off;` openresty
+    # forks into the background and the container exits at once, and `-c <other>` would
+    # serve a config other than the one rendered here.
+    assert r.returncode == 0 and r.stdout.strip() == "openresty-exec -g daemon off;", (
+        f"the entrypoint did not exec `openresty -g 'daemon off;'` (rc={r.returncode}); did "
+        f"its invocation or the image paths under {OPENRESTY} change?{streams}"
     )
     rendered = root / "nginx" / "conf" / "nginx.conf"
-    assert rendered.is_file(), f"the entrypoint rendered nothing to {OPENRESTY}/nginx/conf"
+    assert rendered.is_file(), (
+        f"the entrypoint rendered nothing to {OPENRESTY}/nginx/conf{streams}"
+    )
     conf = rendered.read_text(encoding="utf-8")
-    assert "${POSTGREST_" not in conf, "a POSTGREST_* placeholder survived substitution"
-    upstreams = re.findall(r"^\s*proxy_pass\s+http://([^:;/\s]*):([^;/\s]*);", conf, re.M)
-    assert len(upstreams) == 1, f"expected one PostgREST proxy_pass, found {upstreams}"
+    # Any surviving placeholder, not only POSTGREST_*: a literal `${REWRITE_LOG}` directive
+    # stops nginx from starting just as surely. (The template's own comment says `${...}`,
+    # which this deliberately does not match.)
+    leftover = re.findall(r"\$\{[A-Z_][A-Z0-9_]*\}", conf)
+    assert not leftover, f"placeholders survived substitution: {leftover}{streams}"
+    upstreams = re.findall(r"^\s*proxy_pass\s+http://([^:;/\s]*):([^;/\s]*)\s*;", conf, re.M)
+    assert len(upstreams) == 1, (
+        f"expected one PostgREST proxy_pass, found {upstreams}{streams}"
+    )
     return upstreams[0]
 
 
@@ -477,22 +492,37 @@ def test_the_rewriter_image_runs_that_entrypoint_with_nothing_preset():
     text = re.sub(r"\\\r?\n", " ", DOCKERFILE_REWRITER.read_text(encoding="utf-8"))
     instructions = [" ".join(line.split()) for line in text.splitlines()
                     if line.strip() and not line.lstrip().startswith("#")]
-    preset = [i for i in instructions
+    # Only the final stage is the image. A multi-stage build satisfied every check below
+    # from an earlier stage while a bare final `FROM` shipped none of it.
+    froms = [n for n, i in enumerate(instructions) if re.match(r"(?i)FROM\s", i)]
+    assert froms, "Dockerfile.rewriter has no FROM"
+    final = instructions[froms[-1] + 1:]
+
+    preset = [i for i in final
               if re.match(r"(?i)ENV\s", i) and re.search(r"\bPOSTGREST_(HOST|PORT)\b", i)]
     assert not preset, (
         f"Dockerfile.rewriter presets the upstream, so rewriter_entrypoint.sh's default "
         f"never applies: {preset}"
     )
-    for required in (
-        "COPY docker/rewriter_entrypoint.sh /entrypoint.sh",
-        f"COPY docker/haf_fyp_nginx.conf.template {OPENRESTY}/nginx/conf/nginx.conf.template",
-    ):
-        assert required in instructions, (
-            f"Dockerfile.rewriter no longer has `{required}`, so the image default tested "
-            f"above is not the one the image runs"
-        )
-    starts = [i for i in instructions if re.match(r"(?i)(CMD|ENTRYPOINT)\s", i)]
-    assert starts == ['CMD ["/entrypoint.sh"]'], (
+    targets = {
+        "/entrypoint.sh": "docker/rewriter_entrypoint.sh",
+        f"{OPENRESTY}/nginx/conf/nginx.conf.template": "docker/haf_fyp_nginx.conf.template",
+    }
+    for target, source in targets.items():
+        # Everything in the final stage that names the target: flags such as
+        # `COPY --chmod=755` are legitimate, but a second COPY/ADD onto it, or a RUN that
+        # does more than chmod it, means the image does not run the file tested above.
+        writes = [i for i in final if re.search(rf"(^|\s){re.escape(target)}(\s|$)", i)]
+        copies = [i for i in writes if re.match(r"(?i)(COPY|ADD)\s", i)]
+        assert len(copies) == 1 and re.fullmatch(
+            rf"(?i)COPY(\s+--\S+)*\s+{re.escape(source)}\s+{re.escape(target)}", copies[0]
+        ), f"{target} must be written once, by `COPY {source} {target}`: got {copies}"
+        others = [i for i in writes if i not in copies
+                  and not re.fullmatch(rf"RUN chmod \S+ {re.escape(target)}", i)]
+        assert not others, f"the final stage alters {target} after copying it: {others}"
+
+    starts = [i for i in final if re.match(r"(?i)(CMD|ENTRYPOINT)\s", i)]
+    assert starts in (['CMD ["/entrypoint.sh"]'], ['ENTRYPOINT ["/entrypoint.sh"]']), (
         f"the rewriter image must start /entrypoint.sh, got {starts}"
     )
 
@@ -517,28 +547,41 @@ def test_rewriter_upstream_agrees_with_the_image_default(path, image_default_ups
         f"[{path.name}] POSTGREST_HOST={host!r} is not a service in this file: openresty "
         f"exits at startup with `host not found in upstream`."
     )
-    image_default, _ = image_default_upstream
+    image_default, default_port = image_default_upstream
     assert host == image_default, (
         f"[{path.name}] sets POSTGREST_HOST={host!r} but the image defaults to "
         f"{image_default!r}. They may both be right, but nothing would tell you which one "
         f"a deployment is using -- keep them equal."
     )
+    port = _resolve(str(env.get("POSTGREST_PORT", default_port)), _read_env(ENV_FILE))
+    assert port == default_port, (
+        f"[{path.name}] sets POSTGREST_PORT={port!r} but the image defaults to "
+        f"{default_port!r}, which is where PostgREST listens"
+    )
 
 
-# `scheme://[user[:password]@]host` -- http, redis and postgres alike.
-_URI_HOST = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/\s]*@)?([^:/?\s]+)")
+# `scheme://[user[:password]@]host` -- http, redis and postgres alike. An IPv6 literal
+# (`[::1]`) is captured whole and, like any address, is not a service name.
+_URI_HOST = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/\s]*@)?(\[[^\]]*\]|[^:/?\s]+)")
+
+
+def _names_a_service(host: str) -> bool:
+    """False for what can only be an external name or an address: dotted, bracketed, or
+    localhost. Everything else in these files is meant to be a compose service."""
+    return bool(host) and host != "localhost" and not any(c in host for c in ".[:")
 
 
 @pytest.mark.parametrize("path", [COMPOSE, CI_COMPOSE], ids=["stack", "ci"])
 def test_every_service_reference_resolves_within_its_own_file(path):
-    """depends_on targets, and the host of every URI a service is handed, must be services
-    in the same file.
+    """depends_on targets, every `*_HOST` setting, and the host of every URI a service is
+    handed must be services in the same file.
 
     A rename that misses one fails late and obscurely: a dangling depends_on only at `up`
-    (compose-validate resolves docker-compose.yml, not the CI file), and a stale URI host
-    as connection errors deep inside the service. #48 renamed a service referenced from
-    both files by depends_on, POSTGREST_HOST and API_URL; this is what makes the next
-    rename cheap to get right.
+    (compose-validate resolves docker-compose.yml, not the CI file), and a stale host as
+    connection errors deep inside the service. #48 renamed a service referenced from both
+    files by depends_on, POSTGREST_HOST and API_URL. `*_HOST` matters as much as URIs:
+    `haf` is referenced ONLY through POSTGRES_HOST, and `REDIS_HOST: redis` is the exact
+    shape of the #39 bug.
     """
     yaml_mod = _require_yaml()
     doc = yaml_mod.safe_load(path.read_text(encoding="utf-8"))
@@ -550,12 +593,15 @@ def test_every_service_reference_resolves_within_its_own_file(path):
             if dep not in names:
                 dangling.append(f"{name}.depends_on -> {dep}")
         for key, value in _environment(doc, name, path.name).items():
-            if "://" not in str(value):
+            if key.endswith("_HOST"):
+                host = _resolve(str(value), env_file)
+            elif "://" in str(value):
+                m = _URI_HOST.match(_resolve(str(value), env_file))
+                host = m.group(1) if m else ""
+            else:
                 continue
-            m = _URI_HOST.match(_resolve(str(value), env_file))
-            # A dotted host is an external name or an address, never one of these services.
-            if m and m.group(1) not in names | {"localhost"} and "." not in m.group(1):
-                dangling.append(f"{name}.{key} -> {m.group(1)}")
+            if _names_a_service(host) and host not in names:
+                dangling.append(f"{name}.{key} -> {host}")
     assert not dangling, (
         f"[{path.name}] these name no service in this file: {dangling}"
     )
@@ -563,13 +609,14 @@ def test_every_service_reference_resolves_within_its_own_file(path):
 
 # --- service naming: nothing generic may reappear (#48) -----------------------------
 #
-# Services sharing a name across compose files are COMBINED: layered with `-f` the later
-# file silently wins image, healthcheck and same-target mounts while `ports:` concatenate,
-# and Compose v5 merges `include:`d files silently too (v2.20.3-v2.40.3 refuse). That is
-# how a generic name here becomes "the node's HAF runs this file's image on an empty
-# volume and publishes 5432". This file is never combined with a node's (see the header of
-# docker/docker-compose.yml, which has the measurements), so the exposure is latent rather
-# than live; the point of these tests is that it stays latent by decision, not by luck.
+# Compose identifies a service by project and name, so a same-named service from another
+# file is not a second service: under a shared project name it recreates the other
+# container, layered with `-f` it overrides image and mounts, and Compose v5 merges an
+# `include:`d one silently. That is how a generic name here becomes "the node's HAF runs
+# this file's image on an empty volume and publishes 5432". This file is never combined
+# with a node's (see the header of docker/docker-compose.yml, which has the measured
+# versions), so the exposure is latent rather than live; the point of these tests is that
+# it stays latent by decision, not by luck.
 #
 # `redis` was renamed in !64 for exactly this reason, `postgrest` in #48. Both were
 # spotted by a human reading the file. This is the part that does not rely on that.
@@ -583,8 +630,8 @@ GENERIC_NAME_EXEMPTIONS = {
     # Named to MATCH haf_api_node's own service, deliberately: it is what makes
     # `POSTGRES_HOST: haf` correct in both this stack and a node module, so the app's
     # config is portable between them. Renaming would not make combining this file with a
-    # node's safe -- the renamed service is added as a second, empty HAF -- and would
-    # orphan the running `haf` over the same volume. Reasoned in the compose header.
+    # node's safe -- layered, the renamed service is added as a second, empty HAF -- and
+    # would orphan the running `haf` over the same volume. Reasoned in the compose header.
     "haf",
 }
 
@@ -605,8 +652,8 @@ def test_no_service_carries_a_generic_name(services):
         if not APP_SCOPED.fullmatch(name) and name not in GENERIC_NAME_EXEMPTIONS
     )
     assert not offenders, (
-        f"{offenders} are generic service names. Services sharing a name across compose "
-        f"files are combined, silently in most cases (see the header of "
+        f"{offenders} are generic service names. A same-named service from another "
+        f"compose file is not a second service (see the header of "
         f"docker/docker-compose.yml). Prefix with `haf-fyp-`, or add to "
         f"GENERIC_NAME_EXEMPTIONS with the reason -- do not add it silently."
     )
@@ -618,19 +665,45 @@ def test_no_service_carries_a_generic_name(services):
 
 
 def test_no_volume_carries_a_generic_name():
-    """Top-level volumes merge by name exactly as services do."""
+    """Top-level volumes combine by name exactly as services do -- by the name compose
+    actually uses, which a pinned `name:` overrides."""
     doc = _require_yaml().safe_load(COMPOSE.read_text(encoding="utf-8"))
-    volumes = set(doc.get("volumes") or {})
+    volumes = doc.get("volumes") or {}
+    scoped = re.compile(r"haf[-_]fyp[-_][a-z0-9][a-z0-9_-]*")
     offenders = sorted(
-        v for v in volumes
-        if not re.fullmatch(r"haf_fyp_[a-z0-9][a-z0-9_]*", v) and v not in VOLUME_EXEMPTIONS
+        key for key, spec in volumes.items()
+        if not scoped.fullmatch(key) and key not in VOLUME_EXEMPTIONS
     )
     assert not offenders, (
-        f"{offenders} are generic volume names. Prefix with `haf_fyp_`, or add to "
-        f"VOLUME_EXEMPTIONS with the reason."
+        f"{offenders} are generic volume names. Prefix with `haf_fyp_` or `haf-fyp-`, or "
+        f"add to VOLUME_EXEMPTIONS with the reason."
     )
-    stale = sorted(VOLUME_EXEMPTIONS - volumes)
+    pinned = sorted(
+        f"{key}: name={(spec or {})['name']}" for key, spec in volumes.items()
+        if isinstance(spec, dict) and "name" in spec and not scoped.fullmatch(str(spec["name"]))
+    )
+    assert not pinned, (
+        f"{pinned} pin a generic volume name. `name:` is used verbatim -- not even "
+        f"project-prefixed -- so it is shared with anything else of that name on the host."
+    )
+    stale = sorted(VOLUME_EXEMPTIONS - set(volumes))
     assert not stale, f"VOLUME_EXEMPTIONS lists {stale}, which is no longer a volume"
+
+
+def test_no_network_or_container_name_escapes_the_naming_rule(services):
+    """The header says no `networks:` key is declared, and a generic `container_name`
+    collides host-wide regardless of how the service is named -- neither was checked."""
+    doc = _require_yaml().safe_load(COMPOSE.read_text(encoding="utf-8"))
+    assert "networks" not in doc, (
+        "docker-compose.yml gained a top-level `networks:` key. The header records why "
+        "there is none; revisit that reasoning (and scope any network name) first."
+    )
+    named = sorted(
+        f"{name}: container_name={svc['container_name']}" for name, svc in services.items()
+        if (svc or {}).get("container_name")
+        and not APP_SCOPED.fullmatch(str(svc["container_name"]))
+    )
+    assert not named, f"generic container names: {named}"
 
 
 def test_nothing_is_pulled_in_from_another_file():

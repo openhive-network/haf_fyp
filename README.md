@@ -315,20 +315,26 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml run --r
 > **Upgrading from before #48:** the `postgrest` service is now `haf-fyp-postgrest`.
 > Renaming a compose service does not rename its running container: the old one is
 > orphaned and keeps host port 3000, so step 3 fails with `port is already allocated`, the
-> recreated rewriter never starts, and 3001 stops serving. Remove the orphan once, with the
-> same service list:
+> recreated rewriter never starts, and 3001 stops serving. Stopping the renamed services
+> does not reach the orphan, and neither does a plain `down` — so it can also keep
+> PostgREST's sessions open as `haf_fyp_user`, and the uninstall script refuses.
 >
-> ```bash
-> docker compose --env-file docker/.env.local -f docker/docker-compose.yml up -d \
->   --remove-orphans haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest \
->   haf-fyp-postgrest-rewriter haf-fyp-redis
-> ```
+> 1. **First**, if `docker/.env.local` sets `POSTGREST_HOST=postgrest`, delete that line.
+>    Left in, the command below still succeeds but does not recreate the rewriter, which
+>    keeps proxying to the address it resolved at startup: it may work by accident until
+>    its next restart, or time out on every request while reporting healthy.
+> 2. Remove the orphan once, with the same service list (add `--build` if the same pull
+>    changed anything else — see step 2):
 >
-> `stop postgrest` now fails with `no such service`, and neither `stop` nor a plain `down`
-> reaches the orphan — which can keep PostgREST's sessions open as `haf_fyp_user`, so the
-> uninstall script's session check refuses. If `docker/.env.local` sets
-> `POSTGREST_HOST=postgrest`, delete that line: the rewriter would proxy to the orphan, and
-> once the orphan is gone, fail to start.
+>    ```bash
+>    docker compose --env-file docker/.env.local -f docker/docker-compose.yml up -d \
+>      --remove-orphans haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest \
+>      haf-fyp-postgrest-rewriter haf-fyp-redis
+>    ```
+>
+> 3. Re-run the step 4 smoke test. `curl http://localhost:3001/health` goes through the
+>    rewriter to PostgREST (`/rpc/get_health`), so it fails if the rewriter is proxying
+>    anywhere else.
 
 ## API Endpoints
 
@@ -567,16 +573,17 @@ haf                # the HAF node itself. The ONE service without the app prefix
                    # module. See the header of docker/docker-compose.yml (#48).
 ```
 
-Every other service carries the `haf-fyp-` prefix. That is not cosmetic: services sharing
-a name across compose files are combined. Layered with `-f`, the later file silently wins
-the image, healthcheck and same-target mounts while `ports:` concatenate; `include:`d,
-Compose v5 merges them silently too (v2.20.3–v2.40.3 refuse with an error). A
-`haf_api_node` never combines this file with its own — it runs apps from module yamls, and
-haf_fyp's lives outside this repo — so the exposure is latent, and the prefix keeps it
-latent by decision rather than by luck. **Never combine this file with a node's compose
-files:** its `haf` would replace the node's HAF image and datadir mount. The header of
-`docker/docker-compose.yml` has the measurements, and `tests/unit/test_compose_contract.py`
-pins the naming rule.
+Every other service carries the `haf-fyp-` prefix. That is not cosmetic: compose
+identifies a service by project and name, so a same-named service from another file is not
+a second service. Run under a node's project name, this file's `haf` **recreates** the
+node's HAF container from this file's definition. Layered with `-f`, it overrides the
+node's image, healthcheck and datadir mount (most Compose versions do this silently).
+`include:`d, Compose v5 merges it silently too. A `haf_api_node` never does any of this
+with this file — it runs apps from module yamls, and haf_fyp's lives outside this repo —
+so the exposure is latent, and the prefix keeps it latent by decision rather than by luck.
+**Never combine this file with a node's compose files, and never run it under a node's
+project name.** The header of `docker/docker-compose.yml` has the measured versions, and
+`tests/unit/test_compose_contract.py` pins the naming rule.
 
 ### The SQL image's verbs
 
