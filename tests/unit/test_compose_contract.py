@@ -19,6 +19,7 @@ smoke-tests the image.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -27,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.unit.shell_harness import clean_env, require_bash, write_exec
+from tests.unit.shell_harness import clean_env, write_exec
 
 try:
     import yaml
@@ -391,7 +392,7 @@ def test_rewriter_proxies_to_the_postgrest_service_on_its_port():
     # The upstream PORT is equally load-bearing and was asserted nowhere: pointing it at a
     # dead port 502s every /v1/fyp/* path while the container still reports healthy.
     port = _resolve(str(svc.get("POSTGREST_PORT", "")), env_file)
-    _, container = _ports(doc["services"][POSTGREST]["ports"][0], env_file)
+    container = _container_port(doc["services"], POSTGREST)
     assert port == container, (
         f"POSTGREST_PORT is {port!r} but `{POSTGREST}` listens on {container!r}"
     )
@@ -409,47 +410,72 @@ DOCKERFILE_REWRITER = ROOT / "Dockerfile.rewriter"
 OPENRESTY = "/usr/local/openresty"
 
 
-@pytest.fixture(scope="module")
-def image_default_upstream(tmp_path_factory) -> tuple:
-    """(host, port) the rewriter image proxies to when nothing sets POSTGREST_HOST/PORT.
+def _posix_sh() -> str:
+    """The shell the image uses: `#!/bin/sh`, started as CMD ["/entrypoint.sh"].
 
-    Obtained by RUNNING the entrypoint against the real template and reading the rendered
-    `proxy_pass`, not by pulling the default out of the script with a regex. The first
-    version did the latter, and an independent reviewer's mutations walked straight past
-    it: a commented-out copy of the old line, a `[ -n "$X" ] || X=postgrest` guard ahead of
-    the assignment, and the assignment renamed to a longer variable all left the regex
-    matching a line the shell no longer acted on -- while the rendered upstream became
-    `postgrest`, `postgrest`, and the empty string.
-
-    Only the image's absolute paths are redirected into a scratch root. Everything that
-    computes the value is the shell executing the shipped script, and each redirected path
-    is checked by its outcome: no rendered file or no openresty exec fails here by name.
+    Not bash. Under bash, bash-only syntax the image's /bin/sh rejects rendered fine here
+    while the real rewriter would crash-loop. CI's `sh` is dash, which rejects it too. A
+    Windows `sh` is Git Bash in POSIX mode and is laxer; shell-lint's shellcheck (SC3xxx)
+    covers that gap. Override with HAF_FYP_TEST_SH.
     """
-    bash = require_bash()
+    sh = os.environ.get("HAF_FYP_TEST_SH") or shutil.which("sh")
+    if sh:
+        return sh
+    if os.environ.get("CI"):
+        pytest.fail("sh is unavailable, so the rewriter entrypoint cannot be run in CI")
+    pytest.skip("sh is required to run the rewriter entrypoint")
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _render_upstream(tmp_path_factory, **settings) -> tuple:
+    """Run the entrypoint against the real template; return the rendered (host, port).
+
+    `settings` are the only POSTGREST_* / REWRITE_LOG values in the environment; with none,
+    this is the image default. Obtained by RUNNING the script, not by pulling the default
+    out of it with a regex. The first version did the latter, and an independent reviewer's
+    mutations walked straight past it: a commented-out copy of the old line, a
+    `[ -n "$X" ] || X=postgrest` guard ahead of the assignment, and the assignment renamed to
+    a longer variable all left the regex matching a line the shell no longer acted on --
+    while the rendered upstream became `postgrest`, `postgrest`, and the empty string.
+
+    Only the image's absolute paths are redirected, into a scratch root. Everything that
+    computes the value is the shell executing the shipped script, and each redirected path
+    is checked by its outcome.
+    """
+    sh = _posix_sh()
     root = tmp_path_factory.mktemp("openresty")
     (root / "nginx" / "conf").mkdir(parents=True)
     (root / "bin").mkdir()
     shutil.copyfile(TEMPLATE, root / "nginx" / "conf" / "nginx.conf.template")
-    write_exec(root / "bin" / "openresty", '#!/bin/sh\necho "openresty-exec $*"\n')
+    # The stub records its arguments rather than printing them, so the script may log
+    # whatever it likes to stdout.
+    write_exec(root / "bin" / "openresty", "#!/bin/sh\nprintf '%s\\n' \"$@\" > exec-args\n")
 
     # Relative, run from `root`: the script's paths are unquoted, so substituting an
-    # absolute temp root split it wherever the path held a space.
+    # absolute temp root split it wherever the path held a space. The trailer is reached
+    # only if openresty is NOT exec'd -- run as a child it is not PID 1 and never receives
+    # the container's signals.
     staged = root / "entrypoint.sh"
     with open(staged, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(ENTRYPOINT.read_text(encoding="utf-8").replace(OPENRESTY, "."))
+        handle.write("\necho 'openresty was not exec-ed' >&2\nexit 99\n")
 
     env = clean_env()
     for name in ("POSTGREST_HOST", "POSTGREST_PORT", "REWRITE_LOG"):
         env.pop(name, None)
-    r = subprocess.run([bash, "entrypoint.sh"], cwd=root, env=env, capture_output=True,
+    env.update(settings)
+    r = subprocess.run([sh, "entrypoint.sh"], cwd=root, env=env, capture_output=True,
                        text=True, timeout=10)
     streams = f"\nstdout: {r.stdout}\nstderr: {r.stderr}"
+    args_file = root / "exec-args"
+    execed = args_file.read_text(encoding="utf-8").splitlines() if args_file.is_file() else None
     # Exactly this invocation, not merely "openresty ran": without `daemon off;` openresty
     # forks into the background and the container exits at once, and `-c <other>` would
     # serve a config other than the one rendered here.
-    assert r.returncode == 0 and r.stdout.strip() == "openresty-exec -g daemon off;", (
-        f"the entrypoint did not exec `openresty -g 'daemon off;'` (rc={r.returncode}); did "
-        f"its invocation or the image paths under {OPENRESTY} change?{streams}"
+    assert r.returncode == 0 and execed == ["-g", "daemon off;"], (
+        f"the entrypoint did not exec `openresty -g 'daemon off;'` (rc={r.returncode}, "
+        f"args={execed}); did its invocation or the image paths under {OPENRESTY} "
+        f"change?{streams}"
     )
     rendered = root / "nginx" / "conf" / "nginx.conf"
     assert rendered.is_file(), (
@@ -468,16 +494,46 @@ def image_default_upstream(tmp_path_factory) -> tuple:
     return upstreams[0]
 
 
+def _container_port(services: dict, service: str) -> str:
+    ports = (services.get(service) or {}).get("ports")
+    assert ports, f"`{service}` publishes no ports, so its listen port cannot be checked"
+    return _ports(ports[0], _read_env(ENV_FILE))[1]
+
+
+@pytest.fixture(scope="module")
+def image_default_upstream(tmp_path_factory) -> tuple:
+    """(host, port) the rewriter image proxies to when nothing sets POSTGREST_HOST/PORT."""
+    return _render_upstream(tmp_path_factory)
+
+
 def test_the_image_default_upstream_is_the_postgrest_service(services, image_default_upstream):
     host, port = image_default_upstream
-    assert host == POSTGREST and host in services, (
-        f"with POSTGREST_HOST unset the rewriter image proxies to {host!r}, which is not "
+    assert host == POSTGREST, (
+        f"with POSTGREST_HOST unset the rewriter image proxies to {host!r}, not "
         f"`{POSTGREST}`: a deployment relying on the default gets no working rewriter."
     )
-    _, container = _ports(services[POSTGREST]["ports"][0], _read_env(ENV_FILE))
+    assert host in services, (
+        f"the image default `{host}` is not a service in docker-compose.yml"
+    )
+    container = _container_port(services, POSTGREST)
     assert port == container, (
         f"with POSTGREST_PORT unset the rewriter proxies to port {port!r}, but "
         f"`{POSTGREST}` listens on {container!r}"
+    )
+
+
+def test_an_explicit_upstream_overrides_the_image_default(tmp_path_factory):
+    """Every compose file and node module sets POSTGREST_HOST/PORT explicitly, so the
+    override path is the one that actually runs. A template that hardcodes
+    `haf-fyp-postgrest:3000`, or an entrypoint that assigns the host unconditionally,
+    renders the default correctly while silently ignoring every explicit value -- and
+    passed every other test here.
+    """
+    host, port = _render_upstream(tmp_path_factory, POSTGREST_HOST="sentinel-upstream",
+                                  POSTGREST_PORT="4242")
+    assert (host, port) == ("sentinel-upstream", "4242"), (
+        f"POSTGREST_HOST=sentinel-upstream POSTGREST_PORT=4242 rendered {host}:{port}: the "
+        f"entrypoint or template ignores an explicit upstream"
     )
 
 
@@ -487,11 +543,13 @@ def test_the_rewriter_image_runs_that_entrypoint_with_nothing_preset():
     in Dockerfile.rewriter would make the shell default dead code with every other test in
     this file still green -- a reviewer's mutation did exactly that.
     """
-    # Join `\` continuations first, so `ENV A=1 \` + `    POSTGREST_HOST=x` is one
-    # instruction rather than a line that does not start with ENV.
-    text = re.sub(r"\\\r?\n", " ", DOCKERFILE_REWRITER.read_text(encoding="utf-8"))
-    instructions = [" ".join(line.split()) for line in text.splitlines()
-                    if line.strip() and not line.lstrip().startswith("#")]
+    # Drop comment lines, THEN join `\` continuations -- Docker's own order. Joining first
+    # let a `# note` line inside an `ENV A=1 \` block swallow the `POSTGREST_HOST=x` after
+    # it, which Docker would still set.
+    lines = [line for line in DOCKERFILE_REWRITER.read_text(encoding="utf-8").splitlines()
+             if not line.lstrip().startswith("#")]
+    text = re.sub(r"\\[ \t]*\n", " ", "\n".join(lines))
+    instructions = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
     # Only the final stage is the image. A multi-stage build satisfied every check below
     # from an earlier stage while a bare final `FROM` shipped none of it.
     froms = [n for n, i in enumerate(instructions) if re.match(r"(?i)FROM\s", i)]
@@ -512,18 +570,28 @@ def test_the_rewriter_image_runs_that_entrypoint_with_nothing_preset():
         # Everything in the final stage that names the target: flags such as
         # `COPY --chmod=755` are legitimate, but a second COPY/ADD onto it, or a RUN that
         # does more than chmod it, means the image does not run the file tested above.
-        writes = [i for i in final if re.search(rf"(^|\s){re.escape(target)}(\s|$)", i)]
+        writes = [i for i in final
+                  if not re.match(r"(?i)(CMD|ENTRYPOINT)\s", i)    # starts it, checked below
+                  and re.search(rf"(^|[\s\"'=]){re.escape(target)}([\s\"';&|]|$)", i)]
         copies = [i for i in writes if re.match(r"(?i)(COPY|ADD)\s", i)]
+        # `--from=<stage>` is a flag too, but it copies from another stage, not this repo.
         assert len(copies) == 1 and re.fullmatch(
-            rf"(?i)COPY(\s+--\S+)*\s+{re.escape(source)}\s+{re.escape(target)}", copies[0]
+            rf"(?i)COPY(\s+--(?!from)\S+)*\s+{re.escape(source)}\s+{re.escape(target)}",
+            copies[0],
         ), f"{target} must be written once, by `COPY {source} {target}`: got {copies}"
         others = [i for i in writes if i not in copies
                   and not re.fullmatch(rf"RUN chmod \S+ {re.escape(target)}", i)]
         assert not others, f"the final stage alters {target} after copying it: {others}"
 
-    starts = [i for i in final if re.match(r"(?i)(CMD|ENTRYPOINT)\s", i)]
-    assert starts in (['CMD ["/entrypoint.sh"]'], ['ENTRYPOINT ["/entrypoint.sh"]']), (
-        f"the rewriter image must start /entrypoint.sh, got {starts}"
+    starts = [m.group(1) for i in final
+              for m in [re.match(r"(?i)(?:CMD|ENTRYPOINT)\s+(.*)", i)] if m]
+    try:
+        forms = [json.loads(s) for s in starts]
+    except ValueError:
+        forms = starts
+    assert forms == [["/entrypoint.sh"]], (
+        f"the rewriter image must start exactly [\"/entrypoint.sh\"] (CMD or ENTRYPOINT, "
+        f"exec form), got {starts}"
     )
 
 
@@ -553,7 +621,8 @@ def test_rewriter_upstream_agrees_with_the_image_default(path, image_default_ups
         f"{image_default!r}. They may both be right, but nothing would tell you which one "
         f"a deployment is using -- keep them equal."
     )
-    port = _resolve(str(env.get("POSTGREST_PORT", default_port)), _read_env(ENV_FILE))
+    assert "POSTGREST_PORT" in env, f"[{path.name}] {REWRITER} must set POSTGREST_PORT"
+    port = _resolve(str(env["POSTGREST_PORT"]), _read_env(ENV_FILE))
     assert port == default_port, (
         f"[{path.name}] sets POSTGREST_PORT={port!r} but the image defaults to "
         f"{default_port!r}, which is where PostgREST listens"
@@ -580,8 +649,8 @@ def test_every_service_reference_resolves_within_its_own_file(path):
     (compose-validate resolves docker-compose.yml, not the CI file), and a stale host as
     connection errors deep inside the service. #48 renamed a service referenced from both
     files by depends_on, POSTGREST_HOST and API_URL. `*_HOST` matters as much as URIs:
-    `haf` is referenced ONLY through POSTGRES_HOST, and `REDIS_HOST: redis` is the exact
-    shape of the #39 bug.
+    haf-fyp-sync and haf-fyp-ranker reach `haf` ONLY through POSTGRES_HOST, and
+    `REDIS_HOST: redis` is the exact shape of the #39 bug.
     """
     yaml_mod = _require_yaml()
     doc = yaml_mod.safe_load(path.read_text(encoding="utf-8"))
@@ -595,11 +664,18 @@ def test_every_service_reference_resolves_within_its_own_file(path):
         for key, value in _environment(doc, name, path.name).items():
             if key.endswith("_HOST"):
                 host = _resolve(str(value), env_file)
-            elif "://" in str(value):
-                m = _URI_HOST.match(_resolve(str(value), env_file))
-                host = m.group(1) if m else ""
             else:
-                continue
+                # Resolve BEFORE looking for a URI: `${HIVE_RPC_URL:-}` is not one until
+                # docker/.env supplies `http://...`. A `${VAR}` with no default has nothing
+                # to resolve against here, and is left as written.
+                try:
+                    resolved = _resolve(str(value), env_file)
+                except AssertionError:
+                    resolved = str(value)
+                if "://" not in resolved:
+                    continue
+                m = _URI_HOST.match(resolved)
+                host = m.group(1) if m else ""
             if _names_a_service(host) and host not in names:
                 dangling.append(f"{name}.{key} -> {host}")
     assert not dangling, (
@@ -678,22 +754,35 @@ def test_no_volume_carries_a_generic_name():
         f"{offenders} are generic volume names. Prefix with `haf_fyp_` or `haf-fyp-`, or "
         f"add to VOLUME_EXEMPTIONS with the reason."
     )
+    env_file = _read_env(ENV_FILE)
     pinned = sorted(
-        f"{key}: name={(spec or {})['name']}" for key, spec in volumes.items()
-        if isinstance(spec, dict) and "name" in spec and not scoped.fullmatch(str(spec["name"]))
+        f"{key}: {_resolve(str(spec.get('name', key)), env_file)}"
+        for key, spec in volumes.items()
+        if isinstance(spec, dict) and ("name" in spec or spec.get("external"))
+        and not scoped.fullmatch(_resolve(str(spec.get("name", key)), env_file))
     )
     assert not pinned, (
-        f"{pinned} pin a generic volume name. `name:` is used verbatim -- not even "
-        f"project-prefixed -- so it is shared with anything else of that name on the host."
+        f"{pinned} use a generic host-wide volume name. A pinned `name:` or an `external:` "
+        f"volume is used verbatim -- not project-prefixed -- so it is shared with anything "
+        f"else of that name on the host."
     )
     stale = sorted(VOLUME_EXEMPTIONS - set(volumes))
     assert not stale, f"VOLUME_EXEMPTIONS lists {stale}, which is no longer a volume"
 
 
-def test_no_network_or_container_name_escapes_the_naming_rule(services):
-    """The header says no `networks:` key is declared, and a generic `container_name`
-    collides host-wide regardless of how the service is named -- neither was checked."""
+def test_no_project_network_or_container_name_escapes_the_naming_rule(services):
+    """A top-level `name: haf` is exactly what the header forbids -- running this file
+    under a node's project name, which recreates the node's containers -- and it passed
+    every other test. The header also says no `networks:` key is declared, and a generic
+    `container_name` collides host-wide regardless of how the service is named."""
     doc = _require_yaml().safe_load(COMPOSE.read_text(encoding="utf-8"))
+    if "name" in doc:
+        project = _resolve(str(doc["name"]), _read_env(ENV_FILE))
+        assert re.fullmatch(r"haf[-_]fyp([-_][a-z0-9]+)*", project), (
+            f"docker-compose.yml pins project name {project!r}. Compose identifies services "
+            f"by project and name, so a project a node also uses would recreate the node's "
+            f"containers from this file. Use an app-scoped name such as `haf_fyp`."
+        )
     assert "networks" not in doc, (
         "docker-compose.yml gained a top-level `networks:` key. The header records why "
         "there is none; revisit that reasoning (and scope any network name) first."

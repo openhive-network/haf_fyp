@@ -314,17 +314,26 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml run --r
 
 > **Upgrading from before #48:** the `postgrest` service is now `haf-fyp-postgrest`.
 > Renaming a compose service does not rename its running container: the old one is
-> orphaned and keeps host port 3000, so step 3 fails with `port is already allocated`, the
-> recreated rewriter never starts, and 3001 stops serving. Stopping the renamed services
-> does not reach the orphan, and neither does a plain `down` — so it can also keep
-> PostgREST's sessions open as `haf_fyp_user`, and the uninstall script refuses.
+> orphaned and keeps host port 3000, so a plain quick-start step 3 fails with `port is
+> already allocated` and leaves the new PostgREST and the rewriter half-created. Stopping
+> the renamed services does not reach the orphan, and neither does a plain `down` — so it
+> can also keep PostgREST's sessions open as `haf_fyp_user`, and the uninstall script
+> refuses (the uninstall command below passes `--remove-orphans` for that reason).
 >
-> 1. **First**, if `docker/.env.local` sets `POSTGREST_HOST=postgrest`, delete that line.
->    Left in, the command below still succeeds but does not recreate the rewriter, which
->    keeps proxying to the address it resolved at startup: it may work by accident until
->    its next restart, or time out on every request while reporting healthy.
-> 2. Remove the orphan once, with the same service list (add `--build` if the same pull
->    changed anything else — see step 2):
+> 1. If `docker/.env.local` sets `POSTGREST_HOST=postgrest`, delete that line.
+> 2. Remove the two containers the rename affects. This matters most after a failed step
+>    3: retrying `up` over its half-created PostgREST exits 0 but starts it with **no
+>    network**, so the rewriter cannot resolve it. It also forces the rewriter to be
+>    recreated, and so to resolve its upstream afresh:
+>
+>    ```bash
+>    docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
+>      rm -sf haf-fyp-postgrest haf-fyp-postgrest-rewriter
+>    ```
+>
+> 3. Remove the orphan and start the stack, with quick-start step 3's service list (add
+>    `--build` if the same pull changed anything else — see quick-start step 2). Like
+>    step 3, this re-runs `haf-fyp-setup`, and PostgREST starts only once it finishes:
 >
 >    ```bash
 >    docker compose --env-file docker/.env.local -f docker/docker-compose.yml up -d \
@@ -332,9 +341,12 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml run --r
 >      haf-fyp-postgrest-rewriter haf-fyp-redis
 >    ```
 >
-> 3. Re-run the step 4 smoke test. `curl http://localhost:3001/health` goes through the
->    rewriter to PostgREST (`/rpc/get_health`), so it fails if the rewriter is proxying
->    anywhere else.
+> 4. Smoke-test through the rewriter. `/health` on 3001 goes to PostgREST
+>    (`/rpc/get_health`), and `-f` makes an error status a non-zero exit:
+>
+>    ```bash
+>    curl -fsS http://localhost:3001/health
+>    ```
 
 ## API Endpoints
 
@@ -576,8 +588,9 @@ haf                # the HAF node itself. The ONE service without the app prefix
 Every other service carries the `haf-fyp-` prefix. That is not cosmetic: compose
 identifies a service by project and name, so a same-named service from another file is not
 a second service. Run under a node's project name, this file's `haf` **recreates** the
-node's HAF container from this file's definition. Layered with `-f`, it overrides the
-node's image, healthcheck and datadir mount (most Compose versions do this silently).
+node's HAF container from this file's definition. Layered with `-f` after the node's
+files, it overrides the node's image, healthcheck and datadir mount (most Compose versions
+do this silently).
 `include:`d, Compose v5 merges it silently too. A `haf_api_node` never does any of this
 with this file — it runs apps from module yamls, and haf_fyp's lives outside this repo —
 so the exposure is latent, and the prefix keeps it latent by decision rather than by luck.
@@ -686,8 +699,12 @@ context had already been removed. The script refuses while any such session exis
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
   stop haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
-  run --rm haf-fyp-uninstall
+  run --rm --remove-orphans haf-fyp-uninstall
 ```
+
+`--remove-orphans` removes containers of services no longer in the file before the
+uninstall starts — on a stack upgraded across #48, the old `postgrest`, which `stop`
+cannot reach and which would otherwise hold sessions the script refuses on.
 
 The profile keeps it out of a plain `up`, and is namespaced `haf-fyp-uninstall` so
 `COMPOSE_PROFILES` cannot collide with another app's teardown on a shared node.
@@ -743,10 +760,12 @@ unauthenticated `/v1/fyp/events` is Redis write traffic. `MAX_REQUEST_BODY_BYTES
 (default 256 KiB) and the per-IP limits are what bound it.
 
 **The Redis service is named `haf-fyp-redis`, and it must not be an evicting
-instance.** Both matter wherever haf_fyp runs on a `haf_api_node`, whose `jussi.yaml`
-already defines a service called `redis`: services sharing a name across compose files
-are combined, so a generically-named Redis in a haf_fyp module file silently becomes
-jussi's instance. That one runs
+instance.** Both matter wherever haf_fyp runs on a `haf_api_node` that runs jussi, whose
+`jussi.yaml` (included when `JSONRPC_API_SERVER_NAME=jussi`) defines a service called
+`redis`. A same-named service is not a second service: under the node's shared project
+name, whichever file was applied last recreates the one container, so a generically-named
+Redis in a haf_fyp module file would silently become jussi's instance, or replace it.
+Jussi's runs
 `--maxmemory 8G --maxmemory-policy allkeys-lru`, and under `allkeys-lru` the limiter's
 buckets are evicted under memory pressure rather than expiring on their TTL — rate
 limits stop holding, with no error raised anywhere. The shipped compose states

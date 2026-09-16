@@ -47,8 +47,9 @@ version: "3.8"
 #                Layered, a renamed service is simply added: a SECOND, empty HAF, with
 #                every haf-fyp-* service that connects to PostgreSQL pointed at it. Under
 #                the node's project name, the prefix protects nothing either — this
-#                file's haf-fyp-* services would recreate the node's own haf_fyp
-#                containers. And renaming has an upgrade hazard of its own: the running
+#                file's haf-fyp-* services would recreate the node's same-named haf_fyp
+#                containers and add the rest alongside. And renaming has an upgrade
+#                hazard of its own: the running
 #                `haf` container is orphaned, not renamed, while the new service mounts
 #                the same haf_datadir volume.
 #   volumes    — haf_datadir / redis_data are generic and combine the same way. Renaming a
@@ -164,7 +165,8 @@ services:
   #
   #     docker compose -f docker/docker-compose.yml \
   #         stop haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest
-  #     docker compose -f docker/docker-compose.yml run --rm haf-fyp-uninstall
+  #     docker compose -f docker/docker-compose.yml run --rm --remove-orphans \
+  #         haf-fyp-uninstall
   #
   # USE `run --rm`, NOT `--profile haf-fyp-uninstall up`. Upstream documents the `up`
   # form and it is safe THERE because upstream puts every app service behind a profile
@@ -305,8 +307,9 @@ services:
   # `proxy_pass http://haf-fyp-postgrest:3000` with no `resolver`, so nginx resolves that
   # name ONCE at startup and caches the IP for the process lifetime. Recreating
   # `haf-fyp-postgrest` (an image bump, --force-recreate) gives it a new IP and this
-  # container then fails every request -- a 502, or a timeout when nothing answers at the
-  # stale address -- while still reporting HEALTHY, because the :81 probe is an
+  # container then fails every request -- a 502 once the connect to the stale address
+  # fails, or a timeout to a client that gives up sooner -- while still reporting HEALTHY,
+  # because the :81 probe is an
   # unconditional 204 that never touches the upstream. Restart the rewriter after anything
   # that recreates haf-fyp-postgrest.
   #
