@@ -68,6 +68,17 @@ GRANT SELECT ON haf_fyp_app.app_status TO haf_fyp_user;
 
 -- ---------------------------------------------------------------------------
 -- Lifecycle control functions
+--
+-- LEGACY LOOP ONLY. These three drive the continue_processing flag that the
+-- eternal haf_fyp_app.main() loop re-checks on every iteration. Under the
+-- generic HAF driver (haf_app_driver.py, the default since !51 on a HAF with
+-- the application registry) they are inert: the driver never reads the flag
+-- and never calls allow_processing() at startup, so stop_processing() changes
+-- nothing there. To pause the app under the driver use HAF's own mechanism,
+--     SELECT hive.app_pause('haf_fyp');   -- and hive.app_resume('haf_fyp')
+-- which app_next_iteration honours (a paused application gets no ranges).
+-- Kept for the legacy fallback path (scripts/process_blocks.sh on a
+-- pre-registry HAF, or HAF_FYP_USE_LEGACY_LOOP=true) and for the tests.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.continue_processing()
