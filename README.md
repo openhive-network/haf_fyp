@@ -315,29 +315,37 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml run --r
 > **Upgrading from before #48:** the `postgrest` service is now `haf-fyp-postgrest`.
 > Renaming a compose service does not rename its running container: the old one is
 > orphaned and keeps host port 3000, so a plain quick-start step 3 fails with `port is
-> already allocated` and leaves the new PostgREST and the rewriter half-created. Stopping
-> the renamed services does not reach the orphan, and neither does a plain `down` — so it
-> can also keep PostgREST's sessions open as `haf_fyp_user`, and the uninstall script
-> refuses (the uninstall command below passes `--remove-orphans` for that reason).
+> already allocated` and leaves the new PostgREST half-created. Stopping the renamed
+> services does not reach the orphan, and neither does a plain `down` — so it can also keep
+> PostgREST's sessions open as `haf_fyp_user`, and the uninstall script refuses.
 >
 > 1. If `docker/.env.local` sets `POSTGREST_HOST=postgrest`, delete that line.
-> 2. Remove the two containers the rename affects. This matters most after a failed step
->    3: retrying `up` over its half-created PostgREST exits 0 but starts it with **no
->    network**, so the rewriter cannot resolve it. It also forces the rewriter to be
->    recreated, and so to resolve its upstream afresh:
+> 2. Remove the old `postgrest` container, and the two containers the rename affects.
+>    3001 is down from here until step 3's PostgREST is up.
 >
 >    ```bash
+>    project=$(docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
+>      config | sed -n 's/^name: //p')
+>    docker ps -aq --filter "label=com.docker.compose.project=$project" \
+>      --filter label=com.docker.compose.service=postgrest | xargs -r docker rm -f
 >    docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
 >      rm -sf haf-fyp-postgrest haf-fyp-postgrest-rewriter
 >    ```
 >
-> 3. Remove the orphan and start the stack, with quick-start step 3's service list (add
->    `--build` if the same pull changed anything else — see quick-start step 2). Like
->    step 3, this re-runs `haf-fyp-setup`, and PostgREST starts only once it finishes:
+>    The first command matches the old container by this stack's project and service
+>    labels, so nothing else is touched. **Not** `--remove-orphans`: that removes every
+>    container of the project that this file does not define, and the default project
+>    name here is just the directory, `docker`. The `rm -sf` matters most after a failed
+>    step 3. Retrying `up` over the half-created PostgREST exits 0 but starts it with **no
+>    network**, so the rewriter cannot resolve it. It also forces the rewriter to be
+>    recreated, and so to resolve its upstream afresh.
+> 3. Start the stack with quick-start step 3's service list (add `--build` if the same
+>    pull changed anything else — see quick-start step 2). Like step 3, this re-runs
+>    `haf-fyp-setup`, and PostgREST starts only once it finishes:
 >
 >    ```bash
 >    docker compose --env-file docker/.env.local -f docker/docker-compose.yml up -d \
->      --remove-orphans haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest \
+>      haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest \
 >      haf-fyp-postgrest-rewriter haf-fyp-redis
 >    ```
 >
@@ -572,7 +580,7 @@ haf_fyp_endpoints
 haf-fyp-setup      # one-shot DDL install + cross-schema grants (Dockerfile.sql)
 haf-fyp-sync       # PL/pgSQL block loop (Dockerfile.sql)
 haf-fyp-uninstall  # removes the app from the database — profile "haf-fyp-uninstall",
-                   # starts on a plain `up` (Dockerfile.sql)
+                   # never starts on a plain `up` (Dockerfile.sql)
 haf-fyp-ranker     # Python ranking daemon, 5-minute cycles (Dockerfile.python)
 haf-fyp-api        # FastAPI overlay on port 3002 (Dockerfile.python)
 haf-fyp-postgrest  # PostgREST on port 3000 (raw /rpc/, for debugging)
@@ -699,12 +707,14 @@ context had already been removed. The script refuses while any such session exis
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
   stop haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
-  run --rm --remove-orphans haf-fyp-uninstall
+  run --rm haf-fyp-uninstall
 ```
 
-`--remove-orphans` removes containers of services no longer in the file before the
-uninstall starts — on a stack upgraded across #48, the old `postgrest`, which `stop`
-cannot reach and which would otherwise hold sessions the script refuses on.
+Keep `--env-file` on the `run` as well as the `stop`. `run` recreates any dependency whose
+configuration differs, so without it `haf` is recreated from `docker/.env`'s values just
+before the teardown. On a stack upgraded across #48 whose old `postgrest` container is
+still running, `stop` cannot reach it. Remove it first, as step 2 of *Upgrading from
+before #48* above does.
 
 The profile keeps it out of a plain `up`, and is namespaced `haf-fyp-uninstall` so
 `COMPOSE_PROFILES` cannot collide with another app's teardown on a shared node.

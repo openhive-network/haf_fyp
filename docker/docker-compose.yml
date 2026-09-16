@@ -163,10 +163,15 @@ services:
   # Removes haf_fyp from the database: HAF context, both schemas (CASCADE), both
   # roles. Behind a profile, so `docker compose up` never starts it.
   #
-  #     docker compose -f docker/docker-compose.yml \
+  #     docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
   #         stop haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest
-  #     docker compose -f docker/docker-compose.yml run --rm --remove-orphans \
-  #         haf-fyp-uninstall
+  #     docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
+  #         run --rm haf-fyp-uninstall
+  #
+  # --env-file on BOTH: `run` recreates a dependency whose config differs, so without it
+  # `haf` is recreated from docker/.env just before the teardown. A pre-#48 `postgrest`
+  # container is not reached by `stop`; README "Upgrading from before #48" step 2
+  # removes it (by label -- not --remove-orphans, which removes far more).
   #
   # USE `run --rm`, NOT `--profile haf-fyp-uninstall up`. Upstream documents the `up`
   # form and it is safe THERE because upstream puts every app service behind a profile
@@ -306,8 +311,9 @@ services:
   # OPERATIONAL NOTE: after substitution the template is a literal
   # `proxy_pass http://haf-fyp-postgrest:3000` with no `resolver`, so nginx resolves that
   # name ONCE at startup and caches the IP for the process lifetime. Recreating
-  # `haf-fyp-postgrest` (an image bump, --force-recreate) gives it a new IP and this
-  # container then fails every request -- a 502 once the connect to the stale address
+  # `haf-fyp-postgrest` (an image bump, --force-recreate) can give it a new IP -- Docker
+  # often hands the same address back, so this may keep working by accident -- and when
+  # it does change, this container fails every request -- a 502 once the connect to the stale address
   # fails, or a timeout to a client that gives up sooner -- while still reporting HEALTHY,
   # because the :81 probe is an
   # unconditional 204 that never touches the upstream. Restart the rewriter after anything
@@ -348,10 +354,10 @@ services:
 
   # NAMED haf-fyp-redis, NOT redis (#39).
   #
-  # haf_api_node's jussi.yaml already defines a service called `redis`. Combine this
-  # file with a node's -- which the header forbids, and explains -- and two services
-  # of the same name become one, so the generic name would have silently pointed this
-  # app at jussi's instance.
+  # haf_api_node's jussi.yaml (included when the node runs jussi) defines a service
+  # called `redis`. Combine this file with a node's -- which the header forbids, and
+  # explains -- and two services of the same name become one, so the generic name would
+  # have silently pointed this app at jussi's instance.
   #
   # That is not merely sharing -- jussi runs it as
   #     redis-server --maxmemory ${JUSSI_REDIS_MAX_MEMORY:-8G} --maxmemory-policy allkeys-lru

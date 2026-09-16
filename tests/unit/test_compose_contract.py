@@ -217,7 +217,7 @@ POSTGREST = "haf-fyp-postgrest"
 # may legitimately move turns a legal change into a test failure.
 PORT_OWNERS = {"3000": (POSTGREST, "3000"), "3001": (REWRITER, "80")}
 
-_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-([^{}]*)\}")
+_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^{}]*))?\}")
 
 
 def _read_env(path: Path) -> dict:
@@ -249,19 +249,28 @@ def _read_env(path: Path) -> dict:
 
 
 def _resolve(text, env: dict) -> str:
-    """Expand ${VAR:-default} with compose's semantics.
+    """Expand ${VAR:-default}, and ${VAR} when the env file sets VAR, as compose does.
 
     `:-` falls back when the variable is unset OR EMPTY. `env.get(name, default)` gets
     the empty case wrong, and an empty value is what someone leaves behind when they
-    blank a line out rather than deleting it.
+    blank a line out rather than deleting it. A bare ${VAR} the env file does not set is
+    left unresolved and fails below: it depends on the operator's shell.
     """
+    def one(m):
+        name, default = m.group(1), m.group(2)
+        if default is None:
+            return env[name] if name in env else m.group(0)
+        return env.get(name) or default
+
     out, passes = str(text), 0
     while "${" in out and passes < 10:                # ${A:-${B:-3001}} nests
-        out = _VAR.sub(lambda m: env.get(m.group(1)) or m.group(2), out)
-        passes += 1
+        expanded = _VAR.sub(one, out)
+        if expanded == out:
+            break
+        out, passes = expanded, passes + 1
     assert "$" not in out, (
-        f"unresolved variable in {text!r}. Only ${{VAR:-default}} is handled -- give it a "
-        f"default, or teach _resolve the form you need.")
+        f"unresolved variable in {text!r}. ${{VAR:-default}} is handled, and ${{VAR}} when "
+        f"docker/.env sets it -- give it a default, or teach _resolve the form you need.")
     return out
 
 
@@ -391,10 +400,11 @@ def test_rewriter_proxies_to_the_postgrest_service_on_its_port():
 
     # The upstream PORT is equally load-bearing and was asserted nowhere: pointing it at a
     # dead port 502s every /v1/fyp/* path while the container still reports healthy.
-    port = _resolve(str(svc.get("POSTGREST_PORT", "")), env_file)
-    container = _container_port(doc["services"], POSTGREST)
-    assert port == container, (
-        f"POSTGREST_PORT is {port!r} but `{POSTGREST}` listens on {container!r}"
+    assert "POSTGREST_PORT" in svc, f"{REWRITER} must set POSTGREST_PORT explicitly"
+    port = _resolve(str(svc["POSTGREST_PORT"]), env_file)
+    listening = _container_ports(doc["services"], POSTGREST)
+    assert port in listening, (
+        f"POSTGREST_PORT is {port!r} but `{POSTGREST}` listens on {sorted(listening)}"
     )
 
 
@@ -414,9 +424,11 @@ def _posix_sh() -> str:
     """The shell the image uses: `#!/bin/sh`, started as CMD ["/entrypoint.sh"].
 
     Not bash. Under bash, bash-only syntax the image's /bin/sh rejects rendered fine here
-    while the real rewriter would crash-loop. CI's `sh` is dash, which rejects it too. A
-    Windows `sh` is Git Bash in POSIX mode and is laxer; shell-lint's shellcheck (SC3xxx)
-    covers that gap. Override with HAF_FYP_TEST_SH.
+    while the real rewriter would crash-loop. CI's `sh` is dash, which rejects some of it
+    (a bad substitution such as `${X,,}` aborts the script) but not all (`[[ ]]` merely
+    fails as a command). A Windows `sh` is Git Bash in POSIX mode and laxer still;
+    shell-lint's shellcheck (SC3xxx) is what covers bash-only syntax as a class. Override
+    with HAF_FYP_TEST_SH.
     """
     sh = os.environ.get("HAF_FYP_TEST_SH") or shutil.which("sh")
     if sh:
@@ -447,17 +459,23 @@ def _render_upstream(tmp_path_factory, **settings) -> tuple:
     (root / "nginx" / "conf").mkdir(parents=True)
     (root / "bin").mkdir()
     shutil.copyfile(TEMPLATE, root / "nginx" / "conf" / "nginx.conf.template")
-    # The stub records its arguments rather than printing them, so the script may log
-    # whatever it likes to stdout.
-    write_exec(root / "bin" / "openresty", "#!/bin/sh\nprintf '%s\\n' \"$@\" > exec-args\n")
+    # The stub records its arguments and its PID rather than printing, so the script may
+    # log whatever it likes to stdout.
+    write_exec(root / "bin" / "openresty",
+               "#!/bin/sh\necho $$ > exec-pid\nprintf '%s\\n' \"$@\" > exec-args\n")
 
     # Relative, run from `root`: the script's paths are unquoted, so substituting an
-    # absolute temp root split it wherever the path held a space. The trailer is reached
-    # only if openresty is NOT exec'd -- run as a child it is not PID 1 and never receives
-    # the container's signals.
+    # absolute temp root split it wherever the path held a space.
+    #
+    # openresty must be EXEC'd: run as a child it is not PID 1 and never receives the
+    # container's signals. The shell records its PID first, and the stub must report the
+    # same one -- which a child cannot, however the script exits afterwards (`; exit $?`,
+    # `& wait`, an EXIT trap all passed a fall-through check alone). The trailer still
+    # catches a script that simply carries on.
+    shebang, _, body = ENTRYPOINT.read_text(encoding="utf-8").partition("\n")
     staged = root / "entrypoint.sh"
     with open(staged, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(ENTRYPOINT.read_text(encoding="utf-8").replace(OPENRESTY, "."))
+        handle.write(f"{shebang}\necho $$ > shell-pid\n{body.replace(OPENRESTY, '.')}")
         handle.write("\necho 'openresty was not exec-ed' >&2\nexit 99\n")
 
     env = clean_env()
@@ -467,15 +485,26 @@ def _render_upstream(tmp_path_factory, **settings) -> tuple:
     r = subprocess.run([sh, "entrypoint.sh"], cwd=root, env=env, capture_output=True,
                        text=True, timeout=10)
     streams = f"\nstdout: {r.stdout}\nstderr: {r.stderr}"
-    args_file = root / "exec-args"
-    execed = args_file.read_text(encoding="utf-8").splitlines() if args_file.is_file() else None
-    # Exactly this invocation, not merely "openresty ran": without `daemon off;` openresty
-    # forks into the background and the container exits at once, and `-c <other>` would
-    # serve a config other than the one rendered here.
-    assert r.returncode == 0 and execed == ["-g", "daemon off;"], (
+    def read(name):
+        path = root / name
+        return path.read_text(encoding="utf-8").split() if path.is_file() else None
+
+    execed = (root / "exec-args").read_text(encoding="utf-8").splitlines() \
+        if (root / "exec-args").is_file() else None
+    # This invocation, not merely "openresty ran": without `daemon off;` openresty forks
+    # into the background and the container exits at once, and `-c <other>` would serve a
+    # config other than the one rendered here. `-c` naming the rendered file is fine.
+    flags = dict(zip(execed[::2], execed[1::2])) if execed and len(execed) % 2 == 0 else {}
+    assert (r.returncode == 0 and flags.get("-g") == "daemon off;" and set(flags) <= {"-g", "-c"}
+            and flags.get("-c", "./nginx/conf/nginx.conf") == "./nginx/conf/nginx.conf"), (
         f"the entrypoint did not exec `openresty -g 'daemon off;'` (rc={r.returncode}, "
         f"args={execed}); did its invocation or the image paths under {OPENRESTY} "
         f"change?{streams}"
+    )
+    assert read("exec-pid") == read("shell-pid"), (
+        f"openresty ran as a child (pid {read('exec-pid')}) of the entrypoint shell (pid "
+        f"{read('shell-pid')}), not via exec: it is not PID 1 and never receives the "
+        f"container's signals.{streams}"
     )
     rendered = root / "nginx" / "conf" / "nginx.conf"
     assert rendered.is_file(), (
@@ -487,23 +516,24 @@ def _render_upstream(tmp_path_factory, **settings) -> tuple:
     # which this deliberately does not match.)
     leftover = re.findall(r"\$\{[A-Z_][A-Z0-9_]*\}", conf)
     assert not leftover, f"placeholders survived substitution: {leftover}{streams}"
-    upstreams = re.findall(r"^\s*proxy_pass\s+http://([^:;/\s]*):([^;/\s]*)\s*;", conf, re.M)
+    upstreams = re.findall(r"^\s*proxy_pass\s+http://([^:;/\s]*):([^;/\s]*)/?\s*;", conf, re.M)
     assert len(upstreams) == 1, (
-        f"expected one PostgREST proxy_pass, found {upstreams}{streams}"
+        f"expected one `proxy_pass http://<host>:<port>;` for PostgREST, found "
+        f"{upstreams}{streams}"
     )
-    return upstreams[0]
+    return upstreams[0][0], upstreams[0][1], conf
 
 
-def _container_port(services: dict, service: str) -> str:
+def _container_ports(services: dict, service: str) -> set:
     ports = (services.get(service) or {}).get("ports")
     assert ports, f"`{service}` publishes no ports, so its listen port cannot be checked"
-    return _ports(ports[0], _read_env(ENV_FILE))[1]
+    return {_ports(spec, _read_env(ENV_FILE))[1] for spec in ports}
 
 
 @pytest.fixture(scope="module")
 def image_default_upstream(tmp_path_factory) -> tuple:
     """(host, port) the rewriter image proxies to when nothing sets POSTGREST_HOST/PORT."""
-    return _render_upstream(tmp_path_factory)
+    return _render_upstream(tmp_path_factory)[:2]
 
 
 def test_the_image_default_upstream_is_the_postgrest_service(services, image_default_upstream):
@@ -515,10 +545,10 @@ def test_the_image_default_upstream_is_the_postgrest_service(services, image_def
     assert host in services, (
         f"the image default `{host}` is not a service in docker-compose.yml"
     )
-    container = _container_port(services, POSTGREST)
-    assert port == container, (
+    listening = _container_ports(services, POSTGREST)
+    assert port in listening, (
         f"with POSTGREST_PORT unset the rewriter proxies to port {port!r}, but "
-        f"`{POSTGREST}` listens on {container!r}"
+        f"`{POSTGREST}` listens on {sorted(listening)}"
     )
 
 
@@ -529,11 +559,21 @@ def test_an_explicit_upstream_overrides_the_image_default(tmp_path_factory):
     renders the default correctly while silently ignoring every explicit value -- and
     passed every other test here.
     """
-    host, port = _render_upstream(tmp_path_factory, POSTGREST_HOST="sentinel-upstream",
-                                  POSTGREST_PORT="4242")
+    host, port, _ = _render_upstream(tmp_path_factory, POSTGREST_HOST="sentinel-upstream",
+                                     POSTGREST_PORT="4242")
     assert (host, port) == ("sentinel-upstream", "4242"), (
         f"POSTGREST_HOST=sentinel-upstream POSTGREST_PORT=4242 rendered {host}:{port}: the "
         f"entrypoint or template ignores an explicit upstream"
+    )
+
+
+def test_rewrite_logging_renders_a_valid_directive(tmp_path_factory):
+    """REWRITE_LOG=on takes the entrypoint's other branch, which no other render reaches.
+    A typo there -- a dropped `;` -- stops nginx from starting only for the operator who
+    turned logging on to debug something."""
+    _, _, conf = _render_upstream(tmp_path_factory, REWRITE_LOG="on")
+    assert re.search(r"^\s*rewrite_log on;\s*$", conf, re.M), (
+        "REWRITE_LOG=on did not render a `rewrite_log on;` directive"
     )
 
 
@@ -543,11 +583,11 @@ def test_the_rewriter_image_runs_that_entrypoint_with_nothing_preset():
     in Dockerfile.rewriter would make the shell default dead code with every other test in
     this file still green -- a reviewer's mutation did exactly that.
     """
-    # Drop comment lines, THEN join `\` continuations -- Docker's own order. Joining first
-    # let a `# note` line inside an `ENV A=1 \` block swallow the `POSTGREST_HOST=x` after
-    # it, which Docker would still set.
+    # Drop comment AND empty lines, THEN join `\` continuations -- Docker skips both inside
+    # a continuation. Joining first let a `# note` or blank line inside an `ENV A=1 \`
+    # block cut off the `POSTGREST_HOST=x` after it, which Docker still sets (measured).
     lines = [line for line in DOCKERFILE_REWRITER.read_text(encoding="utf-8").splitlines()
-             if not line.lstrip().startswith("#")]
+             if line.strip() and not line.lstrip().startswith("#")]
     text = re.sub(r"\\[ \t]*\n", " ", "\n".join(lines))
     instructions = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
     # Only the final stage is the image. A multi-stage build satisfied every check below
@@ -556,7 +596,9 @@ def test_the_rewriter_image_runs_that_entrypoint_with_nothing_preset():
     assert froms, "Dockerfile.rewriter has no FROM"
     final = instructions[froms[-1] + 1:]
 
-    preset = [i for i in final
+    # Presets are looked for in EVERY stage: `FROM base` inherits base's ENV, so a final
+    # stage built on an earlier one carries it in.
+    preset = [i for i in instructions
               if re.match(r"(?i)ENV\s", i) and re.search(r"\bPOSTGREST_(HOST|PORT)\b", i)]
     assert not preset, (
         f"Dockerfile.rewriter presets the upstream, so rewriter_entrypoint.sh's default "
@@ -570,17 +612,20 @@ def test_the_rewriter_image_runs_that_entrypoint_with_nothing_preset():
         # Everything in the final stage that names the target: flags such as
         # `COPY --chmod=755` are legitimate, but a second COPY/ADD onto it, or a RUN that
         # does more than chmod it, means the image does not run the file tested above.
+        # Bounded by anything that cannot continue a path, so `>>/entrypoint.sh` and
+        # `"/entrypoint.sh"` count while `/entrypoint.sh.bak` does not.
         writes = [i for i in final
                   if not re.match(r"(?i)(CMD|ENTRYPOINT)\s", i)    # starts it, checked below
-                  and re.search(rf"(^|[\s\"'=]){re.escape(target)}([\s\"';&|]|$)", i)]
+                  and re.search(rf"(?<![\w./-]){re.escape(target)}(?![\w./-])", i)]
         copies = [i for i in writes if re.match(r"(?i)(COPY|ADD)\s", i)]
-        # `--from=<stage>` is a flag too, but it copies from another stage, not this repo.
+        # `--from=` is a flag too, but it copies from another stage, image or build context,
+        # not from this repo.
         assert len(copies) == 1 and re.fullmatch(
-            rf"(?i)COPY(\s+--(?!from)\S+)*\s+{re.escape(source)}\s+{re.escape(target)}",
+            rf"(?i)COPY(\s+--(?!from)\S+)*\s+(\./)?{re.escape(source)}\s+{re.escape(target)}",
             copies[0],
         ), f"{target} must be written once, by `COPY {source} {target}`: got {copies}"
         others = [i for i in writes if i not in copies
-                  and not re.fullmatch(rf"RUN chmod \S+ {re.escape(target)}", i)]
+                  and not re.fullmatch(rf"(?i)RUN chmod \S+ {re.escape(target)}", i)]
         assert not others, f"the final stage alters {target} after copying it: {others}"
 
     starts = [m.group(1) for i in final
@@ -662,12 +707,12 @@ def test_every_service_reference_resolves_within_its_own_file(path):
             if dep not in names:
                 dangling.append(f"{name}.depends_on -> {dep}")
         for key, value in _environment(doc, name, path.name).items():
-            if key.endswith("_HOST"):
+            if key.endswith("HOST"):                         # POSTGRES_HOST, PGHOST, ...
                 host = _resolve(str(value), env_file)
             else:
                 # Resolve BEFORE looking for a URI: `${HIVE_RPC_URL:-}` is not one until
-                # docker/.env supplies `http://...`. A `${VAR}` with no default has nothing
-                # to resolve against here, and is left as written.
+                # docker/.env supplies `http://...`. Only a `${VAR}` that docker/.env does
+                # not set is left as written -- it depends on the operator's shell.
                 try:
                     resolved = _resolve(str(value), env_file)
                 except AssertionError:
@@ -755,11 +800,22 @@ def test_no_volume_carries_a_generic_name():
         f"add to VOLUME_EXEMPTIONS with the reason."
     )
     env_file = _read_env(ENV_FILE)
+    def host_wide_name(key, spec):
+        """The verbatim name of a pinned or external volume, or None if compose prefixes it.
+        Legacy `external: {name: x}` is still honoured by compose v5."""
+        if not isinstance(spec, dict):
+            return None
+        external = spec.get("external")
+        if isinstance(external, dict) and "name" in external:
+            return _resolve(str(external["name"]), env_file)
+        if "name" in spec or external:
+            return _resolve(str(spec.get("name", key)), env_file)
+        return None
+
     pinned = sorted(
-        f"{key}: {_resolve(str(spec.get('name', key)), env_file)}"
-        for key, spec in volumes.items()
-        if isinstance(spec, dict) and ("name" in spec or spec.get("external"))
-        and not scoped.fullmatch(_resolve(str(spec.get("name", key)), env_file))
+        f"{key}: {name}" for key, spec in volumes.items()
+        for name in [host_wide_name(key, spec)]
+        if name is not None and not scoped.fullmatch(name)
     )
     assert not pinned, (
         f"{pinned} use a generic host-wide volume name. A pinned `name:` or an `external:` "
@@ -776,11 +832,18 @@ def test_no_project_network_or_container_name_escapes_the_naming_rule(services):
     every other test. The header also says no `networks:` key is declared, and a generic
     `container_name` collides host-wide regardless of how the service is named."""
     doc = _require_yaml().safe_load(COMPOSE.read_text(encoding="utf-8"))
-    if "name" in doc:
-        project = _resolve(str(doc["name"]), _read_env(ENV_FILE))
+    # COMPOSE_PROJECT_NAME in the auto-loaded docker/.env outranks `name:` in the file, so
+    # both are checked.
+    env_file = _read_env(ENV_FILE)
+    for source, project in (("docker/.env COMPOSE_PROJECT_NAME",
+                             env_file.get("COMPOSE_PROJECT_NAME")),
+                            ("docker-compose.yml `name:`",
+                             _resolve(str(doc["name"]), env_file) if "name" in doc else None)):
+        if project is None:
+            continue
         assert re.fullmatch(r"haf[-_]fyp([-_][a-z0-9]+)*", project), (
-            f"docker-compose.yml pins project name {project!r}. Compose identifies services "
-            f"by project and name, so a project a node also uses would recreate the node's "
+            f"{source} pins project name {project!r}. Compose identifies services by "
+            f"project and name, so a project a node also uses would recreate the node's "
             f"containers from this file. Use an app-scoped name such as `haf_fyp`."
         )
     assert "networks" not in doc, (
