@@ -1,5 +1,12 @@
 version: "3.8"
 
+# The project name, pinned (#53). Unpinned it was this file's directory, `docker` -- shared
+# by every stack started from a `docker/` directory on the host. Compose identifies
+# containers, networks and volumes by project and name, so those stacks recreated each
+# other's same-named services and removed each other's containers on --remove-orphans.
+# `-p` and COMPOSE_PROJECT_NAME still override it. haf_stats pins `haf_stats` likewise.
+name: haf_fyp
+
 # Full production stack:
 #   haf                        — HAF PostgreSQL node (hived + sql_serializer)
 #   haf-fyp-setup              — One-time schema installation (runs as haf_admin)
@@ -52,10 +59,14 @@ version: "3.8"
 #                hazard of its own: the running
 #                `haf` container is orphaned, not renamed, while the new service mounts
 #                the same haf_datadir volume.
-#   volumes    — haf_datadir / redis_data are generic and combine the same way. Renaming a
-#                key alone creates a new, empty project-prefixed volume and orphans the old
-#                one with the data in it; keeping the data needs a pinned `name:` or a
-#                migration. A deploy decision, not a text edit.
+#   volumes    — the keys haf_datadir / redis_data are generic and combine by key the same
+#                way; kept, because this file is never combined with a node's. Since #53
+#                the volume NAMES on the host follow the project, with an override for an
+#                upgraded stack (see `volumes:` at the end).
+#
+# The same collision exists one level up, on a single host, which is why this file pins
+# `name: haf_fyp` (#53): unpinned, the project was the compose file's directory, `docker`,
+# shared by every stack started from a `docker/` directory.
 #
 # tests/unit/test_compose_contract.py pins both rules, so a NEW generic service or volume
 # cannot appear without this being revisited.
@@ -80,6 +91,12 @@ services:
       timeout: 5s
       retries: 10
       start_period: 72h   # replay can take days on first run
+    # As haf_api_node's haf_base.yaml does: compose's default ten seconds is not enough for
+    # PostgreSQL to shut down cleanly, and a SIGKILL after it makes the next start perform
+    # crash recovery. It is stored on the container when compose creates it, so it applies to
+    # `stop`, `down` and a recreate of containers created from this file. An older container
+    # keeps the ten seconds until it is replaced: stop one with `docker stop -t 120` first.
+    stop_grace_period: 2m
 
   haf-fyp-setup:
     build:
@@ -170,9 +187,10 @@ services:
   #
   # --env-file on BOTH: `run` recreates a dependency whose config differs, so if .env.local
   # pins HAF_VERSION/HAF_REGISTRY, leaving it off recreates `haf` from docker/.env just
-  # before the teardown. A pre-#48 `postgrest`
-  # container is not reached by `stop`; README "Upgrading from before #48" step 2
-  # removes it (by label -- not --remove-orphans, which removes far more).
+  # before the teardown. Add the stack's -p to both if it runs under one. A stack started
+  # before #53 without -p or COMPOSE_PROJECT_NAME runs its old containers under the project
+  # `docker`, which `stop` here does not reach: scripts/upgrade_standalone_stack.sh removes
+  # them (by label -- not --remove-orphans, which removes far more).
   #
   # USE `run --rm`, NOT `--profile haf-fyp-uninstall up`. Upstream documents the `up`
   # form and it is safe THERE because upstream puts every app service behind a profile
@@ -199,9 +217,9 @@ services:
       context: ..
       dockerfile: Dockerfile.sql
       args:
-        # Same build args as the other two services from this Dockerfile, so compose
-        # reuses their image instead of building a third one that differs only in a
-        # baked ENV.
+        # Same build args as the other two services from this Dockerfile, so its build hits
+        # their cached layers rather than rebuilding for a different baked ENV. Compose
+        # still tags one image per service.
         GIT_HASH: ${GIT_HASH:-}
     command: ["uninstall_app", "--force"]
     environment:
@@ -387,5 +405,24 @@ services:
       - redis_data:/data
 
 volumes:
+  # These names need Compose v2.18.1 or newer: earlier releases reject a default inside a
+  # default (`${A:-${B:-c}}`) with `invalid interpolation format`, and then every command
+  # on this file fails. README's Prerequisites states it.
+  #
+  # Named through variables (#53). Unset, the names follow the project as unpinned ones
+  # would: `haf_fyp_*`, or `<p>_*` under `-p <p>` / COMPOSE_PROJECT_NAME -- so a second
+  # instance started with `-p` gets its own volumes, not the first stack's HAF datadir.
+  # (Before Compose v2.27.1, `-p` combined with a DIFFERENT COMPOSE_PROJECT_NAME in the shell
+  # or env file takes the volume names from COMPOSE_PROJECT_NAME.)
+  #
+  # Set, HAF_FYP_HAF_DATADIR_VOLUME=docker_haf_datadir in .env.local lets a stack started
+  # before #53 under the default project, `docker`, keep its HAF database without copying it;
+  # scripts/upgrade_standalone_stack.sh sets it. Compose warns that such a
+  # volume `already exists but was created for project "docker"` and uses it (measured on
+  # Compose v2.20.3, v2.24.7, v2.30.3, v2.39.4 and v5.1.4). The redis override exists for
+  # symmetry; the upgrade does not need it, since redis holds nothing worth keeping.
+  # tests/unit/test_compose_contract.py pins this wiring.
   haf_datadir:
+    name: ${HAF_FYP_HAF_DATADIR_VOLUME:-${COMPOSE_PROJECT_NAME:-haf_fyp}_haf_datadir}
   redis_data:
+    name: ${HAF_FYP_REDIS_DATA_VOLUME:-${COMPOSE_PROJECT_NAME:-haf_fyp}_redis_data}

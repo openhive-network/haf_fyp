@@ -51,7 +51,10 @@ hived ──► sql_serializer ──► HAF PostgreSQL
   -- run as superuser before installing haf_fyp
   CREATE EXTENSION IF NOT EXISTS vector;
   ```
-- Docker and Docker Compose
+- Docker, and Docker Compose **v2.18.1 or newer** (older releases cannot parse the
+  volume names in `docker/docker-compose.yml`, and fail every command with
+  *invalid interpolation format*). From **v2.27.1** a `-p` also decides the volume
+  names; before it, a `COMPOSE_PROJECT_NAME` left in the shell decides them instead.
 - **[Hivemind](https://gitlab.syncad.com/hive/hivemind), installed and synced on the
   same PostgreSQL server.** This is a hard dependency, not an accuracy enhancement:
 
@@ -312,51 +315,104 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml run --r
 > A stale `:3001/rpc/x` call returns a PostgREST 404 body rather than a connection error,
 > so it reads as "the endpoint was removed" — it moved.
 
-> **Upgrading from before #48:** the `postgrest` service is now `haf-fyp-postgrest`.
-> Renaming a compose service does not rename its running container: the old one is
-> orphaned and keeps host port 3000, so a plain quick-start step 3 fails with `port is
-> already allocated`. It leaves the new PostgREST created but not running, and usually the
-> rewriter too, so 3001 is down. Stopping the renamed services does not reach the orphan,
-> and neither does a plain `down` — so it can also keep PostgREST's sessions open as
-> `haf_fyp_user`, and the uninstall script refuses.
+> **Upgrading a standalone stack from before #53** (this includes #48's rename of
+> `postgrest` to `haf-fyp-postgrest`). The compose project name is now pinned to
+> `haf_fyp`. Before, it defaulted to the compose file's directory, `docker`, unless you
+> passed `-p` or set `COMPOSE_PROJECT_NAME`. The quick-start commands above no longer
+> reach the old containers: they would create a second stack beside them, on a new, empty
+> HAF volume (while the old HAF runs, the new one cannot start on port 5432 and is left
+> `created`). Use the upgrade script instead.
 >
-> 1. If `docker/.env.local` sets `POSTGREST_HOST=postgrest`, delete that line.
-> 2. Remove the old `postgrest` container, and the two containers the rename affects.
->    3001 is down from here (already, if step 3 failed) until step 3's PostgREST is up.
+> **Before you run it,** run no compose command that stops, restarts or recreates the old
+> stack (`stop`, `down`, `restart`, `up`, `run`). Its containers were created before
+> `stop_grace_period`, so compose gives HAF only ten seconds to shut PostgreSQL down, and
+> a killed HAF runs crash recovery on its next start. For a stack that already ran under
+> `haf_fyp` or a `COMPOSE_PROJECT_NAME`, that includes the quick start itself.
 >
->    ```bash
->    project=$(docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
->      config | sed -n 's/^name: //p' | tr -d '"')
->    docker ps -aq --filter "label=com.docker.compose.project=$project" \
->      --filter label=com.docker.compose.service=postgrest | xargs -r docker rm -f
->    docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
->      rm -sf haf-fyp-postgrest haf-fyp-postgrest-rewriter
->    ```
+> From the repository root, with `docker/.env.local` in place:
 >
->    The first command matches the old container by this stack's project and service
->    labels, so nothing else is touched. **Not** `--remove-orphans`: that removes the
->    containers of every service this file does not define, and every exited `run`
->    container, across the whole project. The default project name here is just the
->    directory, `docker`. The `rm -sf` matters most after a failed
->    step 3. Retrying `up` over the half-created PostgREST exits 0 but starts it with **no
->    network**, so the rewriter cannot resolve it. It also forces the rewriter to be
->    recreated, and so to resolve its upstream afresh.
-> 3. Start the stack with quick-start step 3's service list (add `--build` if the same
->    pull changed anything else — see quick-start step 2). Like step 3, this re-runs
->    `haf-fyp-setup`, and PostgREST starts only once it finishes:
+> ```bash
+> scripts/upgrade_standalone_stack.sh            # inspects and prints the plan; changes nothing
+> scripts/upgrade_standalone_stack.sh --apply    # does it
+> ```
 >
->    ```bash
->    docker compose --env-file docker/.env.local -f docker/docker-compose.yml up -d \
->      haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest \
->      haf-fyp-postgrest-rewriter haf-fyp-redis
->    ```
+> Read the plan before applying it: it names the old project, the data volume, and any
+> other HAF data volume it leaves alone. The script handles a stack run from
+> `docker/docker-compose.yml` alone with HAF's data in a named volume; for anything else
+> it refuses, and the stack is moved by hand (below).
 >
-> 4. Smoke-test through the rewriter. `/health` on 3001 goes to PostgREST
->    (`/rpc/get_health`), and `-f` makes an error status a non-zero exit:
+> **What it does,** with `--apply:`
+> - **Finds the old project** from this checkout's HAF container that has run and is not
+>   from the #53 file: one without the two-minute grace period, or any under the project
+>   `docker`, which the new file pins away from. Where no such container is left, pass
+>   `--old=PROJECT` naming the project whose `PROJECT_haf_datadir` holds the data; after an
+>   `--apply` that failed, the `HAF_FYP_HAF_DATADIR_VOLUME` line it had already written
+>   names it, and the script reads it back.
+> - **Stops this checkout's other stacks:** a quick start already created from the new
+>   file on another volume, or a start whose HAF never ran (one that failed on a port).
+>   Their volumes are left in place.
+> - **Stops the old stack's containers,** only those labelled with both the old project and
+>   this checkout: the applications, then HAF, each with `docker stop -t 120`. If HAF was
+>   killed at that limit it stops there (exit 3), keeping the containers so their log can
+>   be read. Otherwise it removes them, and the old network if nothing else is attached.
+> - **Adds `HAF_FYP_HAF_DATADIR_VOLUME`** to `docker/.env.local` when the data volume is not
+>   the one the new project's name gives (`docker_haf_datadir` for the default project
+>   `docker`, which moves to `haf_fyp`). A `-p` stack keeps its name, and its volume
+>   already follows it.
+> - **Runs `down`, then `up -d --build`** for the new project. As in the quick start, that
+>   runs `haf-fyp-setup` (`install_app`) against the existing database first. It then
+>   checks, twice a few seconds apart, that HAF mounts the old volume and every service
+>   runs. Anything that fails after the host has changed exits 3 and says how to go on.
+> - **Finishes a half-started stack:** where HAF already runs from the new file on the
+>   right volume but services are down -- what an `--apply` that failed on a port leaves --
+>   it starts those services instead of moving anything.
 >
->    ```bash
->    curl -fsS http://localhost:3001/health
->    ```
+> **What it refuses** (exit 1), changing nothing:
+> - `docker/.env.local` missing, without `HAF_VERSION`, or tracked by git (the volume line
+>   it adds must not be dropped by a checkout); `HAF_FYP_HAF_DATADIR_VOLUME` or
+>   `HAF_FYP_REDIS_DATA_VOLUME` set in the shell, where they outrank the env file
+> - no HAF container from this checkout that has run, without `--old`; `--old` naming
+>   another project than that container's
+> - two HAF containers from before #53 in this checkout that have run: remove the one that
+>   is not this stack's (`docker stop -t 120`, then `docker rm`) and run again
+> - an old HAF that had already exited 137 before the run, unless `--accept-killed-haf`
+> - an old stack started with other compose files as well, or with its data directory
+>   bind-mounted
+> - a data volume that does not exist or was created for another project (with `--old`),
+>   or that another checkout's container or another project's also uses
+> - containers of another checkout in the project the stack will run under (`down` and
+>   `up` would take them over), or another directory's running containers in the old
+>   project (they reach this HAF as `haf`, and would lose it)
+> - a `COMPOSE_PROJECT_NAME` line other than the old stack's own project name, `POSTGREST_HOST=postgrest`
+>   (renamed in #48), or a `HAF_FYP_HAF_DATADIR_VOLUME` naming another volume; or a compose
+>   file that resolves another project or volume
+> - when this checkout's HAF already runs from the new file: any HAF data volume on the
+>   host that nothing uses (it may hold this stack's data: pass `--old` if so), or compose
+>   resolving another volume than the one HAF runs on
+> - `docker` unusable, an unwritable env file, a `docker compose config` that fails (which
+>   is also what Compose older than v2.18.1 does here), an old HAF mounting nothing at the
+>   data directory, or another run of the script already in progress
+>
+> It never removes a volume, and never runs `down -v` or `--remove-orphans`. A second run
+> finds nothing to do, unless a HAF data volume that nothing uses is left, such as the empty
+> one a quick start created. That run refuses and lists every such volume on the host: the
+> list covers other checkouts' and other apps' volumes too, so remove one only if you know
+> which stack created it and that nothing needs it.
+>
+> **Moving a stack by hand,** when the script refuses one it does not handle: stop this
+> checkout's old containers with `docker stop -t 120` (HAF last), check HAF did not exit
+> 137, remove them, and start the new file with the files and settings the old stack used
+> plus `HAF_FYP_HAF_DATADIR_VOLUME` in `docker/.env.local` when the data volume is not
+> `<the project the stack will run under>_haf_datadir` (`haf_fyp_haf_datadir` for the
+> default project). Keep the stack's `-p` on every command.
+>
+> **Afterwards,** pass `--env-file docker/.env.local` (and the stack's `-p`, if it has one)
+> to every compose command for this stack, keep the `HAF_FYP_HAF_DATADIR_VOLUME` line, and
+> keep `COMPOSE_PROJECT_NAME` out of the shell: before Compose v2.27.1 one there renames
+> this stack's volumes even when `-p` names the project, which starts HAF on an empty one.
+> `/health` on port 3001 should report a `last_processed_block` that continues from the
+> old stack's. A second checkout on the same host now shares `haf_fyp`: run it under its
+> own `-p`.
 
 ## API Endpoints
 
@@ -608,6 +664,17 @@ so the exposure is latent, and the prefix keeps it latent by decision rather tha
 project name.** The header of `docker/docker-compose.yml` has the measured versions, and
 `tests/unit/test_compose_contract.py` pins the naming rule.
 
+The same applies one level up, on a single host. The stack's own project name is pinned
+to `haf_fyp` (#53). Unpinned, it was the compose file's directory, `docker`, which every
+stack started from a `docker/` directory shares. Its volume names follow the project
+(`haf_fyp_haf_datadir`, `haf_fyp_redis_data`; `<p>_…` under `-p <p>`), and
+`HAF_FYP_HAF_DATADIR_VOLUME` in `.env.local` lets a stack that ran under the old default
+project, `docker`, keep its HAF data.
+Two checkouts on one host now share `haf_fyp`, so run a second one under its own `-p`.
+`docker-compose-ci.yml`,
+which `scripts/run_tests.sh` runs on the host, is pinned to `haf_fyp_ci` for the same
+reason.
+
 ### The SQL image's verbs
 
 `Dockerfile.sql` builds one image used by three services, dispatched by
@@ -715,9 +782,12 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
 Keep `--env-file` on the `run` as well as the `stop`. `run` recreates any dependency whose
 configuration differs. So if `.env.local` changes `HAF_REGISTRY` or `HAF_VERSION` — and
 the quick start tells production to pin `HAF_VERSION` — leaving it off recreates `haf`
-from `docker/.env`'s values just before the teardown. On a stack upgraded across #48 whose old `postgrest` container is
-still running, `stop` cannot reach it. Remove it first, as step 2 of *Upgrading from
-before #48* above does.
+from `docker/.env`'s values just before the teardown. Add the stack's `-p` to both
+commands if it runs under one. A stack started before #53 must first be moved with
+`scripts/upgrade_standalone_stack.sh` (see *Upgrading a standalone stack from before #53*
+above). Unless it was started with `-p` or `COMPOSE_PROJECT_NAME`, its containers belong
+to the old default project, `docker`, which `stop` here does not reach, and they would
+keep their sessions open.
 
 The profile keeps it out of a plain `up`, and is namespaced `haf-fyp-uninstall` so
 `COMPOSE_PROFILES` cannot collide with another app's teardown on a shared node.
@@ -806,24 +876,21 @@ which is silent by construction: `_publish_refresh` wraps its call in
 you point them at.
 
 **Deploying a change to this file's limits:** `requirements.txt` is part of the image,
-so use `up -d --build haf-fyp-api`, not a bare `up -d`, which silently reuses the cached
-image. `haf-fyp-ranker` builds from the same `Dockerfile.python`, so a plain
+so rebuild it, not a bare `up -d`, which silently reuses the cached image:
+`docker compose --env-file docker/.env.local -f docker/docker-compose.yml up -d --build haf-fyp-api`
+(plus `-p` if the stack runs under one). `haf-fyp-ranker` builds from the same `Dockerfile.python`, so a plain
 `docker compose build` restarts it mid-cycle — rebuild the api service by name if that
 matters. Nothing needs ordering and a rollback strands nothing: bucket identities are
 unchanged and every key expires with its window.
 
-⚠️ **The upgrade that renamed `redis` to `haf-fyp-redis` is the exception to every
-sentence above.** Recreate `haf-fyp-api` **and** `haf-fyp-ranker` together, after removing
-the old `redis` container the way step 2 of *Upgrading from before #48* removes the old
-`postgrest` (service label `redis` instead). Not `--remove-orphans`, which reaches far
-more than that one container. Renaming a compose service does not rename the running container:
-the old one is orphaned and keeps the `redis` network alias, so a per-service
-`up -d --build haf-fyp-api` leaves the ranker resolving `redis` while the api publishes
-to `haf-fyp-redis`. Force-refresh then stops working **with no error on either side**
-— the publish succeeds into an instance nobody subscribes to, and its
-`except Exception: pass` would swallow a failure anyway — until the ranker's next
-5-minute cycle picks the work up regardless. The orphan also still mounts
-`redis_data`, so two `redis-server` processes share one `/data` until it is removed.
+⚠️ **A stack from before the rename of `redis` to `haf-fyp-redis` (#39) is the exception
+to every sentence above.** It is also from before #53, so move it with
+`scripts/upgrade_standalone_stack.sh`: that removes the old `redis` container with the rest
+of the old stack, and starts `haf-fyp-api` and `haf-fyp-ranker` together on the new
+stack's network. Do not upgrade it per service. Under the old project, the orphaned `redis` kept its network alias, so the
+ranker could resolve the old instance while the api published to the new one. Force-refresh
+then failed with no error on either side, until the ranker's next 5-minute cycle picked
+the work up regardless.
 
 ## Development Phases
 

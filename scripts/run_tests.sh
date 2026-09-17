@@ -11,7 +11,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-COMPOSE="docker compose -f ${SCRIPT_DIR}/../docker/docker-compose-ci.yml"
+# -p as well as the file's `name:`: a COMPOSE_PROJECT_NAME left in the shell outranks
+# `name:`, and would send the `down -v --remove-orphans` below into that project (#53).
+COMPOSE="docker compose -p haf_fyp_ci -f ${SCRIPT_DIR}/../docker/docker-compose-ci.yml"
 
 KEEP=0
 for arg in "$@"; do

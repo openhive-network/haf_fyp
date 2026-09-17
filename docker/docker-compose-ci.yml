@@ -1,5 +1,15 @@
 version: "3.8"
 
+# Project name pinned (#53). In GitLab CI this runs in a fresh docker-in-docker service,
+# but scripts/run_tests.sh runs it on the host, where the unpinned default -- this file's
+# directory, `docker` -- is shared with the standalone stack of a pre-#53 checkout and any
+# other `docker/`-directory stack. Its first command is `down -v --remove-orphans`, which
+# under a shared project removes every container of it: this file's own services --
+# including a stack's same-named haf-fyp-postgrest and rewriter -- and every orphan.
+# scripts/run_tests.sh also passes `-p haf_fyp_ci`, which outranks a COMPOSE_PROJECT_NAME
+# in the shell.
+name: haf_fyp_ci
+
 # CI test stack — plain postgres with pgvector (no HAF replay needed).
 # Tests all PostgREST endpoint functions against seeded app tables.
 #

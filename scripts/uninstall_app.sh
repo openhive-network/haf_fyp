@@ -238,9 +238,10 @@ assert_no_active_sessions() {
         log "           docker compose --env-file docker/.env.local \\"
         log "               -f docker/docker-compose.yml stop \\"
         log "               haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest"
-        log "       then re-run this script. On a stack upgraded across #48, an old"
-        log "       postgrest container is not reached by stop: remove it as step 2 of"
-        log "       'Upgrading from before #48' in README.md does."
+        log "       (add the stack's -p if it runs under one), then re-run this script."
+        log "       A stack started before #53 without -p or COMPOSE_PROJECT_NAME runs"
+        log "       its old containers under the project 'docker', which stop does not"
+        log "       reach: move it with scripts/upgrade_standalone_stack.sh first."
         exit 1
     fi
 }

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -28,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.unit.shell_harness import clean_env, write_exec
+from tests.unit.shell_harness import clean_env, require_bash, write_exec
 
 try:
     import yaml
@@ -217,7 +218,7 @@ POSTGREST = "haf-fyp-postgrest"
 # may legitimately move turns a legal change into a test failure.
 PORT_OWNERS = {"3000": (POSTGREST, "3000"), "3001": (REWRITER, "80")}
 
-_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^{}]*))?\}")
+_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(:?[-?+])([^{}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def _read_env(path: Path) -> dict:
@@ -230,11 +231,15 @@ def _read_env(path: Path) -> dict:
     env = {}
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip().lstrip("﻿")
-        if not line or line.startswith("#") or "=" not in line:
+        if not line or line.startswith("#"):
             continue
-        if line.startswith("export "):
-            line = line[len("export "):]
-        key, value = line.split("=", 1)
+        # `KEY=value`, and the YAML-style `KEY: value` and `KEY:value` compose also accepts,
+        # each optionally after `export` and any whitespace -- skipping those let
+        # `COMPOSE_PROJECT_NAME: haf` through every check.
+        m = re.match(r"(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*[=:](.*)$", line)
+        if not m:
+            continue
+        key, value = m.group(1), m.group(2)
         value = value.strip()
         if value[:1] in ("'", '"'):
             # Quoted: the closing quote ends the value; anything after it is a comment.
@@ -249,22 +254,29 @@ def _read_env(path: Path) -> dict:
 
 
 def _resolve(text, env: dict, strict: bool = True) -> str:
-    """Expand ${VAR:-default}, and ${VAR} when the env file sets VAR, as compose does.
+    """Expand variables as compose does, reading the env file as the only source.
 
-    `:-` falls back when the variable is unset OR EMPTY. `env.get(name, default)` gets
-    the empty case wrong, and an empty value is what someone leaves behind when they
-    blank a line out rather than deleting it. A bare ${VAR} the env file does not set is
+    `${VAR:-default}` falls back when the variable is unset OR EMPTY. `env.get(name,
+    default)` gets the empty case wrong, and an empty value is what someone leaves behind
+    when they blank a line out rather than deleting it. `${VAR-default}` falls back only
+    when it is unset; `${VAR:+alt}` and `${VAR+alt}` give `alt` when it is set (non-empty).
+    A bare `${VAR}` or `$VAR`, or a `${VAR:?error}`, that the env file does not satisfy is
     left unresolved: it depends on the operator's shell. With `strict` that fails; without
     it the partly resolved text is returned for the caller to inspect.
     """
     def one(m):
-        name, default = m.group(1), m.group(2)
-        if default is None:
-            return env[name] if name in env else m.group(0)
-        return env.get(name) or default
+        name, op, arg = m.group(1) or m.group(4), m.group(2), m.group(3)
+        is_set, value = name in env, env.get(name, "")
+        if op is None:
+            return value if is_set else m.group(0)
+        if op in (":-", "-"):
+            return value if (value if op == ":-" else is_set) else arg
+        if op in (":?", "?"):
+            return value if (value if op == ":?" else is_set) else m.group(0)
+        return arg if (value if op == ":+" else is_set) else ""
 
     out, passes = str(text), 0
-    while "${" in out and passes < 10:                # ${A:-${B:-3001}} nests
+    while "$" in out and passes < 10:                 # ${A:-${B:-3001}} nests
         expanded = _VAR.sub(one, out)
         if expanded == out:
             break
@@ -783,9 +795,9 @@ def test_every_service_reference_resolves_within_its_own_file(path):
 # `redis` was renamed in !64 for exactly this reason, `postgrest` in #48. Both were
 # spotted by a human reading the file. This is the part that does not rely on that.
 #
-# docker-compose.yml only. The CI file is out of scope and does not pretend otherwise:
-# it is never composed into a node, and its `postgres`, `setup` and `tavern` are local to
-# that lane. What matters there -- that its references resolve -- is asserted above.
+# Service and volume names: docker-compose.yml only. The CI file is never composed into a
+# node, and its `postgres`, `setup` and `tavern` are local to that lane; its references
+# are checked above and its project name below.
 APP_SCOPED = re.compile(r"haf-fyp-[a-z0-9][a-z0-9-]*")
 
 GENERIC_NAME_EXEMPTIONS = {
@@ -798,10 +810,9 @@ GENERIC_NAME_EXEMPTIONS = {
 }
 
 VOLUME_EXEMPTIONS = {
-    # Compose names a volume <project>_<key>, so renaming the key alone does not move
-    # anything: it creates a new, empty volume and orphans the old one with the data still
-    # in it. Keeping the data needs a pinned `name:` or a migration -- a deploy decision,
-    # not a text edit. See the header of docker/docker-compose.yml.
+    # Generic KEYS, kept: this file is never combined with a node's. The volume NAMES on the
+    # host follow the project (#53); test_volume_names_follow_the_project_unless_overridden
+    # checks that wiring and test_no_volume_carries_a_generic_name the resolved names.
     "haf_datadir",
     "redis_data",
 }
@@ -867,24 +878,126 @@ def test_no_volume_carries_a_generic_name():
     assert not stale, f"VOLUME_EXEMPTIONS lists {stale}, which is no longer a volume"
 
 
+# Exact, not merely app-scoped (#53). The two must differ -- the CI file's own commands
+# (.gitlab-ci.yml's `docker compose -f docker/docker-compose-ci.yml down -v`, run by hand)
+# would otherwise remove the stack's same-named haf-fyp-postgrest and rewriter containers;
+# run_tests.sh passes -p itself -- and the stack's is what
+# its volume names derive from, so renaming it (say to `haf_fyp_prod`) moves an existing
+# stack onto new, empty volumes.
+STACK_PROJECT = "haf_fyp"
+CI_PROJECT = "haf_fyp_ci"
+_COMPOSE_VALUE_OPTIONS = {"-f", "--file", "--env-file", "--project-directory", "--profile",
+                          "--ansi", "--progress", "--parallel", "--workdir"}
+
+
+def _compose_options(call: str):
+    """(project names, subcommand) of a recorded `docker [opts] compose [opts] SUBCOMMAND
+    ...` (or `docker-compose ...`) call, read from compose's own options only: a `-p` after
+    the subcommand belongs to that subcommand (`run -p 8080:80`) or the container."""
+    tokens = call.split()
+    tokens = tokens[tokens.index("compose") + 1:] if tokens[0] == "docker" else tokens[1:]
+    projects, i = [], 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in ("-p", "--project-name"):
+            projects.append(tokens[i + 1] if i + 1 < len(tokens) else "")
+            i += 2
+        elif re.fullmatch(r"-p=?.+|--project-name=.*", token):
+            projects.append(re.sub(r"^(-p=?|--project-name=)", "", token))
+            i += 1
+        elif token in _COMPOSE_VALUE_OPTIONS:
+            i += 2
+        elif token.startswith("-"):
+            i += 1
+        else:
+            return projects, token
+    return projects, None
+
+
+def _compose_projects(call: str) -> list:
+    return _compose_options(call)[0]
+
+
+def _compose_subcommand(call: str):
+    return _compose_options(call)[1]
+
+
+VOLUME_NAME_OVERRIDES = {
+    "haf_datadir": "HAF_FYP_HAF_DATADIR_VOLUME",
+    "redis_data": "HAF_FYP_REDIS_DATA_VOLUME",
+}
+
+
+def test_volume_names_follow_the_project_unless_overridden():
+    """scripts/upgrade_standalone_stack.sh keeps the HAF database of a stack that ran under
+    the default project `docker` by setting HAF_FYP_HAF_DATADIR_VOLUME. If a volume's
+    `name:` stopped reading its variable -- removed, renamed,
+    hardcoded -- a fresh stack would resolve to the same names and nothing would look
+    wrong, while an upgraded stack started HAF on an empty volume. Unset, the names must
+    follow the project, so a `-p` instance does not mount another stack's datadir."""
+    doc = _require_yaml().safe_load(COMPOSE.read_text(encoding="utf-8"))
+    volumes = doc.get("volumes") or {}
+    assert set(volumes) == set(VOLUME_NAME_OVERRIDES), (
+        f"volumes are {sorted(volumes)}; VOLUME_NAME_OVERRIDES covers "
+        f"{sorted(VOLUME_NAME_OVERRIDES)} -- decide how a new volume is named and upgraded"
+    )
+    # The overrides are for .env.local only. Set in the TRACKED docker/.env they would pin
+    # every checkout's volume name, and a `-p` instance would mount this stack's datadir.
+    env_file = _read_env(ENV_FILE)
+    preset = sorted(v for v in VOLUME_NAME_OVERRIDES.values() if env_file.get(v))
+    assert not preset, (
+        f"docker/.env sets {preset}: that pins the volume names for every checkout and "
+        f"every `-p` instance. They belong in .env.local, for an upgraded stack only."
+    )
+    for key, variable in VOLUME_NAME_OVERRIDES.items():
+        raw = str((volumes[key] or {}).get("name", ""))
+        cases = [
+            ({variable: "sentinel_volume"}, "sentinel_volume"),
+            ({"COMPOSE_PROJECT_NAME": "otherproject"}, f"otherproject_{key}"),
+            # What compose actually passes for a plain run: the pinned `name:`.
+            ({"COMPOSE_PROJECT_NAME": STACK_PROJECT}, f"{STACK_PROJECT}_{key}"),
+            ({}, f"{STACK_PROJECT}_{key}"),
+            # Blanked rather than deleted -- what an operator leaves behind. With `-`
+            # instead of `:-` the name would resolve empty, and compose accepts that.
+            ({variable: ""}, f"{STACK_PROJECT}_{key}"),
+            ({"COMPOSE_PROJECT_NAME": ""}, f"{STACK_PROJECT}_{key}"),
+        ]
+        for env, expected in cases:
+            got = _resolve(raw, env, strict=False) if raw else f"<{key} has no name:>"
+            assert got == expected, (
+                f"volume {key}: with {env or 'nothing set'} its name resolves to {got!r}, "
+                f"expected {expected!r}. The name must be "
+                f"${{{variable}:-${{COMPOSE_PROJECT_NAME:-{STACK_PROJECT}}}_{key}}}."
+            )
+
+
 def test_no_project_network_or_container_name_escapes_the_naming_rule(services):
     """A top-level `name: haf` is exactly what the header forbids -- running this file
     under a node's project name, which recreates the node's containers -- and it passed
     every other test. The header also says no `networks:` key is declared, and a generic
     `container_name` collides host-wide regardless of how the service is named."""
     doc = _require_yaml().safe_load(COMPOSE.read_text(encoding="utf-8"))
-    # COMPOSE_PROJECT_NAME in docker/.env outranks `name:` in the file whenever that .env is
-    # loaded (no --env-file), and docker/.env.local is copied from it, so both are checked.
+    # COMPOSE_PROJECT_NAME in docker/.env outranks `name:` in BOTH compose files whenever
+    # that .env is loaded (no --env-file), and docker/.env.local is copied from it. With the
+    # names pinned it can only re-project them -- to a node's project, or both onto one --
+    # so it must not be set there at all.
     env_file = _read_env(ENV_FILE)
-    for source, raw in (("docker/.env COMPOSE_PROJECT_NAME", env_file.get("COMPOSE_PROJECT_NAME")),
-                        ("docker-compose.yml `name:`", doc.get("name"))):
-        project = _resolve(str(raw), env_file) if raw is not None else ""
-        if not project:            # unset, or empty -- which compose ignores
-            continue
-        assert re.fullmatch(r"haf[-_]fyp([-_][a-z0-9]+)*", project), (
-            f"{source} pins project name {project!r}. Compose identifies services by "
-            f"project and name, so a project a node also uses would recreate the node's "
-            f"containers from this file. Use an app-scoped name such as `haf_fyp`."
+    assert not env_file.get("COMPOSE_PROJECT_NAME"), (
+        f"docker/.env sets COMPOSE_PROJECT_NAME={env_file['COMPOSE_PROJECT_NAME']!r}, "
+        f"overriding the pinned `name:` of both compose files."
+    )
+    # Pinned, exactly (#53). Unpinned, a file's project is its directory, `docker`, which
+    # every stack started from a `docker/` directory on the host shares.
+    for path, expected in ((COMPOSE, STACK_PROJECT), (CI_COMPOSE, CI_PROJECT)):
+        pinned = _require_yaml().safe_load(path.read_text(encoding="utf-8")).get("name")
+        project = _resolve(str(pinned), env_file) if pinned else ""
+        assert project == expected, (
+            f"{path.name} pins project name {project!r}, expected {expected!r}. Unpinned, "
+            f"its project is its directory, `docker`, shared with every other stack "
+            f"started from a `docker/` directory; the stack and CI projects must differ, "
+            f"or the CI file's `down -v`, run by hand, removes the stack's same-named "
+            f"PostgREST and rewriter; and the stack's "
+            f"volume names derive from its project. See STACK_PROJECT."
         )
     assert "networks" not in doc, (
         "docker-compose.yml gained a top-level `networks:` key. The header records why "
@@ -896,6 +1009,153 @@ def test_no_project_network_or_container_name_escapes_the_naming_rule(services):
         and not APP_SCOPED.fullmatch(str(svc["container_name"]))
     )
     assert not named, f"generic container names: {named}"
+
+
+def _seconds(duration) -> float:
+    """A compose duration (`2m`, `90s`, `1m30s`, `500ms`, `.5h`, `+2m`) in seconds.
+    Spaces are not allowed, as compose does not allow them."""
+    text = str(duration).removeprefix("+")
+    parts = re.findall(r"(\d+\.?\d*|\.\d+)(ns|us|µs|μs|ms|w|d|h|m|s)", text)
+    assert parts and "".join(n + u for n, u in parts) == text, (
+        f"unparsed compose duration {duration!r}"
+    )
+    scale = {"w": 604800, "d": 86400, "h": 3600, "m": 60, "s": 1, "ms": 1e-3, "us": 1e-6,
+             "µs": 1e-6, "μs": 1e-6, "ns": 1e-9}
+    return sum(float(n) * scale[u] for n, u in parts)
+
+
+def test_haf_gets_time_to_shut_postgresql_down():
+    """Compose's default is ten seconds, then SIGKILL, and PostgreSQL then performs crash
+    recovery on the next start. haf_api_node's haf_base.yaml gives `haf` two minutes, and
+    the grace period is only worth anything if the stop signal is one HAF handles."""
+    haf = _require_yaml().safe_load(COMPOSE.read_text(encoding="utf-8"))["services"].get("haf") or {}
+    env = _read_env(ENV_FILE)
+    grace = haf.get("stop_grace_period")
+    assert grace is not None and _seconds(_resolve(str(grace), env)) >= 60, (
+        f"`haf` has stop_grace_period {grace!r}; it needs at least a minute (haf_api_node "
+        f"uses 2m) for PostgreSQL to shut down cleanly"
+    )
+    signal = _resolve(str(haf.get("stop_signal") or "SIGINT"), env)
+    assert signal.upper().removeprefix("SIG") in ("INT", "TERM"), (
+        f"`haf` has stop_signal {signal!r}; leave it to the image (SIGINT) so the grace "
+        f"period is a shutdown, not a wait before a kill"
+    )
+
+
+def _clean(path: str) -> str:
+    """A container path as Go's path.Clean leaves it, which compose uses: unlike
+    posixpath.normpath, it also collapses a leading `//`."""
+    return re.sub(r"^/+", "/", posixpath.normpath(path))
+
+
+def test_haf_keeps_its_data_in_the_haf_datadir_volume():
+    """HAF_FYP_HAF_DATADIR_VOLUME and scripts/upgrade_standalone_stack.sh both assume HAF's
+    data directory is the `haf_datadir` volume. Mounted elsewhere, the override would keep
+    a volume HAF no longer reads."""
+    haf = _require_yaml().safe_load(COMPOSE.read_text(encoding="utf-8"))["services"].get("haf") or {}
+    env = _read_env(ENV_FILE)
+    datadir = "/home/hived/datadir"
+    mounts = {}                                   # target -> (type, source, subpath)
+    for v in haf.get("volumes") or []:
+        if isinstance(v, dict):
+            source = v.get("source")
+            mount = (v.get("type"),
+                     None if source is None else _resolve(str(source), env, strict=False),
+                     (v.get("volume") or {}).get("subpath") or None)
+            target = _resolve(str(v.get("target", "")), env, strict=False)
+        else:
+            v = _resolve(str(v), env, strict=False)           # as compose sees it
+            drive = re.match(r"[A-Za-z]:", v)                 # C:/data:/target is a bind
+            parts = v[len(drive.group(0)) if drive else 0:].split(":")
+            if len(parts) == 1:                               # `- /target`: anonymous volume
+                mount, target = ("volume", None, None), parts[0]
+            else:
+                source = (drive.group(0) if drive else "") + parts[0]
+                kind = "bind" if drive or source.startswith((".", "/", "~", "$")) else "volume"
+                mount, target = (kind, source, None), parts[1]
+        mounts[_clean(target)] = mount           # as in compose, a later entry wins
+    tmpfs = haf.get("tmpfs") or []
+    for entry in [tmpfs] if isinstance(tmpfs, str) else tmpfs:
+        mounts[_clean(_resolve(str(entry), env, strict=False).split(":")[0])] = ("tmpfs", None, None)
+    nested = sorted(t for t in mounts if t.startswith(datadir + "/"))
+    assert mounts.get(datadir) == ("volume", "haf_datadir", None) and not nested, (
+        f"`haf` must mount the haf_datadir volume, whole, at {datadir}, with nothing mounted "
+        f"inside it (HAF's database lives under it); its mounts are {mounts}"
+    )
+
+
+def test_run_tests_runs_compose_in_the_ci_project(tmp_path):
+    """A COMPOSE_PROJECT_NAME left in the developer's shell outranks the CI file's `name:`,
+    and would send run_tests.sh's `down -v --remove-orphans` into that project. So the
+    script is RUN with a hostile COMPOSE_PROJECT_NAME and stubs for `docker` and
+    `docker-compose` that record every call: once with every call succeeding, once with
+    each of `down`, `up`, `wait` and `logs` failing, and once with `--keep`. Each verb fails
+    with its own code (`up` 3, `wait` 4, the others 5), none of them the generic 1, so the
+    test can tell the failure was passed on rather than replaced.
+    - The successful run must `up`, then `wait` for Tavern, then tear down: two `down`s,
+      the last after the `wait`, or one with --keep.
+    - A failing `up` or `wait` must make the script exit with that verb's code. A failing
+      `logs` or teardown may be tolerated.
+    - Every compose call on every run must name exactly one project, haf_fyp_ci, in its
+      options before the subcommand (`-p`, `-p=`, `-pNAME` or `--project-name`): with two,
+      or an empty one, another decides it. `compose version` names no project."""
+    bash = require_bash()
+    problems = []
+    codes = {"up": 3, "wait": 4, "down": 5, "logs": 5}
+    for failing, args in ((None, []), ("down", []), ("up", []), ("wait", []), ("logs", []),
+                          (None, ["--keep"])):
+        when = (f"with `{failing}` failing" if failing else "with every call succeeding") + (
+            f" and {args[0]}" if args else "")
+        bindir = tmp_path / f"bin-{failing}-{len(args)}"
+        calls = tmp_path / f"calls-{failing}-{len(args)}"
+        bindir.mkdir()
+        # A `ps` answers with a container id, so a script that polls for one moves on.
+        fail = f'*" {failing} "*) exit {codes[failing]} ;; ' if failing else ""
+        stub = (f'#!/bin/sh\nprintf "%s\\n" "${{0##*/}} $*" >> "{calls.as_posix()}"\n'
+                f'case " $* " in {fail}*" ps "*) echo 0123456789ab ;; esac\n')
+        for name in ("docker", "docker-compose"):
+            write_exec(bindir / name, stub)
+        env = clean_env(bindir)
+        env["COMPOSE_PROJECT_NAME"] = "victim"
+        r = subprocess.run([bash, str(ROOT / "scripts" / "run_tests.sh"), *args], env=env,
+                           capture_output=True, text=True, timeout=60)
+        recorded = calls.read_text(encoding="utf-8").splitlines() if calls.is_file() else []
+        outcome = (f"{when}: rc={r.returncode}, calls {recorded}\n"
+                   f"stdout: {r.stdout}\nstderr: {r.stderr}")
+        at = {verb: [i for i, c in enumerate(recorded) if re.search(rf"\s{verb}(\s|$)", c)]
+              for verb in ("down", "up", "wait", "logs")}
+        downs = 1 if args else 2
+        if not failing and not (r.returncode == 0 and at["up"] and at["wait"]
+                                and at["up"][0] < at["wait"][0] and len(at["down"]) == downs
+                                and (args or at["down"][-1] > at["wait"][-1])):
+            problems.append(f"run_tests.sh did not run in order: expected a `down`, an `up`, a "
+                            f"`wait`{' and no teardown' if args else ', then the teardown `down`'}; "
+                            f"{outcome}")
+        if failing in ("up", "wait") and at[failing] and r.returncode != codes[failing]:
+            problems.append(f"run_tests.sh exited {r.returncode} although `{failing}` exited "
+                            f"{codes[failing]}; {outcome}")
+        compose = [c for c in recorded
+                   if c.startswith("docker-compose ") or re.search(r"\scompose(\s|$)", c)]
+        teardowns = [c for c in compose if re.search(r"\sdown(\s|$)", c)]
+        keeps_volumes = [c for c in teardowns if not re.search(r"\s(-v|--volumes)(\s|$)", c)]
+        if keeps_volumes:
+            problems.append(f"{when}, these teardowns keep the CI volumes, so the next run "
+                            f"starts on the last one's database: {keeps_volumes}")
+        unpinned = [c for c in compose
+                    if _compose_projects(c) != [CI_PROJECT] and _compose_subcommand(c) != "version"]
+        files = [re.findall(r"(?:^|\s)-f\s+(\S+)", c) for c in compose]
+        wrong_file = [c for c, f in zip(compose, files)
+                      if _compose_subcommand(c) != "version"
+                      and [p for p in f if p.endswith("/docker/docker-compose-ci.yml")] != f]
+        if wrong_file:
+            problems.append(f"{when}, these calls do not name docker-compose-ci.yml as their only "
+                            f"-f: the stack file declares the HAF datadir volume, which the first "
+                            f"`down -v` would then remove: {wrong_file}")
+        if unpinned:
+            problems.append(f"{when}, these calls do not name exactly one project, "
+                            f"`{CI_PROJECT}`, so a COMPOSE_PROJECT_NAME in the shell or another "
+                            f"`-p` decides it: {unpinned}")
+    assert not problems, "\n".join(problems)
 
 
 def test_nothing_is_pulled_in_from_another_file():
