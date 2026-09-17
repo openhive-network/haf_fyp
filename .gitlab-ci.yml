@@ -219,7 +219,7 @@ python-tests:
     # would put the gate itself back to uncovered.
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends git >/dev/null
     - pip install -r requirements.txt pytest pytest-cov httpx pyyaml -q
-    - PYTHONPATH=. pytest tests/unit/ -v --cov=haf_fyp --cov-report=term-missing --cov-fail-under=40
+    - PYTHONPATH=. pytest tests/unit/ -v -rfEs --cov=haf_fyp --cov-report=term-missing --cov-fail-under=40
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
