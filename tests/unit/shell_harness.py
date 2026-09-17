@@ -15,7 +15,9 @@ import pytest
 # On Linux -- CI, and the containers these scripts actually run in -- this resolves to
 # /bin/bash and the override is never used. It exists for Windows developer machines,
 # where `bash` on PATH resolves to WSL's bash.exe, which cannot execute a script from a
-# Windows path or see a stub's executable bit. Point HAF_FYP_TEST_BASH at Git Bash there.
+# Windows path or see a stub's executable bit. Point HAF_FYP_TEST_BASH at Git Bash there:
+# Git's usr/bin/bash.exe, not bin/bash.exe, a launcher whose timeout leaves the real shell
+# running.
 BASH = os.environ.get("HAF_FYP_TEST_BASH") or shutil.which("bash")
 
 
@@ -57,10 +59,14 @@ def clean_env(bindir=None) -> dict:
 
     Inheriting the ambient environment wholesale means a developer with, say,
     HAF_FYP_HEALTHCHECK_MAX_AGE_SECONDS exported gets failures unrelated to their
-    change. Stripping the app's own variables makes each test state its own inputs.
+    change. Stripping the app's own variables makes each test state its own inputs. So is
+    stripping what can change a script before it runs: BASH_ENV names a file bash runs
+    first (which could put another `docker` on PATH), an exported function can override a
+    command such as `docker`, and ENV is read by interactive POSIX shells.
     """
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith("HAF_FYP_") and not k.startswith("POSTGRES_")}
+           if not k.startswith(("HAF_FYP_", "POSTGRES_", "BASH_FUNC_"))
+           and k not in ("BASH_ENV", "ENV")}
     if "HAF_FYP_TEST_BASH" in os.environ:
         env["HAF_FYP_TEST_BASH"] = os.environ["HAF_FYP_TEST_BASH"]
     if bindir is not None:
