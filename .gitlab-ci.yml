@@ -2,6 +2,7 @@ stages:
   - lint
   - test
   - build
+  - release
 
 .python-cache:
   variables:
@@ -344,10 +345,12 @@ postgrest-tests:
 #                     otherwise be an invalid reference and hard-fail the push.
 # haf_fyp has no releases, so the branch tag is the honest stand-in for the
 # ${..._VERSION} tag haf_api_node's compose files expect. Siblings differ here:
-# haf_stats is short-sha only (137/137), while balance_tracker and
+# haf_stats published short SHAs only until it added a release lane of its own (its
+# #66); it now carries `1.29.0-rc2` as well. balance_tracker and
 # reputation_tracker are mostly semver (50/132 and 5/71 sha) -- which is exactly
 # why ${APP_VERSION:-${HIVE_API_NODE_VERSION}} has nothing to resolve to for us.
-# Add a semver tag when releases start rather than pinning raw SHAs forever (#26).
+# publish_tag at the end of this file now turns a release tag into :<tag> images (#57);
+# the branch tag remains what a downstream tracks between releases.
 # A scalar, not a list: `- *anchor` then splices ONE string. Aliasing a list here
 # would nest an array inside script:, which GitLab flattens but which reads as a
 # mistake to anyone who does not know that.
@@ -503,3 +506,109 @@ docker-build-rewriter:
         --build-arg GIT_LAST_COMMIT_DATE="$CI_COMMIT_TIMESTAMP"
         -t "$IMAGE:$CI_COMMIT_SHORT_SHA" .
     - *push_if_default_branch
+
+# =============================================================================
+# release
+# =============================================================================
+#
+# Until this job existed, a tag pipeline did not exist. Every job above matches only
+# `merge_request_event` or `$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH`; a tag pipeline sets
+# CI_COMMIT_TAG and leaves CI_COMMIT_BRANCH unset, so nothing matched -- and GitLab does
+# not create a pipeline with no jobs. The 1.29.0-rc2 tag (2026-09-16) produced no
+# pipeline and published nothing, which is #57.
+#
+# RETAG, DO NOT REBUILD. The three images are built and tested per commit on the default
+# branch, and this job re-tags those exact images. Rebuilding from the tag would publish
+# bytes no lane ever ran -- a newer base layer, a different pip resolution -- under a
+# name that claims to be the tested build. It is also why this job needs no test stage
+# of its own: the commit being tagged already went green on develop.
+#
+# PULL AND TAG EVERYTHING BEFORE PUSHING ANYTHING. The three images are consumed as a
+# set: the rewriter proxies paths that the SQL image's schema defines, and the python
+# image serves them. A push that failed halfway would leave :<tag> resolving for some
+# images and not others, and a deployment pinning it would mix versions. Pulling first
+# turns the expected failure -- a tag on a commit whose images are not in the registry --
+# into a failure before any tag is published.
+#
+# That failure is deliberate and loud (`set -e` over a failed `docker pull`). A tag on a
+# commit that never ran a default-branch pipeline has no SHA images, and there is
+# nothing honest to publish under a release name.
+#
+# NOT interruptible, unlike .docker-build. That template pushes a moving tag too, so the
+# difference is not what it publishes: it is that its tags are rewritten by the next
+# push to develop, which makes a cancelled run cheap. A release tag is written once and
+# nothing re-runs it, so a cancel between two pushes leaves `:<tag>` skewed until a
+# human notices.
+#
+# No resource_group either. The template needs one because two overlapping
+# default-branch pipelines race per image and can leave the three moving tags on
+# different commits; a second pipeline for the same release tag re-pushes identical
+# digests instead, so serialising buys nothing. Re-cutting a tag onto a DIFFERENT commit
+# would race, and moving a published release tag is already a mistake this job cannot
+# make safe.
+#
+# GIT_STRATEGY: none because the job reads no file from the checkout, and
+# dependencies: [] to state that it consumes no artifact -- defensive rather than a
+# saving, since in a tag pipeline there is no earlier job to download from. No `needs:`
+# either: this is the only job in that pipeline, so naming another would reference a job
+# that does not exist there.
+publish_tag:
+  stage: release
+  image: docker:24
+  interruptible: false
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    GIT_STRATEGY: none
+  dependencies: []
+  retry:
+    max: 2
+    when: runner_system_failure
+  before_script:
+    # --password-stdin, unlike .docker-build's `-p`: this job is new, and the flag form
+    # puts the token in the job container's process list and prints docker's own warning.
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - |
+      set -e
+      # A docker tag cannot contain "/", so a git tag like `1.29/rc2` -- which the rule
+      # below accepts -- would die inside `docker tag` with docker's own message about an
+      # invalid reference. This file already handles that class for branch names at
+      # .push-if-default-branch (`tr '/' '-'`), but renaming is wrong HERE: the published
+      # tag has to be the release name people look for, not a mangled variant of it. So
+      # refuse early and say why.
+      case "$CI_COMMIT_TAG" in
+        */*)
+          echo "refusing to publish: tag '$CI_COMMIT_TAG' contains '/', which is not a valid docker tag"
+          exit 1
+          ;;
+      esac
+      for repo in "$CI_REGISTRY_IMAGE/sql" "$CI_REGISTRY_IMAGE/python" "$CI_REGISTRY_IMAGE/postgrest-rewriter"; do
+        docker pull "${repo}:${CI_COMMIT_SHORT_SHA}"
+        docker tag  "${repo}:${CI_COMMIT_SHORT_SHA}" "${repo}:${CI_COMMIT_TAG}"
+      done
+      for repo in "$CI_REGISTRY_IMAGE/sql" "$CI_REGISTRY_IMAGE/python" "$CI_REGISTRY_IMAGE/postgrest-rewriter"; do
+        docker push "${repo}:${CI_COMMIT_TAG}"
+        echo "published ${repo}:${CI_COMMIT_TAG}"
+      done
+  # GATED ON THE TAG'S SHAPE, NOT ON CI_COMMIT_REF_PROTECTED, which is what hive/haf_stats
+  # uses. That difference is deliberate and worth removing later: haf_stats protects `1.*`
+  # for Maintainers, and this project has NO protected-tag rule at all today (verified
+  # against the API). Gating on CI_COMMIT_REF_PROTECTED here would make this lane dead
+  # code -- green, never running -- which is the failure mode #57 is about in the first
+  # place. Once a `1.*` protected-tag rule exists here, tighten this to match haf_stats.
+  #
+  # `v?` because a shape gate fails the same silent way when it is too narrow: a tag it
+  # does not match creates no job, so no pipeline, so no signal anywhere -- exactly #57.
+  # hive/haf_api_node, which drives the release sweep, carries both spellings today
+  # (`1.28.6-rc10` and `v1.28.6-rc11`), so both have to publish here.
+  rules:
+    # The escape hatch haf_stats' publish lane carries: a tag that should not be
+    # published can be stopped by re-running the pipeline with SKIP_DOCKER_PUBLISH set,
+    # rather than by racing to cancel the job.
+    - if: $SKIP_DOCKER_PUBLISH == "true"
+      when: never
+    - if: $CI_COMMIT_TAG =~ /^v?[0-9]+\.[0-9]+/
+      when: on_success
+    - when: never
