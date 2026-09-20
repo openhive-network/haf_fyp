@@ -443,6 +443,225 @@ def test_rewriter_proxies_to_the_postgrest_service_on_its_port(path, request):
         )
 
 
+# --- the HAF image: a path that is published, and a tag that stays (#56) -------------
+#
+# `haf` is the one service this stack pulls rather than builds, and NOTHING in CI pulls it:
+# docker-compose-ci.yml runs plain PostgreSQL with pgvector, and compose-validate only runs
+# `docker compose config`, which parses YAML and never contacts a registry. A reference
+# that cannot resolve is therefore invisible until an operator's first `up`, which fails on
+# the pull. That is how it shipped: the file asked for `haf/instance`, whose newest tag is
+# 1.27.11rc3 -- haf publishes the instance image to <registry>/haf now, the path
+# haf_api_node's haf_base.yaml reads too.
+#
+# The reference rots in two ways, one check each:
+#   the PATH, into a flavour repository (haf/instance, haf/minimal-instance,
+#     haf/testnet-instance, ...) that is no longer published, or holds a different build;
+#   the TAG, into something that does not stay. hive/haf's cleanup policy keeps every
+#     `1.x` tag and keeps anything else only while it is one of the 5 newest or younger
+#     than 7 days, so a short SHA's life depends on how busy haf's develop is: d26f14cc
+#     was pinned on 2026-09-15 and swept by 2026-09-20. `latest` is not swept, but it
+#     moves -- it is a pointer, not a pin, and nothing records what it meant on the day.
+#
+# Neither check contacts a registry. They keep the reference in the shape that resolved
+# when it was last run; only a run proves a tag is still there.
+HAF_SERVICE = "haf"
+
+# The oldest HAF RELEASE carrying src/hive_fork_manager/app_registry.sql (hive.app_register,
+# haf#341). 1.29.0-rc1 and every 1.28.x lack it, so an older pin installs and then fails
+# where the app registers itself. Move this only to a tag that has been run.
+HAF_MINIMUM_RELEASE = "1.29.0-rc2"
+
+_NUM = r"(0|[1-9][0-9]*)"
+_PRERELEASE = {"alpha": 0, "beta": 1, "rc": 2}          # a release itself sorts above all
+_RELEASE_TAG = re.compile(rf"{_NUM}\.{_NUM}\.{_NUM}(?:-?({'|'.join(_PRERELEASE)}){_NUM})?")
+
+
+def _release_key(tag: str):
+    """A sort key for a HAF release tag, or None when it is not one.
+
+    haf spells its pre-releases both ways -- 1.28.6-rc14, 1.27.12rc1, v1.28.6-rc11,
+    1.28.6-alpha10 -- and each sorts below the release it leads to: alpha < beta < rc <
+    1.29.0, with the number compared as a number (rc10 > rc2). Anything else (a short SHA,
+    a branch name, `latest`, `stable`, a decorated tag like 1.29.0-rc2-arm64) has no key,
+    because it is not a pin this test can reason about.
+    """
+    m = _RELEASE_TAG.fullmatch(tag[1:] if tag[:1] == "v" else tag)
+    if not m:
+        return None
+    major, minor, patch, kind, num = m.groups()
+    return (int(major), int(minor), int(patch),
+            _PRERELEASE[kind] if kind else len(_PRERELEASE), int(num or 0))
+
+
+def _image_parts(reference: str):
+    """(repository, tag, digest) of an image reference.
+
+    A registry may carry a port, so the last colon separates the tag only when no `/`
+    follows it; a `@sha256:...` digest is neither, and is returned on its own so a caller
+    can say so rather than reporting a repository that ends in `@sha256`.
+    """
+    repo, at, digest = reference.partition("@")
+    if at:
+        return repo, "", digest
+    repo, sep, tag = reference.rpartition(":")
+    return (reference, "", "") if not sep or "/" in tag else (repo, tag, "")
+
+
+def _haf_service(doc: dict) -> dict:
+    assert HAF_SERVICE in (doc.get("services") or {}), (
+        f"docker-compose.yml has no `{HAF_SERVICE}` service. It is named to match "
+        f"haf_api_node's (see the file's header); if it really was renamed, update "
+        f"HAF_SERVICE and check what else assumed `POSTGRES_HOST: haf`."
+    )
+    return doc["services"][HAF_SERVICE] or {}
+
+
+def test_the_haf_service_pulls_the_image_haf_publishes():
+    """Resolved through docker/.env, the repository must be `<HAF_REGISTRY>/haf` exactly.
+
+    A path with a flavour segment is what #56 was: every tag this stack could pin 404s
+    there, so a fresh `up` dies on the pull and a host with the image cached goes on
+    working until it pulls again -- and CI, which never pulls HAF, stays green throughout.
+
+    `haf` must also stay a PULL. A service carrying both `image:` and `build:` is built
+    from source when the pull fails, which would have made #56 undetectable forever: the
+    404 disappears into a local build, the stack comes up on something nobody published,
+    and every test here stays green. The same goes for `pull_policy: build|never`.
+    """
+    doc = _require_yaml().safe_load(COMPOSE.read_text(encoding="utf-8"))
+    haf = _haf_service(doc)
+    spec = str(haf.get("image") or "")
+    assert spec, (
+        f"`{HAF_SERVICE}` has no `image:`: this stack pulls HAF, it does not build it"
+    )
+    assert "build" not in haf, (
+        f"`{HAF_SERVICE}` carries `image:` AND `build:`. Compose builds such a service when "
+        f"the pull fails, so a reference that 404s would come up as a local build instead "
+        f"of an error -- exactly what hid #56 from CI. Keep HAF a pull."
+    )
+    policy = str(haf.get("pull_policy") or "")
+    assert policy not in ("build", "never"), (
+        f"`{HAF_SERVICE}` sets pull_policy: {policy}, which stops the published image from "
+        f"being fetched -- the stack would run whatever that tag happens to mean locally"
+    )
+    env_file = _read_env(ENV_FILE)
+    registry = env_file.get("HAF_REGISTRY", "")
+    assert registry, (
+        "docker/.env does not set HAF_REGISTRY, so the image resolves against Docker Hub "
+        "for anyone who does not set it in .env.local"
+    )
+    assert "haf" not in registry.split("/"), (
+        f"docker/.env sets HAF_REGISTRY={registry!r}, which already ends in the repository: "
+        f"the image resolves to {registry}/haf. HAF_REGISTRY names the namespace HAF is "
+        f"published under -- moving a flavour segment here hides it from the check below."
+    )
+    repo, tag, digest = _image_parts(_resolve(spec, env_file))
+    assert not digest, (
+        f"`{HAF_SERVICE}` pins the digest {digest!r}. A digest cannot be swept, but nothing "
+        f"here can tell which HAF version it names, so the floor below stops applying and "
+        f"the README's `HAF_VERSION` stops describing what runs. Pin a release tag."
+    )
+    assert repo == f"{registry}/haf", (
+        f"`{HAF_SERVICE}` resolves to the repository {repo!r}, not {registry}/haf. haf "
+        f"publishes the instance image there (haf_api_node's haf_base.yaml reads the same "
+        f"path); the flavour repositories beside it -- haf/instance, haf/minimal-instance, "
+        f"haf/testnet-instance -- are either unpublished or a different build. Nothing in "
+        f"CI pulls HAF, so a wrong path fails first on an operator's machine."
+    )
+    assert tag, f"`{HAF_SERVICE}` names no tag, so `up` pulls whatever `latest` is today"
+
+
+def test_the_haf_image_takes_both_halves_from_the_env_file():
+    """`${HAF_REGISTRY}` and `${HAF_VERSION}`, neither with a default behind it.
+
+    Every documented command passes `--env-file docker/.env.local`, and an `--env-file`
+    REPLACES the tracked docker/.env rather than adding to it. So a default here is not
+    unreachable: an .env.local that forgets HAF_VERSION would silently start the database
+    on whatever the default says, instead of failing the way
+    scripts/upgrade_standalone_stack.sh and the deployment checklist both intend.
+
+    This is stricter than the rewriter's image a few services below, which does spell
+    `${HAF_FYP_REWRITER_IMAGE:-...}`, deliberately: a rewriter on an unintended tag serves
+    wrong paths and is noticed, while HAF is the database the whole stack writes into.
+    `${HAF_REGISTRY:?}` and `${HAF_VERSION:?}` stay legal -- they demand the value rather
+    than inventing one -- so there is a spelling for anyone who wants the check explicit.
+    """
+    doc = _require_yaml().safe_load(COMPOSE.read_text(encoding="utf-8"))
+    spec = str(_haf_service(doc).get("image") or "")
+    referenced, defaulted = [], []
+    for m in _VAR.finditer(spec):
+        referenced.append(m.group(1) or m.group(4))
+        if m.group(2) in (":-", "-", ":+", "+"):
+            defaulted.append(m.group(0))
+    assert referenced == ["HAF_REGISTRY", "HAF_VERSION"], (
+        f"`{HAF_SERVICE}`'s image is {spec!r}, which reads {referenced}: it must read "
+        f"HAF_REGISTRY then HAF_VERSION, or an operator's pin in .env.local does not reach "
+        f"the container"
+    )
+    assert not defaulted, (
+        f"`{HAF_SERVICE}`'s image is {spec!r}: {defaulted} would start the stack on a "
+        f"version nobody pinned, and a missing pin would stop being an error"
+    )
+
+
+def test_the_pinned_haf_version_is_a_release_tag_that_has_the_app_registry():
+    """docker/.env must pin a release tag, and not one older than HAF_MINIMUM_RELEASE.
+
+    Two ways to ship a default that installs cleanly and disappoints later:
+      - a short-SHA tag rots. The registry keeps one only while it is among the newest
+        five or younger than a week (#56), so the pin stops resolving on the next pull
+        -- a recreate, another host, a cold cache -- on a date nobody here decides.
+      - a release older than hive.app_register (haf#341) has no registry to register in.
+        That is not an error: db/register_app.sql warns and returns, and
+        scripts/process_blocks.sh probes hafd.applications and keeps the legacy
+        `CALL main()` loop, both deliberately (an operator may run such a HAF, and says
+        so in .env.local). But it is not what the reference stack should DEFAULT to --
+        silently pre-#51 -- and no CI lane would notice: they run plain PostgreSQL with
+        pgvector and no hive_fork_manager at all.
+
+    Checked on the tag the stack ASKS FOR, not on the env line alone: the compose file can
+    decorate `${HAF_VERSION}` (`:${HAF_VERSION}-arm64`, `:v${HAF_VERSION}`) into a
+    reference that resolves to nothing while the pin itself still reads like a release.
+
+    This reads the TRACKED docker/.env, which is the default an operator starts from; it
+    says nothing about what .env.local may pin.
+    """
+    floor = _release_key(HAF_MINIMUM_RELEASE)
+    assert floor, f"HAF_MINIMUM_RELEASE={HAF_MINIMUM_RELEASE!r} is not a release tag itself"
+    env_file = _read_env(ENV_FILE)
+    # `.env` values interpolate, so a pin may be spelled through another line in the file.
+    pinned = _resolve(env_file.get("HAF_VERSION", ""), env_file, strict=False)
+    assert pinned, (
+        "docker/.env sets no HAF_VERSION, so the stack has no pinned HAF at all: an "
+        ".env.local that does not set one would leave the image reference unresolved"
+    )
+    spec = str(_haf_service(_require_yaml().safe_load(COMPOSE.read_text(encoding="utf-8")))
+               .get("image") or "")
+    _, tag, _ = _image_parts(_resolve(spec, env_file, strict=False))
+    assert tag == pinned, (
+        f"docker/.env pins HAF_VERSION={pinned!r} but the compose file asks the registry "
+        f"for {tag!r}: the tag must be the pin itself, not a decoration of it. A suffix or "
+        f"a `v` prefix here resolves to a tag nobody pinned -- and to nothing at all, if "
+        f"haf does not publish that spelling. Put the exact tag in HAF_VERSION."
+    )
+    where = f"docker/.env pins HAF_VERSION={pinned!r}"
+    key = _release_key(tag)
+    assert key, (
+        f"{where}, which is not a release tag. A short SHA is swept from the registry "
+        f"once it falls out of the newest five (#56: d26f14cc was gone five days after "
+        f"it was pinned here), "
+        f"`latest`/`stable`/a branch name move under the stack, and a decorated tag "
+        f"resolves to nothing at all. Pin a release such as {HAF_MINIMUM_RELEASE}."
+    )
+    assert key >= floor, (
+        f"{where}, older than {HAF_MINIMUM_RELEASE}: that HAF has no hive.app_register "
+        f"(haf#341), so db/register_app.sql skips registration and "
+        f"scripts/process_blocks.sh runs the legacy `CALL main()` loop -- with no error "
+        f"anywhere, and the shipped default silently back on the pre-#51 path. Lower "
+        f"HAF_MINIMUM_RELEASE only with a version the stack has been installed against."
+    )
+
+
 # --- the rewriter image: what it runs, and where it proxies (#48) -------------------
 #
 # docker/rewriter_entrypoint.sh defaults POSTGREST_HOST/PORT and renders the nginx config.
