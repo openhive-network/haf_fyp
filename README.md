@@ -45,7 +45,32 @@ hived ──► sql_serializer ──► HAF PostgreSQL
 
 ### Required
 
-- A running HAF node (`haf_block_log` PostgreSQL database)
+- A running HAF node (`haf_block_log` PostgreSQL database). The standalone stack starts
+  one for you, from `registry.gitlab.syncad.com/hive/haf` — the repository haf publishes
+  the instance image to, and the same name `haf_api_node` reads (under whichever registry
+  it is pointed at; its own default is `registry.hive.blog`). The `haf/instance`
+  repository beside it stopped at 1.27.x
+  ([#56](https://gitlab.syncad.com/hive/haf_fyp/-/issues/56)). `docker/.env` pins
+  **1.29.0-rc2**, the oldest release carrying the HAF application registry
+  (`hive.app_register`, haf#341) that the block-processing driver registers with. An
+  older HAF is supported and not an error: installation warns, skips registration, and
+  block processing keeps to the legacy `CALL main()` loop.
+
+  > **Pin `HAF_VERSION` before the first sync — changing it afterwards means a replay.**
+  > HAF 1.29.0 added `hafd.transactions.rc_cost` and ships no migration for it on purpose:
+  > the values cannot be backfilled, so HAF's update script compares schema hashes and
+  > exits 1 rather than migrate. The container's `restart: unless-stopped` turns that into
+  > a crash loop, and because the HAF healthcheck allows 72 h to start, nothing reports
+  > unhealthy — every dependent service simply waits. To move an already-synced stack to a
+  > new HAF line: stop it, move the HAF data volume aside, and let the new version replay
+  > into a fresh one. (Moving a stack *between projects* keeping its data is a different
+  > job — that is `scripts/upgrade_standalone_stack.sh`, and it does not change the image.)
+  >
+  > A stack that already runs can only be on a `1.27.x` pin, because no newer tag ever
+  > resolved on the old path. Those tags exist on the new path as a **different build** of
+  > the same version (`1.27.11rc3`: 277 MB here against 1.65 GB there). The schema is that
+  > version's either way, so nothing replays — but the runtime underneath changes, so
+  > recreate `haf` deliberately rather than discovering it on the next unrelated `up`.
 - `pgvector` extension installed on the HAF PostgreSQL server:
   ```sql
   -- run as superuser before installing haf_fyp
@@ -271,7 +296,10 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
 # 1. Copy and configure environment
 cp docker/.env docker/.env.local
 # Edit .env.local:
-#   - Set HAF_VERSION to a pinned release tag (not "latest") for production
+#   - Set HAF_VERSION to a pinned release tag (not "latest") for production. A RELEASE
+#     tag: hive/haf keeps a short-SHA tag only while it is one of the five newest or
+#     younger than a week, so a commit pinned here stops resolving on the next pull,
+#     on a date set by how busy haf's develop is (#56).
 #   - Set FYP_ADMIN_API_KEY to a strong random secret
 #   - Set TRUSTED_PROXY_IPS to whatever fronts this app (Caddy/Varnish/HAProxy),
 #     or to `direct` if nothing does. Left empty, every caller shares one bucket
@@ -782,7 +810,10 @@ docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
 Keep `--env-file` on the `run` as well as the `stop`. `run` recreates any dependency whose
 configuration differs. So if `.env.local` changes `HAF_REGISTRY` or `HAF_VERSION` — and
 the quick start tells production to pin `HAF_VERSION` — leaving it off recreates `haf`
-from `docker/.env`'s values just before the teardown. Add the stack's `-p` to both
+from `docker/.env`'s values just before the teardown. Since #56 that matters more, not
+less: this repo's pin now resolves, so the recreate succeeds on a different HAF rather
+than failing on the pull, and against a synced datadir a HAF from another line refuses to
+start (see the replay warning under Prerequisites). Add the stack's `-p` to both
 commands if it runs under one. A stack started before #53 must first be moved with
 `scripts/upgrade_standalone_stack.sh` (see *Upgrading a standalone stack from before #53*
 above). Unless it was started with `-p` or `COMPOSE_PROJECT_NAME`, its containers belong
@@ -810,7 +841,7 @@ Before going live:
 - [ ] `pgvector` extension installed by superuser on the HAF PostgreSQL server
 - [ ] `FYP_ADMIN_API_KEY` set to a strong random value in `docker/.env.local`
 - [ ] **`TRUSTED_PROXY_IPS` set to the reverse proxy's address or CIDR** (or the literal `direct` if nothing fronts this app). Since #28 this also gates *when* limits are charged: with it unset the app logs an ERROR at startup and falls back to charging only after validation, because charging a request before it is validated is safe only when the bucket identifies the caller — into one shared bucket it lets a single sender 429 everybody else, which is worse than the bug #28 fixes. Rate limits key on `X-Real-IP` only from a trusted peer; unset, every caller keys on the proxy's address instead — one shared bucket for all of them, which is no per-client limit at all. The app logs a warning at startup when it is unset, and once more if a peer outside the list presents the header (which usually means the proxy was recreated with a new address and the list is now stale). Re-check it after anything that can renumber the proxy container.
-- [ ] `HAF_VERSION` pinned to a specific release tag (not `latest`)
+- [ ] `HAF_VERSION` pinned to a specific release tag — not `latest`, which moves, and not a commit tag, which the registry sweeps once it falls out of the five newest — at `1.29.0-rc2` or newer so the app registers itself instead of falling back to the legacy loop. Pinned **before the first sync**: changing it later is a replay, not an upgrade (see Prerequisites)
 - [ ] **If Hivemind was installed AFTER haf_fyp started syncing: `CALL haf_fyp_app.run_hive_post_id_backfill();`** — the per-block resolver only covers a rolling 7-day window, so without this every older post stays unresolved and the feeds stay empty. `/metrics` cannot detect this yet ([#43](https://gitlab.syncad.com/hive/haf_fyp/-/issues/43)) — run the backfill on the strength of the install order alone.
 - [ ] **Hivemind installed and synced** → `grant_cross_schema.sh` re-run. REQUIRED: with hivemind ABSENT every feed returns `[]`. (A lost *grant* on an already-running node is different — resolution stops, but already-rendered posts keep serving from `post_bridge_cache`, so the outage is delayed rather than immediate.) Confirm with `GET /metrics` → `ranking_sources.degraded` is `false`, not by assuming — alert on that rather than on `sources.hivemind == "readable"`, which misses both the `readable_unverified` case and everything the servability probe sees. (Losing `SELECT` on the table does at least `RAISE WARNING` from the resolver; an absent schema — or a revoked `USAGE` on it, which makes `to_regclass` return NULL — is entirely silent.)
 - [ ] HiveSense installed and synced → `grant_cross_schema.sh` re-run (optional; without it nobody is personalized — see [Without HiveSense there is no personalization](#without-hivesense-there-is-no-personalization-not-neutral-relevance))

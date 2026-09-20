@@ -79,7 +79,15 @@ name: haf_fyp
 
 services:
   haf:
-    image: ${HAF_REGISTRY}/haf/instance:${HAF_VERSION}
+    # `haf`, not `haf/instance` (#56). haf's CI has published nothing to .../haf/instance
+    # since April 2025 -- its newest tag there is 1.27.11rc3 -- and puts the instance
+    # image in .../haf instead, the repository haf_api_node's haf_base.yaml reads too
+    # (`${HAF_IMAGE:-${HIVE_API_NODE_REGISTRY:-registry.hive.blog}/haf}`, i.e. the same
+    # name under whichever registry a node is pointed at). That path still holds 1.27.x
+    # tags, but every tag this stack has ever pinned 404s there: a fresh `up` fails, and
+    # a host that already has the image cached keeps working until it pulls again.
+    # tests/unit/test_compose_contract.py pins the path and the shape of the tag.
+    image: ${HAF_REGISTRY}/haf:${HAF_VERSION}
     restart: unless-stopped
     ports:
       - "5432:5432"
@@ -187,7 +195,9 @@ services:
   #
   # --env-file on BOTH: `run` recreates a dependency whose config differs, so if .env.local
   # pins HAF_VERSION/HAF_REGISTRY, leaving it off recreates `haf` from docker/.env just
-  # before the teardown. Add the stack's -p to both if it runs under one. A stack started
+  # before the teardown. That got sharper with #56: this file's pin now RESOLVES, so the
+  # recreate succeeds on a different HAF instead of failing on the pull -- and on a synced
+  # datadir a HAF from another line refuses to start at all (docker/.env, HAF_VERSION). Add the stack's -p to both if it runs under one. A stack started
   # before #53 without -p or COMPOSE_PROJECT_NAME runs its old containers under the project
   # `docker`, which `stop` here does not reach: scripts/upgrade_standalone_stack.sh removes
   # them (by label -- not --remove-orphans, which removes far more).

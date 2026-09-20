@@ -86,6 +86,11 @@ compose-validate:
   stage: lint
   image: docker:24
   variables:
+    # Placeholders, not a pin: this job runs `config`, which parses YAML and never
+    # contacts a registry, and the compose file interpolates every ${VAR} it names. They
+    # are deliberately NOT the values docker/.env ships -- a lane that cannot pull cannot
+    # tell a good reference from a dead one, which is how #56 stayed green here. The pin
+    # itself is checked offline by tests/unit/test_compose_contract.py.
     HAF_REGISTRY: "registry.example.com"
     HAF_VERSION: "latest"
     POSTGREST_VERSION: "latest"
