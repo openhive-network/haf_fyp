@@ -13,7 +13,35 @@ events {
 }
 
 http {
-    access_log /dev/stdout;
+    # WHO called us, which the default `combined` format cannot reliably say. (#64)
+    #
+    # This API is consumed by front ends we do not run, from the browser, cross-origin. `combined`
+    # logs Referer, and Referer is the CALLER'S to suppress: a site chooses its referrer policy,
+    # and PeakD sends none at all (its requests arrive with Sec-Fetch-Mode: cors, an Origin, and
+    # no Referer). `Origin` is not optional in the same way -- the browser attaches it to every
+    # CORS-mode request and a site cannot turn it off. So Referer names some callers and misses
+    # exactly the ones we most wanted: in a 2026-06-03..09-22 harvest, 1,566 of 2,812 feed
+    # requests had no Referer, while 67 named Waggle (hdev-core.github.io).
+    #
+    # `origin="-"` is a signal too, though a broad one: a server-side caller, a same-origin
+    # request, a top-level navigation, or a crawler -- anything that is not a browser fetch from
+    # another site.
+    #
+    # $http_x_forwarded_for is deliberately NOT logged: the end-user IP is not needed to attribute
+    # a caller. That is a narrower statement than "this log holds no personal data", and the
+    # difference matters if anyone widens the format later. $remote_addr is the fronting proxy on
+    # a haf_api_node deployment (Caddy -> HAProxy -> Varnish -> here) but IS the client's address
+    # on the standalone stack, which publishes this port directly (docker/docker-compose.yml,
+    # ${API_PORT:-3001}:80). And $request already carries /v1/fyp/feed/<account>, i.e. the name of
+    # the person whose feed is being fetched.
+    #
+    # These are nginx variables, not ${...} placeholders, so docker/rewriter_entrypoint.sh's sed
+    # leaves them alone; tests/unit/test_rewriter_log_format.py pins that, and pins that the
+    # format stays wired to access_log.
+    log_format fyp_access '$remote_addr - $remote_user [$time_local] "$request" '
+                          '$status $body_bytes_sent "$http_referer" "$http_user_agent" '
+                          'origin="$http_origin"';
+    access_log /dev/stdout fyp_access;
 
     server {
         listen 0.0.0.0:80 default_server;
@@ -38,6 +66,12 @@ http {
     # lightweight health endpoint for container/orchestrator checks
     server {
         listen 0.0.0.0:81;
+        # Not logged, or it buries the log this file exists to make readable: the orchestrator
+        # probes every 10s, which was 122,487 of 123,590 lines -- 99.1% of them and 98.4% of the
+        # bytes -- in a 2026-09-22 snapshot of the deployed container's log. An operator running
+        # `docker logs` to see who calls the API would still have to filter it out. The
+        # http-level access_log above stays inherited by the API server.
+        access_log off;
         location /health {
             return 204;
         }
