@@ -195,6 +195,46 @@ registry_has_haf_fyp() {
     [ "$(psql_cmd -Atq -c "SELECT EXISTS (SELECT 1 FROM hafd.applications WHERE name = 'haf_fyp')" 2>/dev/null || true)" = "t" ]
 }
 
+# "Not registered" has two causes that need OPPOSITE answers, and the probe above
+# cannot tell them apart (#62):
+#
+#   no registry at all (1.28.x)  -> the legacy loop, which is what this app did
+#                                   before haf#341 and is safe: nothing else is
+#                                   driving the context.
+#   the context belongs to       -> NOT the legacy loop. main() calls
+#   ANOTHER application             hive.app_next_iteration on context haf_fyp,
+#                                   and the owning application's driver is calling
+#                                   it on the same context. That pointer has no
+#                                   lock on the path taken when the stages need no
+#                                   analysis, so two loops hand each other's ranges
+#                                   out: blocks processed twice, blocks skipped,
+#                                   for both applications. db/register_app.sql
+#                                   leaves the install standing in this state
+#                                   deliberately -- upstream added that quiet
+#                                   return so an EMBEDDED app's install can be
+#                                   re-run -- so the refusal has to live here.
+#
+# Park rather than exit: this runs as PID 1 under `restart: unless-stopped`, so a
+# non-zero exit is an indefinite crash loop, and a crash loop is the one shape the
+# healthcheck's 72h start_period cannot surface. Idle instead and let
+# docker/block-processing-healthcheck.sh report it: no block is processed, so the
+# container goes unhealthy and says why, once, in a log that is still readable.
+context_taken_by_another_app() {
+    [ "$(psql_cmd -Atq -c "SELECT to_regclass('hafd.applications') IS NOT NULL" 2>/dev/null || true)" = "t" ] || return 1
+    [ "$(psql_cmd -Atq -c "SELECT EXISTS (SELECT 1 FROM hafd.applications WHERE name <> 'haf_fyp' AND contexts @> ARRAY['haf_fyp'])" 2>/dev/null || true)" = "t" ]
+}
+
+refuse_foreign_context() {
+    owner=$(psql_cmd -Atq -c "SELECT name FROM hafd.applications WHERE name <> 'haf_fyp' AND contexts @> ARRAY['haf_fyp'] LIMIT 1" 2>/dev/null || true)
+    log "ERROR: context haf_fyp belongs to application '${owner:-<unknown>}', which drives it"
+    log "       itself. Running haf_fyp's loop as well would advance one context pointer from"
+    log "       two places and lose blocks for both applications, so block processing will NOT"
+    log "       start. Either install haf_fyp on a HAF where it owns its context, or let"
+    log "       '${owner:-that application}' process it and stop this service."
+    # Idle, so the healthcheck reports an unhealthy container rather than a restart loop.
+    while true; do sleep 3600; done
+}
+
 if command -v haf_app_driver.py >/dev/null 2>&1 \
    && [ "${HAF_FYP_USE_LEGACY_LOOP:-false}" != "true" ]; then
     if registry_has_haf_fyp; then
@@ -206,6 +246,12 @@ if command -v haf_app_driver.py >/dev/null 2>&1 \
     log "WARNING: haf_app_driver.py is on PATH but haf_fyp is not in the HAF application registry"
     log "         (HAF older than haf#341, or db/register_app.sql skipped it); falling back to"
     log "         the legacy CALL main() loop"
+fi
+
+# Checked on every path into the legacy loop, including HAF_FYP_USE_LEGACY_LOOP=true: the
+# hazard is the loop itself, not how the loop was chosen.
+if context_taken_by_another_app; then
+    refuse_foreign_context
 fi
 
 log "haf_app_driver.py not used, falling back to the legacy CALL main() loop"

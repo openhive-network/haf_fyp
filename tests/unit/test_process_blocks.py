@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -40,14 +41,17 @@ def bash():
     return require_bash()
 
 
-def make_psql(tmp_path, registry: str = "t") -> Path:
+def make_psql(tmp_path, registry: str = "t", taken_by: str | None = None) -> Path:
     """A stub psql: answers `SELECT now()` and the two application-registry
     probes, records every -c, and never blocks.
 
     registry: what the probes see -- "t" (hafd.applications exists and lists
     haf_fyp, the registry-era HAF), "f" (registry present, haf_fyp not in it),
     "absent" (no hafd.applications: a pre-haf#341 HAF), or "error" (psql itself
-    fails on the probe, e.g. a permissions problem)."""
+    fails on the probe, e.g. a permissions problem).
+
+    taken_by: the application that owns context haf_fyp, if any. Its two queries are
+    matched BEFORE the generic one, because they also read hafd.applications (#62)."""
     stub_bin(tmp_path)
     logfile = tmp_path / "sql.log"
     if registry == "error":
@@ -56,6 +60,8 @@ def make_psql(tmp_path, registry: str = "t") -> Path:
         table = "f" if registry == "absent" else "t"
         row = "t" if registry == "t" else "f"
         probe = (
+            f'  *"SELECT name FROM hafd.applications"*) printf "%s" {taken_by or ""!r} ;;\n'
+            f"  *\"name <> 'haf_fyp'\"*) printf \"%s\" {'t' if taken_by else 'f'} ;;\n"
             f'  *"to_regclass(\'hafd.applications\')"*) printf "%s" {table} ;;\n'
             f'  *"FROM hafd.applications"*) printf "%s" {row} ;;\n'
         )
@@ -263,6 +269,38 @@ def run_env(bash, tmp_path, *args: str, startup_file=None, extra_env=None):
     )
 
 
+def run_until_parked(bash, tmp_path, extra_env=None, seconds: int = 10) -> str:
+    """Run the script expecting it NOT to finish, and return what it printed (#62).
+
+    To a FILE, never a pipe: the script parks in `while true; do sleep ...; done`, and
+    killing it leaves that `sleep` holding a pipe's write end open, so reading to EOF
+    would hang long after the script itself is gone. Nothing here needs streaming.
+    """
+    env = clean_env(stub_bin(tmp_path))
+    env["HAF_FYP_STARTUP_TIME_FILE"] = str(tmp_path / "startup.txt")
+    if extra_env:
+        env.update(extra_env)
+    out = tmp_path / "parked.log"
+    with out.open("w") as sink:
+        proc = subprocess.Popen([bash, str(SCRIPT)], env=env, stdout=sink,
+                                stderr=subprocess.STDOUT, text=True)
+        try:
+            deadline = time.time() + seconds
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    pytest.fail(f"run_tests parked check: the script EXITED ({proc.returncode}) "
+                                f"instead of idling, which crash-loops under "
+                                f"`restart: unless-stopped`; {out.read_text(errors='replace')}")
+                if "belongs to application" in out.read_text(errors="replace"):
+                    return out.read_text(errors="replace")
+                time.sleep(0.2)
+            pytest.fail(f"no refusal was printed within {seconds}s; "
+                        f"{out.read_text(errors='replace')}")
+        finally:
+            proc.kill()
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 def test_the_driver_is_used_when_available(bash, tmp_path):
     """With the driver on PATH the script execs it for the registered application
     (context name, matching db/register_app.sql) instead of CALL main()."""
@@ -344,6 +382,38 @@ def test_an_unregistered_app_falls_back_too(bash, tmp_path):
     run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
     assert not argv_log.exists()
     assert "CALL haf_fyp_app.main('haf_fyp');" in sql.read_text()
+
+
+def test_the_legacy_loop_is_refused_on_a_context_another_application_owns(bash, tmp_path):
+    """The one state where the legacy loop is NOT the safe answer (#62).
+
+    `CALL haf_fyp_app.main('haf_fyp')` calls hive.app_next_iteration on context haf_fyp.
+    When another application's contexts array contains haf_fyp, that application's driver
+    is calling it on the same context, and the pointer is advanced without a lock on the
+    path where the stages need no analysis -- so the two loops hand each other's ranges
+    out and both applications lose blocks. db/register_app.sql leaves the install standing
+    in this state on purpose (upstream's quiet return exists so an embedded app's install
+    can be re-run), which is why the refusal has to be here.
+
+    It parks rather than exits: this is PID 1 under `restart: unless-stopped`, and a
+    non-zero exit is an indefinite crash loop -- the one shape the healthcheck's 72h
+    start_period cannot surface. Idling makes the healthcheck report it instead.
+    """
+    sql = make_psql(tmp_path, registry="f", taken_by="embedding_app")
+    argv_log = make_driver_stub(tmp_path)
+    out = run_until_parked(bash, tmp_path)
+    assert "CALL haf_fyp_app.main" not in sql.read_text(), (
+        f"a second loop was started on a context embedding_app owns; {sql.read_text()}")
+    assert not argv_log.exists(), "the driver was run for an unregistered application"
+    assert "embedding_app" in out, f"the refusal does not name the owning application; {out}"
+
+
+def test_the_refusal_also_applies_when_the_legacy_loop_is_forced(bash, tmp_path):
+    """HAF_FYP_USE_LEGACY_LOOP=true asks for the loop; the hazard is the loop itself."""
+    sql = make_psql(tmp_path, registry="f", taken_by="embedding_app")
+    out = run_until_parked(bash, tmp_path, extra_env={"HAF_FYP_USE_LEGACY_LOOP": "true"})
+    assert "CALL haf_fyp_app.main" not in sql.read_text(), out
+    assert "embedding_app" in out
 
 
 def test_a_failing_probe_counts_as_not_registered(bash, tmp_path):

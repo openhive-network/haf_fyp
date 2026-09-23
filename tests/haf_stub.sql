@@ -77,3 +77,93 @@ ON CONFLICT DO NOTHING;
 INSERT INTO hafd.contexts (name, owner, current_block_num)
 VALUES ('haf_fyp', 'haf_fyp_owner', 5000000)
 ON CONFLICT DO NOTHING;
+
+-- The application registry (haf#341), modelled for #62 the same way
+-- hive.is_instance_ready() is above: a one-row flag chooses what hive.app_register
+-- DOES, so tests/integration/test_register_app_db.py can drive db/register_app.sql
+-- through every state it has to survive -- including haf#345's quiet path, which
+-- registers nothing and raises only a NOTICE, and which no lane could reach before.
+--
+-- Columns mirror hive/haf @ 1.29.0-rc2 src/hive_fork_manager/applications.sql:
+-- name is the primary key, contexts is TEXT[], paused survives a re-register.
+-- Guarded: this file is loaded again by every test that needs a clean registry, and
+-- CREATE DOMAIN has no IF NOT EXISTS.
+DO $$
+BEGIN
+    CREATE DOMAIN hive.contexts_group AS TEXT [];
+EXCEPTION WHEN duplicate_object THEN NULL;
+END;
+$$;
+
+CREATE TABLE IF NOT EXISTS hafd.applications (
+    name TEXT PRIMARY KEY,
+    contexts TEXT [] NOT NULL DEFAULT ARRAY[]::TEXT [],
+    process_procedure TEXT,
+    paused BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+-- registers: TRUE  -> the row lands, as on a HAF that accepts the registration.
+--            FALSE -> haf#345's quiet path: a NOTICE, no row, no exception.
+--            NULL  -> one of the refusals that RAISE (missing context, foreign
+--                     owner, absent entry procedure), which must fail the install.
+-- paused:    what the registration leaves behind, since ON CONFLICT keeps the flag.
+CREATE TABLE IF NOT EXISTS hive.ci_register_behaviour (
+    only_row BOOLEAN PRIMARY KEY DEFAULT TRUE,
+    registers BOOLEAN DEFAULT TRUE,
+    paused BOOLEAN NOT NULL DEFAULT FALSE,
+    CONSTRAINT ci_register_behaviour_single CHECK (only_row)
+);
+INSERT INTO hive.ci_register_behaviour (only_row) VALUES (TRUE) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS hive.ci_register_calls (called TEXT, arg TEXT);
+
+CREATE OR REPLACE FUNCTION hive.app_register(
+    -- The domain, not TEXT[]: db/register_app.sql probes for this exact signature
+    -- with to_regprocedure, and a TEXT[] parameter would make every scenario below
+    -- take the "no registry" path instead. noqa: the name is lower case because it
+    -- is one, and this file is not in sql-lint's scope.
+    _name TEXT, _contexts hive.contexts_group, --noqa: CP05
+    _process_procedure TEXT DEFAULT NULL,
+    _completed_block_function TEXT DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    __behaviour BOOLEAN;
+    __paused BOOLEAN;
+BEGIN
+    INSERT INTO hive.ci_register_calls (called, arg) VALUES ('app_register', _name);
+    SELECT registers, paused INTO __behaviour, __paused FROM hive.ci_register_behaviour;
+
+    IF __behaviour IS NULL THEN
+        RAISE EXCEPTION 'Cannot register application %: context % does not exist', _name, _name;
+    END IF;
+
+    IF NOT __behaviour THEN
+        -- haf#345, verbatim in shape: the contexts belong to the embedding application.
+        RAISE NOTICE 'Application % is not registered: its contexts % are part of another application', _name, _contexts;
+        RETURN;
+    END IF;
+
+    INSERT INTO hafd.applications (name, contexts, process_procedure, paused)
+    VALUES (_name, _contexts::TEXT [], _process_procedure, __paused)
+    ON CONFLICT (name) DO UPDATE
+    SET contexts = excluded.contexts, process_procedure = excluded.process_procedure;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION hive.app_add_dependency(_name TEXT, _depends_on TEXT)
+RETURNS VOID
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+BEGIN
+    -- What the real one does, and the reason #62 is not only cosmetic.
+    IF NOT EXISTS (SELECT 1 FROM hafd.applications WHERE name = _name) THEN
+        RAISE EXCEPTION 'Application % is not registered', _name;
+    END IF;
+    INSERT INTO hive.ci_register_calls (called, arg) VALUES ('app_add_dependency', _depends_on);
+END;
+$$;
