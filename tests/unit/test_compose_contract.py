@@ -20,6 +20,7 @@ import re
 import shutil
 import signal
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -1470,22 +1471,38 @@ def test_run_tests_runs_compose_in_the_ci_project(tmp_path):
     - The successful run must `up`, then `wait` for Tavern, then tear down: two `down`s,
       the last after the `wait`, or one with --keep.
     - A failing `up` or `wait` must make the script exit with that verb's code. A failing
-      `logs` or teardown may be tolerated.
+      `logs` or teardown is tolerated in one direction only: it may not end the run, and it
+      may not replace Tavern's verdict with the janitor's.
+    - Once `up` has RUN -- succeeded or not, since a failed `up` half-starts the stack --
+      the logs and the teardown must both happen (#55), and the logs must be OF THIS RUN:
+      a `logs` call before the stack existed proves nothing, and one after `down -v` reads
+      a container that is gone. At least one of them must name `tavern`. `--keep` is the
+      one exception, and only for the teardown.
+    - Signals are covered separately, by
+      test_run_tests_tears_down_when_it_is_interrupted: this matrix only makes verbs fail.
+    - `docker compose rm -fsv` is deliberately NOT accepted as the teardown: it removes
+      containers and anonymous volumes, leaving the named volumes and the network.
     - Every compose call on every run must name exactly one project, haf_fyp_ci, in its
       options before the subcommand (`-p`, `-p=`, `-pNAME` or `--project-name`): with two,
       or an empty one, another decides it. `compose version` names no project."""
     bash = require_bash()
     problems = []
     codes = {"up": 3, "wait": 4, "down": 5, "logs": 5}
+    # The ("wait", "logs") row is not redundant: the trap's own logs only run when the run
+    # failed, so a guard missing THERE is invisible on every single-verb row.
     for failing, args in ((None, []), ("down", []), ("up", []), ("wait", []), ("logs", []),
-                          (None, ["--keep"])):
-        when = (f"with `{failing}` failing" if failing else "with every call succeeding") + (
-            f" and {args[0]}" if args else "")
-        bindir = tmp_path / f"bin-{failing}-{len(args)}"
-        calls = tmp_path / f"calls-{failing}-{len(args)}"
+                          (("wait", "logs"), []), (None, ["--keep"])):
+        verbs = (failing,) if isinstance(failing, str) else tuple(failing or ())
+        # `up` and `wait` decide the script's exit code; the rest are cleanup.
+        deciding = next((v for v in ("up", "wait") if v in verbs), None)
+        when = (" and ".join(f"with `{v}` failing" for v in verbs) if verbs
+                else "with every call succeeding") + (f" and {args[0]}" if args else "")
+        tag = "-".join(verbs) or "none"
+        bindir = tmp_path / f"bin-{tag}-{len(args)}"
+        calls = tmp_path / f"calls-{tag}-{len(args)}"
         bindir.mkdir()
         # A `ps` answers with a container id, so a script that polls for one moves on.
-        fail = f'*" {failing} "*) exit {codes[failing]} ;; ' if failing else ""
+        fail = "".join(f'*" {v} "*) exit {codes[v]} ;; ' for v in verbs)
         stub = (f'#!/bin/sh\nprintf "%s\\n" "${{0##*/}} $*" >> "{calls.as_posix()}"\n'
                 f'case " $* " in {fail}*" ps "*) echo 0123456789ab ;; esac\n')
         for name in ("docker", "docker-compose"):
@@ -1500,15 +1517,48 @@ def test_run_tests_runs_compose_in_the_ci_project(tmp_path):
         at = {verb: [i for i, c in enumerate(recorded) if re.search(rf"\s{verb}(\s|$)", c)]
               for verb in ("down", "up", "wait", "logs")}
         downs = 1 if args else 2
-        if not failing and not (r.returncode == 0 and at["up"] and at["wait"]
+        if not verbs and not (r.returncode == 0 and at["up"] and at["wait"]
                                 and at["up"][0] < at["wait"][0] and len(at["down"]) == downs
                                 and (args or at["down"][-1] > at["wait"][-1])):
             problems.append(f"run_tests.sh did not run in order: expected a `down`, an `up`, a "
                             f"`wait`{' and no teardown' if args else ', then the teardown `down`'}; "
                             f"{outcome}")
-        if failing in ("up", "wait") and at[failing] and r.returncode != codes[failing]:
-            problems.append(f"run_tests.sh exited {r.returncode} although `{failing}` exited "
-                            f"{codes[failing]}; {outcome}")
+        if deciding and at[deciding] and r.returncode != codes[deciding]:
+            problems.append(f"run_tests.sh exited {r.returncode} although `{deciding}` exited "
+                            f"{codes[deciding]}; {outcome}")
+        # The other half of "tolerated": a cleanup that fails must not INVENT a failure.
+        # Both guards this script relies on (`|| true` in the trap, `|| echo` on the logs)
+        # are invisible without this -- delete either and a passing run reports the
+        # janitor's exit code instead of Tavern's.
+        expected = codes[deciding] if deciding else 0
+        if verbs and not deciding and r.returncode != expected:
+            problems.append(f"run_tests.sh exited {r.returncode} although the tests passed and "
+                            f"only cleanup failed. A failing cleanup may be tolerated, but it "
+                            f"may not replace Tavern's verdict; {outcome}")
+        # Whatever happened after the stack came up, the run must still say why and clean up
+        # (#55). `up` having RUN is the trigger, not `up` having succeeded: a failed `up`
+        # half-starts the stack, which is exactly when it must still be removed and read.
+        # Anchored on the last call that could have started containers, because there is no
+        # `wait` on that path -- and because a `logs` call that ran BEFORE the stack existed
+        # satisfies nothing.
+        started = bool(at["up"])
+        last_start = max(at["up"] + at["wait"]) if started else -1
+        after_idx = [i for i in at["logs"] if i > last_start]
+        after = [recorded[i] for i in after_idx]
+        if started and not after:
+            problems.append(f"{when}, run_tests.sh printed no logs of the run. They are the "
+                            f"only place a failing run is described, so they must be printed "
+                            f"on the failing path too; {outcome}")
+        elif started and not any(re.search(r"\stavern(\s|$)", c) for c in after):
+            problems.append(f"{when}, run_tests.sh read logs, but none of Tavern's: {after}; "
+                            f"{outcome}")
+        if started and not args and not (at["down"] and at["down"][-1] > last_start):
+            problems.append(f"{when}, run_tests.sh did not tear the CI stack down after the "
+                            f"run. The teardown must run whatever happened, or a failed run "
+                            f"leaves the stack up until the next one; {outcome}")
+        if started and not args and after_idx and at["down"] and after_idx[-1] > at["down"][-1]:
+            problems.append(f"{when}, run_tests.sh read the logs after tearing the stack down, "
+                            f"which reads a container that no longer exists; {outcome}")
         compose = [c for c in recorded
                    if c.startswith("docker-compose ") or re.search(r"\scompose(\s|$)", c)]
         teardowns = [c for c in compose if re.search(r"\sdown(\s|$)", c)]
@@ -1518,10 +1568,15 @@ def test_run_tests_runs_compose_in_the_ci_project(tmp_path):
                             f"starts on the last one's database: {keeps_volumes}")
         unpinned = [c for c in compose
                     if _compose_projects(c) != [CI_PROJECT] and _compose_subcommand(c) != "version"]
-        files = [re.findall(r"(?:^|\s)-f\s+(\S+)", c) for c in compose]
+        # `-f x`, `-f=x`, `--file x` and `--file=x` are all Docker CLI spellings. Matching
+        # only the first left the others resolving to NO files at all, which compared equal
+        # to the empty expected list -- so `--file=docker/docker-compose.yml` passed, and
+        # that file declares the HAF datadir volume this script's `down -v` would remove.
+        files = [re.findall(r"(?:^|\s)(?:-f|--file)[= ]\s*(\S+)", c) for c in compose]
         wrong_file = [c for c, f in zip(compose, files)
                       if _compose_subcommand(c) != "version"
-                      and [p for p in f if p.endswith("/docker/docker-compose-ci.yml")] != f]
+                      and (not f
+                           or [p for p in f if p.endswith("/docker/docker-compose-ci.yml")] != f)]
         if wrong_file:
             problems.append(f"{when}, these calls do not name docker-compose-ci.yml as their only "
                             f"-f: the stack file declares the HAF datadir volume, which the first "
@@ -1531,6 +1586,73 @@ def test_run_tests_runs_compose_in_the_ci_project(tmp_path):
                             f"`{CI_PROJECT}`, so a COMPOSE_PROJECT_NAME in the shell or another "
                             f"`-p` decides it: {unpinned}")
     assert not problems, "\n".join(problems)
+
+
+def test_run_tests_tears_down_when_it_is_interrupted(tmp_path):
+    """A signal must remove the CI stack too, and promptly (#55).
+
+    The matrix above cannot reach this path: it only makes verbs fail. Two separate things
+    are pinned here, both of which were broken while this was being written.
+
+    - Bash runs NO trap while a foreground child is running, so with `compose wait` in the
+      foreground a TERM aimed at this script alone did nothing until Tavern finished --
+      measured at nine seconds late against a ten-second stub, and unbounded in real life,
+      since a hung Tavern is why someone reaches for the signal. The script backgrounds the
+      wait and uses the `wait` builtin so the shell can act at once; the stub here sleeps
+      far longer than the test allows, so a regression to the foreground form times out.
+    - The teardown and the logs must still happen. An interrupted CI job is exactly when
+      the logs are wanted, and a stack left running is what the next run has to clean up.
+    """
+    bash = require_bash()
+    if os.name == "nt":  # pragma: no cover - CI is Linux
+        pytest.skip("Windows terminates the process instead of delivering SIGTERM to bash")
+    bindir, calls = tmp_path / "bin", tmp_path / "calls"
+    bindir.mkdir()
+    stub = (f'#!/bin/sh\nprintf "%s\\n" "${{0##*/}} $*" >> "{calls.as_posix()}"\n'
+            'case " $* " in *" wait "*) sleep 120 ;; esac\n')
+    for name in ("docker", "docker-compose"):
+        write_exec(bindir / name, stub)
+    env = clean_env(bindir)
+    env["COMPOSE_PROJECT_NAME"] = "victim"
+    # To a FILE, not a pipe. The backgrounded `compose wait` is killed by the teardown, but
+    # the stub's own `sleep` child outlives it and keeps a pipe's write end open, so reading
+    # to EOF would block for two minutes after the script had already exited -- measured on
+    # Linux, where this test actually runs. Nothing here needs streaming.
+    log = tmp_path / "out"
+    proc = subprocess.Popen([bash, str(ROOT / "scripts" / "run_tests.sh")], env=env,
+                            stdout=log.open("w"), stderr=subprocess.STDOUT, text=True)
+    try:
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if calls.is_file() and any(re.search(r"\swait(\s|$)", line)
+                                       for line in calls.read_text(encoding="utf-8").splitlines()):
+                break
+            time.sleep(0.2)
+        else:  # pragma: no cover - the script never got as far as waiting
+            pytest.fail("run_tests.sh never reached `compose wait`")
+        proc.send_signal(signal.SIGTERM)
+        # Far below the stub's sleep: the point is that it does NOT wait for Tavern.
+        proc.wait(timeout=20)
+    except subprocess.TimeoutExpired:  # pragma: no cover - that is the regression
+        proc.kill()
+        pytest.fail("run_tests.sh did not act on SIGTERM while waiting for Tavern; it is "
+                    "waiting in the foreground, where bash runs no trap until the child "
+                    "returns")
+    finally:
+        if proc.poll() is None:  # pragma: no cover
+            proc.kill()
+    recorded = calls.read_text(encoding="utf-8").splitlines()
+    outcome = (f"rc={proc.returncode}, calls {recorded}\n"
+               f"output: {log.read_text(encoding='utf-8', errors='replace')}")
+    at = {verb: [i for i, c in enumerate(recorded) if re.search(rf"\s{verb}(\s|$)", c)]
+          for verb in ("down", "up", "wait", "logs")}
+    assert at["down"] and at["down"][-1] > at["up"][-1], (
+        f"an interrupted run left the CI stack up; {outcome}")
+    assert any(re.search(r"\stavern(\s|$)", recorded[i]) for i in at["logs"]), (
+        f"an interrupted run printed no Tavern logs, which is when they are most wanted; "
+        f"{outcome}")
+    assert proc.returncode == 143, (
+        f"an interrupted run must exit 143 (128+SIGTERM), not {proc.returncode}; {outcome}")
 
 
 def test_nothing_is_pulled_in_from_another_file():

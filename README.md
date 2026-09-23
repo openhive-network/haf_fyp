@@ -703,6 +703,14 @@ Two checkouts on one host now share `haf_fyp`, so run a second one under its own
 which `scripts/run_tests.sh` runs on the host, is pinned to `haf_fyp_ci` for the same
 reason.
 
+Run that suite locally with `./scripts/run_tests.sh`. It exits with Tavern's code, prints
+the logs of the services that matter (`setup` first — a SQL error there fails the `up`
+itself, since every service waits on it), and tears the stack down on the way out whatever
+happened, including on Ctrl-C. To keep the stack and inspect it instead — `psql` into it,
+curl the rewriter — use `./scripts/run_tests.sh --keep`; the script says so too when a run
+fails. A kept stack survives only until the next run, which starts by removing it
+([#55](https://gitlab.syncad.com/hive/haf_fyp/-/issues/55)).
+
 ### The SQL image's verbs
 
 `Dockerfile.sql` builds one image used by three services, dispatched by
