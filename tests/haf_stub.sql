@@ -24,8 +24,16 @@ CREATE SCHEMA IF NOT EXISTS hive;
 CREATE TABLE IF NOT EXISTS hafd.contexts (
     name VARCHAR(255) PRIMARY KEY,
     owner NAME NOT NULL DEFAULT 'haf_fyp_owner',
-    current_block_num INT NOT NULL DEFAULT 0
+    current_block_num INT NOT NULL DEFAULT 0,
+    -- Where the context's own table and views live: hive.context_create does
+    -- `CREATE TABLE %I.%I (_schema, _name)` and hive.context_remove drops it again, which
+    -- is why scripts/uninstall_foreign_context.sql asks about schemas as well as names
+    -- (#66). Defaulted, so every row seeded before this column existed still reads as
+    -- haf_fyp's own.
+    schema TEXT NOT NULL DEFAULT 'haf_fyp_app'
 );
+-- Added after the table shipped, for the lanes that already have one.
+ALTER TABLE hafd.contexts ADD COLUMN IF NOT EXISTS schema TEXT NOT NULL DEFAULT 'haf_fyp_app';
 
 CREATE TABLE IF NOT EXISTS hafd.blocks (
     num INT PRIMARY KEY,

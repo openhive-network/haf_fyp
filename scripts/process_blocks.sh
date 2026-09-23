@@ -231,6 +231,8 @@ refuse_foreign_context() {
     log "       two places and lose blocks for both applications, so block processing will NOT"
     log "       start. Either install haf_fyp on a HAF where it owns its context, or let"
     log "       '${owner:-that application}' process it and stop this service."
+    log "       Removing haf_fyp from such a node needs the context detached first; README,"
+    log "       \"If another application owns the context\", has the SQL (#66)."
     # Idle, so the healthcheck reports an unhealthy container rather than a restart loop.
     while true; do sleep 3600; done
 }

@@ -14,6 +14,11 @@
 #
 # OPTIONS:                                                      # --- help-start ---
 #   --force        Skip the interactive confirmation. Required to run without a TTY.
+#   --allow-foreign-context
+#                  Tear down even when another application owns the HAF context, or a
+#                  context whose tables live in a schema this drops. That application
+#                  loses the context, is unregistered outright if it was its only one,
+#                  and loses its state table. NOT implied by --force.
 #   --host=VALUE   PostgreSQL host (default: $POSTGRES_HOST, else haf)
 #   --port=NUMBER  PostgreSQL port (default: $POSTGRES_PORT, else 5432)
 #   --user=VALUE   PostgreSQL user (default: $POSTGRES_USER, else haf_admin)
@@ -57,6 +62,20 @@ HAF_FYP_ROLES="haf_fyp_user haf_fyp_owner"
 
 FORCE=0
 
+# A SEPARATE flag from --force, and an option rather than an environment variable.
+# Both halves of that matter:
+#
+#   not --force, because --force means "there is no TTY, do not prompt" and the docker
+#   entrypoint path passes it unconditionally -- balance_tracker.yaml-shaped module files
+#   run uninstall as a compose service. Folding the ownership override into it would
+#   disable this guard on exactly the automated runs where nobody is reading the output.
+#
+#   not HAF_FYP_ALLOW_FOREIGN_CONTEXT, because an override that can be set once in a
+#   compose environment or an .env file and then forgotten is a guard that has silently
+#   stopped existing. This one has to be typed at the moment of the destructive act, and
+#   it shows up in --help where the operator looks for it.
+ALLOW_FOREIGN_CONTEXT=0
+
 print_help() {
     # See scripts/install_app.sh for why the markers carry a character class.
     sed -n '/--- help-sta[r]t ---/,/--- help-en[d] ---/p' "$0" | sed 's/#\( \|$\)//; s/ *# --- help-[a-z]* ---//'
@@ -65,6 +84,7 @@ print_help() {
 for arg in "$@"; do
     case "$arg" in
         --force) FORCE=1 ;;
+        --allow-foreign-context) ALLOW_FOREIGN_CONTEXT=1 ;;
         # --postgres-host is balance_tracker's spelling (its install_app.sh takes that
         # and nothing else); --host is haf_block_explorer's and hivesense's. The trio
         # this MR claims parity with does not agree with itself, so accept both rather
@@ -501,6 +521,156 @@ if [ "${_can_drop_roles}" != "t" ]; then
     log "       haf_fyp_user and haf_fyp_owner. Nothing has been changed."
     _report_connected_identity
     exit 1
+fi
+
+# GUARD 4 -- is this context ours to take apart? (#66)
+#
+# From haf#341 a context can belong to an APPLICATION, and from haf#345 an application
+# may hold the contexts of one it embeds. In that arrangement both destructive steps
+# below reach into somebody else's app:
+#
+#   step 3  hive.app_remove_context routes through hive.app_registry_context_removed,
+#           which strips the context from the OWNING application's contexts array and
+#           app_unregisters that application outright when it was its only one.
+#   step 4  DROP SCHEMA haf_fyp_app CASCADE takes the context's own state table and
+#           views with it -- they live in the app's schema -- while that application's
+#           driver is still calling hive.app_next_iteration on the context.
+#
+# Neither is recoverable by re-running anything here, and the operator asked to remove
+# THIS app, not to stop another one. So refuse before the first destructive statement,
+# which is where this script puts every other unrecoverable answer.
+#
+# Existence via pg_class, not to_regclass: Guard 1 records why (to_regclass resolves the
+# schema and aclcheck_error fires even under missing_ok, so it raises for a caller
+# without USAGE on hafd). A HAF that predates haf#341 has no hafd.applications at all,
+# and on such a node no application can own anything -- skip, do not refuse.
+#
+# The APPLICATION is 'haf_fyp' whatever the context is called, so the probe excludes that
+# name and nothing else. Being exact about HAF_FYP_CONTEXT, because the note at the top of
+# this file is easy to over-read: it does not rename the context in the database.
+# db/haf_fyp_app.sql creates the context as 'haf_fyp', db/register_app.sql registers the
+# application as 'haf_fyp' and scripts/process_blocks.sh drives 'haf_fyp', all hardcoded.
+# Only this script and docker/block-processing-healthcheck.sh read the variable, so it
+# retargets a teardown -- which is exactly why the schema half of the probe matters: set
+# it to something the database does not have and the name half matches nothing, while
+# step 4 still drops the schema the real context lives in.
+if [ "${_has_contexts}" = "t" ]; then
+    if ! _has_applications="$(psql_cmd -Atq -c "
+        SELECT EXISTS (SELECT 1 FROM pg_class c
+                       JOIN pg_namespace n ON n.oid = c.relnamespace
+                       WHERE n.nspname = 'hafd' AND c.relname = 'applications')")"; then
+        log "ERROR: could not query the catalog for the HAF application registry."
+        log "       Nothing has been changed. See the psql error above."
+        exit 1
+    fi
+
+    if [ "${_has_applications}" = "t" ]; then
+        # The query is scripts/uninstall_foreign_context.sql, not an inline -c, for the
+        # reason the verification is a file: it decides whether to destroy anything, so it
+        # has to be runnable on its own. tests/integration/test_uninstall_foreign_context_db.py
+        # executes THAT FILE against a real PostgreSQL with rows in it -- which is the only
+        # way to tell `a.name <> 'haf_fyp'` from `a.name <> a.name`, or `@>` from `<@`. A
+        # stub psql that answers by matching the table name cannot, and did not.
+        #
+        # It asks by context name AND by schema, because the two destructive steps are
+        # keyed differently and both reach a foreign application; the file says which.
+        _schema_list="$(printf '%s' "${HAF_FYP_SCHEMAS}" | tr ' ' ',')"
+
+        # Not `2>/dev/null || echo ""`, for Guard 2's reason: that collapses a
+        # connection reset and a permission error into a confident "nobody owns it".
+        if ! _context_owners="$(psql_cmd -Atq \
+            -v context="${HAF_FYP_CONTEXT}" -v schemas="${_schema_list}" \
+            -f "${SCRIPT_DIR}/uninstall_foreign_context.sql")"; then
+            log "ERROR: could not determine which application owns the HAF context."
+            log "       That query needs SELECT on hafd.applications, which comes with"
+            log "       hive_applications_group. Nothing has been changed. See the psql"
+            log "       error above."
+            exit 1
+        fi
+
+        if [ -n "${_context_owners}" ] && [ "${ALLOW_FOREIGN_CONTEXT}" -eq 1 ]; then
+            # The escape hatch. haf#345 makes a foreign owner a LEGITIMATE arrangement --
+            # a parent application deliberately holds the contexts of the apps it embeds
+            # -- and an operator tearing that parent down knows it. Refusing outright left
+            # them nothing but the hand-written SQL below, on a teardown that every other
+            # HAF app performs unconditionally (balance_tracker, haf_block_explorer and
+            # hivesense all call app_remove_context behind nothing but app_context_exists).
+            # So the default stays safe and the informed operator gets a way through.
+            #
+            # Still printed in full, and still naming every owner: an override says the
+            # operator accepted this, not that they should stop being told what it costs.
+            log "WARNING: --allow-foreign-context was given, so this is going ahead."
+            log "         These applications own a HAF context this teardown is about to"
+            log "         destroy -- '${HAF_FYP_CONTEXT}' itself, or a context whose tables"
+            log "         live in a schema this script drops:"
+            printf '%s\n' "${_context_owners}" | while IFS= read -r _owner; do
+                [ -n "${_owner}" ] || continue
+                log "           ${_owner}"
+            done
+            log "         Each one loses this context, is unregistered outright if it was"
+            log "         its only context, and loses that context's state table to DROP"
+            log "         SCHEMA CASCADE while its driver is still calling"
+            log "         hive.app_next_iteration on it. Re-installing haf_fyp does not"
+            log "         undo any of it."
+            log "         See README, \"If another application owns the context\"."
+        elif [ -n "${_context_owners}" ]; then
+            # One name per line, and each gets its own remedy. Asking by schema as well as
+            # by name made more than one owner reachable -- two contexts in haf_fyp_app,
+            # owned by different applications -- and a comma-joined list interpolated into
+            # `WHERE name = '...'` would have printed SQL that does not run.
+            log "ERROR: these applications own a HAF context this teardown would destroy"
+            log "       -- '${HAF_FYP_CONTEXT}' itself, or a context whose tables live in a"
+            log "       schema this script drops:"
+            printf '%s\n' "${_context_owners}" | while IFS= read -r _owner; do
+                [ -n "${_owner}" ] && log "         ${_owner}"
+            done
+            log "       Removing the context strips it from that application -- and"
+            log "       unregisters the application entirely if it was its only context --"
+            log "       and DROP SCHEMA CASCADE takes the context's state table with it"
+            log "       while that application is still processing blocks."
+            log "       Nothing has been changed."
+            log ""
+            # The obvious remedy is wrong twice over, so spell out the one that is not.
+            # hive.app_register(name, fewer_contexts) ALSO sets process_procedure and
+            # completed_block_function from its arguments (ON CONFLICT DO UPDATE), so the
+            # detach silently blanks the other application's driver wiring -- and with an
+            # empty group it does nothing at all, because CARDINALITY(contexts) > 0 is a
+            # CHECK and `contexts @> '{}'` matches every other row, which sends
+            # app_register down its quiet "already part of another application" return.
+            log "       Where an application has other contexts, detach this one without"
+            log "       touching the rest of its registration (as haf_admin, or a role that"
+            log "       can impersonate its owner):"
+            printf '%s\n' "${_context_owners}" | while IFS= read -r _owner; do
+                [ -n "${_owner}" ] || continue
+                log "         UPDATE hafd.applications"
+                log "            SET contexts = array_remove(contexts, '${HAF_FYP_CONTEXT}')"
+                log "          WHERE name = '${_owner}';"
+            done
+            log ""
+            log "       Where this is an application's ONLY context there is no detach --"
+            log "       hafd.applications requires at least one -- so removing haf_fyp here"
+            log "       means removing that application too:"
+            printf '%s\n' "${_context_owners}" | while IFS= read -r _owner; do
+                [ -n "${_owner}" ] && log "         SELECT hive.app_unregister('${_owner}');"
+            done
+            log "       It keeps its position (hafd.contexts is untouched), but every"
+            log "       dependency row it takes part in is deleted, in BOTH directions, and"
+            log "       re-registering later does not bring them back."
+            log ""
+            # Named here because this is where the operator who meant it is standing. An
+            # embedding application holding this context is a supported arrangement since
+            # haf#345, not necessarily a mistake -- the refusal is the default, not a
+            # verdict.
+            log "       If that other application is yours and this is deliberate -- an"
+            log "       application that embeds haf_fyp, being torn down with it -- re-run"
+            log "       with --allow-foreign-context to accept all of the above and"
+            log "       continue. It is not implied by --force."
+            log ""
+            log "       See README, \"If another application owns the context\"."
+            _report_connected_identity
+            exit 1
+        fi
+    fi
 fi
 
 log "Removing HAF context '${HAF_FYP_CONTEXT}'..."
