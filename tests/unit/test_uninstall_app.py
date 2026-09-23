@@ -47,7 +47,8 @@ def bash():
 
 def make_psql(tmp_path, *, sessions: str = "0", remaining: str = "",
               context_left: str = "", log: str = "sql.log",
-              can_remove: str = "t", fail_on: str | None = None) -> Path:
+              can_remove: str = "t", fail_on: str | None = None,
+              has_applications: str = "f", context_owners: str = "") -> Path:
     """A stub psql that records what it was asked and answers each of the script's reads.
 
     Dispatch is on the statement text AND on any -f file, because the verification is a
@@ -92,10 +93,22 @@ def make_psql(tmp_path, *, sessions: str = "0", remaining: str = "",
         + f'  *is_superuser*)         printf "%s" {can_remove!r} ;;\n'
         f'  *pg_stat_activity*)     printf "%s" {sessions!r} ;;\n'
         f'  *uninstall_verify.sql*) printf "%s" {remaining!r} ;;\n'
+        # #66's two probes, ahead of the generic pg_class arm that would otherwise answer
+        # the first of them. has_applications defaults to "f" -- a HAF older than haf#341,
+        # which is the world every test written before #66 assumes.
+        f'  *"relname = \'applications\'"*) printf "%s" {has_applications!r} ;;\n'
+        # Errors when the table is not there, as a real pre-haf#341 HAF does. That is what
+        # makes the existence probe load-bearing: drop it and this arm fails the uninstall
+        # on every 1.28.x node.
+        + (f'  *uninstall_foreign_context.sql*) printf "%b" {context_owners!r} ;;\n'
+           if has_applications == "t" else
+           '  *uninstall_foreign_context.sql*) echo "ERROR:  relation \\"hafd.applications\\" '
+           'does not exist" >&2; exit 1 ;;\n')
+        # `+` because the line above is an expression, not a literal to concatenate with.
         # Step 6's HAF probe is a pg_class/pg_namespace join (to_regclass raises
         # without USAGE on hafd). Both spellings answer, so a regression to the
         # old form fails the whole-expression test rather than silently passing.
-        '  *pg_class*)             printf "t" ;;\n'
+        + '  *pg_class*)             printf "t" ;;\n'
         '  *to_regclass*)          printf "t" ;;\n'
         f'  *"hafd.contexts AS c"*) printf "%s" {context_left!r} ;;\n'
         + "esac\n"
@@ -104,10 +117,13 @@ def make_psql(tmp_path, *, sessions: str = "0", remaining: str = "",
     return logfile
 
 
-def run(bash, tmp_path, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+def run(bash, tmp_path, *args: str, stdin: str | None = None,
+        extra_env: dict | None = None) -> subprocess.CompletedProcess:
+    env = clean_env(stub_bin(tmp_path))
+    env.update(extra_env or {})
     return subprocess.run(
         [bash, str(SCRIPT), *args],
-        env=clean_env(stub_bin(tmp_path)),
+        env=env,
         input=stdin,
         capture_output=True,
         text=True,
@@ -144,6 +160,229 @@ def test_refuses_when_the_role_cannot_delete_the_context(bash, tmp_path):
     # And it really did stop BEFORE the destructive statements.
     assert "DROP SCHEMA" not in sql_of(log)
     assert "app_remove_context" not in sql_of(log)
+
+
+def test_refuses_when_another_application_owns_the_context(bash, tmp_path):
+    """Uninstalling haf_fyp must not take another application apart (#66).
+
+    From haf#341 a context belongs to an APPLICATION, and from haf#345 an application may
+    hold the contexts of one it embeds. Both destructive steps then reach into it:
+    hive.app_remove_context routes through hive.app_registry_context_removed, which strips
+    the context from the OWNING application and unregisters that application outright when
+    it was its only context; and DROP SCHEMA haf_fyp_app CASCADE takes the context's own
+    state table and views with it, while that application's driver is still calling
+    hive.app_next_iteration on the context.
+
+    Neither is undone by re-running anything here, so this refuses before the first
+    destructive statement -- where this script puts every other unrecoverable answer.
+    """
+    log = make_psql(tmp_path, has_applications="t", context_owners="embedding_app")
+    r = run(bash, tmp_path, "--force")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "embedding_app" in r.stdout, r.stdout
+    assert "Nothing has been changed" in r.stdout
+    assert "DROP SCHEMA" not in sql_of(log)
+    assert "app_remove_context" not in sql_of(log)
+    # The remedy is the whole value of refusing, so it is asserted like code. An earlier
+    # revision told the operator to re-register the other application with fewer contexts;
+    # that ALSO blanks its process_procedure and completed_block_function (ON CONFLICT DO
+    # UPDATE takes them from the arguments), and with an empty group it does nothing at
+    # all -- CARDINALITY(contexts) > 0 is a CHECK, and `contexts @> '{}'` matches every
+    # other row, so app_register takes its quiet "part of another application" return.
+    assert "array_remove(contexts" in r.stdout, r.stdout
+    assert "app_unregister" in r.stdout, r.stdout
+    assert "app_register(" not in r.stdout, (
+        f"the refusal recommends re-registering, which blanks the other application's "
+        f"driver wiring and silently does nothing when this is its only context; {r.stdout}")
+
+
+def test_a_haf_without_the_application_registry_still_uninstalls(bash, tmp_path):
+    """A HAF older than haf#341 has no hafd.applications, so nothing can own anything.
+
+    The probe must skip, not refuse: 1.28.x is a supported HAF here (db/register_app.sql
+    warns and returns on it), and an uninstall that stopped on every such node would be a
+    regression for every install that predates the registry. The stub errors on the query
+    in that world, exactly as the database would, so the existence check is load-bearing.
+    """
+    log = make_psql(tmp_path, has_applications="f")
+    r = run(bash, tmp_path, "--force")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "app_remove_context" in sql_of(log)
+
+
+def test_an_unowned_context_is_removed_normally(bash, tmp_path):
+    """Registry present, nobody else holds this context: the ordinary case."""
+    log = make_psql(tmp_path, has_applications="t", context_owners="")
+    r = run(bash, tmp_path, "--force")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "app_remove_context" in sql_of(log)
+
+
+def test_a_failing_ownership_probe_refuses_rather_than_guessing(bash, tmp_path):
+    """An error reading the registry is not "nobody owns it".
+
+    Guard 2 records the same rule: `2>/dev/null || echo ""` collapses a connection reset
+    and a permission error into a confident answer, and here the confident answer destroys
+    another application.
+    """
+    log = make_psql(tmp_path, has_applications="t",
+                    fail_on="uninstall_foreign_context.sql")
+    r = run(bash, tmp_path, "--force")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "Nothing has been changed" in r.stdout
+    assert "DROP SCHEMA" not in sql_of(log)
+    assert "app_remove_context" not in sql_of(log)
+
+
+def test_the_ownership_probe_is_given_the_context_and_the_schemas(bash, tmp_path):
+    """The shell's half of the contract: which question the file is asked.
+
+    The query itself is scripts/uninstall_foreign_context.sql and is executed for real by
+    tests/integration/test_uninstall_foreign_context_db.py -- a stub psql answers by
+    matching text, and no amount of matching can tell `a.name <> 'haf_fyp'` from
+    `a.name <> a.name`. What belongs here is what the script passes in: the context it is
+    about to remove, and every schema it is about to drop. Miss either and the file asks a
+    narrower question than this teardown will act on.
+    """
+    log = make_psql(tmp_path, has_applications="t", context_owners="")
+    run(bash, tmp_path, "--force", extra_env={"HAF_FYP_CONTEXT": "fyp_renamed"})
+    calls = [c for c in (tmp_path / "argv.log").read_text().splitlines()
+             if "uninstall_foreign_context.sql" in c]
+    assert calls, (tmp_path / "argv.log").read_text()
+    assert "context=fyp_renamed" in calls[0], calls[0]
+    for schema in ("haf_fyp_app", "haf_fyp_endpoints"):
+        assert schema in calls[0], (
+            f"{schema} is dropped CASCADE by step 4 but the probe is not asked about it; "
+            f"{calls[0]}")
+
+
+def test_a_failing_registry_existence_probe_refuses_too(bash, tmp_path):
+    """The OTHER probe in this guard, which had no failure coverage.
+
+    Guard 4 asks two questions: does hafd.applications exist, and who owns what. An error
+    on the first one must refuse for the same reason as the second -- swallowing it leaves
+    _has_applications empty, the whole guard skipped in silence, and both destructive steps
+    running on a node nobody checked.
+    """
+    log = make_psql(tmp_path, fail_on="relname = 'applications'")
+    r = run(bash, tmp_path, "--force")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "Nothing has been changed" in r.stdout
+    assert "DROP SCHEMA" not in sql_of(log)
+    assert "app_remove_context" not in sql_of(log)
+
+
+def test_every_owner_gets_its_own_remedy(bash, tmp_path):
+    """Asking by schema as well as by name made more than one owner reachable.
+
+    Two contexts living in haf_fyp_app, owned by different applications, is enough. The
+    probe prints one name per line; a comma-joined list interpolated into
+    `WHERE name = '...'` would print SQL that does not run, which is worse than no advice.
+    """
+    log = make_psql(tmp_path, has_applications="t", context_owners="app_a\napp_b")
+    r = run(bash, tmp_path, "--force")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "DROP SCHEMA" not in sql_of(log)
+    for owner in ("app_a", "app_b"):
+        assert f"WHERE name = '{owner}';" in r.stdout, r.stdout
+        assert f"hive.app_unregister('{owner}');" in r.stdout, r.stdout
+    assert "'app_a, app_b'" not in r.stdout, (
+        f"the remedy names both applications in one quoted identifier, which is not SQL; "
+        f"{r.stdout}")
+
+
+# --- the escape hatch -------------------------------------------------------------
+#
+# A foreign owner is not always a mistake: since haf#345 an application may deliberately
+# hold the contexts of the ones it embeds, and the operator tearing that parent down knows
+# it. Every other HAF app's uninstall removes the context unconditionally, so refusing with
+# no way through made this the only teardown in the ecosystem an informed operator could
+# not complete.
+
+def test_the_override_proceeds_and_still_says_what_it_costs(bash, tmp_path):
+    """--allow-foreign-context tears down anyway, having named every owner."""
+    log = make_psql(tmp_path, has_applications="t", context_owners="embedding_app")
+    r = run(bash, tmp_path, "--force", "--allow-foreign-context")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "app_remove_context" in sql_of(log)
+    assert "DROP SCHEMA" in sql_of(log)
+    # Overriding a guard is not a reason to stop being told what it was guarding.
+    assert "WARNING" in r.stdout, r.stdout
+    assert "embedding_app" in r.stdout, r.stdout
+
+
+def test_the_override_names_every_owner_too(bash, tmp_path):
+    """The warning is the operator's last chance to notice a second application."""
+    log = make_psql(tmp_path, has_applications="t", context_owners="app_a\napp_b")
+    r = run(bash, tmp_path, "--force", "--allow-foreign-context")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "DROP SCHEMA" in sql_of(log)
+    for owner in ("app_a", "app_b"):
+        assert owner in r.stdout, r.stdout
+
+
+def test_force_alone_does_not_unlock_the_context_guard(bash, tmp_path):
+    """The load-bearing half of the design: --force must NOT imply the override.
+
+    --force means "there is no TTY, do not prompt", and docker/docker_entrypoint.sh's
+    uninstall_app verb is how a balance_tracker.yaml-shaped module file runs this -- as a
+    compose service, non-interactively, with --force always present. Folding the ownership
+    override into it would disable the guard on exactly the runs nobody is watching.
+    """
+    log = make_psql(tmp_path, has_applications="t", context_owners="embedding_app")
+    r = run(bash, tmp_path, "--force")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "app_remove_context" not in sql_of(log)
+    assert "DROP SCHEMA" not in sql_of(log)
+    # And the refusal has to name the way through, or the operator who meant it is stuck
+    # with the hand-written SQL -- which is what the flag exists to spare them.
+    assert "--allow-foreign-context" in r.stdout, r.stdout
+
+
+def test_the_environment_cannot_unlock_the_context_guard(bash, tmp_path):
+    """The other half of the design: no environment variable turns this off.
+
+    An override that can be set once in a compose `environment:` block or an `.env` file
+    and then forgotten is a guard that has silently stopped existing -- and this script
+    already reads HAF_FYP_CONTEXT from the environment, so the shape is plausible enough
+    that someone will add it. It has to be typed at the moment of the destructive act.
+    """
+    log = make_psql(tmp_path, has_applications="t", context_owners="embedding_app")
+    r = run(bash, tmp_path, "--force", extra_env={
+        "HAF_FYP_ALLOW_FOREIGN_CONTEXT": "1", "ALLOW_FOREIGN_CONTEXT": "1"})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "app_remove_context" not in sql_of(log)
+    assert "DROP SCHEMA" not in sql_of(log)
+
+
+def test_the_override_does_not_excuse_a_failing_probe(bash, tmp_path):
+    """It waives a known owner, not an unknown answer.
+
+    "Proceed anyway" applied to a probe that ERRORED would destroy another application on
+    a connection reset -- the guessing that test_a_failing_ownership_probe_refuses_rather
+    _than_guessing exists to prevent, reintroduced through the back door.
+    """
+    log = make_psql(tmp_path, has_applications="t",
+                    fail_on="uninstall_foreign_context.sql")
+    r = run(bash, tmp_path, "--force", "--allow-foreign-context")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "Nothing has been changed" in r.stdout
+    assert "app_remove_context" not in sql_of(log)
+    assert "DROP SCHEMA" not in sql_of(log)
+
+
+def test_the_override_is_a_real_flag_not_a_typo_that_is_shrugged_off(bash, tmp_path):
+    """The option loop refuses unknown flags; a near-miss must not read as the override.
+
+    A mistyped safety flag that fell through to "ignored, continuing" would be the worst
+    of both -- the operator believes they overrode the guard, and the guard is still armed
+    (or, in the mirror case, believes they are protected while it is not).
+    """
+    log = make_psql(tmp_path, has_applications="t", context_owners="embedding_app")
+    r = run(bash, tmp_path, "--force", "--allow-foreign-contexts")
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "is not a valid option" in r.stdout, r.stdout
+    assert sql_of(log) == ""
 
 
 def test_the_probe_asks_the_question_the_policy_asks(bash, tmp_path):

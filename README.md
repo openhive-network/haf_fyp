@@ -808,6 +808,66 @@ processor. `DROP SCHEMA ... CASCADE` needs an `AccessExclusiveLock`, so with the
 or the API still holding sessions it would **block** rather than fail, after the HAF
 context had already been removed. The script refuses while any such session exists.
 
+### If another application owns the context
+
+The script also refuses, before changing anything, when a **different application** in the
+HAF registry holds haf_fyp's context — or any context whose tables live in a schema this
+teardown drops ([#66](https://gitlab.syncad.com/hive/haf_fyp/-/issues/66)). That happens on
+a node where haf_fyp is *embedded* in another application: since haf#345 the host
+application's registration carries the embedded app's contexts, and haf_fyp's own install
+warns and leaves itself unregistered
+([#62](https://gitlab.syncad.com/hive/haf_fyp/-/issues/62)). Uninstalling anyway would strip
+the context from that application, unregister it outright if it was its only one, and drop
+the context's state table — `hive.app_remove_context` ends in `DROP TABLE <schema>.<context>`
+— while its driver is still processing blocks.
+
+To remove haf_fyp there, detach the context first. **Not** by re-registering the other
+application with fewer contexts: `hive.app_register` also sets `process_procedure` and
+`completed_block_function` from its arguments, so that blanks its driver wiring, and with an
+empty group it does nothing at all (`CARDINALITY(contexts) > 0` is a CHECK, and
+`contexts @> '{}'` matches every other row). Edit the array instead, as `haf_admin` or a role
+that can impersonate its owner:
+
+```sql
+UPDATE hafd.applications
+   SET contexts = array_remove(contexts, 'haf_fyp')
+ WHERE name = '<the other application>';
+```
+
+If that context is the application's **only** one there is no detach — the same CHECK
+forbids it — so removing haf_fyp means removing that application as well:
+
+```sql
+SELECT hive.app_unregister('<the other application>');
+```
+
+It keeps its position (`hafd.contexts` is untouched), but every dependency row it takes part
+in is deleted in **both** directions, and re-registering later does not restore them.
+
+If the other application is yours and this is deliberate — you are tearing down the host
+application along with the haf_fyp it embeds — pass `--allow-foreign-context` and the
+teardown goes ahead, still printing every owner and what each one loses. It is **not**
+implied by `--force`: `--force` only means "there is no TTY, do not prompt", and the
+`uninstall_app` verb in `docker/docker_entrypoint.sh` always passes it, so overloading it
+would disable this guard on precisely the automated runs nobody is watching. There is no
+environment variable for it either — an override sitting in an `.env` file is a guard that
+has quietly stopped existing.
+
+Worth knowing what the rest of the ecosystem does here, because it is not this. In
+balance_tracker, haf_block_explorer and reputation_tracker the teardown calls
+`hive.app_remove_context` behind nothing but `hive.app_context_exists` — all three were
+written before the registry existed (`src/hive_fork_manager/app_registry.sql` landed in HAF
+on 2026-08-25). hivesense has adapted, but only for itself: it `app_unregister`s its own
+row *before* removing its contexts, so the registry hook finds nothing to rewrite. None of
+the four asks who owns the context. The *install* side is further along — balance_tracker
+and reputation_tracker both skip registration with
+`Context % already belongs to application %` when another application holds it, which is
+the same check haf_fyp makes in `db/register_app.sql`.
+
+Block processing refuses the same state for the same reason: `scripts/process_blocks.sh`
+will not drive a context another application owns, because two loops advancing one context
+pointer lose blocks for both.
+
 ```bash
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
   stop haf-fyp-sync haf-fyp-ranker haf-fyp-api haf-fyp-postgrest
