@@ -1013,6 +1013,56 @@ the work up regardless.
 | T-0.7 — community custom_json format | ✅ Resolved | Double-encoded JSON array `["subscribe", {"community": "hive-NNNNNN"}]`; account from `required_posting_auths[0]` |
 | T-0.1 — HiveSense table and column names | ✅ Resolved | Live: `hivesense_app.posts_vectors.embedding halfvec(1024)`, keyed by **hivemind post id** (`hive_posts.id`), one row per chunk. haf_fyp's own post_id keyspace does not overlap, so the ranker bridges via (author, permlink) → hivemind → hivesense and averages chunks |
 
+## Checking that the pinned images still exist
+
+`scripts/check_pinned_images.sh` resolves every image the compose files **pull** —
+`docker/docker-compose.yml` and `docker/docker-compose-ci.yml`, through `docker/.env` — and
+fails when one of them no longer exists in its registry.
+
+```bash
+sh scripts/check_pinned_images.sh
+# sha256:1b1d9202... registry.gitlab.syncad.com/hive/haf:1.29.0-rc2
+# sha256:729bf65c... postgrest/postgrest:v12.2.3
+# ...
+```
+
+Needs `docker` (the CLI, with the buildx plugin) and `jq`. It needs **no docker daemon** and
+**no login**: `docker buildx imagetools inspect` talks to the registry itself, and these are
+public repositories. Authenticating would be worse than not checking, because it would keep
+the check green for a repository that has become unreadable to anyone without our
+credentials.
+
+Nothing else notices a dead pin. `compose-validate` runs `docker compose config`, which
+parses YAML and never contacts a registry — and deliberately uses placeholder values, since
+a lane that cannot pull cannot tell a good reference from a dead one. `docker-compose-ci.yml`
+runs plain PostgreSQL with pgvector, so no test lane pulls HAF at all. The guards in
+`tests/unit/test_compose_contract.py` are offline by design: they keep the reference in the
+shape that resolved when it was last run. That combination is how
+[#56](https://gitlab.syncad.com/hive/haf_fyp/-/issues/56) lived — the stack asked for an
+image path nobody had ever published, and every pipeline stayed green until an operator hit
+it on a cold cache.
+
+### The scheduled lane
+
+CI runs it as `registry-resolution`, **on a schedule only**
+([#63](https://gitlab.syncad.com/hive/haf_fyp/-/issues/63)). Whether a tag still exists is a
+question whose answer changes without anyone touching this repository, so a merge request is
+the wrong moment to ask it and the wrong thing to block on a registry being reachable.
+
+Create it under **Settings → CI/CD → Pipeline schedules** on the default branch; a daily or
+weekly cadence is plenty. Nothing else in `.gitlab-ci.yml` runs in that pipeline — every
+other lane carries `.standard-rules`, whose first rule is `$CI_PIPELINE_SOURCE ==
+"schedule" → when: never`. That rule is load-bearing rather than tidy: a scheduled pipeline
+runs *on a branch*, so it sets `CI_COMMIT_BRANCH`, and a schedule on `develop` would
+otherwise match every lane's `$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH` — running the three
+`docker-build` jobs on a timer, republishing `:<short-sha>` and `:develop` from unchanged
+source, and moving the very digests this lane exists to watch.
+
+The job prints the **manifest-list digest** next to each reference, which is what
+`docker pull` records. A tag that is re-pointed upstream still resolves — `stable` was
+re-pointed without its `created_at` moving — so the digest is what makes that visible as a
+change between runs rather than another green tick.
+
 ## Running Tests
 
 ```bash

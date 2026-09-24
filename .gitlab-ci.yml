@@ -12,6 +12,22 @@ stages:
     paths:
       - .pip-cache/
 
+# The rules every lane below carries, as one definition rather than ten copies -- because
+# they now have to say something they did not before.
+#
+# A SCHEDULED pipeline runs on a branch, so it sets CI_COMMIT_BRANCH, and a schedule on
+# develop makes `$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH` TRUE. Without the first rule,
+# creating the schedule this MR adds would run the ENTIRE pipeline every time -- every lint,
+# every test, and all three docker-build jobs, which push `:<short-sha>` and `:develop`. That
+# would republish images from unchanged source and move the very digests registry-resolution
+# exists to watch, on a timer, for nothing. `when: never` first, because the first matching
+# rule decides.
+.standard-rules: &standard_rules
+  - if: $CI_PIPELINE_SOURCE == "schedule"
+    when: never
+  - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
 sql-lint:
   stage: lint
   image: python:3.12-slim
@@ -29,9 +45,7 @@ sql-lint:
     # Excluding the layout rules keeps the parse check and every rule about meaning --
     # which is what would catch a broken predicate. db/ and endpoints/ stay strict.
     - sqlfluff lint scripts/ docker/ --dialect postgres --exclude-rules LT01,LT02,LT14
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *standard_rules
 
 shell-lint:
   stage: lint
@@ -50,9 +64,7 @@ shell-lint:
     # on ALL-CAPS names, and that edit has been reverted. The scope widening is worth
     # keeping on its own terms; it is future coverage, not a fix.
     - find scripts/ docker/ -name "*.sh" -exec shellcheck --severity=warning {} +
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *standard_rules
 
 python-lint:
   extends: .python-cache
@@ -68,9 +80,7 @@ python-lint:
     - pip install ruff==0.15.12 mypy types-redis -q
     - ruff check haf_fyp/
     - mypy haf_fyp/ --ignore-missing-imports
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *standard_rules
 
 hadolint:
   stage: lint
@@ -78,9 +88,7 @@ hadolint:
   image: hadolint/hadolint:v2.12.0-alpine
   script:
     - hadolint Dockerfile.python Dockerfile.sql Dockerfile.rewriter
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *standard_rules
 
 compose-validate:
   stage: lint
@@ -90,16 +98,47 @@ compose-validate:
     # contacts a registry, and the compose file interpolates every ${VAR} it names. They
     # are deliberately NOT the values docker/.env ships -- a lane that cannot pull cannot
     # tell a good reference from a dead one, which is how #56 stayed green here. The pin
-    # itself is checked offline by tests/unit/test_compose_contract.py.
+    # itself is checked offline by tests/unit/test_compose_contract.py, and whether it still
+    # RESOLVES by the scheduled registry-resolution job below (#63). The three are
+    # complements, not duplicates: syntax here, shape and release floor there, existence
+    # against the real registry on a timer.
     HAF_REGISTRY: "registry.example.com"
     HAF_VERSION: "latest"
     POSTGREST_VERSION: "latest"
     FYP_ADMIN_API_KEY: "dummy"
   script:
     - docker compose -f docker/docker-compose.yml config --quiet
+  rules: *standard_rules
+
+# Does what compose-validate CANNOT, and the two are complements, not duplicates.
+# compose-validate parses YAML with placeholder values and never contacts a registry; this
+# resolves the values docker/.env actually ships, against the real registries. #56 was green
+# in the first and would have been red here on the day it was written.
+#
+# SCHEDULED, not per-MR. The question -- "does this tag still exist?" -- has an answer that
+# changes without anyone touching this repository, so an MR is the wrong moment to ask it and
+# the wrong thing to block on a registry being reachable. Set the schedule up in
+# Settings > CI/CD > Schedules on the default branch; nothing else in this file runs there
+# (see .standard-rules).
+#
+# NO dind service and NO docker login, both verified in this exact image:
+# `docker buildx imagetools inspect` is client-side, so it resolves manifests with `docker
+# info` failing, and these are public repositories. Authenticating would mask a repository
+# that has become unreadable to anyone without our credentials -- which is a real way for an
+# operator's pull to break while CI stays green.
+#
+# allow_failure is deliberately ABSENT. A registry hiccup turning this pipeline red on a timer
+# is the intended cost: a check that cannot fail is what #56 already had.
+registry-resolution:
+  stage: lint
+  image: docker:24
+  before_script:
+    - apk add --no-cache jq
+  script:
+    - sh scripts/check_pinned_images.sh
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - when: never
 
 openapi-drift:
   stage: lint
@@ -200,9 +239,7 @@ openapi-drift:
       sys.exit(1 if errs else 0)
       PYEOF
     - echo "served OpenAPI document is valid."
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *standard_rules
 
 python-tests:
   extends: .python-cache
@@ -226,9 +263,7 @@ python-tests:
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends git >/dev/null
     - pip install -r requirements.txt pytest pytest-cov httpx pyyaml -q
     - PYTHONPATH=. pytest tests/unit/ -v -rfEs --cov=haf_fyp --cov-report=term-missing --cov-fail-under=40
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *standard_rules
 
 fastapi-tests:
   extends: .python-cache
@@ -285,9 +320,7 @@ fastapi-tests:
     - 'echo "  fastapi_url: $FASTAPI_URL" >> /tmp/tavern_cfg.yaml'
     - 'echo "  api_url: $API_URL" >> /tmp/tavern_cfg.yaml'
     - PYTHONPATH=. pytest tests/tavern/test_fastapi_endpoints.tavern.yaml --tavern-global-cfg=/tmp/tavern_cfg.yaml -v
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *standard_rules
 
 postgrest-tests:
   stage: test
@@ -313,9 +346,7 @@ postgrest-tests:
     # container, and a non-zero here would skip the `down -v` below.
     - docker compose -f docker/docker-compose-ci.yml logs haf-fyp-postgrest-rewriter || true
     - docker compose -f docker/docker-compose-ci.yml down -v
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *standard_rules
 
 .docker-build:
   stage: build
@@ -333,9 +364,7 @@ postgrest-tests:
     DOCKER_TLS_CERTDIR: "/certs"
   before_script:
     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *standard_rules
 
 # Push only from the default branch. Merge-request pipelines still BUILD -- that is
 # what catches a broken Dockerfile before review -- but publishing every MR commit
