@@ -1015,9 +1015,16 @@ the work up regardless.
 
 ## Checking that the pinned images still exist
 
-`scripts/check_pinned_images.sh` resolves every image the compose files **pull** —
-`docker/docker-compose.yml` and `docker/docker-compose-ci.yml`, through `docker/.env` — and
-fails when one of them no longer exists in its registry.
+`scripts/check_pinned_images.sh` resolves every image this repository pins — everything the
+compose files **pull** (`docker/docker-compose.yml` and `docker/docker-compose-ci.yml`,
+through `docker/.env`), plus every `FROM` in `Dockerfile.*` — and fails when one of them no
+longer exists in its registry. Ten references today.
+
+It distinguishes **a pin that is gone** from **a registry that would not say**. Docker Hub
+rate-limits anonymous requests per source IP, which a shared CI runner reaches routinely, and
+reporting a 429 as "this pin is dead" sends someone to change a perfectly good pin. The
+former exits 1; the latter is retried, then reported as `INCONCLUSIVE` and exits 75, which
+the CI lane treats as a warning.
 
 ```bash
 sh scripts/check_pinned_images.sh
@@ -1026,11 +1033,16 @@ sh scripts/check_pinned_images.sh
 # ...
 ```
 
-Needs `docker` (the CLI, with the buildx plugin) and `jq`. It needs **no docker daemon** and
-**no login**: `docker buildx imagetools inspect` talks to the registry itself, and these are
-public repositories. Authenticating would be worse than not checking, because it would keep
-the check green for a repository that has become unreadable to anyone without our
-credentials.
+Needs `docker` (the CLI, with the buildx and compose plugins) and `jq`. It needs **no docker
+daemon** and **no login**: `docker buildx imagetools inspect` talks to the registry itself,
+and these are public repositories. Authenticating would be worse than not checking, because
+it would keep the check green for a repository that has become unreadable to anyone without
+our credentials.
+
+It also unsets the env file's own keys before calling compose. Compose reads the **shell
+environment in preference to `--env-file`** (this file says so under `HAF_VERSION`), so
+without that a CI/CD variable named `HAF_VERSION` would silently redirect the check away from
+the pin the repository actually ships.
 
 Nothing else notices a dead pin. `compose-validate` runs `docker compose config`, which
 parses YAML and never contacts a registry — and deliberately uses placeholder values, since
@@ -1050,9 +1062,13 @@ question whose answer changes without anyone touching this repository, so a merg
 the wrong moment to ask it and the wrong thing to block on a registry being reachable.
 
 Create it under **Settings → CI/CD → Pipeline schedules** on the default branch; a daily or
-weekly cadence is plenty. Nothing else in `.gitlab-ci.yml` runs in that pipeline — every
-other lane carries `.standard-rules`, whose first rule is `$CI_PIPELINE_SOURCE ==
-"schedule" → when: never`. That rule is load-bearing rather than tidy: a scheduled pipeline
+weekly cadence is plenty. To exercise the job without waiting for a tick, run a pipeline with
+`RUN_REGISTRY_RESOLUTION=true`.
+
+Nothing else in `.gitlab-ci.yml` runs in a scheduled pipeline — every other lane carries
+`.standard-rules`, whose first rule is `$CI_PIPELINE_SOURCE == "schedule" → when: never`, and
+`publish_tag` carries the same exclusion of its own because a schedule may target a **tag**,
+where it would otherwise re-publish a release from unchanged source on a timer. That rule is load-bearing rather than tidy: a scheduled pipeline
 runs *on a branch*, so it sets `CI_COMMIT_BRANCH`, and a schedule on `develop` would
 otherwise match every lane's `$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH` — running the three
 `docker-build` jobs on a timer, republishing `:<short-sha>` and `:develop` from unchanged

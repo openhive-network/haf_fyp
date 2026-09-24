@@ -118,8 +118,10 @@ compose-validate:
 # SCHEDULED, not per-MR. The question -- "does this tag still exist?" -- has an answer that
 # changes without anyone touching this repository, so an MR is the wrong moment to ask it and
 # the wrong thing to block on a registry being reachable. Set the schedule up in
-# Settings > CI/CD > Schedules on the default branch; nothing else in this file runs there
-# (see .standard-rules).
+# Settings > CI/CD > Schedules on the default branch. Nothing else in this file runs in a
+# scheduled pipeline: every other lane carries .standard-rules, and publish_tag -- which is
+# not a branch lane and so does not -- carries the same exclusion of its own, because a
+# schedule may target a TAG.
 #
 # NO dind service and NO docker login, both verified in this exact image:
 # `docker buildx imagetools inspect` is client-side, so it resolves manifests with `docker
@@ -132,12 +134,42 @@ compose-validate:
 registry-resolution:
   stage: lint
   image: docker:24
+  # Cancellable, like .docker-build. This project has auto-cancel-redundant-pipelines on, and
+  # GitLab only collects a pipeline whose jobs are ALL interruptible -- one job defaulting to
+  # false is enough to pin a whole scheduled pipeline in place.
+  interruptible: true
+  # The script gives each reference 60s and three tries, so a healthy run is well inside this.
+  # Without it the ceiling is the project default, an hour, and a registry that accepts the
+  # connection and never answers would hold a shared runner for all of it, unattended.
+  timeout: 10m
+  # Infrastructure only, and the same single reason publish_tag uses. A registry that answers
+  # "gone" is not retried here: the script already retries anything it could not classify, and
+  # re-running the whole job on a real failure would print the same dead pin three times.
+  # Both stuck_or_timeout_failure and job_execution_timeout are reported deprecated by this
+  # GitLab's linter, and a timeout is already covered by the script's own per-reference
+  # `timeout` plus the job `timeout` above -- so neither is worth a deprecation warning.
+  retry:
+    max: 2
+    when: runner_system_failure
   before_script:
     - apk add --no-cache jq
   script:
     - sh scripts/check_pinned_images.sh
+  # NARROW, not blanket. 75 is what the script exits when a registry would not say whether a
+  # tag exists -- a Docker Hub 429 against a shared runner's IP, say -- as opposed to saying
+  # it is gone. That shows as a warning rather than an accusation; a dead pin still exits 1
+  # and still fails the pipeline. `allow_failure: true` would make the lane decorative, which
+  # is what #56 already had.
+  allow_failure:
+    exit_codes:
+      - 75
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
+    # An on-demand hatch, because otherwise this job's FIRST EVER run would be a cron tick on
+    # develop after merge: "Run pipeline" creates a `web` pipeline, not a `schedule` one, so
+    # without this there is no way to exercise it -- and the debug loop for a lane that fails
+    # in a way only the real registry shows would be edit, merge, wait a day.
+    - if: $RUN_REGISTRY_RESOLUTION == "true"
     - when: never
 
 openapi-drift:
@@ -638,6 +670,14 @@ publish_tag:
   # hive/haf_api_node, which drives the release sweep, carries both spellings today
   # (`1.28.6-rc10` and `v1.28.6-rc11`), so both have to publish here.
   rules:
+    # A GitLab pipeline schedule can target a TAG, not only a branch -- so this lane needs the
+    # same exclusion .standard-rules carries, and for a sharper reason than the others: a
+    # schedule pointed at a release tag would re-pull `:<short-sha>` and re-push all three
+    # `:<tag>` images on a timer, republishing a release from unchanged source. Found by
+    # review; an earlier revision of #63 asserted "nothing else in this file runs there",
+    # which was true only for a BRANCH schedule.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
     # The escape hatch haf_stats' publish lane carries: a tag that should not be
     # published can be stopped by re-running the pipeline with SKIP_DOCKER_PUBLISH set,
     # rather than by racing to cancel the job.

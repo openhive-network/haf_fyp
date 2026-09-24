@@ -21,8 +21,6 @@ it. Teaching it new syntax there teaches it here.
 
 from __future__ import annotations
 
-import re
-
 import pytest
 
 from .test_publish_tag_lane import (
@@ -60,12 +58,34 @@ def _mr_pipeline() -> dict:
                      CI_COMMIT_REF_NAME="feature/x")
 
 
-def _runs(ci: dict, name: str, env: dict) -> bool:
+# The keys registry-resolution may carry, in the spirit of test_publish_tag_lane's JOB_KEYS:
+# anything else -- `extends`, `needs`, `variables`, `when`, `dependencies`, `services` -- can
+# change whether or how the job runs in ways nothing here models, so it fails loudly rather
+# than being assumed harmless. `services` in particular would silently turn a daemon-free job
+# into the most expensive one in the file.
+JOB_KEYS = {
+    "stage", "image", "interruptible", "timeout", "retry", "before_script", "script",
+    "allow_failure", "rules",
+}
+
+# `when` values that do NOT mean "this runs by itself". `manual` is the dangerous one: it
+# creates the job and then waits for a human, so a scheduled pipeline would contain a
+# registry-resolution nobody ever presses -- "a lane that silently does not run", which is
+# #57, arriving through the front door. A review demonstrated it: both `when: manual` on the
+# job and on its schedule rule passed every test in this file before this existed.
+_NOT_AUTOMATIC = ("never", "manual", "delayed")
+
+
+def _outcome_of(ci: dict, name: str, env: dict):
     rules = _resolve(ci, name, "rules")
-    outcome = ("on_success", False) if rules is None else _outcome(
-        rules, env, _resolve(ci, name, "when") or "on_success"
-    )
-    return outcome not in (None, ("never", False))
+    if rules is None:
+        return (_resolve(ci, name, "when") or "on_success", False)
+    return _outcome(rules, env, _resolve(ci, name, "when") or "on_success")
+
+
+def _runs(ci: dict, name: str, env: dict) -> bool:
+    outcome = _outcome_of(ci, name, env)
+    return outcome is not None and outcome[0] not in _NOT_AUTOMATIC
 
 
 def _running(env: dict) -> set:
@@ -78,9 +98,17 @@ def _running(env: dict) -> set:
 # --------------------------------------------------------------------------------------
 
 def test_a_scheduled_pipeline_runs_this_job():
+    """And runs it BY ITSELF -- the outcome is asserted exactly, not merely "not never".
+
+    `when: manual` creates the job and waits for a human who is not there at 03:00. An
+    earlier version of this file accepted that, because it only excluded ("never", False).
+    """
     assert JOB in _running(_schedule_pipeline()), (
         "the scheduled check does not run on a schedule, so it answers nothing -- a lane "
         "that silently does not run is #57"
+    )
+    assert _outcome_of(_ci(), JOB, _schedule_pipeline()) == ("on_success", False), (
+        "the job is created on a schedule but does not start on its own"
     )
 
 
@@ -185,33 +213,140 @@ def test_it_does_not_authenticate():
         )
 
 
-def test_it_is_allowed_to_fail_the_pipeline():
-    """allow_failure would make it decorative -- a check that cannot fail is what #56 had."""
+def test_a_dead_pin_still_fails_the_pipeline():
+    """A blanket allow_failure would make the lane decorative -- what #56 already had.
+
+    The one permitted form is the NARROW one: `exit_codes: [75]`, which the script exits when
+    a registry would not say whether a tag exists (a Docker Hub 429 against a shared runner's
+    IP, say). That shows as a warning. A pin that is genuinely gone exits 1, which this form
+    does not excuse.
+    """
     job = _ci()[JOB]
-    assert job.get("allow_failure") in (None, False), (
-        "registry-resolution sets allow_failure: %r, so a dead pin leaves the pipeline "
-        "green and nobody is told" % (job.get("allow_failure"),)
+    allowed = job.get("allow_failure")
+    assert allowed is not True, (
+        "registry-resolution sets allow_failure: true, so a dead pin leaves the pipeline "
+        "green and nobody is told"
     )
-    rules = _resolve(_ci(), JOB, "rules")
-    for rule in rules:
+    if allowed not in (None, False):
+        assert isinstance(allowed, dict) and set(allowed) == {"exit_codes"}, (
+            "allow_failure is %r; the only form this suite models is exit_codes" % (allowed,)
+        )
+        codes = allowed["exit_codes"]
+        codes = [codes] if isinstance(codes, int) else list(codes)
+        assert 1 not in codes, (
+            "exit code 1 is excused, which is the code the script uses for a pin that is "
+            "genuinely gone -- the failure this lane exists to report"
+        )
+        assert codes == [75], (
+            "allow_failure excuses %r; 75 is the script's 'the registry would not say', and "
+            "nothing else should be forgiven here" % (codes,)
+        )
+    for rule in _resolve(_ci(), JOB, "rules"):
         assert rule.get("allow_failure") in (None, False), (
             "a rule sets allow_failure on registry-resolution: %r" % (rule,)
         )
 
 
-def test_the_shared_rules_are_one_definition():
+def test_a_schedule_pointed_at_a_tag_does_not_republish_a_release():
+    """GitLab schedules can target a TAG, and publish_tag is not a branch lane.
+
+    Without its own exclusion, a schedule on a release tag re-pulls `:<short-sha>` and
+    re-pushes all three `:<tag>` images on a timer, republishing a release from unchanged
+    source. Found by review, after this file's comment claimed no such thing could run.
+    """
+    ci = _ci()
+    tag_schedule = _pipeline(CI_PIPELINE_SOURCE="schedule", CI_COMMIT_TAG="1.29.0-rc2",
+                             CI_COMMIT_REF_NAME="1.29.0-rc2", CI_COMMIT_REF_PROTECTED="false")
+    running = {name for name, _ in _jobs(ci) if _runs(ci, name, tag_schedule)}
+    assert running == {JOB}, (
+        "a scheduled pipeline on a tag also runs %s" % sorted(running - {JOB})
+    )
+
+
+def test_no_lane_carries_a_private_copy_of_the_shared_rules():
     """Ten copies is how one of them silently drifts.
 
-    This is not style: the schedule exclusion is only correct if EVERY lane has it, and the
-    anchor is what makes "every" true by construction rather than by review.
+    Not style: the schedule exclusion is only correct if EVERY lane has it, and the anchor is
+    what makes "every" true by construction rather than by review. Asserted on the resolved
+    rules rather than by counting text, so adding a legitimate second anchor later does not
+    false-fail this.
     """
-    text = (_ci.__globals__["CI"]).read_text(encoding="utf-8")
-    copies = len(re.findall(r'-\s*if:\s*\$CI_PIPELINE_SOURCE\s*==\s*"merge_request_event"',
-                            text))
-    assert copies == 1, (
-        "the merge-request rule is written out %d times; it was factored into "
-        "`.standard-rules` so that the schedule exclusion cannot be missed from one of "
-        "them" % copies
+    ci = _ci()
+    shared = ci[".standard-rules"]
+    offenders = []
+    for name, _ in _jobs(ci):
+        rules = _resolve(ci, name, "rules")
+        if not rules or name == JOB:
+            continue
+        if rules is not shared and rules == shared:
+            offenders.append(name)          # same content, separate object: a copy
+        elif rules is not shared and any(
+                r.get("if") == '$CI_PIPELINE_SOURCE == "merge_request_event"' for r in rules):
+            offenders.append(name)
+    assert not offenders, (
+        "%s write out the standard rules instead of aliasing `.standard-rules`; the schedule "
+        "exclusion has to be in one place or it will be missed from one of them"
+        % sorted(offenders)
+    )
+
+
+def test_the_on_demand_hatch_works_and_is_off_by_default():
+    """Without it the job's first run would be a cron tick on develop after merge.
+
+    "Run pipeline" creates a `web` pipeline, not a `schedule` one, so with only the schedule
+    rule there is no way to exercise this before merging -- and the debug loop for a lane that
+    only fails against a real registry would be edit, merge, wait a day.
+    """
+    ci = _ci()
+    on_demand = _pipeline(CI_PIPELINE_SOURCE="web", CI_COMMIT_BRANCH="develop",
+                          CI_COMMIT_REF_NAME="develop", RUN_REGISTRY_RESOLUTION="true")
+    assert _runs(ci, JOB, on_demand), "the on-demand hatch does not start the job"
+    plain_web = _pipeline(CI_PIPELINE_SOURCE="web", CI_COMMIT_BRANCH="develop",
+                          CI_COMMIT_REF_NAME="develop")
+    assert not _runs(ci, JOB, plain_web), (
+        "pressing Run pipeline starts the registry check without being asked to"
+    )
+    # And the hatch must not drag the rest of the pipeline along on a schedule.
+    with_var_on_schedule = _schedule_pipeline()
+    with_var_on_schedule["RUN_REGISTRY_RESOLUTION"] = "true"
+    running = {name for name, _ in _jobs(ci) if _runs(ci, name, with_var_on_schedule)}
+    assert running == {JOB}, sorted(running)
+
+
+def test_a_workflow_that_excludes_schedules_is_not_invisible():
+    """A `workflow:` kills the pipeline whole, and job rules cannot see it.
+
+    test_publish_tag_lane carries this guard for tag pipelines; the model was imported here
+    without it, and a review showed a four-line `workflow:` excluding schedules passing all
+    fourteen tests while no scheduled pipeline would exist at all.
+    """
+    ci = _ci()
+    workflow = ci.get("workflow")
+    if workflow is None or "rules" not in workflow:
+        return
+    outcome = _outcome(workflow["rules"], _schedule_pipeline())
+    assert outcome is not None and outcome[0] not in _NOT_AUTOMATIC, (
+        "a workflow: was added that does not admit scheduled pipelines, so none is created "
+        "and the registry check never runs -- the shape of #57"
+    )
+
+
+def test_an_include_would_hide_rules_from_this_model():
+    """Same class: an `include:` can bring in rules, defaults or a workflow nothing here reads."""
+    assert "include" not in _ci(), (
+        "an include: was added; this suite reasons only about what is in this file, so it "
+        "can no longer tell whether the scheduled lane runs"
+    )
+
+
+def test_the_job_uses_only_keys_this_suite_models():
+    """Fail closed, as the release lane does. `services:` alone would change what this costs."""
+    job = _ci()[JOB]
+    unknown = set(job) - JOB_KEYS
+    assert not unknown, (
+        "%s now uses %s, which this suite does not model -- teach it, because each of those "
+        "can stop the job, change when it starts, or change what it is allowed to do"
+        % (JOB, sorted(unknown))
     )
 
 
