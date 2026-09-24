@@ -234,7 +234,12 @@ def test_git_hash_reaches_the_build(host):
         git = ["git", "-C", str(host.repo), "-c", "user.name=t", "-c", "user.email=t@t"]
         subprocess.run([*git, "init", "-q"], check=True)
         subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "x"], check=True)
-        head = subprocess.run([*git, "rev-parse", "--short=8", "HEAD"], capture_output=True, text=True).stdout.strip()
+        # The same spelling the script uses, for the same reason (#70): --short=8 is a
+        # floor, so computing the expected value that way would agree with a script
+        # that had drifted back to it, and disagree with a correct one in any clone
+        # where the eight-character prefix is ambiguous.
+        head = subprocess.run([*git, "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()[:8]
         host2 = Host(host.repo.parent / "second", host.bash)
         host2.repo = host.repo
         host2.script, host2.workdir, host2.env_file = host.script, host.workdir, host.env_file

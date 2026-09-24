@@ -310,14 +310,18 @@ cp docker/.env docker/.env.local
 # leaving FYP_ADMIN_API_KEY at its shipped placeholder.
 
 # 2. Install schema (one-time)
-#    GIT_HASH is what GET /version reports. --short=8 matches CI's CI_COMMIT_SHORT_SHA,
-#    so the hash is the same width however the node was installed. Omit it and /version
-#    reports a placeholder rather than a commit.
+#    GIT_HASH is what GET /version reports. CI_COMMIT_SHORT_SHA is the first EIGHT
+#    characters of the SHA and is also the image tag, so `cut -c1-8` gives the same
+#    value however the node was installed. Do not substitute `git rev-parse --short=8`:
+#    --short=N is a minimum, not a width -- git extends the abbreviation until it is
+#    unambiguous in your clone, so it returns nine or more where that prefix collides,
+#    and the hash then matches no image for its own commit (#70). Omit GIT_HASH
+#    altogether and /version reports a placeholder rather than a commit.
 #    --build is required: GIT_HASH is a build argument baked into the image, so a plain
 #    `up` (or `run`) reuses the existing image and silently ignores a changed export.
 #    It is baked rather than passed at runtime on purpose -- the image carries the SQL,
 #    so the hash must describe the code inside it. See Dockerfile.sql.
-export GIT_HASH="$(git rev-parse --short=8 HEAD)"
+export GIT_HASH="$(git rev-parse HEAD | cut -c1-8)"
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml up --build haf-fyp-setup
 
 # 3. Start the full stack
