@@ -321,7 +321,7 @@ cp docker/.env docker/.env.local
 #    `up` (or `run`) reuses the existing image and silently ignores a changed export.
 #    It is baked rather than passed at runtime on purpose -- the image carries the SQL,
 #    so the hash must describe the code inside it. See Dockerfile.sql.
-export GIT_HASH="$(git rev-parse HEAD | cut -c1-8)"
+export GIT_HASH="$(git rev-parse --verify HEAD | cut -c1-8)"
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml up --build haf-fyp-setup
 
 # 3. Start the full stack

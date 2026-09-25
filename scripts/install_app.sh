@@ -519,7 +519,7 @@ else
     log "         GET /version will not name a commit. GIT_HASH is baked into the image"
     log "         at build time, so exporting it and re-running is NOT enough -- a plain"
     log "         'up' reuses the existing image. Rebuild:"
-    log "         GIT_HASH=\$(git rev-parse HEAD | cut -c1-8) docker compose \\"
+    log "         GIT_HASH=\$(git rev-parse --verify HEAD | cut -c1-8) docker compose \\"
     log "             --env-file docker/.env.local -f docker/docker-compose.yml \\"
     log "             up --build haf-fyp-setup"
 fi
