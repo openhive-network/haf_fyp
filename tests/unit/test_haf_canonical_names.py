@@ -6,12 +6,14 @@
 names are `hafd.*`, and the consumer was already canonical --
 `hive.app_create_context`'s parameter has always been `_stages hafd.application_stages`.
 
-Why a guard rather than just the fix: **no CI lane executes that declaration.**
-`docker/docker-compose-ci.yml` hand-applies individual `db/*.sql` files and skips
-`db/haf_fyp_app.sql`, saying so in a comment ("it calls the hive.* API the stub does not
-implement") -- see #47. `sql-lint` parses the file but resolves no types. So the shim
-spelling can come back, and the first place anyone finds out is an operator's node, during
-install, after roles and the schema exist.
+Why a guard rather than just the fix: when it was written, **no CI lane executed that
+declaration.** `docker/docker-compose-ci.yml` hand-applies individual `db/*.sql` files and
+skips `db/haf_fyp_app.sql` (#47), and `sql-lint` parses the file but resolves no types.
+Since #65 the fastapi lane does run it:
+`tests/integration/test_install_context_pointer_db.py` drives the stage declaration
+against `tests/haf_stub.sql`, which defines only the canonical names, so a shim spelling
+there now fails that lane too. This stays as the cheap static check: it needs no database,
+and it covers every file this repo ships, not only the one function that lane runs.
 
 Scope, deliberately: this is NOT an upstream-drift checker. It cannot notice HAF renaming
 or deleting something -- for that, hive/haf_stats has `scripts/check_haf_drift.sh` (323
@@ -142,7 +144,7 @@ def test_the_scan_actually_scans_something():
 
 @pytest.mark.parametrize("alias,canonical", sorted(COMPAT_ALIASES.items()))
 def test_no_haf_compatibility_aliases(alias, canonical):
-    """A shim spelling in shipped SQL is a time bomb no lane can hear ticking."""
+    """A shim spelling in shipped SQL fails only on an operator's node, at install."""
     offenders, _ = _scan(_qualified("hive", alias))
     assert not offenders, (
         f"`hive.{alias}` exists only in HAF's compatibility_with_old_haf_apps.sql; "

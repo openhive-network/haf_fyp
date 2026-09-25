@@ -62,9 +62,10 @@ ON haf_fyp_app.app_status ((TRUE));
 GRANT SELECT ON haf_fyp_app.app_status TO haf_fyp_user;
 
 -- app_version and its singleton machinery live in db/app_version.sql, loaded next by
--- scripts/install_app.sh (step 2b). Split out so the postgrest CI lane -- which cannot
--- load this file, because it calls the hive.* API the stub does not implement -- can
--- execute the shipped DDL instead of a copy of it.
+-- scripts/install_app.sh (step 2b). Split out so the postgrest CI lane -- which does not
+-- load this file -- can execute the shipped DDL instead of a copy of it. That lane could
+-- load it since #65 (tests/haf_stub.sql gained the context lifecycle); the split stays,
+-- because asserting the shipped DDL is the point of it.
 
 -- ---------------------------------------------------------------------------
 -- Lifecycle control functions
@@ -138,6 +139,51 @@ $$;
 --
 -- So: seed the pointer from app_status rather than zeroing it, and repair a lagging
 -- detached context instead of skipping it.
+
+-- ---------------------------------------------------------------------------
+-- Who else claims this context (#65)
+-- ---------------------------------------------------------------------------
+-- Returns the name of an application OTHER than haf_fyp whose registration lists this
+-- context, or NULL when nobody does. The SQL callers share it -- the pointer repair below,
+-- db/register_app.sql, and the post-install assertion in scripts/install_app.sh.
+-- scripts/process_blocks.sh still asks the same question with two inline queries of its
+-- own; those are not converged here.
+--
+-- `to_regclass`, not `to_regprocedure`: a HAF without haf#341 (1.28.7, for one; the
+-- first tag that ships it is 1.28.8-rc1) has no hafd.applications and must still install.
+-- On PostgreSQL 15 and older, to_regprocedure with a full signature RAISES rather than
+-- returning NULL when it cannot resolve the argument types (hive/haf_fyp#68); to_regclass
+-- on a table has no such failure mode. The query is a statement of its own after the
+-- early return because plpgsql plans each statement the first time it runs -- folded into
+-- one condition with the probe, it would be planned, and fail on the missing table,
+-- before the probe could short-circuit it.
+--
+-- STABLE, not IMMUTABLE: it reads a table.
+CREATE OR REPLACE FUNCTION haf_fyp_app.context_claimed_by_other_app(
+    _context text DEFAULT 'haf_fyp'
+)
+RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    _owner TEXT;
+BEGIN
+    IF to_regclass('hafd.applications') IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    SELECT a.name INTO _owner
+    FROM hafd.applications AS a
+    WHERE a.name <> 'haf_fyp'
+      AND a.contexts @> ARRAY[_context]
+    ORDER BY a.name
+    LIMIT 1;
+
+    RETURN _owner;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION haf_fyp_app.create_context_if_not_exists()
 RETURNS void
 LANGUAGE plpgsql
@@ -146,7 +192,14 @@ DECLARE
     _stages hafd.application_stages;
     _app_block int;
     _ctx_block int;
+    _claimed_by TEXT;
 BEGIN
+    -- The lock HAF's own catalog changes take (hive.app_register, hive.app_unregister,
+    -- hive.context_create and hive.context_remove among them; the pointer setter does
+    -- not). Held to the end of the transaction, so an application cannot register this
+    -- context between the ownership check below and the pointer move after it (#65).
+    PERFORM pg_advisory_xact_lock(hashtext('hive_catalog_modification'));
+
     -- LEAST(..., consistent_block) because hive.app_context_attach raises if
     -- current_block_num exceeds the consistent block, and app_next_iteration attaches on
     -- its first stage analysis -- so an over-seeded pointer would fail at run time rather
@@ -194,10 +247,49 @@ BEGIN
         RETURN;
     END IF;
 
+    -- NOT OURS TO MOVE (#65). Since haf#341 a context can belong to an APPLICATION, which
+    -- may list contexts another application created; haf#345 made the embedded
+    -- application's own re-registration a quiet no-op, which is what makes that
+    -- arrangement workable. There, this repair would move THAT application's pointer.
+    -- If its group is ['haf_fyp'] alone, the blocks jumped over are silently never
+    -- processed for it; if the group has other contexts (haf_block_explorer drives
+    -- [hafbe_app, hafbe_bal] this way), its loop stops with "Contexts ... are not
+    -- synchronized" until someone repairs the pointers by hand.
+    --
+    -- This is the earliest place it can be caught. #62's check runs after
+    -- hive.app_register, at step 10b, and scripts/process_blocks.sh's refusal runs later
+    -- still; by the time either prints a warning the pointer has already moved.
+    --
+    -- BEFORE the attached check, not after it: when the owning application is running,
+    -- its context is attached, and that branch would tell the operator to stop "the
+    -- block processor" -- which is the other application's.
+    --
+    -- A context owned by a different ROLE never reaches this point: install_app.sh step 0
+    -- refuses any haf_fyp context not owned by haf_fyp_owner. The reachable case is the
+    -- same owner role and a different APPLICATION, which is the embedded arrangement.
+    _claimed_by := haf_fyp_app.context_claimed_by_other_app('haf_fyp');
+    IF _claimed_by IS NOT NULL THEN
+        -- WARNING, not EXCEPTION, and deliberately: install_app.sh runs with
+        -- ON_ERROR_STOP=on, haf-fyp-setup is `restart: on-failure`, and haf_fyp's other
+        -- services wait on it with service_completed_successfully. Raising here would
+        -- turn "haf_fyp cannot process on this node" into a setup container restarting
+        -- forever and none of haf_fyp's services starting. It also matches what the rest
+        -- of the app does in this state: db/register_app.sql warns and returns, and
+        -- scripts/process_blocks.sh parks rather than exiting.
+        RAISE WARNING
+            'HAF context haf_fyp is at block % while app_status reports %, but the context '
+            'belongs to application %, whose driver advances it. NOT repairing: moving '
+            'another application''s pointer would skip blocks for it. haf_fyp will install '
+            'but not process -- see db/register_app.sql and scripts/process_blocks.sh.',
+            _ctx_block, _app_block, _claimed_by;
+        RETURN;
+    END IF;
+
     -- A lagging ATTACHED context means the processor is live and owns both clocks; do not
-    -- reach in. hive.app_set_current_block_num raises on an attached context anyway
-    -- ("Cannot directly set current_block_num when contexts are attached"), so this turns
-    -- an install-time exception into an actionable warning.
+    -- reach in. hive.app_set_current_block_num refuses an attached context anyway -- for a
+    -- single context the refusal reads "Contexts do not exist", which would send an
+    -- operator looking in the wrong place -- so this turns that exception into an
+    -- actionable warning.
     IF hive.app_context_is_attached('haf_fyp') THEN
         RAISE WARNING
             'HAF context haf_fyp is at block % while app_status reports %, but the '

@@ -71,10 +71,12 @@ services:
       # CI-only: lets a tavern stage drive the stub's readiness flag over HTTP so
       # the documented 503 contract is asserted rather than only described.
       - ../tests/ci_test_hooks.sql:/ci_test_hooks.sql:ro
-      # #20: the SHIPPED app_version DDL, not a copy. db/haf_fyp_app.sql cannot be loaded
-      # in this lane (it calls the hive.* API the stub does not implement), which is why
-      # this table's DDL lives in its own file -- so tests/ci_invariants.sql probes the
-      # product rather than restating its own fixture.
+      # #20: the SHIPPED app_version DDL, not a copy. This lane does not load
+      # db/haf_fyp_app.sql, which is why this table's DDL lives in its own file -- so
+      # tests/ci_invariants.sql probes the product rather than restating its own fixture.
+      # Since #65 that is a CHOICE rather than an impossibility: tests/haf_stub.sql gained
+      # the context lifecycle, and the integration lane loads db/haf_fyp_app.sql against it.
+      # The split stays regardless -- it is what lets this lane assert the shipped DDL.
       - ../db/app_version.sql:/app_version.sql:ro
       # The SAME file scripts/install_app.sh step 15 runs -- not a copy of it -- invoked here
       # with a known hash so the tavern checks can assert a concrete /version body.

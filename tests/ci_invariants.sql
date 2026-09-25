@@ -17,10 +17,11 @@
 -- and haf_stats_app.app_status carries four rows -- one of them 0, three at the tip.
 --
 -- KNOWN LIMIT, stated so nobody reads more assurance into this than it carries: this lane
--- does not load db/haf_fyp_app.sql, because that file calls the hive.* application API
--- and the stub does not implement it. So the repair logic in
--- haf_fyp_app.create_context_if_not_exists() is NOT exercised here -- it is asserted
--- against a real HAF node by scripts/install_app.sh on every deploy. What this file
+-- does not load db/haf_fyp_app.sql, so the repair logic in
+-- haf_fyp_app.create_context_if_not_exists() is NOT exercised here. It is asserted
+-- against a real HAF node by scripts/install_app.sh on every deploy, and since #65 also
+-- by tests/integration/test_install_context_pointer_db.py, which loads that file against
+-- the stub's context lifecycle and drives the function directly. What this file
 -- covers is the invariant itself: if any code path ever desyncs the two clocks in a lane
 -- that can see both, this goes red.
 

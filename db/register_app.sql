@@ -7,7 +7,7 @@
 -- assertions follow it.
 --
 -- Tolerant on purpose, in three places, and each one WARNS rather than claiming
--- success (#62): against a HAF without the registry (pre-haf#341, i.e. 1.28.x)
+-- success (#62): against a HAF without the registry (pre-haf#341, e.g. 1.28.7)
 -- it warns and returns, and scripts/process_blocks.sh probes the registry before
 -- exec'ing the driver, so such a node keeps running the legacy CALL main() loop;
 -- against a HAF that refuses the registration because another application owns
@@ -37,8 +37,9 @@ BEGIN
 
     PERFORM hive.app_register('haf_fyp', ARRAY['haf_fyp']::hive.contexts_group, 'haf_fyp_app.process_blocks');
 
-    -- app_register does not return whether it registered anything, and from
-    -- 1.29.0-rc2 it has a path that registers NOTHING and raises only a NOTICE:
+    -- app_register does not return whether it registered anything, and since haf#345
+    -- (in 1.28.8-rc1 and 1.29.0-rc2) it has a path that registers NOTHING and raises
+    -- only a NOTICE:
     -- when every one of the named contexts already belongs to another
     -- application, because that application embeds this one (haf#345 added it so
     -- an embedded app's install script can be re-run). Every other refusal in it
@@ -57,9 +58,11 @@ BEGIN
         -- `contexts @> ARRAY[c]` are the same predicate -- so today this is always the
         -- quiet path. A second context would make a PARTIAL overlap raise instead, and
         -- then this message would be the only thing that was wrong.
-        SELECT a.name INTO __taken_by
-        FROM hafd.applications AS a
-        WHERE a.name <> 'haf_fyp' AND a.contexts @> ARRAY['haf_fyp'];
+        -- "Who else claims this context" is defined in db/haf_fyp_app.sql, which step 2
+        -- loads well before this file runs at step 10b, and shared with the pointer repair
+        -- in create_context_if_not_exists() (#65) and install_app.sh's post-install
+        -- assertion, so the SQL callers cannot drift apart.
+        __taken_by := haf_fyp_app.context_claimed_by_other_app('haf_fyp');
 
         RAISE WARNING 'haf_fyp was NOT registered: context haf_fyp belongs to application %. Block processing cannot run: scripts/process_blocks.sh refuses to drive a context another application owns', COALESCE(__taken_by, '<unknown>');
         RETURN;

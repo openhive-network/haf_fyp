@@ -123,7 +123,7 @@ CREATE TABLE IF NOT EXISTS hive.ci_register_behaviour (
 );
 INSERT INTO hive.ci_register_behaviour (only_row) VALUES (TRUE) ON CONFLICT DO NOTHING;
 
-CREATE TABLE IF NOT EXISTS hive.ci_register_calls (called TEXT, arg TEXT);
+CREATE TABLE IF NOT EXISTS hive.ci_register_calls (seq BIGSERIAL, called TEXT, arg TEXT);
 
 CREATE OR REPLACE FUNCTION hive.app_register(
     -- The domain, not TEXT[]: db/register_app.sql probes for this exact signature
@@ -173,5 +173,218 @@ BEGIN
         RAISE EXCEPTION 'Application % is not registered', _name;
     END IF;
     INSERT INTO hive.ci_register_calls (called, arg) VALUES ('app_add_dependency', _depends_on);
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Context lifecycle, enough to load and run db/haf_fyp_app.sql (#65)
+-- ---------------------------------------------------------------------------
+-- Before this, no lane could load that file: install_app.sh records that the postgrest
+-- lane "does not load db/haf_fyp_app.sql, because it calls the HAF application API and
+-- tests/haf_stub.sql does not implement it". #65 puts a guard INSIDE
+-- create_context_if_not_exists(), so the guard was untestable for exactly that reason.
+-- Measured rather than guessed: the file references sixteen hafd./hive. objects outside
+-- its comments, of which hafd.contexts and hafd.applications were already here.
+--
+-- Every function here that CHANGES a context records the call, in order, so a test can
+-- assert that a path touched nothing at all -- not merely that the block number came out
+-- right.
+--
+-- STRICT WHERE HAF IS STRICT, checked against hive/haf develop src/hive_fork_manager/
+-- app_api.sql. A permissive model passed mutations that would break a real install:
+-- dropping the detach, detaching before set_non_forking, omitting _schema, asking about
+-- the wrong context. So, as in HAF:
+--   * app_create_context has no default for _schema, and the stages overload creates
+--     the context DETACHED at block 0;
+--   * app_context_set_non_forking on a forking context detaches and RE-ATTACHES it, so
+--     it must come before app_context_detach, not after;
+--   * attachment is per context (hafd.contexts_attachment), not one global flag;
+--   * app_context_is_attached, app_context_detach and app_set_current_block_num raise on
+--     a context that does not exist, and app_set_current_block_num raises on an
+--     attached one -- with HAF's own messages.
+-- The attachment table is keyed by context NAME where HAF's uses context_id; the stub's
+-- hafd.contexts has no id column.
+
+-- Guarded the way hive.contexts_group above is, and for the same reason: this file is
+-- re-executed by every test in tests/integration/ (the `conn` fixtures load it per test),
+-- and CREATE TYPE / CREATE DOMAIN have no IF NOT EXISTS.
+DO $$
+BEGIN
+    CREATE DOMAIN hafd.context_name AS TEXT;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END;
+$$;
+
+DO $$
+BEGIN
+    CREATE TYPE hafd.application_stage AS (
+        name TEXT,
+        inclusive_limit INT,
+        batch_size INT,
+        wait INTERVAL
+    );
+EXCEPTION WHEN duplicate_object THEN NULL;
+END;
+$$;
+
+DO $$
+BEGIN
+    CREATE DOMAIN hafd.application_stages AS hafd.application_stage [];
+EXCEPTION WHEN duplicate_object THEN NULL;
+END;
+$$;
+
+DO $$
+BEGIN
+    CREATE TYPE hive.blocks_range AS (
+        first_block INT,
+        last_block INT
+    );
+EXCEPTION WHEN duplicate_object THEN NULL;
+END;
+$$;
+
+-- Seeded, and seeded HIGH. create_context_if_not_exists() takes
+-- LEAST(app_status.last_processed_block, consistent_block), so an unseeded table would
+-- clamp every scenario to block 0 and the repair path -- the one #65 guards -- would never
+-- be reached. A test that needs a low consistent block sets it explicitly.
+CREATE TABLE IF NOT EXISTS hafd.hive_state (
+    consistent_block INT NOT NULL DEFAULT 0
+);
+INSERT INTO hafd.hive_state (consistent_block)
+SELECT 5000000 WHERE NOT EXISTS (SELECT 1 FROM hafd.hive_state);
+
+CREATE OR REPLACE FUNCTION hive.stage(
+    _name TEXT, _inclusive_limit INT, _batch_size INT, _wait INTERVAL
+)
+RETURNS hafd.application_stage LANGUAGE sql IMMUTABLE AS $$
+    SELECT ROW(_name, _inclusive_limit, _batch_size, _wait)::hafd.application_stage;
+$$;
+
+-- HAF's own value (hive/haf develop).
+CREATE OR REPLACE FUNCTION hafd.live_stage()
+RETURNS hafd.application_stage LANGUAGE sql IMMUTABLE AS $$
+    SELECT hive.stage('live', 0, 1, '3 seconds');
+$$;
+
+-- Defaulted FALSE, so the seeded haf_fyp row reads as what an install leaves behind: a
+-- non-forking context (create_context_if_not_exists() sets it so).
+ALTER TABLE hafd.contexts ADD COLUMN IF NOT EXISTS is_forking BOOLEAN NOT NULL DEFAULT FALSE;
+
+CREATE TABLE IF NOT EXISTS hafd.contexts_attachment (
+    context_name VARCHAR(255) PRIMARY KEY REFERENCES hafd.contexts (name) ON DELETE CASCADE,
+    is_attached BOOLEAN NOT NULL
+);
+INSERT INTO hafd.contexts_attachment (context_name, is_attached)
+SELECT name, FALSE FROM hafd.contexts WHERE name = 'haf_fyp'
+ON CONFLICT DO NOTHING;
+
+CREATE OR REPLACE FUNCTION hive.app_context_exists(_name TEXT)
+RETURNS BOOLEAN LANGUAGE sql STABLE AS $$
+    SELECT EXISTS (SELECT 1 FROM hafd.contexts WHERE name = _name);
+$$;
+
+-- The stages overload, the one db/haf_fyp_app.sql calls. HAF passes _is_attached => FALSE
+-- to hive.context_create from it, and every context starts at block 0.
+CREATE OR REPLACE FUNCTION hive.app_create_context(
+    _name hafd.context_name,
+    _schema TEXT,
+    _stages hafd.application_stages,
+    _is_forking BOOLEAN DEFAULT TRUE
+)
+RETURNS VOID LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+    -- HAF's hive.context_create runs `CREATE TABLE %I.%I (_schema, _name)`, so a schema
+    -- that does not exist fails the install there.
+    IF to_regnamespace(_schema) IS NULL THEN
+        RAISE EXCEPTION 'schema "%" does not exist', _schema;
+    END IF;
+    INSERT INTO hive.ci_register_calls (called, arg) VALUES ('app_create_context', _name);
+    INSERT INTO hafd.contexts (name, current_block_num, owner, schema, is_forking)
+    VALUES (_name::TEXT, 0, current_user, _schema, _is_forking);
+    INSERT INTO hafd.contexts_attachment (context_name, is_attached) VALUES (_name::TEXT, FALSE);
+END;
+$$;
+
+-- HAF raises 'Contexts % are not synchronized' when a context in the group does not exist
+-- (hive.app_check_contexts_synchronized counts zero rows), before anything else.
+CREATE OR REPLACE FUNCTION hive.ci_require_context(_name TEXT)
+RETURNS VOID LANGUAGE plpgsql STABLE AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM hafd.contexts WHERE name = _name) THEN
+        RAISE EXCEPTION 'Contexts {%} are not synchronized', _name;
+    END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION hive.app_context_set_non_forking(_name TEXT)
+RETURNS VOID LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+    INSERT INTO hive.ci_register_calls (called, arg) VALUES ('app_context_set_non_forking', _name);
+    -- HAF: a no-op unless some context in the group is still forking.
+    IF NOT EXISTS (SELECT 1 FROM hafd.contexts WHERE name = _name AND is_forking) THEN
+        RETURN;
+    END IF;
+    UPDATE hafd.contexts SET is_forking = FALSE WHERE name = _name;
+    -- HAF detaches to drop the reversible data and triggers, then re-attaches.
+    UPDATE hafd.contexts_attachment SET is_attached = TRUE WHERE context_name = _name;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION hive.app_context_detach(_name TEXT)
+RETURNS VOID LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+    PERFORM hive.ci_require_context(_name);
+    INSERT INTO hive.ci_register_calls (called, arg) VALUES ('app_context_detach', _name);
+    UPDATE hafd.contexts_attachment SET is_attached = FALSE WHERE context_name = _name;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION hive.app_context_is_attached(_name TEXT)
+RETURNS BOOLEAN LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    __attached BOOLEAN;
+BEGIN
+    PERFORM hive.ci_require_context(_name);
+    SELECT is_attached INTO __attached FROM hafd.contexts_attachment WHERE context_name = _name;
+    IF __attached IS NULL THEN
+        RAISE EXCEPTION 'No contexts or attached and detached contexts are present in the same group {%}', _name;
+    END IF;
+    RETURN __attached;
+END;
+$$;
+
+-- Refuses an ATTACHED context the way HAF does: its lookup joins on is_attached = FALSE,
+-- finds nothing, and reports 'Contexts do not exist' -- the message the attached branch
+-- in create_context_if_not_exists() exists to pre-empt.
+CREATE OR REPLACE FUNCTION hive.app_set_current_block_num(_name TEXT, _block INT)
+RETURNS VOID LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+    PERFORM hive.ci_require_context(_name);
+    IF NOT EXISTS (SELECT 1 FROM hafd.contexts_attachment
+                   WHERE context_name = _name AND NOT is_attached) THEN
+        RAISE EXCEPTION 'Contexts do not exist';
+    END IF;
+    INSERT INTO hive.ci_register_calls (called, arg)
+    VALUES ('app_set_current_block_num', _name || '=' || _block::TEXT);
+    UPDATE hafd.contexts SET current_block_num = _block WHERE name = _name;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION hive.app_get_current_block_num(_name TEXT)
+RETURNS INT LANGUAGE sql STABLE AS $$
+    SELECT current_block_num FROM hafd.contexts WHERE name = _name;
+$$;
+
+CREATE OR REPLACE PROCEDURE hive.app_next_iteration(
+    IN _context hafd.context_name,
+    INOUT _blocks_range hive.blocks_range,
+    IN _override_max_batch INT DEFAULT NULL,
+    IN _limit INT DEFAULT NULL
+)
+LANGUAGE plpgsql AS $$
+BEGIN
+    -- Hands out nothing: the legacy loop's body is not what these tests exercise.
+    _blocks_range := NULL;
 END;
 $$;
