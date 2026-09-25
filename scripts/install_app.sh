@@ -410,10 +410,12 @@ psql_cmd -v ON_ERROR_STOP=on -c "
 # 14. Post-install assertion that the two clocks agree. The context pointer and
 #     app_status.last_processed_block are one clock (see db/haf_fyp_app.sql), and
 #     step 10 has just run create_context_if_not_exists(), which seeds or repairs the
-#     pointer. This is the only place that repair runs against the real hive.* API --
-#     the postgrest CI lane does not load db/haf_fyp_app.sql, because it calls the HAF
-#     application API and tests/haf_stub.sql does not implement it. tests/ci_invariants.sql
-#     asserts the same invariant against the stub.
+#     pointer. This is the only place that repair runs against the REAL hive.* API; the
+#     postgrest CI lane does not load db/haf_fyp_app.sql at all, and
+#     tests/ci_invariants.sql asserts the same invariant against the stub. Since #65 the
+#     function's branches are also driven directly in
+#     tests/integration/test_install_context_pointer_db.py, against the stub's context
+#     lifecycle -- which is a model of HAF, not HAF.
 #
 #     A desynced pointer is silent by default: GET /sync-status answers HTTP 200 with
 #     {"last_block_num": 0, "last_block_time": null} because the context row exists, and
@@ -424,6 +426,7 @@ DECLARE
     __ctx int;
     __app int;
     __rows bigint;
+    __claimed_by TEXT;
 BEGIN
     SELECT count(*) INTO __rows FROM haf_fyp_app.app_status;
     IF __rows <> 1 THEN
@@ -440,7 +443,21 @@ BEGIN
         RAISE EXCEPTION 'no hafd.contexts row named haf_fyp after install';
     END IF;
 
-    IF __app > 0 AND __ctx = 0 THEN
+    -- A context another application owns is NOT ours to repair (#65), so the assertion
+    -- below would be asserting something this install deliberately did not do. Without
+    -- this branch the new guard in create_context_if_not_exists() would turn a warning
+    -- into a failed install whenever the context sits at 0 with app_status above it --
+    -- and a failed install is haf-fyp-setup restarting forever with haf_fyp's other
+    -- services waiting on it.
+    __claimed_by := haf_fyp_app.context_claimed_by_other_app('haf_fyp');
+
+    IF __claimed_by IS NOT NULL THEN
+        RAISE WARNING
+            'HAF context haf_fyp (block %) belongs to application %, so this install did '
+            'not seed or repair the pointer and the two clocks are not expected to agree '
+            '(app_status: %). haf_fyp is installed but will not process blocks.',
+            __ctx, __claimed_by, __app;
+    ELSIF __app > 0 AND __ctx = 0 THEN
         RAISE EXCEPTION
             'HAF context is at block 0 while app_status reports % processed, and '
             'create_context_if_not_exists() did not repair it. GET /sync-status would '
@@ -448,7 +465,10 @@ BEGIN
             'would replay from genesis.', __app;
     END IF;
 
-    IF abs(__ctx - __app) > 10000 THEN
+    -- Skipped when another application owns the context: the clocks are then not
+    -- expected to agree, the line above has already said so, and a second warning saying
+    -- the same thing in different words is how an operator learns to skim them.
+    IF __claimed_by IS NULL AND abs(__ctx - __app) > 10000 THEN
         RAISE WARNING
             'HAF context (%) and app_status (%) differ by more than one 10000-block '
             'batch. If the block processor is running this is an in-flight batch and '

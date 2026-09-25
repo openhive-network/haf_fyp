@@ -1,9 +1,11 @@
 -- Application version: the commit GET /version reports.
 --
 -- Split out of db/haf_fyp_app.sql so CI can actually execute it. That file calls the
--- hive.* application API, which tests/haf_stub.sql does not implement, so the postgrest
--- lane cannot load it -- and the lane was therefore asserting against a hand-copied
--- restatement of this DDL in tests/ci_setup.sql rather than against the shipped file.
+-- hive.* application API, which the postgrest lane does not load -- and the lane was
+-- therefore asserting against a hand-copied restatement of this DDL in tests/ci_setup.sql
+-- rather than against the shipped file. (Since #65 tests/haf_stub.sql does implement that
+-- API well enough to load haf_fyp_app.sql; the split remains the right shape, because it
+-- is what lets this lane assert the SHIPPED DDL rather than a copy.)
 -- tests/ci_setup.sql:124-127 forbids exactly that shape for the group memberships
 -- ("Granting it here would make that probe a restatement of its own fixture"); this file
 -- is the same rule applied to app_version. docker/docker-compose-ci.yml loads it verbatim,

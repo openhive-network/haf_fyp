@@ -63,8 +63,9 @@ SELECT TRUE, 5000000
 WHERE NOT EXISTS (SELECT 1 FROM haf_fyp_app.app_status);
 
 -- Mirrors the singleton index in db/haf_fyp_app.sql. That file is not loaded in this
--- lane (it calls the hive.* app API, which the stub does not provide), so this fixture
--- restates its DDL and must be kept in step with it.
+-- lane, so this fixture restates its DDL and must be kept in step with it. (The stub has
+-- modelled enough of the hive.* app API to load it since #65, and the fastapi lane's
+-- tests/integration/test_install_context_pointer_db.py does; this lane still does not.)
 CREATE UNIQUE INDEX IF NOT EXISTS uq_app_status_singleton
 ON haf_fyp_app.app_status ((TRUE));
 

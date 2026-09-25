@@ -26,6 +26,7 @@ import pytest
 HERE = os.path.dirname(__file__)
 REGISTER_SQL = os.path.join(HERE, "..", "..", "db", "register_app.sql")
 STUB_SQL = os.path.join(HERE, "..", "haf_stub.sql")
+APP_SQL = os.path.join(HERE, "..", "..", "db", "haf_fyp_app.sql")
 
 
 def _connect():
@@ -41,18 +42,36 @@ def _connect():
 
 @pytest.fixture()
 def conn():
+    """A transaction that is always rolled back.
+
+    Autocommit until #65, which made this fixture load db/haf_fyp_app.sql as well -- and
+    autocommit then left the haf_fyp_app schema COMMITTED in the database the tavern suite
+    uses later in the same job. Nothing here needs a commit: register_app.sql is one DO
+    block, and the one test that drops hive.app_register is undone by the rollback.
+    """
     try:
         c = _connect()
     except Exception:  # noqa: BLE001
         pytest.skip("no postgres available")
-    c.autocommit = True
-    with c.cursor() as cur:
-        cur.execute(open(STUB_SQL).read())
-        cur.execute("DELETE FROM hafd.applications")
-        cur.execute("DELETE FROM hive.ci_register_calls")
-        cur.execute("UPDATE hive.ci_register_behaviour SET registers = TRUE, paused = FALSE")
-    yield c
-    c.close()
+    c.autocommit = False
+    try:
+        with c.cursor() as cur:
+            cur.execute(open(STUB_SQL).read())
+            # db/haf_fyp_app.sql too, in the order scripts/install_app.sh loads them: it
+            # runs at step 2 and defines haf_fyp_app.context_claimed_by_other_app, which
+            # this file calls at step 10b (#65). Newly possible -- the stub gained the
+            # context lifecycle for #65, and before that this file could not be loaded in
+            # CI at all.
+            cur.execute(open(APP_SQL).read())
+            cur.execute("DELETE FROM hafd.applications")
+            cur.execute("DELETE FROM hive.ci_register_calls")
+            cur.execute("UPDATE hive.ci_register_behaviour SET registers = TRUE, paused = FALSE")
+        yield c
+    finally:
+        # Also when setup fails, so an open transaction cannot leave later tests waiting on
+        # its locks.
+        c.rollback()
+        c.close()
 
 
 def run_register(conn) -> list:
@@ -65,7 +84,7 @@ def run_register(conn) -> list:
 
 def calls(conn) -> list:
     with conn.cursor() as cur:
-        cur.execute("SELECT called, arg FROM hive.ci_register_calls ORDER BY ctid")
+        cur.execute("SELECT called, arg FROM hive.ci_register_calls ORDER BY seq")
         return cur.fetchall()
 
 
@@ -142,22 +161,18 @@ def test_a_paused_registration_says_so(conn):
 
 
 def test_a_haf_without_the_registry_is_tolerated(conn):
-    """Pre-haf#341 (1.28.x): warn, return, leave the node on the legacy loop.
+    """Pre-haf#341 (e.g. 1.28.7): warn, return, leave the node on the legacy loop.
 
     Nothing may raise here -- psql_cmd runs with ON_ERROR_STOP=on, so a raise fails the
     whole install on a HAF that is simply older than the registry.
     """
     with conn.cursor() as cur:
         cur.execute("DROP FUNCTION hive.app_register(TEXT, hive.contexts_group, TEXT, TEXT)")
-    try:
-        notices = run_register(conn)
-        assert any("registry not available" in n for n in notices), notices
-        assert not [c for c in calls(conn) if c[0] == "app_add_dependency"], notices
-        assert not any("registered in the HAF application registry" in n for n in notices), (
-            f"a HAF with no registry was told it had registered; {notices}")
-    finally:
-        with conn.cursor() as cur:
-            cur.execute(open(STUB_SQL).read())
+    notices = run_register(conn)
+    assert any("registry not available" in n for n in notices), notices
+    assert not [c for c in calls(conn) if c[0] == "app_add_dependency"], notices
+    assert not any("registered in the HAF application registry" in n for n in notices), (
+        f"a HAF with no registry was told it had registered; {notices}")
 
 
 def test_a_raising_refusal_still_fails_the_install(conn):
