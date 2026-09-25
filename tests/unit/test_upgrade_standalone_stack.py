@@ -226,6 +226,25 @@ def test_an_old_haf_on_a_hand_made_volume_moves_with_the_override(host):
     assert "HAF_FYP_HAF_DATADIR_VOLUME=hand_made" in host.env_text(), host.out
 
 
+def test_a_repository_with_no_commits_bakes_no_version(host):
+    """The one input where the two spellings disagree, and so the one test here with power.
+
+    `git rev-parse HEAD` in a repository with no commits echoes "HEAD" back on stdout
+    before failing, so `| cut -c1-8` baked the literal string "HEAD": install_app then
+    recorded it without its unset-GIT_HASH warning, and GET /version served it -- a version
+    matching no image, reached silently, which is the failure #70 exists to prevent. The
+    test beside this one cannot see it: with a single commit, every spelling agrees.
+    """
+    if not shutil.which("git"):
+        pytest.skip("git is required")
+    git = ["git", "-C", str(host.repo)]
+    subprocess.run([*git, "init", "-q"], check=True)   # a repository, and no commits
+    host.stack("docker")
+    assert host.run("--apply").returncode == 0, host.out
+    assert host.after["up_git_hash"] in ("", None), (
+        "a repository with no commits baked %r as the version" % host.after["up_git_hash"])
+
+
 def test_git_hash_reaches_the_build(host):
     host.stack("docker")
     assert host.run("--apply", env_extra={"GIT_HASH": "feedbeef"}).returncode == 0, host.out
@@ -234,7 +253,12 @@ def test_git_hash_reaches_the_build(host):
         git = ["git", "-C", str(host.repo), "-c", "user.name=t", "-c", "user.email=t@t"]
         subprocess.run([*git, "init", "-q"], check=True)
         subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "x"], check=True)
-        head = subprocess.run([*git, "rev-parse", "--short=8", "HEAD"], capture_output=True, text=True).stdout.strip()
+        # The same spelling the script uses, for the same reason (#70): --short=8 is a
+        # floor, so computing the expected value that way would agree with a script
+        # that had drifted back to it, and disagree with a correct one in any clone
+        # where the eight-character prefix is ambiguous.
+        head = subprocess.run([*git, "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()[:8]
         host2 = Host(host.repo.parent / "second", host.bash)
         host2.repo = host.repo
         host2.script, host2.workdir, host2.env_file = host.script, host.workdir, host.env_file

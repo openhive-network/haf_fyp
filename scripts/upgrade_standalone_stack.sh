@@ -509,7 +509,21 @@ AFTER_FAILURE="HAF's data is still in ${VOLUME}. Fix the cause shown above (a po
 act "clear anything a failed attempt left under project ${PROJECT}: docker compose ... down (volumes kept)" -- \
     clear_project
 if [[ -z ${GIT_HASH:-} ]]; then
-    GIT_HASH=$(git -C "${ROOT}" rev-parse --short=8 HEAD 2>/dev/null || true)
+    # cut -c1-8, not --short=8. `--short=N` is a MINIMUM: git extends the abbreviation
+    # until it is unambiguous in THIS clone, so it returns nine or more where the
+    # eight-character prefix collides. CI_COMMIT_SHORT_SHA is unconditionally the first
+    # eight characters and is also the image tag (.gitlab-ci.yml, docker build/push), so
+    # a longer value matches no image for its own commit -- which is the whole reason a
+    # width is specified here. (#70)
+    #
+    # --verify is load-bearing. Without it, `git rev-parse HEAD` in a repository with NO
+    # commits echoes the argument back ON STDOUT before exiting 128 -- its treat-as-path
+    # fallback -- so `cut` baked the literal string "HEAD" as the version, install_app
+    # recorded it without a warning, and GET /version served it. --short=N suppresses
+    # that echo, which is why the old spelling was accidentally safe here. With
+    # --verify, every failure (not a repo, unborn HEAD) yields an empty GIT_HASH, as
+    # before. (#70, caught in review.)
+    GIT_HASH=$(git -C "${ROOT}" rev-parse --verify HEAD 2>/dev/null | cut -c1-8 || true)
 fi
 export GIT_HASH
 act "build and start the stack under project ${PROJECT}: docker compose ... up -d --build ${SERVICES}" -- \
