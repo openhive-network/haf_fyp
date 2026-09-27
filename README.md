@@ -956,10 +956,16 @@ first wait is `HAF_FYP_OWNERSHIP_RETRY_SECONDS` if that is set in the block-proc
 service's `environment:` -- neither compose file passes it through, so `.env` alone does not
 set it.) If the error is a missing `haf_fyp_app.context_claimed_by_other_app()`, the database
 predates this image: re-run the install as in step 2 above (`up --build haf-fyp-setup`; in
-haf_api_node, the `haf-fyp-install` service). In both states the container's log is the
-signal. The healthcheck does not flag either during its 72-hour `start_period`, and while
-another application drives the context it does not flag it at all
-([#76](https://gitlab.syncad.com/hive/haf_fyp/-/issues/76)).
+haf_api_node, the `haf-fyp-install` service). In both states the container's log says why,
+and so does its healthcheck ([#76](https://gitlab.syncad.com/hive/haf_fyp/-/issues/76)): it
+fails with the reason ("parked: …" or "waiting: …"), whatever the context's heartbeat says —
+another application driving the context keeps that fresh. Docker does not count failures
+during the 72-hour `start_period` until a check first succeeds, and a parked container's
+never does, so for those 72 hours it shows `health: starting` rather than `unhealthy`; the
+reason is in `docker inspect --format '{{json .State.Health}}'`. Docker's health is the
+only signal for a park: `/sync-status` and haf_api_node's HAProxy agent-check read the
+context's block pointer, which the owning application keeps advancing, so they stay
+green, and haf_api_node's `stack_status.sh` lists a `health: starting` container as `up`.
 
 ```bash
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml \

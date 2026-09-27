@@ -78,6 +78,7 @@ def make_psql(tmp_path, registry: str = "t", taken_by: str | None = None,
     suffix = '" #$n"' if varying_error else ""
     ownership = (
         '  *"context_claimed_by_other_app"*)\n'
+        f'    cat "$HAF_FYP_PARKED_FILE" >> "{(tmp_path / "parked_at_probe.log").as_posix()}" 2>/dev/null\n'
         f'    n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "{counter}"\n'
         f'    if [ "$n" -le {fails} ]; then echo {ownership_error!r}{suffix} >&2; exit 2; fi\n'
         '    if [ -n "$bare" ]; then\n'
@@ -173,8 +174,27 @@ def _run_in_group(cmd, env):
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
+def reason_in(path: Path, starts: str, contains: str = "", seconds: float = 5.0) -> str:
+    """The reason file's content once it starts with `starts` (and holds `contains`).
+    Polled: the log line a test waits for is printed before the write."""
+    deadline = time.time() + seconds
+    text = ""
+    while time.time() < deadline:
+        text = path.read_text() if path.exists() else ""
+        if text.startswith(starts) and contains in text:
+            return text
+        time.sleep(0.05)
+    raise AssertionError(f"reason never became {starts!r}...{contains!r}; last: {text!r}")
+
+
+def parked_file(tmp_path) -> Path:
+    """Where these runs write "not processing, and why" (#76) -- never the host's /tmp."""
+    return tmp_path / "parked.txt"
+
+
 def run(bash, tmp_path, *args: str, startup_file: Path | None = None):
     env = clean_env(stub_bin(tmp_path))
+    env["HAF_FYP_PARKED_FILE"] = str(parked_file(tmp_path))
     if startup_file is not None:
         env["HAF_FYP_STARTUP_TIME_FILE"] = str(startup_file)
     return _run_in_group([bash, str(SCRIPT), *args], env)
@@ -340,6 +360,7 @@ def make_driver_stub(tmp_path) -> Path:
         "#!/bin/sh\n"
         f'printf "%s\\n" "$*" >> "{argv_log.as_posix()}"\n'
         f'cat "${{HAF_FYP_STARTUP_TIME_FILE:-/tmp/block_processing_startup_time.txt}}" >> "{(tmp_path / "marker_at_exec.log").as_posix()}" 2>/dev/null\n'
+        f'if [ -e "$HAF_FYP_PARKED_FILE" ]; then echo present; else echo absent; fi > "{(tmp_path / "parked_at_exec.log").as_posix()}"\n'
         "exit 0\n",
     )
     return argv_log
@@ -347,6 +368,7 @@ def make_driver_stub(tmp_path) -> Path:
 
 def run_env(bash, tmp_path, *args: str, startup_file=None, extra_env=None):
     env = clean_env(stub_bin(tmp_path))
+    env["HAF_FYP_PARKED_FILE"] = str(parked_file(tmp_path))
     if startup_file is not None:
         env["HAF_FYP_STARTUP_TIME_FILE"] = str(startup_file)
     if extra_env:
@@ -356,7 +378,8 @@ def run_env(bash, tmp_path, *args: str, startup_file=None, extra_env=None):
 
 def run_until_parked(bash, tmp_path, extra_env=None, seconds: int = 10,
                      marker: str = "belongs to application", min_ownership_calls: int = 0,
-                     linger: float = 0.0) -> str:
+                     linger: float = 0.0, script: Path = SCRIPT,
+                     parked_env: bool = True) -> str:
     """Run the script expecting it NOT to finish, and return what it printed (#62).
 
     To a FILE, never a pipe: the script parks in `while true; do sleep ...; done`, and
@@ -371,11 +394,13 @@ def run_until_parked(bash, tmp_path, extra_env=None, seconds: int = 10,
     """
     env = clean_env(stub_bin(tmp_path))
     env["HAF_FYP_STARTUP_TIME_FILE"] = str(tmp_path / "startup.txt")
+    if parked_env:
+        env["HAF_FYP_PARKED_FILE"] = str(parked_file(tmp_path))
     if extra_env:
         env.update(extra_env)
     out = tmp_path / "parked.log"
     with out.open("w") as sink:
-        proc = subprocess.Popen([bash, str(SCRIPT)], env=env, stdout=sink,
+        proc = subprocess.Popen([bash, str(script)], env=env, stdout=sink,
                                 stderr=subprocess.STDOUT, text=True, start_new_session=True)
         calls = tmp_path / "ownership_calls"
         try:
@@ -414,6 +439,7 @@ def test_stopping_the_legacy_loop_cancels_its_statement(bash, tmp_path):
     sql = make_psql(tmp_path, registry="f", blocking_main=True)
     env = clean_env(stub_bin(tmp_path))
     env["HAF_FYP_STARTUP_TIME_FILE"] = str(tmp_path / "startup.txt")
+    env["HAF_FYP_PARKED_FILE"] = str(parked_file(tmp_path))
     proc = subprocess.Popen([bash, str(SCRIPT)], env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, start_new_session=True)
     try:
@@ -558,8 +584,8 @@ def test_the_legacy_loop_is_refused_on_a_context_another_application_owns(bash, 
     can be re-run), which is why the refusal has to be here.
 
     It parks rather than exits: this is PID 1 under `restart: unless-stopped`, and a
-    non-zero exit is an indefinite crash loop. (The healthcheck does not report the park
-    either -- see #76 -- so the ERROR lines are the signal.)
+    non-zero exit is an indefinite crash loop. (It reports the park through the
+    healthcheck instead -- #76, tested below.)
     """
     sql = make_psql(tmp_path, registry="f", taken_by="embedding_app")
     argv_log = make_driver_stub(tmp_path)
@@ -780,3 +806,152 @@ def test_the_probe_names_the_relation_in_a_statement_of_its_own(bash, tmp_path):
     assert len(statements) == 2, statements
     assert "FROM hafd.applications" not in statements[0]
     assert "to_regclass" not in statements[1]
+
+
+# --- a processor that will not process says so to the healthcheck (#76) -------------
+#
+# The healthcheck's heartbeat is per CONTEXT: while another application drives haf_fyp,
+# that application's loop keeps last_active_at fresh, so a parked container passed the
+# check it was parked for. Every refusal path now leaves its reason in a file the check
+# reads first.
+
+
+def test_a_parked_processor_leaves_its_reason(bash, tmp_path):
+    make_psql(tmp_path, registry="f", taken_by="embedding_app")
+    run_until_parked(bash, tmp_path, linger=0.5)
+    reason_in(parked_file(tmp_path), "parked:", "embedding_app")
+
+
+def test_a_forced_legacy_loop_that_parks_leaves_its_reason_too(bash, tmp_path):
+    make_psql(tmp_path, registry="t", taken_by="embedding_app")
+    make_driver_stub(tmp_path)
+    run_until_parked(bash, tmp_path, linger=0.5, extra_env={"HAF_FYP_USE_LEGACY_LOOP": "true"})
+    reason_in(parked_file(tmp_path), "parked:", "embedding_app")
+
+
+def test_a_probe_that_cannot_answer_leaves_its_reason(bash, tmp_path):
+    """#74's retry is a refusal too: nothing is processed while it lasts."""
+    make_psql(tmp_path, registry="f", ownership_failures=-1)
+    run_until_parked(bash, tmp_path, marker="retrying in", linger=1,
+                     extra_env={"HAF_FYP_OWNERSHIP_RETRY_SECONDS": "1"})
+    reason_in(parked_file(tmp_path), "waiting:", "stub ownership failure")
+
+
+def test_an_owner_found_after_a_failure_replaces_the_waiting_reason(bash, tmp_path):
+    make_psql(tmp_path, registry="f", taken_by="embedding_app", ownership_failures=1)
+    run_until_parked(bash, tmp_path, linger=0.5,
+                     extra_env={"HAF_FYP_OWNERSHIP_RETRY_SECONDS": "1"})
+    reason_in(parked_file(tmp_path), "parked:", "embedding_app")
+
+
+def test_a_probe_that_recovers_clears_the_reason(bash, tmp_path):
+    """Failed once, then answered "nobody": the loop starts, and the check must not go on
+    reporting a wait that is over."""
+    sql = make_psql(tmp_path, registry="f", ownership_failures=1)
+    r = run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt",
+                extra_env={"HAF_FYP_OWNERSHIP_RETRY_SECONDS": "1"})
+    assert "CALL haf_fyp_app.main('haf_fyp');" in sql.read_text(), r.stdout + r.stderr
+    assert not parked_file(tmp_path).exists(), parked_file(tmp_path).read_text()
+
+
+def test_a_reason_left_by_the_previous_run_is_cleared(bash, tmp_path):
+    """`docker restart` keeps the container's /tmp. A reason from the last run must not
+    make a processor that now runs look parked."""
+    parked_file(tmp_path).write_text("parked: stale, from the previous run\n")
+    sql = make_psql(tmp_path)
+    run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    assert "CALL haf_fyp_app.main('haf_fyp');" in sql.read_text()
+    assert not parked_file(tmp_path).exists()
+
+
+def test_the_driver_path_clears_a_stale_reason_too(bash, tmp_path):
+    """The registered path execs the driver without the ownership probe; it must still
+    start from a clean slate."""
+    parked_file(tmp_path).write_text("parked: stale\n")
+    make_psql(tmp_path, registry="t")
+    argv_log = make_driver_stub(tmp_path)
+    run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    assert argv_log.exists()
+    assert not parked_file(tmp_path).exists()
+
+
+def test_the_reason_is_written_atomically(bash, tmp_path):
+    """The check reads it on its own schedule; it must never see a half-written file."""
+    body = [line for line in SCRIPT.read_text().splitlines()
+            if not line.lstrip().startswith("#")]
+    assert any('mv "${tmp}" "${PARKED_FILE}"' in line for line in body)
+
+
+def test_the_writer_and_the_reader_agree_on_the_parked_path(bash, tmp_path):
+    default = "/tmp/block_processing_parked.txt"
+    writer = re.search(r"HAF_FYP_PARKED_FILE:-([^}\"]+)", SCRIPT.read_text())
+    reader = re.search(r"HAF_FYP_PARKED_FILE:-([^}\"]+)", HEALTHCHECK.read_text())
+    assert writer is not None and reader is not None
+    assert writer.group(1) == reader.group(1) == default
+
+
+def test_the_reason_says_starting_until_ownership_is_known(bash, tmp_path):
+    """No window in which the heartbeat speaks for a container that is not processing yet:
+    between start and the ownership answer -- which can hang -- the file says so."""
+    make_psql(tmp_path, registry="f")
+    run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    at_probe = (tmp_path / "parked_at_probe.log").read_text()
+    assert at_probe.startswith("starting:"), at_probe
+    assert not parked_file(tmp_path).exists()
+
+
+def test_the_driver_is_exec_d_without_a_reason_in_place(bash, tmp_path):
+    """The driver never returns; a "starting" reason left at exec would report the
+    processor unhealthy for as long as it runs."""
+    make_psql(tmp_path, registry="t")
+    make_driver_stub(tmp_path)
+    run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    assert (tmp_path / "parked_at_exec.log").read_text().strip() == "absent"
+
+
+def test_a_reason_that_cannot_be_written_does_not_stop_the_park(bash, tmp_path):
+    """The write is best-effort. Failing it under set -e was an exit -- a crash loop under
+    the restart policy -- and on the owner path it came before the explanation was logged."""
+    make_psql(tmp_path, registry="f", taken_by="embedding_app")
+    out = run_until_parked(bash, tmp_path, linger=1, extra_env={
+        "HAF_FYP_PARKED_FILE": str(tmp_path / "no_such_dir" / "parked.txt")})
+    assert "belongs to application 'embedding_app'" in out, out
+    assert "could not record" in out, out
+
+
+def test_the_waiting_reason_lasts_as_long_as_the_wait(bash, tmp_path):
+    """Still there after several failed attempts, not just the first: a reason that went
+    away mid-wait would hand the verdict back to the owner's heartbeat."""
+    make_psql(tmp_path, registry="f", ownership_failures=-1)
+    run_until_parked(bash, tmp_path, marker="still cannot find out", min_ownership_calls=4,
+                     linger=0.5, extra_env={"HAF_FYP_OWNERSHIP_RETRY_SECONDS": "1"})
+    reason_in(parked_file(tmp_path), "waiting:", "stub ownership failure")
+
+
+def test_the_waiting_reason_follows_a_changed_error(bash, tmp_path):
+    """The reason is rewritten when the error changes, as the log is."""
+    make_psql(tmp_path, registry="f", ownership_failures=-1, varying_error=True)
+    run_until_parked(bash, tmp_path, marker="retrying in", min_ownership_calls=3, linger=1,
+                     extra_env={"HAF_FYP_OWNERSHIP_RETRY_SECONDS": "1"})
+    reason = reason_in(parked_file(tmp_path), "waiting:", "stub ownership failure #")
+    attempt = int(re.search(r"stub ownership failure #(\d+)", reason).group(1))
+    assert attempt > 1, f"the reason still names the first failure; {reason}"
+
+
+def test_the_default_path_is_used_when_nothing_is_set(bash, tmp_path):
+    """Production sets no HAF_FYP_PARKED_FILE. Every other run here does, so a script that
+    wrote the reason only when the variable was set passed them all. This runs a copy whose
+    DEFAULT points into tmp_path -- and the variable unset -- so the default path itself is
+    what gets written."""
+    copy = tmp_path / "scripts"
+    copy.mkdir()
+    target = tmp_path / "default_parked.txt"
+    for name in ("process_blocks.sh", "common.sh"):
+        text = (SCRIPT.parent / name).read_text()
+        (copy / name).write_text(
+            text.replace("/tmp/block_processing_parked.txt", target.as_posix()), newline="\n")
+    assert target.as_posix() in (copy / "process_blocks.sh").read_text()
+    make_psql(tmp_path, registry="f", taken_by="embedding_app")
+    run_until_parked(bash, tmp_path, linger=0.5, script=copy / "process_blocks.sh",
+                     parked_env=False)
+    reason_in(target, "parked:", "embedding_app")
