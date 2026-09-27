@@ -62,6 +62,7 @@ def env(tmp_path, bash):
     # HAF_FYP_HEALTHCHECK_MAX_AGE_SECONDS gets failures unrelated to their change.
     base = clean_env(bindir)
     base["HAF_FYP_STARTUP_TIME_FILE"] = str(tmp_path / "startup.txt")
+    base["HAF_FYP_PARKED_FILE"] = str(tmp_path / "parked.txt")
     return base
 
 
@@ -445,3 +446,87 @@ def test_the_application_name_tag_is_unconditional():
     assert "haf_fyp_health_check" in uninstall, (
         "the uninstall session guard no longer excludes this probe by name"
     )
+
+
+# --- a processor that will not process (#76) ---------------------------------------
+
+
+def test_a_parked_processor_is_unhealthy_whatever_the_heartbeat_says(bash, tmp_path, env):
+    """The bug: while another application drives haf_fyp, its loop keeps the context's
+    heartbeat fresh, so the database says 't' for a container that processes nothing.
+    The reason file wins, and the database is not even asked."""
+    set_startup(env)
+    asked = tmp_path / "psql_called"
+    write_exec(tmp_path / "bin" / "psql", f"#!/bin/sh\ntouch '{asked.as_posix()}'\nprintf t\n")
+    Path(env["HAF_FYP_PARKED_FILE"]).write_text(
+        "parked: context haf_fyp belongs to application 'embedding_app'\n")
+    r = run(bash, env)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "embedding_app" in r.stdout, r.stdout
+    assert not asked.exists(), "the heartbeat was consulted for a parked processor"
+
+
+def test_a_waiting_processor_is_unhealthy_too(bash, tmp_path, env):
+    set_startup(env)
+    stub_psql(tmp_path, stdout="t")
+    Path(env["HAF_FYP_PARKED_FILE"]).write_text("waiting: cannot find out who owns it\n")
+    r = run(bash, env)
+    assert r.returncode == 1
+    assert "waiting:" in r.stdout
+
+
+def test_no_reason_file_leaves_the_heartbeat_in_charge(bash, tmp_path, env):
+    set_startup(env)
+    stub_psql(tmp_path, stdout="t")
+    assert run(bash, env).returncode == 0
+
+
+def test_an_empty_reason_file_is_not_a_reason(bash, tmp_path, env):
+    """The writer moves a complete file into place, so an empty one is not a verdict
+    from it."""
+    set_startup(env)
+    stub_psql(tmp_path, stdout="t")
+    Path(env["HAF_FYP_PARKED_FILE"]).write_text("")
+    assert run(bash, env).returncode == 0
+
+
+def test_the_reason_is_checked_before_the_startup_file(bash, tmp_path, env):
+    """A container parked before it recorded a start time must report WHY, not "hasn't
+    started yet"."""
+    stub_psql(tmp_path, stdout="t")
+    Path(env["HAF_FYP_PARKED_FILE"]).write_text("parked: owned by embedding_app\n")
+    r = run(bash, env)
+    assert r.returncode == 1
+    assert "embedding_app" in r.stdout and "hasn't started" not in r.stdout, r.stdout
+
+
+def test_a_reason_file_that_vanishes_is_no_reason(bash, tmp_path, env):
+    """Read once, not tested-then-read: the writer removes it the moment processing may
+    start. A path that is not a readable file falls through to the heartbeat."""
+    set_startup(env)
+    stub_psql(tmp_path, stdout="t")
+    Path(env["HAF_FYP_PARKED_FILE"]).mkdir()          # exists, but cat cannot read it
+    r = run(bash, env)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+
+def test_the_default_path_is_read_when_nothing_is_set(bash, tmp_path, env):
+    """Production sets no HAF_FYP_PARKED_FILE; every other test here does. A copy whose
+    default points into tmp_path, run with the variable unset, proves the default is read."""
+    copy = tmp_path / "hc"
+    copy.mkdir()
+    target = tmp_path / "default_parked.txt"
+    text = SCRIPT.read_text().replace("/tmp/block_processing_parked.txt", target.as_posix())
+    assert target.as_posix() in text
+    (copy / SCRIPT.name).write_text(text, newline="\n")
+    sql = SCRIPT.with_suffix(".sql")
+    (copy / sql.name).write_text(sql.read_text(), newline="\n")
+    del env["HAF_FYP_PARKED_FILE"]
+    set_startup(env)
+    stub_psql(tmp_path, stdout="t")
+    target.write_text("parked: owned by embedding_app\n")
+    r = subprocess.run([bash, str(copy / SCRIPT.name)], env=env, capture_output=True,
+                       text=True, timeout=TIMEOUT)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "embedding_app" in r.stdout, r.stdout

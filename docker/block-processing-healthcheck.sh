@@ -143,6 +143,27 @@ case "${MAX_AGE}" in
         ;;
 esac
 
+# Written by scripts/process_blocks.sh when it has decided NOT to process: parked because
+# another application owns the context, or waiting on an ownership probe that cannot
+# answer (#76). Read FIRST, because the heartbeat below cannot see either state: it is
+# per context, and while another application drives haf_fyp that application's loop keeps
+# it fresh -- a parked container passed this check. The file holds the reason, which
+# Docker keeps in the container's health log.
+#
+# Inside the compose start_period Docker does not count a failure until some check has
+# succeeded, and a parked container's never does, so it shows `health: starting` rather
+# than `unhealthy` until that period ends; a check cannot override that. The reason is in
+# `docker inspect`'s .State.Health.Log either way.
+#
+# Read once, not tested then read: the writer removes the file the moment processing may
+# start, and a test-then-cat could land between the two and report an empty reason. A file
+# that is gone, or empty, is no reason; the checks below then decide.
+PARKED_FILE=${HAF_FYP_PARKED_FILE:-/tmp/block_processing_parked.txt}
+if reason="$(cat "${PARKED_FILE}" 2>/dev/null)" && [ -n "${reason}" ]; then
+    echo "block processing is not running: ${reason}"
+    exit 1
+fi
+
 # Written by scripts/process_blocks.sh once the database is reachable. Absence means
 # block processing has not started in this container -- a different statement from
 # "the app is behind", and not healthy.

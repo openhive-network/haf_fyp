@@ -120,6 +120,35 @@ for arg in "$@"; do
     esac
 done
 
+# "Not processing, and why" for docker/block-processing-healthcheck.sh (#76). The check
+# reports unhealthy with this reason before it looks at any heartbeat -- which alone cannot
+# tell: hafd.contexts.last_active_at is per CONTEXT, and while another application drives
+# haf_fyp its loop keeps that fresh, so a parked container passed the check it was parked
+# for.
+#
+# It starts out saying "starting", and is removed only on the two paths that go on to
+# process: right before the driver is exec'd, and once the ownership check has answered
+# "nobody". Every other path keeps a reason -- parked because another application owns the
+# context, waiting on a probe that cannot answer, or a probe that simply hangs -- so there
+# is no window in which the heartbeat speaks for a container that is not processing.
+# Written rather than merely cleared at start for a second reason: `docker restart` keeps
+# the container's /tmp, and a reason from the previous run must not outlive it.
+PARKED_FILE="${HAF_FYP_PARKED_FILE:-/tmp/block_processing_parked.txt}"
+
+# Atomic, like the startup file below: the reader sees the old reason or the new one.
+# Best-effort: a reason that cannot be recorded must not end the script. Under set -e that
+# is an exit, and under a restart policy a crash loop -- what parking exists to avoid.
+# The cost of a failed write is the old behaviour: the check falls back to the heartbeat,
+# which the owning application keeps fresh, and only the WARNING says so.
+mark_parked() {
+    local tmp="${PARKED_FILE}.tmp.$$"
+    if ! { printf '%s\n' "$*" > "${tmp}" && mv "${tmp}" "${PARKED_FILE}"; } 2>/dev/null; then
+        rm -f "${tmp}" 2>/dev/null || true
+        log "WARNING: could not record this for the healthcheck in ${PARKED_FILE}: $*"
+    fi
+}
+mark_parked "starting: block processing has not begun (ownership not yet checked)"
+
 wait_for_postgres
 
 # When block processing started, for docker/block-processing-healthcheck.sh (#27).
@@ -229,11 +258,11 @@ registry_has_haf_fyp() {
 #
 # Park rather than exit: this runs as PID 1 under a restart policy (`unless-stopped`
 # here, `on-failure` in haf_api_node's module), so a non-zero exit is an indefinite crash
-# loop. Idle instead, and say why once, in a log that is still readable. Do NOT count on
-# docker/block-processing-healthcheck.sh to flag it: the park happens at start, inside
-# its 72h start_period, and while another application drives the context that
-# application's loop keeps haf_fyp's heartbeat fresh, so the check passes (#76). The
-# ERROR lines are the signal.
+# loop. Idle instead, and say why once, in a log that is still readable -- and in PARKED_FILE, which
+# docker/block-processing-healthcheck.sh turns into a failure (#76). Docker counts no
+# failure inside the 72h start_period until a check first succeeds, which a parked one
+# never does, so there the container shows `health: starting`, with the reason in its
+# health log (`docker inspect`), and `unhealthy` after it.
 #
 # FAILS CLOSED (#74). An earlier version read a failed query -- a dropped connection, a
 # statement timeout, a permissions error -- as "nobody else owns it", discarded the error,
@@ -299,6 +328,7 @@ refuse_if_another_application_owns_the_context() {
                     ;;
             esac
             log "       Block processing will NOT start until that is known; retrying in ${wait_s}s."
+            mark_parked "waiting: cannot find out whether another application owns context haf_fyp: ${msg}"
             last="$msg"
         else
             log "ERROR: still cannot find out who owns context haf_fyp (attempt ${attempt}, same error); retrying in ${wait_s}s."
@@ -319,7 +349,8 @@ refuse_if_another_application_owns_the_context() {
     log "       '${owner}' process it and stop this service."
     log "       Removing haf_fyp from such a node needs the context detached first; README,"
     log "       \"If another application owns the context\", has the SQL (#66)."
-    # Idle rather than exit: a restart loop. (The healthcheck will not flag this; see #76.)
+    mark_parked "parked: context haf_fyp belongs to application '${owner}'; haf_fyp's block processing will not start"
+    # Idle rather than exit: a restart loop. PARKED_FILE is what reports it (#76).
     while true; do sleep 3600; done
 }
 
@@ -332,6 +363,10 @@ if command -v haf_app_driver.py >/dev/null 2>&1 \
         # live processor. The same names as haf_fyp_app.take_block_processor_locks(),
         # which the legacy loop below takes -- see there for why each one. This path runs
         # only on a HAF with the registry, and every such HAF has the lock functions.
+        #
+        # The "starting" reason goes now: from here the driver's heartbeat is the signal
+        # (#76). A registered haf_fyp owns its context, so there is nothing to refuse.
+        rm -f "${PARKED_FILE}"
         exec haf_app_driver.py --app=haf_fyp \
             --postgres-url="postgresql://${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}?application_name=haf_fyp_block_processing" \
             --lock=haf_fyp --lock=hivemind \
@@ -354,8 +389,11 @@ refuse_if_another_application_owns_the_context
 if [ "$ownership_checked" != 1 ]; then
     log "ERROR: the ownership check did not complete, so block processing will NOT start."
     log "       This is a bug in scripts/process_blocks.sh; the lines above say where it stopped."
+    mark_parked "parked: the ownership check did not complete (a bug in process_blocks.sh; see the log)"
     while true; do sleep 3600; done
 fi
+# Answered "nobody": the loop may start, and the heartbeat is the signal from here (#76).
+rm -f "${PARKED_FILE}"
 
 log "haf_app_driver.py not used, falling back to the legacy CALL main() loop"
 

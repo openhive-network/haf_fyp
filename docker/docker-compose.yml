@@ -186,10 +186,13 @@ services:
     # that is perfectly healthy.
     #
     # 72h is inherited from the SELECT 1 check this replaces and is NOT a considered
-    # number for the new one. Docker >= 25 ends the start period at the first success,
-    # so it does not in fact cover a whole replay; on older Docker it means a restarted
-    # service can never report unhealthy for three days, which is the silent window
-    # #27 exists to close. It is left alone here because nothing yet consumes this
+    # number for the new one. Docker stops forgiving failures at the first SUCCESSFUL
+    # check, so it does not in fact cover a whole replay; but a container that never
+    # succeeds -- one that parks at start (#76) -- stays `health: starting` for the full
+    # three days, and every restart opens a fresh window. Inside it, Docker >= 25 probes
+    # every 5s (the default start_interval); cheap here, since a parked check exits
+    # before psql. That is the silent window #27 exists to close. It is left alone here
+    # because nothing yet consumes this
     # service's health -- no depends_on keys on it, and the node's status page uses the
     # HAProxy agent-check instead -- so tuning it without a measured MASSIVE batch
     # duration would be guessing twice.
