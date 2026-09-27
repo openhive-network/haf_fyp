@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import queue
+import signal
 import threading
 import time
 
@@ -131,16 +132,115 @@ def _dsn() -> str:
     )
 
 
+# #77: HAF's application locks (1.28.8-rc1 and later). The ranker writes haf_fyp_app's
+# tables in long transactions, like the block processor, so it holds the same SHARED
+# lock on haf_fyp: install_app.sh skips while it is held rather than re-creating tables
+# and functions under a cycle. Only haf_fyp: hivemind, hivesense, balance_tracker and
+# reputation_tracker are read only as optional signals (fetch_post_vectors_safe,
+# credibility), so a cycle that meets one of their installs degrades, waits, or is
+# skipped, and the next one heals; nothing of theirs is written. A lock on them would
+# make their installs skip whenever this ranker runs.
+APP_LOCKS = ["haf_fyp"]
+APP_NAME = "haf_fyp_ranker"
+
+
+def _take_app_locks(conn) -> None:
+    """Hold APP_LOCKS for the life of this session -- waiting, in HAF's own loop, while
+    an install holds one. Session locks: the rollbacks main() issues do not release them;
+    closing the connection does, which is why every reconnect takes them again."""
+    with conn.cursor() as cur:
+        # HAF names a lock's holders by application_name when it refuses an installer
+        # ("Skipping install: lock on haf_fyp held by ..."); unset, the ranker is a blank.
+        cur.execute("SET application_name = %s", (APP_NAME,))
+        # Checked in the session that stays connected, so a process killed mid-statement
+        # releases the lock within 5s instead of when the server next writes to it.
+        cur.execute("SET client_connection_check_interval = '5s'")
+        cur.execute(
+            "SELECT to_regprocedure('hive.acquire_app_block_processor_locks(text[])') IS NOT NULL"
+        )
+        if not cur.fetchone()[0]:
+            log.warning("this HAF has no application locks "
+                        "(hive.acquire_app_block_processor_locks); running without")
+        else:
+            log.info("taking HAF's application lock on %s (waits while an install runs)",
+                     ", ".join(APP_LOCKS))
+            cur.execute("SELECT hive.acquire_app_block_processor_locks(%s)", (APP_LOCKS,))
+    conn.commit()
+
+
+# The connection main() is using, for _on_sigterm: set by _connect() before the lock is
+# taken, so a stop during the wait for an install cancels that wait too.
+_current_conn: psycopg2.extensions.connection | None = None
+
+
+def _on_sigterm(_signum, _frame) -> None:
+    """`docker stop`: cancel the session's statement, then exit.
+
+    The session holds HAF's lock on haf_fyp, and an install started right after the stop
+    -- `restart: true` starts setup as soon as this container is gone -- is skipped while
+    it lingers. Without a handler, Python as PID 1 ignores SIGTERM and is killed at 10s,
+    and a statement in flight keeps the session alive until the server notices the client
+    is gone (client_connection_check_interval). Cancelled, the backend is idle and sees
+    the socket close at once.
+
+    os._exit rather than sys.exit: this runs inside psycopg2's wait for a result, and the
+    only thing left worth doing is to let the socket close.
+    """
+    try:
+        conn = _current_conn
+        if conn is not None and not conn.closed:
+            try:
+                conn.cancel()
+            except Exception:  # noqa: BLE001 - exiting regardless; a dead socket closes too
+                pass
+        log.info("SIGTERM — cancelled the running statement, exiting")
+    finally:
+        # Whatever the lines above raise (a log write interrupted mid-write raises
+        # "reentrant call"), the process must still go.
+        os._exit(0)
+
+
+def _install_stop_handler() -> None:
+    # A Python signal handler runs only between bytecodes, and psycopg2's default wait
+    # blocks inside libpq for a whole statement. wait_select waits in select() instead,
+    # which a signal interrupts, so SIGTERM is handled mid-statement.
+    psycopg2.extensions.set_wait_callback(psycopg2.extras.wait_select)
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    # Ctrl-C too: wait_select turns a KeyboardInterrupt into a cancel and carries on, so
+    # the statement would fail, main() would reconnect, and the ranker would not stop.
+    signal.signal(signal.SIGINT, _on_sigterm)
+
+
+def _reconnect(conn) -> psycopg2.extensions.connection:
+    """Replace a failed connection. OperationalError also covers a cancelled statement
+    or a deadlock on a session that is still up; closed first, so it does not linger --
+    holding HAF's lock and its aborted transaction's locks -- until garbage-collected."""
+    try:
+        conn.close()
+    except Exception:  # noqa: BLE001 - it may already be gone; that is the usual case
+        pass
+    return _connect()
+
+
 def _connect() -> psycopg2.extensions.connection:
+    global _current_conn
     while True:
+        conn = None
         try:
             conn = psycopg2.connect(_dsn())
             conn.autocommit = False
             log.info("connected to database")
+            _current_conn = conn
+            _take_app_locks(conn)
             return conn
         except psycopg2.OperationalError as exc:
             log.warning("database not ready (%s) — retrying in 5s", exc)
-            time.sleep(5)
+        except psycopg2.Error as exc:
+            # Fail closed: a ranker that could not take its lock must not run unlocked.
+            log.error("could not take HAF's application locks (%s) — retrying in 5s", exc)
+        if conn is not None:
+            conn.close()
+        time.sleep(5)
 
 
 def _redis_subscriber(refresh_q: "queue.Queue[str]") -> None:
@@ -843,6 +943,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     log.info("haf_fyp ranker daemon starting")
+    _install_stop_handler()
 
     threading.Thread(
         target=_redis_subscriber,
@@ -869,7 +970,7 @@ def main() -> None:
                 _run_targeted_refresh(conn, pending)
             except psycopg2.OperationalError:
                 log.warning("database connection lost (targeted refresh) — reconnecting")
-                conn = _connect()
+                conn = _reconnect(conn)
             except Exception:
                 log.exception("targeted refresh failed")
                 _safe_rollback(conn)
@@ -881,7 +982,7 @@ def main() -> None:
                 next_full_cycle = time.monotonic() + CYCLE_SECONDS
             except psycopg2.OperationalError:
                 log.warning("database connection lost — reconnecting")
-                conn = _connect()
+                conn = _reconnect(conn)
                 next_full_cycle = time.monotonic() + CYCLE_SECONDS
             except Exception:
                 log.exception("ranking cycle failed")
@@ -905,7 +1006,7 @@ def main() -> None:
                 _run_embedding_coverage_maintenance(conn)
             except psycopg2.OperationalError:
                 log.warning("database connection lost (maintenance) — reconnecting")
-                conn = _connect()
+                conn = _reconnect(conn)
             next_feed_maint = time.monotonic() + FEED_EVENTS_MAINT_SECONDS
 
         time.sleep(POLL_SECONDS)

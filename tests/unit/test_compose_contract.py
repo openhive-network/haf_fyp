@@ -1671,9 +1671,11 @@ def test_nothing_is_pulled_in_from_another_file():
     )
 
 
-def test_the_block_processor_is_stopped_before_setup_is_recreated(services):
-    """#67: the processor holds HAF's lock on haf_fyp and the install skips while it is held.
-    When only haf-fyp-setup is recreated, `restart: true` is what makes Compose stop the
-    processor first -- without it the old processor keeps the lock and the install skips."""
-    dep = services[SYNC]["depends_on"][SETUP]
+@pytest.mark.parametrize("service", [SYNC, RANKER], ids=["sync", "ranker"])
+def test_lock_holders_are_stopped_before_setup_is_recreated(services, service):
+    """#67, #77: the processor and the ranker hold HAF's lock on haf_fyp, and the install
+    skips while it is held. When only haf-fyp-setup is recreated, `restart: true` is what
+    makes Compose stop them first -- without it the old one keeps the lock and the install
+    skips."""
+    dep = services[service]["depends_on"][SETUP]
     assert dep.get("restart") is True, dep
