@@ -295,6 +295,34 @@ def run_install_full_stub(bash, tmp_path, *args: str):
     return proc, sql_log, argv_log
 
 
+def test_the_preconditions_run_first(bash, tmp_path):
+    """Step 0 is checked "before ANY mutation" (#75): it must be the first thing psql
+    runs, as the connecting role -- a SET ROLE to a role outside hive_applications_group
+    would read zero rows under HAF's RLS and pass every context."""
+    _, _, argv_log = run_install_full_stub(bash, tmp_path)
+    first = argv_log.read_text().splitlines()[0]
+    assert first.endswith("/db/install_preconditions.sql") and " -f " in f" {first} ", first
+    assert "SET ROLE" not in first, first
+
+
+def test_a_precondition_refusal_stops_the_install(bash, tmp_path):
+    """A refusal must end the install there -- nothing after it runs, and the script
+    fails -- or "Nothing has been modified" is untrue."""
+    bindir = stub_bin(tmp_path)
+    argv_log = tmp_path / "argv.log"
+    write_exec(
+        bindir / "psql",
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >> "{argv_log.as_posix()}"\n'
+        'case "$*" in *install_preconditions.sql*) echo "ERROR:  refused" >&2; exit 3 ;; esac\n'
+        "exit 0\n",
+    )
+    proc = subprocess.run([bash, str(INSTALL)], env=clean_env(bindir),
+                          capture_output=True, text=True, timeout=TIMEOUT)
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert len(argv_log.read_text().splitlines()) == 1, argv_log.read_text()
+
+
 def test_swagger_url_reaches_the_endpoint_load(bash, tmp_path):
     """The installer's only functional option. Its default silently baked wrong example
     URLs into the published Swagger page -- the failure the new unknown-option error
