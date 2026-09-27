@@ -46,7 +46,7 @@ def bash():
 def make_psql(tmp_path, registry: str = "t", taken_by: str | None = None,
               ownership_failures: int = 0,
               ownership_error: str = "psql: stub ownership failure",
-              varying_error: bool = False) -> Path:
+              varying_error: bool = False, blocking_main: bool = False) -> Path:
     """A stub psql: answers `SELECT now()`, the two application-registry probes and the
     ownership probe, records every -c, and never blocks.
 
@@ -106,6 +106,20 @@ def make_psql(tmp_path, registry: str = "t", taken_by: str | None = None,
             f'  *"FROM hafd.applications"*) {lookup} ;;\n'
         )
     probe = ownership + probe
+    if blocking_main:
+        # CALL main() as it really is: one statement that does not return until the server
+        # cancels it. The cancel is a pg_cancel_backend from another psql; it names the
+        # session by application_name, which this records, and main() ends on it.
+        cancelled = (tmp_path / "main_cancelled").as_posix()
+        appname = (tmp_path / "main_appname").as_posix()
+        probe = (
+            '  *"pg_cancel_backend"*)\n'
+            f'    echo "$cmd" > "{cancelled}" ;;\n'
+            '  *"CALL haf_fyp_app.main"*)\n'
+            f'    echo "$PGAPPNAME" > "{appname}"\n'
+            f'    while [ ! -e "{cancelled}" ]; do /bin/sleep 0.1; done\n'
+            '    echo "ERROR:  canceling statement due to user request" >&2; exit 1 ;;\n'
+        ) + probe
     write_exec(
         tmp_path / "bin" / "psql",
         "#!/bin/sh\n"
@@ -392,6 +406,50 @@ def run_until_parked(bash, tmp_path, extra_env=None, seconds: int = 10,
     raise AssertionError("unreachable")  # pragma: no cover
 
 
+def test_stopping_the_legacy_loop_cancels_its_statement(bash, tmp_path):
+    """#67: CALL main()'s session holds HAF's block-processor locks, and a server notices a
+    vanished client only when a write to it fails -- so a stopped container used to leave
+    that session, and the lock, behind, and an install started meanwhile skipped. The stop
+    must reach the statement: TERM to the script -> SIGINT to psql -> the server cancels it."""
+    sql = make_psql(tmp_path, registry="f", blocking_main=True)
+    env = clean_env(stub_bin(tmp_path))
+    env["HAF_FYP_STARTUP_TIME_FILE"] = str(tmp_path / "startup.txt")
+    proc = subprocess.Popen([bash, str(SCRIPT)], env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    try:
+        deadline = time.time() + 10
+        while "CALL haf_fyp_app.main" not in (sql.read_text() if sql.exists() else ""):
+            assert time.time() < deadline, "the loop never started"
+            time.sleep(0.05)
+        time.sleep(0.3)                       # psql is inside the statement
+        proc.send_signal(signal.SIGTERM)      # what `docker stop` sends PID 1
+        out, _ = proc.communicate(timeout=10)
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    cancel = tmp_path / "main_cancelled"
+    assert cancel.exists(), f"the statement was not cancelled; {out}"
+    # It cancels THIS loop's session -- by the name that session was given -- and no other.
+    name = (tmp_path / "main_appname").read_text().strip()
+    assert name.startswith("haf_fyp_legacy_main_"), name
+    assert f"application_name = '{name}'" in cancel.read_text(), cancel.read_text()
+    assert "cancelling CALL main()" in out, out
+    assert proc.returncode != 0, "a cancelled loop must not report success"
+
+
+def test_the_legacy_session_checks_for_a_vanished_client(bash, tmp_path):
+    """The backstop for a hard kill, where no signal handler runs: in the SAME session as
+    CALL main(), or it guards nothing."""
+    make_psql(tmp_path, registry="f")
+    run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    calls = [line for line in (tmp_path / "argv.log").read_text().splitlines()
+             if "CALL haf_fyp_app.main" in line]
+    assert len(calls) == 1, calls
+    assert "SET client_connection_check_interval" in calls[0], calls
+
+
 def test_the_driver_is_used_when_available(bash, tmp_path):
     """With the driver on PATH the script execs it for the registered application
     (context name, matching db/register_app.sql) instead of CALL main()."""
@@ -423,6 +481,16 @@ def test_the_driver_does_not_write_its_own_startup_marker(bash, tmp_path):
     argv_log = make_driver_stub(tmp_path)
     run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
     assert "--startup-marker=" in argv_log.read_text().split()
+
+
+def test_the_driver_holds_haf_s_block_processor_locks(bash, tmp_path):
+    """#67: the driver takes no lock unless told. Asserted on the argv it RECEIVED -- a
+    --lock line left after the command's last argument reads fine and is never passed."""
+    make_psql(tmp_path)
+    argv_log = make_driver_stub(tmp_path)
+    run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    args = argv_log.read_text().split()
+    assert "--lock=haf_fyp" in args and "--lock=hivemind" in args, args
 
 
 def test_the_marker_is_written_before_the_driver_runs(bash, tmp_path):

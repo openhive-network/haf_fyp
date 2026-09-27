@@ -170,6 +170,43 @@ done
 
 wait_for_postgres
 
+# HAF's install lock (#67). A block processor holds a SHARED advisory lock on haf_fyp for
+# as long as it runs (haf_fyp_app.take_block_processor_locks, and the driver's --lock);
+# this takes it EXCLUSIVELY, so the install cannot run over a live processor -- which,
+# before, it simply raced: functions re-created and the context pointer seeded under a
+# loop mid-range.
+#
+# The lock is session-level, and this script runs many psql sessions, so it is held by
+# the psql base image's install_with_app_lock.py on a connection of its own, which then
+# runs this script again as its child. The re-run sees HAF_INSTALL_LOCK_HELD and goes
+# straight on. When a processor holds the lock the wrapper logs who, skips the install
+# and exits 0 -- so haf-fyp-setup completes and the running stack is left as it is. Stop
+# the block processor before re-installing (README). The same wrapper and the same flag
+# as balance_tracker, reputation_tracker, haf_block_explorer, hivesense and nft_tracker.
+#
+# Without the wrapper (a checkout run by hand, CI) or on a HAF without the lock functions
+# (the wrapper handles that one itself), the install runs unlocked, as it always has.
+INSTALL_LOCK_WRAPPER="${HAF_FYP_INSTALL_LOCK_WRAPPER:-/usr/local/bin/install_with_app_lock.py}"
+
+# One libpq keyword value, quoted: a space or quote in a value would otherwise split or end
+# it. Inside single quotes libpq takes \' and \\ as escapes.
+dsn_value() {
+    local v="${1//\\/\\\\}"
+    printf "'%s'" "${v//\'/\\\'}"
+}
+
+if [ -z "${HAF_INSTALL_LOCK_HELD:-}" ]; then
+    export HAF_INSTALL_LOCK_HELD=1
+    if command -v python3 >/dev/null 2>&1 && [ -f "${INSTALL_LOCK_WRAPPER}" ]; then
+        log "Taking HAF's install lock on haf_fyp..."
+        exec python3 "${INSTALL_LOCK_WRAPPER}" haf_fyp \
+            "host=$(dsn_value "${POSTGRES_HOST}") port=$(dsn_value "${POSTGRES_PORT}") user=$(dsn_value "${POSTGRES_USER}") dbname=$(dsn_value "${POSTGRES_DB}") application_name=haf_fyp-install" \
+            "$0" "$@"
+    fi
+    log "WARNING: ${INSTALL_LOCK_WRAPPER} not found; installing WITHOUT HAF's install lock,"
+    log "         so nothing stops this install running over a live block processor."
+fi
+
 # 0. PRECONDITIONS — checked before ANY mutation, so a refusal leaves the database
 #    exactly as it was and the script stays "safe to re-run". Aborting later would
 #    strand a half-applied upgrade, and because docker-compose gives haf-fyp-setup
@@ -516,10 +553,9 @@ else
     log "WARNING: GIT_HASH is unset — recording the db/app_version.sql placeholder."
     log "         GET /version will not name a commit. GIT_HASH is baked into the image"
     log "         at build time, so exporting it and re-running is NOT enough -- a plain"
-    log "         'up' reuses the existing image. Rebuild:"
-    log "         GIT_HASH=\$(git rev-parse --verify HEAD | cut -c1-8) docker compose \\"
-    log "             --env-file docker/.env.local -f docker/docker-compose.yml \\"
-    log "             up --build haf-fyp-setup"
+    log "         'up' reuses the existing image. Rebuild, with the block processor"
+    log "         stopped -- it holds HAF's lock on haf_fyp and the install skips (#67):"
+    log "         see README, 'Re-installing while the stack runs'."
 fi
 
 psql_cmd -v git_hash="${GIT_HASH:-}" -f "${SCRIPT_DIR}/../scripts/set_version.sql"

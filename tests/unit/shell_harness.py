@@ -66,7 +66,9 @@ def clean_env(bindir=None) -> dict:
     """
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("HAF_FYP_", "POSTGRES_", "BASH_FUNC_"))
-           and k not in ("BASH_ENV", "ENV")}
+           and k not in ("BASH_ENV", "ENV",
+                         # install_app.sh skips HAF's install-lock wrapper when set (#67).
+                         "HAF_INSTALL_LOCK_HELD")}
     if "HAF_FYP_TEST_BASH" in os.environ:
         env["HAF_FYP_TEST_BASH"] = os.environ["HAF_FYP_TEST_BASH"]
     if bindir is not None:

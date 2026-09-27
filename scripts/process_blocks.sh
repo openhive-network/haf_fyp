@@ -327,8 +327,14 @@ if command -v haf_app_driver.py >/dev/null 2>&1 \
    && [ "${HAF_FYP_USE_LEGACY_LOOP:-false}" != "true" ]; then
     if registry_has_haf_fyp; then
         log "haf_fyp is registered in the HAF application registry; running haf_app_driver.py"
+        # --lock: HAF's shared block-processor locks (#67), held on the driver's own
+        # connection and re-taken on every reconnect, so install_app.sh cannot run over a
+        # live processor. The same names as haf_fyp_app.take_block_processor_locks(),
+        # which the legacy loop below takes -- see there for why each one. This path runs
+        # only on a HAF with the registry, and every such HAF has the lock functions.
         exec haf_app_driver.py --app=haf_fyp \
             --postgres-url="postgresql://${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}?application_name=haf_fyp_block_processing" \
+            --lock=haf_fyp --lock=hivemind \
             --startup-marker=
     fi
     log "WARNING: haf_app_driver.py is on PATH but haf_fyp is not in the HAF application registry"
@@ -352,6 +358,42 @@ if [ "$ownership_checked" != 1 ]; then
 fi
 
 log "haf_app_driver.py not used, falling back to the legacy CALL main() loop"
-psql_cmd -c "CALL haf_fyp_app.main('haf_fyp');"
+
+# CALL main() is ONE statement that runs for as long as the processor does, and its session
+# holds HAF's block-processor locks (#67). Stopping the container used to end psql but not
+# that session: the backend notices a vanished client only when a write to it fails, and
+# testapi's logs show old main() backends outliving their container until the new one
+# started. An install started in that window finds the lock held and skips, exit 0.
+#
+# So the stop is passed on, to the SERVER: on TERM or INT this script cancels the statement
+# with pg_cancel_backend, finding the session by an application_name no other session has.
+# main() is cancelled -- its current range rolls back and is redone on the next start, as
+# after any crash -- psql exits, the session closes, and the lock goes with it. (Not
+# SIGINT to psql: a non-interactive shell starts background jobs with SIGINT ignored.)
+# If the server cannot be reached to cancel, psql is killed instead. psql runs in the
+# background so that this script, PID 1, is free to take the signal.
+#
+# client_connection_check_interval, set in the same session, is the backstop for a hard
+# kill (SIGKILL, OOM) where no handler runs: the server then checks the client every 5s
+# while main() runs, instead of never. PostgreSQL 14 and later; HAF runs 17.
+main_app_name="haf_fyp_legacy_main_${HOSTNAME:-$$}"
+PGAPPNAME="${main_app_name}" psql_cmd -c "SET client_connection_check_interval = '5s'" \
+         -c "CALL haf_fyp_app.main('haf_fyp');" &
+main_pid=$!
+stop_main() {
+    log "Stopping: cancelling CALL main() so its session, and its HAF lock, end now."
+    psql_cmd -Atq -c "SELECT pg_cancel_backend(pid) FROM pg_stat_activity
+                      WHERE application_name = '${main_app_name}' AND pid <> pg_backend_pid()" \
+        >/dev/null 2>&1 || kill -TERM "${main_pid}" 2>/dev/null || true
+}
+trap stop_main TERM INT
+main_rc=0
+wait "${main_pid}" || main_rc=$?
+# A trapped signal returns wait early; wait again for psql itself to finish.
+while kill -0 "${main_pid}" 2>/dev/null; do
+    wait "${main_pid}" || main_rc=$?
+done
+trap - TERM INT
 
 log "Block processing loop exited."
+exit "${main_rc}"

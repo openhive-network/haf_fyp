@@ -1669,3 +1669,11 @@ def test_nothing_is_pulled_in_from_another_file():
     assert not external, (
         f"{external} extend a service from another file, which the naming checks cannot see"
     )
+
+
+def test_the_block_processor_is_stopped_before_setup_is_recreated(services):
+    """#67: the processor holds HAF's lock on haf_fyp and the install skips while it is held.
+    When only haf-fyp-setup is recreated, `restart: true` is what makes Compose stop the
+    processor first -- without it the old processor keeps the lock and the install skips."""
+    dep = services[SYNC]["depends_on"][SETUP]
+    assert dep.get("restart") is True, dep
