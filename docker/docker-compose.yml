@@ -277,6 +277,9 @@ services:
     depends_on:
       haf-fyp-setup:
         condition: service_completed_successfully
+        # The ranker holds HAF's shared lock on haf_fyp too (#77), so the same reason as
+        # haf-fyp-sync's: when only setup is recreated, stop this first.
+        restart: true
       haf-fyp-redis:
         condition: service_started
     restart: unless-stopped
