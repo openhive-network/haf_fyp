@@ -870,7 +870,17 @@ the same check haf_fyp makes in `db/register_app.sql`.
 
 Block processing refuses the same state for the same reason: `scripts/process_blocks.sh`
 will not drive a context another application owns, because two loops advancing one context
-pointer lose blocks for both.
+pointer lose blocks for both. It also will not start while it *cannot find out* — a failed
+ownership query is not read as "nobody" ([#74](https://gitlab.syncad.com/hive/haf_fyp/-/issues/74)).
+It logs the error and retries, doubling the wait from 10 seconds up to five minutes. (The
+first wait is `HAF_FYP_OWNERSHIP_RETRY_SECONDS` if that is set in the block-processing
+service's `environment:` -- neither compose file passes it through, so `.env` alone does not
+set it.) If the error is a missing `haf_fyp_app.context_claimed_by_other_app()`, the database
+predates this image: re-run the install as in step 2 above (`up --build haf-fyp-setup`; in
+haf_api_node, the `haf-fyp-install` service). In both states the container's log is the
+signal. The healthcheck does not flag either during its 72-hour `start_period`, and while
+another application drives the context it does not flag it at all
+([#76](https://gitlab.syncad.com/hive/haf_fyp/-/issues/76)).
 
 ```bash
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml \

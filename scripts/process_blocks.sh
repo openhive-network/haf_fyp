@@ -190,9 +190,22 @@ log "Starting block processing loop..."
 registry_has_haf_fyp() {
     # Two statements, not one: PostgreSQL resolves every relation at plan time,
     # so a single query that names hafd.applications errors on a HAF without
-    # it whatever to_regclass() says. Any psql failure counts as "not ready".
-    [ "$(psql_cmd -Atq -c "SELECT to_regclass('hafd.applications') IS NOT NULL" 2>/dev/null || true)" = "t" ] || return 1
-    [ "$(psql_cmd -Atq -c "SELECT EXISTS (SELECT 1 FROM hafd.applications WHERE name = 'haf_fyp')" 2>/dev/null || true)" = "t" ]
+    # it whatever to_regclass() says. Any psql failure counts as "not ready" --
+    # which is safe HERE, because it only chooses the legacy loop, and every path
+    # into that loop passes the ownership check below, which fails closed (#74).
+    # The failure is logged rather than discarded, so a node silently on the
+    # fallback says why.
+    local answer err
+    err=$(mktemp)
+    answer=$(psql_cmd -Atq -c "SELECT to_regclass('hafd.applications') IS NOT NULL" 2>"$err") \
+        && [ "$answer" = "t" ] \
+        && answer=$(psql_cmd -Atq -c "SELECT EXISTS (SELECT 1 FROM hafd.applications WHERE name = 'haf_fyp')" 2>"$err") \
+        && [ "$answer" = "t" ] && { rm -f "$err"; return 0; }
+    if [ -s "$err" ]; then
+        log "WARNING: the application-registry probe failed: $(tr '\n' ' ' < "$err")"
+    fi
+    rm -f "$err"
+    return 1
 }
 
 # "Not registered" has two causes that need OPPOSITE answers, and the probe above
@@ -214,26 +227,99 @@ registry_has_haf_fyp() {
 #                                   return so an EMBEDDED app's install can be
 #                                   re-run -- so the refusal has to live here.
 #
-# Park rather than exit: this runs as PID 1 under `restart: unless-stopped`, so a
-# non-zero exit is an indefinite crash loop, and a crash loop is the one shape the
-# healthcheck's 72h start_period cannot surface. Idle instead and let
-# docker/block-processing-healthcheck.sh report it: no block is processed, so the
-# container goes unhealthy and says why, once, in a log that is still readable.
-context_taken_by_another_app() {
-    [ "$(psql_cmd -Atq -c "SELECT to_regclass('hafd.applications') IS NOT NULL" 2>/dev/null || true)" = "t" ] || return 1
-    [ "$(psql_cmd -Atq -c "SELECT EXISTS (SELECT 1 FROM hafd.applications WHERE name <> 'haf_fyp' AND contexts @> ARRAY['haf_fyp'])" 2>/dev/null || true)" = "t" ]
+# Park rather than exit: this runs as PID 1 under a restart policy (`unless-stopped`
+# here, `on-failure` in haf_api_node's module), so a non-zero exit is an indefinite crash
+# loop. Idle instead, and say why once, in a log that is still readable. Do NOT count on
+# docker/block-processing-healthcheck.sh to flag it: the park happens at start, inside
+# its 72h start_period, and while another application drives the context that
+# application's loop keeps haf_fyp's heartbeat fresh, so the check passes (#76). The
+# ERROR lines are the signal.
+#
+# FAILS CLOSED (#74). An earlier version read a failed query -- a dropped connection, a
+# statement timeout, a permissions error -- as "nobody else owns it", discarded the error,
+# and went on to CALL main() on a context another application's driver may be advancing.
+# This refusal exists to prevent exactly that, so a probe that cannot answer must not be
+# taken as a "no".
+#
+# One statement, through haf_fyp_app.context_claimed_by_other_app(): the same question
+# db/haf_fyp_app.sql's pointer repair, db/register_app.sql and install_app.sh step 14 ask
+# (#65), with the registry probe already inside it (NULL on a HAF without one), and an
+# ORDER BY, so the owner it names does not vary from run to run. install_app.sh loads that
+# function at step 2, and both deployments start this service only after the install has
+# completed (service_completed_successfully on haf-fyp-setup here, on haf-fyp-install in
+# haf_api_node's module). A container restarted on its own after an image upgrade can
+# still meet a database installed before the function existed; that is reported below.
+#
+# Prints the owning application's name, or nothing. Returns non-zero, with psql's error on
+# stderr, when it could not find out.
+context_claimed_by() {
+    psql_cmd -Atq -c "SELECT COALESCE(haf_fyp_app.context_claimed_by_other_app('haf_fyp'), '')"
 }
 
-refuse_foreign_context() {
-    owner=$(psql_cmd -Atq -c "SELECT name FROM hafd.applications WHERE name <> 'haf_fyp' AND contexts @> ARRAY['haf_fyp'] LIMIT 1" 2>/dev/null || true)
-    log "ERROR: context haf_fyp belongs to application '${owner:-<unknown>}', which drives it"
+# The first wait between attempts, in seconds. Anything but a whole number from 1 to 99999
+# falls back to 10: a value `sleep` rejects would exit this script under `set -e` (a crash
+# loop), and 0 would query the database in a tight loop. Read as DECIMAL (10#): bash
+# arithmetic takes a leading 0 as octal, and `08` then raised "value too great for base"
+# inside the function below -- an expansion error, which set -e does not stop and which
+# abandons the whole function, skipping the ownership check it exists to make.
+ownership_retry_seconds() {
+    local v="${HAF_FYP_OWNERSHIP_RETRY_SECONDS:-10}"
+    case "$v" in
+        '' | *[!0-9]* | ??????*) v=10 ;;
+    esac
+    v=$((10#$v))
+    [ "$v" -ge 1 ] || v=10
+    echo "$v"
+}
+
+# Waits until the ownership question has an answer, then parks if another application
+# owns the context. Retries rather than exiting (an exit is a crash loop), backing off
+# from the interval above to five minutes, and prints the full error only when it
+# changes: a probe that fails for days must not bury its first, useful message under
+# thousands of copies in a log nothing rotates.
+refuse_if_another_application_owns_the_context() {
+    # `last` starts at a value no error text can equal, so the first failure prints in
+    # full even when psql wrote nothing to stderr.
+    local owner err msg last=$'\x01' attempt=0 wait_s cap
+    wait_s=$(ownership_retry_seconds)
+    cap=$(( wait_s > 300 ? wait_s : 300 ))
+    err=$(mktemp)
+    until owner=$(context_claimed_by 2>"$err"); do
+        attempt=$((attempt + 1))
+        msg=$(tr '\n' ' ' < "$err")
+        if [ "$msg" != "$last" ]; then
+            log "ERROR: could not find out whether another application owns context haf_fyp:"
+            log "       ${msg}"
+            case "$msg" in
+                *"context_claimed_by_other_app"*"does not exist"* | *'schema "haf_fyp_app" does not exist'*)
+                    log "       haf_fyp_app.context_claimed_by_other_app() is missing, so this database was"
+                    log "       installed by an older haf_fyp than this image. Re-run the install with this"
+                    log "       image: \`up --build haf-fyp-setup\` here (README, step 2), or the"
+                    log "       haf-fyp-install service in haf_api_node's module."
+                    ;;
+            esac
+            log "       Block processing will NOT start until that is known; retrying in ${wait_s}s."
+            last="$msg"
+        else
+            log "ERROR: still cannot find out who owns context haf_fyp (attempt ${attempt}, same error); retrying in ${wait_s}s."
+        fi
+        sleep "$wait_s"
+        wait_s=$(( wait_s * 2 > cap ? cap : wait_s * 2 ))
+    done
+    rm -f "$err"
+    if [ -z "$owner" ]; then
+        ownership_checked=1
+        return 0
+    fi
+
+    log "ERROR: context haf_fyp belongs to application '${owner}', which drives it"
     log "       itself. Running haf_fyp's loop as well would advance one context pointer from"
     log "       two places and lose blocks for both applications, so block processing will NOT"
     log "       start. Either install haf_fyp on a HAF where it owns its context, or let"
-    log "       '${owner:-that application}' process it and stop this service."
+    log "       '${owner}' process it and stop this service."
     log "       Removing haf_fyp from such a node needs the context detached first; README,"
     log "       \"If another application owns the context\", has the SQL (#66)."
-    # Idle, so the healthcheck reports an unhealthy container rather than a restart loop.
+    # Idle rather than exit: a restart loop. (The healthcheck will not flag this; see #76.)
     while true; do sleep 3600; done
 }
 
@@ -246,14 +332,23 @@ if command -v haf_app_driver.py >/dev/null 2>&1 \
             --startup-marker=
     fi
     log "WARNING: haf_app_driver.py is on PATH but haf_fyp is not in the HAF application registry"
-    log "         (HAF older than haf#341, or db/register_app.sql skipped it); falling back to"
-    log "         the legacy CALL main() loop"
+    log "         (HAF older than haf#341, db/register_app.sql skipped it, or the probe failed --"
+    log "         see above); falling back to the legacy CALL main() loop until the next restart"
 fi
 
 # Checked on every path into the legacy loop, including HAF_FYP_USE_LEGACY_LOOP=true: the
 # hazard is the loop itself, not how the loop was chosen.
-if context_taken_by_another_app; then
-    refuse_foreign_context
+#
+# And checked that it FINISHED. bash abandons a function on an expansion error without
+# stopping the script, even under `set -e` -- that is how an interval of `08` once skipped
+# this check entirely -- so the go-ahead is a flag set on the one path that answered
+# "nobody", not the mere fact that the call returned.
+ownership_checked=
+refuse_if_another_application_owns_the_context
+if [ "$ownership_checked" != 1 ]; then
+    log "ERROR: the ownership check did not complete, so block processing will NOT start."
+    log "       This is a bug in scripts/process_blocks.sh; the lines above say where it stopped."
+    while true; do sleep 3600; done
 fi
 
 log "haf_app_driver.py not used, falling back to the legacy CALL main() loop"

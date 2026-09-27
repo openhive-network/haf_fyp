@@ -17,7 +17,9 @@ run on Debian and nothing in CI starts the image.
 
 from __future__ import annotations
 
+import os
 import re
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -41,38 +43,85 @@ def bash():
     return require_bash()
 
 
-def make_psql(tmp_path, registry: str = "t", taken_by: str | None = None) -> Path:
-    """A stub psql: answers `SELECT now()` and the two application-registry
-    probes, records every -c, and never blocks.
+def make_psql(tmp_path, registry: str = "t", taken_by: str | None = None,
+              ownership_failures: int = 0,
+              ownership_error: str = "psql: stub ownership failure",
+              varying_error: bool = False) -> Path:
+    """A stub psql: answers `SELECT now()`, the two application-registry probes and the
+    ownership probe, records every -c, and never blocks.
 
-    registry: what the probes see -- "t" (hafd.applications exists and lists
+    registry: what the registry probes see -- "t" (hafd.applications exists and lists
     haf_fyp, the registry-era HAF), "f" (registry present, haf_fyp not in it),
-    "absent" (no hafd.applications: a pre-haf#341 HAF), or "error" (psql itself
-    fails on the probe, e.g. a permissions problem).
+    "absent" (no hafd.applications: a pre-haf#341 HAF), "error" (psql itself
+    fails on the probe, e.g. a permissions problem), or "lookup_error" (the table exists
+    but the second query, the lookup, fails).
 
-    taken_by: the application that owns context haf_fyp, if any. Its two queries are
-    matched BEFORE the generic one, because they also read hafd.applications (#62)."""
+    taken_by: the application haf_fyp_app.context_claimed_by_other_app() names, if any
+    (#62, #65).
+
+    ownership_failures: how many times the ownership probe FAILS (psql exits non-zero)
+    before it answers; -1 for never answering (#74). ownership_error is what it prints;
+    varying_error appends the attempt number, so no two failures print the same text.
+
+    The ownership answer is bare only when psql was given -A and -t -- in any spelling
+    real psql accepts: combined (-Atq), separate (-A -t), or long (--no-align
+    --tuples-only). Without them it prints a header and "(1 row)", which is never an empty
+    string, so a probe that lost its flags would read "somebody owns it" on every node.
+
+    `sleep` is replaced too: it records the seconds asked for in sleeps.log and returns at
+    once, so a test can check the whole backoff sequence without waiting it out."""
     stub_bin(tmp_path)
     logfile = tmp_path / "sql.log"
+    counter = (tmp_path / "ownership_calls").as_posix()
+    fails = 10**9 if ownership_failures < 0 else ownership_failures
+    # Outside the f-string: quotes reused inside {...} need Python 3.12, CI runs 3.11.
+    suffix = '" #$n"' if varying_error else ""
+    ownership = (
+        '  *"context_claimed_by_other_app"*)\n'
+        f'    n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "{counter}"\n'
+        f'    if [ "$n" -le {fails} ]; then echo {ownership_error!r}{suffix} >&2; exit 2; fi\n'
+        '    if [ -n "$bare" ]; then\n'
+        f'      printf "%s" {taken_by or ""!r}\n'
+        '    else\n'
+        f'      printf " coalesce \\n----------\\n %s\\n(1 row)\\n" {taken_by or ""!r}\n'
+        '    fi ;;\n'
+    )
     if registry == "error":
         probe = '  *"hafd.applications"*) echo "psql: stub failure" >&2; exit 1 ;;\n'
+    elif registry == "lookup_error":
+        probe = (
+            '  *"to_regclass(\'hafd.applications\')"*) printf "%s" t ;;\n'
+            '  *"FROM hafd.applications"*) echo "psql: stub lookup failure" >&2; exit 1 ;;\n'
+        )
     else:
         table = "f" if registry == "absent" else "t"
         row = "t" if registry == "t" else "f"
+        # Without the registry, a query that names hafd.applications fails at plan time,
+        # as it does on a real pre-haf#341 HAF -- so a script that skipped the to_regclass
+        # answer would log a probe failure there.
+        lookup = ('echo \'ERROR:  relation "hafd.applications" does not exist\' >&2; exit 1'
+                  if registry == "absent" else f'printf "%s" {row}')
         probe = (
-            f'  *"SELECT name FROM hafd.applications"*) printf "%s" {taken_by or ""!r} ;;\n'
-            f"  *\"name <> 'haf_fyp'\"*) printf \"%s\" {'t' if taken_by else 'f'} ;;\n"
             f'  *"to_regclass(\'hafd.applications\')"*) printf "%s" {table} ;;\n'
-            f'  *"FROM hafd.applications"*) printf "%s" {row} ;;\n'
+            f'  *"FROM hafd.applications"*) {lookup} ;;\n'
         )
+    probe = ownership + probe
     write_exec(
         tmp_path / "bin" / "psql",
         "#!/bin/sh\n"
         "cmd=''\n"
+        "bare='' A='' T=''\n"
         'for a in "$@"; do\n'
         '  case "$prev" in -c) cmd="$cmd$a" ;; esac\n'
+        '  case "$a" in\n'
+        '    --no-align) A=1 ;;\n'
+        '    --tuples-only) T=1 ;;\n'
+        '    --*) ;;\n'
+        '    -*) case "$a" in *A*) A=1 ;; esac; case "$a" in *t*) T=1 ;; esac ;;\n'
+        '  esac\n'
         '  prev="$a"\n'
         "done\n"
+        '[ -n "$A" ] && [ -n "$T" ] && bare=1\n'
         f'printf "%s\\n---\\n" "$cmd" >> "{logfile.as_posix()}"\n'
         f'printf "%s\\n" "$*" >> "{(tmp_path / "argv.log").as_posix()}"\n'
         'case "$cmd" in\n'
@@ -81,16 +130,40 @@ def make_psql(tmp_path, registry: str = "t", taken_by: str | None = None) -> Pat
         "esac\n"
         "exit 0\n",
     )
+    write_exec(
+        tmp_path / "bin" / "sleep",
+        "#!/bin/sh\n"
+        f'echo "$1" >> "{(tmp_path / "sleeps.log").as_posix()}"\n'
+        "exec /bin/sleep 0.05\n",
+    )
     return logfile
+
+
+def sleeps(tmp_path) -> list[str]:
+    """What the script asked `sleep` for, in order (the stub returns almost at once)."""
+    f = tmp_path / "sleeps.log"
+    return f.read_text().split() if f.exists() else []
+
+
+def _run_in_group(cmd, env):
+    """subprocess.run with a timeout that also kills the script's children: on timeout
+    `subprocess.run` kills only bash, and a `sleep` it left behind outlives the test."""
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        out, err = proc.communicate()
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 def run(bash, tmp_path, *args: str, startup_file: Path | None = None):
     env = clean_env(stub_bin(tmp_path))
     if startup_file is not None:
         env["HAF_FYP_STARTUP_TIME_FILE"] = str(startup_file)
-    return subprocess.run(
-        [bash, str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=TIMEOUT
-    )
+    return _run_in_group([bash, str(SCRIPT), *args], env)
 
 
 # --- the startup timestamp --------------------------------------------------------
@@ -264,17 +337,23 @@ def run_env(bash, tmp_path, *args: str, startup_file=None, extra_env=None):
         env["HAF_FYP_STARTUP_TIME_FILE"] = str(startup_file)
     if extra_env:
         env.update(extra_env)
-    return subprocess.run(
-        [bash, str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=TIMEOUT
-    )
+    return _run_in_group([bash, str(SCRIPT), *args], env)
 
 
-def run_until_parked(bash, tmp_path, extra_env=None, seconds: int = 10) -> str:
+def run_until_parked(bash, tmp_path, extra_env=None, seconds: int = 10,
+                     marker: str = "belongs to application", min_ownership_calls: int = 0,
+                     linger: float = 0.0) -> str:
     """Run the script expecting it NOT to finish, and return what it printed (#62).
 
     To a FILE, never a pipe: the script parks in `while true; do sleep ...; done`, and
     killing it leaves that `sleep` holding a pipe's write end open, so reading to EOF
     would hang long after the script itself is gone. Nothing here needs streaming.
+
+    Returning at the FIRST sight of the marker would miss a script that refuses and then
+    changes its mind, so it keeps watching: until the ownership probe has been asked at
+    least `min_ownership_calls` times, and then for `linger` more seconds, failing if the
+    script exits meanwhile. It runs in its own process group, killed as a whole, so the
+    script's `sleep` children do not outlive the test.
     """
     env = clean_env(stub_bin(tmp_path))
     env["HAF_FYP_STARTUP_TIME_FILE"] = str(tmp_path / "startup.txt")
@@ -283,7 +362,8 @@ def run_until_parked(bash, tmp_path, extra_env=None, seconds: int = 10) -> str:
     out = tmp_path / "parked.log"
     with out.open("w") as sink:
         proc = subprocess.Popen([bash, str(SCRIPT)], env=env, stdout=sink,
-                                stderr=subprocess.STDOUT, text=True)
+                                stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        calls = tmp_path / "ownership_calls"
         try:
             deadline = time.time() + seconds
             while time.time() < deadline:
@@ -291,13 +371,24 @@ def run_until_parked(bash, tmp_path, extra_env=None, seconds: int = 10) -> str:
                     pytest.fail(f"run_tests parked check: the script EXITED ({proc.returncode}) "
                                 f"instead of idling, which crash-loops under "
                                 f"`restart: unless-stopped`; {out.read_text(errors='replace')}")
-                if "belongs to application" in out.read_text(errors="replace"):
+                seen = int(calls.read_text() or 0) if calls.exists() else 0
+                if marker in out.read_text(errors="replace") and seen >= min_ownership_calls:
+                    end = time.time() + linger
+                    while time.time() < end:
+                        if proc.poll() is not None:
+                            pytest.fail(f"the script EXITED ({proc.returncode}) after "
+                                        f"refusing; {out.read_text(errors='replace')}")
+                        time.sleep(0.1)
                     return out.read_text(errors="replace")
                 time.sleep(0.2)
             pytest.fail(f"no refusal was printed within {seconds}s; "
                         f"{out.read_text(errors='replace')}")
         finally:
-            proc.kill()
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
     raise AssertionError("unreachable")  # pragma: no cover
 
 
@@ -371,6 +462,8 @@ def test_the_driver_needs_the_registry_not_just_the_binary(bash, tmp_path):
     assert not argv_log.exists()
     assert "CALL haf_fyp_app.main('haf_fyp');" in sql.read_text()
     assert "not in the HAF application registry" in r.stdout + r.stderr
+    # An older HAF is an answer, not a failure: the lookup must not even be attempted.
+    assert "probe failed:" not in r.stdout + r.stderr, r.stdout + r.stderr
 
 
 def test_an_unregistered_app_falls_back_too(bash, tmp_path):
@@ -379,9 +472,10 @@ def test_an_unregistered_app_falls_back_too(bash, tmp_path):
     raises SystemExit on an unregistered application."""
     sql = make_psql(tmp_path, registry="f")
     argv_log = make_driver_stub(tmp_path)
-    run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    r = run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
     assert not argv_log.exists()
     assert "CALL haf_fyp_app.main('haf_fyp');" in sql.read_text()
+    assert "probe failed:" not in r.stdout + r.stderr, "a probe that answered was reported as failed"
 
 
 def test_the_legacy_loop_is_refused_on_a_context_another_application_owns(bash, tmp_path):
@@ -396,12 +490,12 @@ def test_the_legacy_loop_is_refused_on_a_context_another_application_owns(bash, 
     can be re-run), which is why the refusal has to be here.
 
     It parks rather than exits: this is PID 1 under `restart: unless-stopped`, and a
-    non-zero exit is an indefinite crash loop -- the one shape the healthcheck's 72h
-    start_period cannot surface. Idling makes the healthcheck report it instead.
+    non-zero exit is an indefinite crash loop. (The healthcheck does not report the park
+    either -- see #76 -- so the ERROR lines are the signal.)
     """
     sql = make_psql(tmp_path, registry="f", taken_by="embedding_app")
     argv_log = make_driver_stub(tmp_path)
-    out = run_until_parked(bash, tmp_path)
+    out = run_until_parked(bash, tmp_path, linger=3)
     assert "CALL haf_fyp_app.main" not in sql.read_text(), (
         f"a second loop was started on a context embedding_app owns; {sql.read_text()}")
     assert not argv_log.exists(), "the driver was run for an unregistered application"
@@ -409,23 +503,201 @@ def test_the_legacy_loop_is_refused_on_a_context_another_application_owns(bash, 
 
 
 def test_the_refusal_also_applies_when_the_legacy_loop_is_forced(bash, tmp_path):
-    """HAF_FYP_USE_LEGACY_LOOP=true asks for the loop; the hazard is the loop itself."""
-    sql = make_psql(tmp_path, registry="f", taken_by="embedding_app")
-    out = run_until_parked(bash, tmp_path, extra_env={"HAF_FYP_USE_LEGACY_LOOP": "true"})
+    """HAF_FYP_USE_LEGACY_LOOP=true asks for the loop; the hazard is the loop itself.
+
+    With the driver ON PATH, as it always is since psql 14-3 -- otherwise the flag is never
+    read and this would only repeat the test above."""
+    sql = make_psql(tmp_path, registry="t", taken_by="embedding_app")
+    argv_log = make_driver_stub(tmp_path)
+    out = run_until_parked(bash, tmp_path, linger=3,
+                           extra_env={"HAF_FYP_USE_LEGACY_LOOP": "true"})
+    assert not argv_log.exists(), out
     assert "CALL haf_fyp_app.main" not in sql.read_text(), out
     assert "embedding_app" in out
 
 
-def test_a_failing_probe_counts_as_not_registered(bash, tmp_path):
-    """A psql failure on the probe (permissions, transient error) must not be
-    fatal under `set -e`, and must not be read as "registered" either: the
-    conservative answer is the legacy loop, which works on every HAF."""
+def test_a_failing_registry_probe_counts_as_not_registered(bash, tmp_path):
+    """A psql failure on the REGISTRY probe (permissions, transient error) must not be
+    fatal under `set -e`, and must not be read as "registered" either: the answer is the
+    legacy loop -- safe only because the ownership probe, which fails closed (#74), still
+    stands between it and CALL main(). Here that probe answers "nobody"."""
     sql = make_psql(tmp_path, registry="error")
     argv_log = make_driver_stub(tmp_path)
     r = run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
     assert r.returncode == 0, r.stdout + r.stderr
     assert not argv_log.exists()
     assert "CALL haf_fyp_app.main('haf_fyp');" in sql.read_text()
+    assert "registry probe failed" in r.stdout + r.stderr, (
+        "the failure was swallowed; a node on the fallback should say why")
+    assert "stub failure" in r.stdout + r.stderr
+
+
+# --- the ownership probe fails CLOSED (#74) ------------------------------------------
+
+def test_an_ownership_probe_that_cannot_answer_does_not_start_the_loop(bash, tmp_path):
+    """The bug. A failed query used to read as "nobody else owns it", and the script went
+    on to CALL main() on a context another application's driver may be advancing.
+
+    It must neither start the loop nor exit (PID 1 under a restart policy: an exit is a
+    crash loop), and must KEEP asking -- watched over four attempts, not one, so a script
+    that gives up after a few tries and starts anyway does not pass. It backs off, and
+    prints the full error once rather than on every attempt.
+    """
+    sql = make_psql(tmp_path, registry="f", ownership_failures=-1)
+    out = run_until_parked(bash, tmp_path, marker="still cannot find out", min_ownership_calls=4,
+                           linger=0.5, seconds=15,
+                           extra_env={"HAF_FYP_OWNERSHIP_RETRY_SECONDS": "1"})
+    assert "CALL haf_fyp_app.main" not in sql.read_text(), (
+        f"the loop started although ownership could not be determined; {out}")
+    assert out.count("stub ownership failure") == 1, f"the full error should print once; {out}"
+    assert "retrying in 1s" in out and "retrying in 2s" in out, f"no backoff; {out}"
+
+
+def test_an_owner_found_after_a_failure_is_still_refused(bash, tmp_path):
+    """The probe fails once, then names an owner. A retry path that forgot the answer, or
+    treated "answered after a failure" as "nobody", would start the second loop -- #74 by
+    another route."""
+    sql = make_psql(tmp_path, registry="f", taken_by="embedding_app", ownership_failures=1)
+    out = run_until_parked(bash, tmp_path, linger=2,
+                           extra_env={"HAF_FYP_OWNERSHIP_RETRY_SECONDS": "1"})
+    assert "CALL haf_fyp_app.main" not in sql.read_text(), out
+    assert "embedding_app" in out, out
+
+
+def test_the_backoff_doubles_to_five_minutes(bash, tmp_path):
+    """10, 20, 40, 80, 160, then 300 and stays there."""
+    make_psql(tmp_path, registry="f", ownership_failures=-1)
+    run_until_parked(bash, tmp_path, marker="retrying in", min_ownership_calls=8)
+    assert sleeps(tmp_path)[:7] == ["10", "20", "40", "80", "160", "300", "300"], sleeps(tmp_path)
+
+
+def test_a_changed_error_is_printed_in_full_again(bash, tmp_path):
+    """The full error prints when it CHANGES, not only the first time: a new failure is
+    new information."""
+    make_psql(tmp_path, registry="f", ownership_failures=-1, varying_error=True)
+    out = run_until_parked(bash, tmp_path, marker="retrying in", min_ownership_calls=3)
+    for n in (1, 2, 3):
+        assert f"stub ownership failure #{n}" in out, out
+    assert "same error" not in out, out
+
+
+def test_a_generic_failure_gets_no_reinstall_hint(bash, tmp_path):
+    """The hint is for a missing helper only; a connection error is not fixed by
+    reinstalling."""
+    make_psql(tmp_path, registry="f", ownership_failures=-1,
+              ownership_error='psql: error: FATAL:  role "haf_fyp_owner" does not exist')
+    out = run_until_parked(bash, tmp_path, marker="retrying in")
+    assert "Re-run the install" not in out, out
+
+
+def test_a_failing_registry_lookup_is_logged_too(bash, tmp_path):
+    """to_regclass answers, then the lookup itself fails: logged, and the legacy loop is
+    chosen only because the ownership probe then answers "nobody"."""
+    sql = make_psql(tmp_path, registry="lookup_error")
+    make_driver_stub(tmp_path)
+    r = run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    assert "stub lookup failure" in r.stdout + r.stderr, r.stdout + r.stderr
+    assert "CALL haf_fyp_app.main('haf_fyp');" in sql.read_text()
+
+
+def test_the_same_holds_when_the_legacy_loop_is_forced(bash, tmp_path):
+    """With the driver on PATH, so HAF_FYP_USE_LEGACY_LOOP is actually read."""
+    sql = make_psql(tmp_path, registry="t", ownership_failures=-1)
+    argv_log = make_driver_stub(tmp_path)
+    out = run_until_parked(bash, tmp_path, marker="retrying in", min_ownership_calls=2,
+                           extra_env={"HAF_FYP_USE_LEGACY_LOOP": "true",
+                                      "HAF_FYP_OWNERSHIP_RETRY_SECONDS": "1"})
+    assert "CALL haf_fyp_app.main" not in sql.read_text(), out
+    assert not argv_log.exists(), out
+
+
+def test_a_registered_app_runs_the_driver_without_asking(bash, tmp_path):
+    """The ownership check guards the LEGACY loop. A registered haf_fyp owns its context
+    (hive.app_register refuses a context another application holds), so its driver must
+    not wait on a probe that cannot answer."""
+    make_psql(tmp_path, registry="t", ownership_failures=-1)
+    argv_log = make_driver_stub(tmp_path)
+    r = run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "--app=haf_fyp" in argv_log.read_text()
+    assert not (tmp_path / "ownership_calls").exists(), "the driver path asked about ownership"
+
+
+@pytest.mark.parametrize("error", [
+    "ERROR:  function haf_fyp_app.context_claimed_by_other_app(unknown) does not exist",
+    'ERROR:  schema "haf_fyp_app" does not exist',
+])
+def test_a_missing_helper_says_to_rerun_the_install(bash, tmp_path, error):
+    """A container restarted on a new image against a database installed before the
+    helper existed: the one permanent failure with a known fix, so name it -- and still
+    do not start the loop."""
+    sql = make_psql(tmp_path, registry="f", ownership_failures=-1, ownership_error=error)
+    out = run_until_parked(bash, tmp_path, marker="retrying in", min_ownership_calls=3,
+                           linger=0.5)
+    assert "Re-run the install" in out, out
+    assert "CALL haf_fyp_app.main" not in sql.read_text(), out
+
+
+@pytest.mark.parametrize("value,expected", [
+    (None, 10), ("abc", 10), ("0", 10), ("-5", 10), ("", 10), (" 7", 10),
+    ("999999", 10), ("99999999999999999999", 10),
+    # A leading 0 is decimal here. Bash arithmetic reads it as octal, and `08` once
+    # raised an expansion error that abandoned the whole ownership check -- and
+    # CALL main() ran on a context another application owned.
+    ("08", 8), ("010", 10), ("007", 7),
+])
+def test_the_retry_interval_defaults_and_rejects_nonsense(bash, tmp_path, value, expected):
+    """Default 10s. A value `sleep` rejects would exit under `set -e` -- a crash loop --
+    and 0 would query the database in a tight loop; both fall back to 10s."""
+    make_psql(tmp_path, registry="f", ownership_failures=-1)
+    env = {} if value is None else {"HAF_FYP_OWNERSHIP_RETRY_SECONDS": value}
+    out = run_until_parked(bash, tmp_path, marker="retrying in", extra_env=env)
+    assert f"retrying in {expected}s" in out, out
+    assert "value too great for base" not in out, out
+
+
+def test_a_leading_zero_interval_does_not_skip_the_check(bash, tmp_path):
+    """The failure itself, end to end: another application owns the context, the interval
+    is `08`, and the loop must still be refused rather than started."""
+    sql = make_psql(tmp_path, registry="f", taken_by="embedding_app")
+    out = run_until_parked(bash, tmp_path, linger=1,
+                           extra_env={"HAF_FYP_OWNERSHIP_RETRY_SECONDS": "08"})
+    assert "CALL haf_fyp_app.main" not in sql.read_text(), out
+
+
+def test_an_empty_error_still_prints_in_full_the_first_time(bash, tmp_path):
+    """psql killed by a signal writes nothing to stderr; the first attempt must still get
+    the full message, not "same error"."""
+    make_psql(tmp_path, registry="f", ownership_failures=-1, ownership_error="")
+    out = run_until_parked(bash, tmp_path, marker="retrying in",
+                           extra_env={"HAF_FYP_OWNERSHIP_RETRY_SECONDS": "1"})
+    assert "could not find out whether another application owns" in out, out
+
+
+def test_a_transient_ownership_failure_recovers(bash, tmp_path):
+    """Retrying, not parking for good: once the probe answers "nobody", the loop starts.
+    A node must not stay down until someone restarts it because of one dropped query."""
+    sql = make_psql(tmp_path, registry="f", ownership_failures=2)
+    r = run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt",
+                extra_env={"HAF_FYP_OWNERSHIP_RETRY_SECONDS": "1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "CALL haf_fyp_app.main('haf_fyp');" in sql.read_text()
+    assert (tmp_path / "ownership_calls").read_text().strip() == "3"
+
+
+def test_the_ownership_question_is_the_shared_helper(bash, tmp_path):
+    """One statement, through haf_fyp_app.context_claimed_by_other_app() (#65): the same
+    predicate as the install's guard and register_app.sql, with the registry probe inside
+    it and an ORDER BY -- not a second inline copy that can drift, and not the old
+    `LIMIT 1` with no ordering, which could name a different owner per run."""
+    sql = make_psql(tmp_path, registry="f")
+    run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    statements = [c for c in sql.read_text().split("---\n") if "context_claimed_by_other_app" in c]
+    assert len(statements) == 1, statements
+    # Keyed on the CONTEXT name. Asked about the schema, 'haf_fyp_app', it would answer
+    # NULL on every node -- "nobody owns it" -- which is #74 again, silently.
+    assert "context_claimed_by_other_app('haf_fyp')" in statements[0], statements
+    assert "LIMIT" not in sql.read_text()
 
 
 def test_the_probe_names_the_relation_in_a_statement_of_its_own(bash, tmp_path):

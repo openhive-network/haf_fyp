@@ -144,10 +144,9 @@ $$;
 -- Who else claims this context (#65)
 -- ---------------------------------------------------------------------------
 -- Returns the name of an application OTHER than haf_fyp whose registration lists this
--- context, or NULL when nobody does. The SQL callers share it -- the pointer repair below,
--- db/register_app.sql, and the post-install assertion in scripts/install_app.sh.
--- scripts/process_blocks.sh still asks the same question with two inline queries of its
--- own; those are not converged here.
+-- context, or NULL when nobody does. Every caller shares it -- the pointer repair below,
+-- db/register_app.sql, the post-install assertion in scripts/install_app.sh, and
+-- scripts/process_blocks.sh's refusal to start (#74).
 --
 -- `to_regclass`, not `to_regprocedure`: a HAF without haf#341 (1.28.7, for one; the
 -- first tag that ships it is 1.28.8-rc1) has no hafd.applications and must still install.
