@@ -156,7 +156,22 @@ services:
     depends_on:
       haf-fyp-setup:
         condition: service_completed_successfully
+        # The block processor holds HAF's shared lock on haf_fyp, and install_app.sh SKIPS
+        # while it is held (#67): exit 0, nothing installed, and this service back on the
+        # old SQL. An ordinary `up -d --build` is safe without this key -- both services are
+        # recreated, and Compose stops every replaced container before it starts any --
+        # but when only haf-fyp-setup is recreated (its own config changed), this one would
+        # keep running and holding the lock. `restart: true` makes Compose stop it first and
+        # start it after setup completes. It does nothing for `up haf-fyp-setup` naming
+        # setup alone, or `run`: stop this service by hand then (README).
+        restart: true
     restart: unless-stopped
+    # Time to stop cleanly, so the session holding HAF's lock ends with the container
+    # instead of outliving it. The legacy loop cancels its own statement on SIGTERM at
+    # once; the driver finishes its current range first, and a MASSIVE-sync range can take
+    # longer than Docker's default 10s. Past this the container is killed, and the server
+    # then notices within client_connection_check_interval (scripts/process_blocks.sh).
+    stop_grace_period: 2m
     # Declared here rather than in Dockerfile.sql -- see the note there. This is the
     # only service the check describes; the other two built from the same image run
     # once and exit.

@@ -16,9 +16,12 @@ and the run carried on with defaults.
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -321,6 +324,134 @@ def test_a_precondition_refusal_stops_the_install(bash, tmp_path):
                           capture_output=True, text=True, timeout=TIMEOUT)
     assert proc.returncode != 0, proc.stdout + proc.stderr
     assert len(argv_log.read_text().splitlines()) == 1, argv_log.read_text()
+
+
+# --- HAF's install lock (#67) -----------------------------------------------------------
+
+def make_lock_wrapper(tmp_path, mode: str) -> Path:
+    """A stand-in for the psql image's install_with_app_lock.py (same argv contract:
+    APP_NAME DSN CMD [ARG ...]). It records what it was given, then either runs CMD -- the
+    lock acquired -- or, like the real one when a processor holds the lock, logs that it
+    is skipping and exits 0 without running it.
+
+    It refuses to be the second link of a recursion -- called again, or called without
+    HAF_INSTALL_LOCK_HELD exported to it -- so a broken guard fails the test at once
+    instead of forking a wrapper/bash chain until the timeout."""
+    wrapper = tmp_path / "install_with_app_lock.py"
+    record = tmp_path / "wrapper.log"
+    wrapper.write_text(
+        "import json, os, subprocess, sys\n"
+        f"again = os.path.exists({str(record)!r})\n"
+        f"open({str(record)!r}, 'a').write(json.dumps("
+        "{'argv': sys.argv[1:], 'held': os.environ.get('HAF_INSTALL_LOCK_HELD')}) + '\\n')\n"
+        "if again or not os.environ.get('HAF_INSTALL_LOCK_HELD'):\n"
+        "    print('stand-in wrapper: called again, or without HAF_INSTALL_LOCK_HELD set')\n"
+        "    sys.exit(97)\n"
+        + ("print('Skipping haf_fyp install -- lock held by an active block-processor.')\n"
+           "sys.exit(0)\n" if mode == "skip" else
+           "sys.exit(subprocess.run(['bash'] + sys.argv[3:]).returncode)\n")
+    )
+    return wrapper
+
+
+def run_install_with_wrapper(bash, tmp_path, mode, *args, extra_env=None, psql_exit=0):
+    """install_app.sh with the full psql stub, and HAF_FYP_INSTALL_LOCK_WRAPPER pointing at
+    a wrapper stand-in. The stand-in runs the script through bash; the real wrapper execs it
+    directly, which needs the executable bit Dockerfile.sql's COPY --chmod=755 sets."""
+    wrapper = make_lock_wrapper(tmp_path, mode)
+    bindir = stub_bin(tmp_path)
+    argv_log = tmp_path / "argv.log"
+    write_exec(bindir / "psql", "#!/bin/sh\n"
+               f'printf "%s\\n" "$*" >> "{argv_log.as_posix()}"\n' f"exit {psql_exit}\n")
+    env = clean_env(bindir)
+    env["HAF_FYP_INSTALL_LOCK_WRAPPER"] = str(wrapper)
+    env.update(extra_env or {})
+    # Its own process group, killed whole on timeout: a recursion regression would
+    # otherwise leave a chain of wrapper and bash processes behind.
+    p = subprocess.Popen([bash, str(INSTALL), *args], env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        # Repeatedly: a link of a recursing chain can fork after one killpg, and carry on.
+        for _ in range(100):
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        p.communicate()
+        raise
+    proc = subprocess.CompletedProcess(p.args, p.returncode, out, err)
+    record = tmp_path / "wrapper.log"
+    calls = [json.loads(line) for line in record.read_text().splitlines()] if record.exists() else []
+    return proc, calls, argv_log
+
+
+def test_the_install_runs_under_the_lock_wrapper_once(bash, tmp_path):
+    """Once: the wrapper runs the script again as its child, and the child must go
+    straight on rather than wrap itself forever."""
+    proc, calls, argv_log = run_install_with_wrapper(bash, tmp_path, "run")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert len(calls) == 1, calls
+    # The guard that stops the child wrapping itself again, exported before the exec. The
+    # script tests it with -z, so any non-empty value is the contract.
+    assert calls[0]["held"], calls
+    assert calls[0]["argv"][0] == "haf_fyp", calls   # the lock NAME, not the schema
+    assert argv_log.exists(), "the install never ran under the wrapper"
+
+
+def test_the_lock_is_taken_on_the_same_database_as_the_install(bash, tmp_path):
+    """--host/--port/--user reach the wrapper's connection. A lock taken on a different
+    server than the one being installed protects nothing."""
+    _, calls, _ = run_install_with_wrapper(bash, tmp_path, "run", "--host=elsewhere",
+                                           "--port=6543", "--user=someone_else",
+                                           extra_env={"POSTGRES_DB": "other_db"})
+    dsn = calls[0]["argv"][1]
+    # Advisory locks are per DATABASE: one taken on another database protects nothing.
+    for part in ("host='elsewhere'", "port='6543'", "user='someone_else'", "dbname='other_db'"):
+        assert part in dsn.split(), dsn
+
+
+def test_the_original_arguments_reach_the_real_install(bash, tmp_path):
+    _, calls, _ = run_install_with_wrapper(bash, tmp_path, "run", "--swagger-url=example.com")
+    assert calls[0]["argv"][2].endswith("install_app.sh"), calls
+    assert calls[0]["argv"][3:] == ["--swagger-url=example.com"], calls
+
+
+def test_a_held_lock_skips_the_install_and_succeeds(bash, tmp_path):
+    """A live processor holds the lock: nothing is installed, and setup still completes --
+    haf-fyp-setup's dependents wait on service_completed_successfully."""
+    proc, _, argv_log = run_install_with_wrapper(bash, tmp_path, "skip")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not argv_log.exists(), f"the install ran although the lock was held: {argv_log.read_text()}"
+    assert "Taking HAF's install lock on haf_fyp" in proc.stdout, proc.stdout
+
+
+def test_a_failed_install_under_the_wrapper_fails_setup(bash, tmp_path):
+    """The wrapper returns the install's exit code, and nothing after it may turn a failure
+    into success: haf-fyp-setup's dependents start on service_completed_successfully."""
+    proc, calls, _ = run_install_with_wrapper(bash, tmp_path, "run", psql_exit=3)
+    assert len(calls) == 1, calls
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+
+
+def test_the_lock_connection_quotes_its_values(bash, tmp_path):
+    """A value with a quote or a backslash must reach libpq intact, not end the value early
+    or change what the next key means -- parsed here by libpq itself."""
+    from psycopg2.extensions import parse_dsn
+    _, calls, _ = run_install_with_wrapper(bash, tmp_path, "run",
+                                           extra_env={"POSTGRES_DB": "we'ird\\db x"})
+    assert parse_dsn(calls[0]["argv"][1])["dbname"] == "we'ird\\db x", calls[0]["argv"][1]
+
+
+def test_without_the_wrapper_the_install_runs_unlocked_and_says_so(bash, tmp_path):
+    """A checkout run by hand, or CI: no wrapper, so no lock -- installed as before, but
+    not silently."""
+    proc, sql_log, _ = run_install_full_stub(bash, tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "WITHOUT HAF's install lock" in proc.stdout + proc.stderr
+    assert sql_log.exists()
 
 
 def test_swagger_url_reaches_the_endpoint_load(bash, tmp_path):

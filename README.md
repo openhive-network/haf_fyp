@@ -722,7 +722,7 @@ fails. A kept stack survives only until the next run, which starts by removing i
 
 | Verb | Runs | Notes |
 |------|------|-------|
-| `install_app [--swagger-url=HOST] [--host=] [--port=] [--user=] [--is_forking=FALSE]` | `scripts/install_app.sh` | idempotent; safe to re-run |
+| `install_app [--swagger-url=HOST] [--host=] [--port=] [--user=] [--is_forking=FALSE]` | `scripts/install_app.sh` | idempotent; safe to re-run — but *skipped* while the block processor runs (below) |
 | `process_blocks` | `scripts/process_blocks.sh` | infinite loop |
 | `uninstall_app [--force] [--host=] [--port=] [--user=]` | `scripts/uninstall_app.sh` | destructive |
 
@@ -754,6 +754,66 @@ print the dispatcher's own usage.
 Moving these services from a script path to a verb needs `--build` on the first run
 after upgrading: they declare `build:` with no `image:`, so a plain `up -d` reuses a
 previously-built image, which has no `install_app` to run.
+
+### Re-installing while the stack runs: HAF's application locks
+
+On a HAF that has them (1.28.8-rc1 and later), the install and the block processor no
+longer run over each other ([#67](https://gitlab.syncad.com/hive/haf_fyp/-/issues/67)). The
+block processor, through the driver or the legacy `CALL main()` loop, holds a shared lock
+on `haf_fyp`, and on `hivemind`, whose tables it reads, for as long as it runs.
+`install_app` takes the `haf_fyp` lock exclusively through the psql image's
+`install_with_app_lock.py`, the same way balance_tracker, haf_block_explorer,
+reputation_tracker, hivesense and nft_tracker do.
+
+So **re-running `install_app` while the block processor is up installs nothing.** The log
+says `Skipping haf_fyp install — lock held by an active block-processor`, names the holder,
+and the install service still exits 0 — so nothing else looks wrong, and the processor,
+ranker and API carry on against the old SQL. `GET /version` still reporting the previous
+commit is the tell.
+
+**A whole-stack `up -d --build` upgrades in the right order**: both services are
+recreated, and Compose stops every replaced container before starting any, so the old
+processor is gone before the install runs (`depends_on … restart: true` covers the case
+where only `haf-fyp-setup` changed). **Running the install on its own** — `up
+haf-fyp-setup`, `run haf-fyp-setup`, `restart haf-fyp-setup` — leaves the processor running
+and holding the lock, so stop it first, and rebuild it too when you start it again
+(`haf-fyp-sync` has its own image, and a plain `up` reuses it):
+
+```bash
+export GIT_HASH="$(git rev-parse --verify HEAD | cut -c1-8)"   # as in Quick Start step 2
+docker compose --env-file docker/.env.local -f docker/docker-compose.yml stop haf-fyp-sync
+docker compose --env-file docker/.env.local -f docker/docker-compose.yml up --build haf-fyp-setup
+docker compose --env-file docker/.env.local -f docker/docker-compose.yml up -d --build haf-fyp-sync
+```
+
+**haf_api_node**: an upgrade to a new `HAF_FYP_VERSION` recreates both services and is safe
+the same way. Running `haf-fyp-install` on its own, or a module change that recreates only
+it, is not — its module has no `restart: true` (hive/haf_api_node#47) — so stop the
+processor first there:
+
+```bash
+docker compose stop haf-fyp-block-processing
+docker compose --profile core --profile haf-fyp up -d    # or your usual profile flags
+```
+
+(`up -d` without the profile that enables haf_fyp leaves the stopped processor stopped and
+never runs the install.)
+
+In either deployment a processor killed mid-statement keeps the lock until PostgreSQL
+finishes that statement; this repo gives `haf-fyp-sync` two minutes to stop cleanly.
+
+The processor's lock on `hivemind` means the same for hivemind: its installer skips while
+haf_fyp is processing, as it already does for hivesense. That includes a **first** install:
+on a new haf_api_node node where haf_fyp's processor starts before `hivemind-install` has
+run, hivemind's schema build is skipped (hivesense's module avoids this with a `depends_on`
+on `hivemind-install`; haf_fyp's is hive/haf_api_node#47). Stop haf_fyp's processor before
+installing or re-installing hivemind.
+
+**Stopping the processor releases the lock.** The legacy `CALL main()` loop cancels its own
+statement on SIGTERM, so its session — and the lock — end with the container; if it is
+killed outright, the server notices the vanished client within
+`client_connection_check_interval` (5s). Before that, a stopped container's session could
+outlive it until the server next wrote to it.
 
 ### Block-processing healthcheck
 

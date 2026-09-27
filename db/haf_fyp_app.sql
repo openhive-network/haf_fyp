@@ -323,6 +323,47 @@ END;
 $$;
 
 -- ---------------------------------------------------------------------------
+-- HAF's block-processor locks (#67)
+-- ---------------------------------------------------------------------------
+-- HAF 1.28.8-rc1 and later ship advisory locks that keep an application's INSTALLER and
+-- its BLOCK PROCESSOR from running over each other (src/hive_fork_manager/app_locks.sql):
+-- every processor holds a SHARED session lock on each application it depends on, itself
+-- included, for as long as it runs; an installer TRIES the same lock EXCLUSIVELY and, if
+-- any processor holds it, skips its work. scripts/install_app.sh takes the installer
+-- side through the base image's install_with_app_lock.py.
+--
+-- The names are the applications' own lock names -- free text, hashed; not their
+-- contexts or schemas:
+--   haf_fyp   -- ourselves.
+--   hivemind  -- db/process_posts.sql reads hivemind_app while processing, and
+--                db/register_app.sql declares hivemind_app a dependency. Hivemind's
+--                installer and sync use the name 'hivemind', as hivesense's processor
+--                does for the same reason.
+-- scripts/process_blocks.sh passes the SAME names to haf_app_driver.py as --lock flags;
+-- tests/integration/test_block_processor_locks_db.py holds the two lists together.
+--
+-- Session-level, so the lock outlives every COMMIT and ROLLBACK in main() and is
+-- released when the connection closes. It WAITS while an installer holds the lock --
+-- which is the point: the loop does not start mid-install.
+--
+-- A HAF without the functions (1.28.7) has no install locks for anyone to respect, so
+-- there is nothing to take: skipped, not refused. to_regprocedure with a text[]
+-- signature resolves on every PostgreSQL (the #68 failure needs an unknown type), and
+-- the PERFORM is planned only when reached, so it never resolves the missing function.
+CREATE OR REPLACE FUNCTION haf_fyp_app.take_block_processor_locks()
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF to_regprocedure('hive.acquire_app_block_processor_locks(text[])') IS NULL THEN
+        RAISE NOTICE 'This HAF has no application locks (hive.acquire_app_block_processor_locks); none taken.';
+        RETURN;
+    END IF;
+    PERFORM hive.acquire_app_block_processor_locks(ARRAY['haf_fyp', 'hivemind']);
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- Main block-processing loop (PROCEDURE so CALL works and transactions commit).
 -- Uses hive.app_next_iteration() which automatically advances the context block
 -- pointer — unlike the older hive.app_next_block() function which does not.
@@ -336,6 +377,8 @@ AS $$
 DECLARE
     _block_range hive.blocks_range;
 BEGIN
+    -- First, before the loop can touch anything: waits out an install in progress.
+    PERFORM haf_fyp_app.take_block_processor_locks();
     PERFORM haf_fyp_app.allow_processing();
     RAISE NOTICE 'haf_fyp starting. Last processed block: %', hive.app_get_current_block_num(_context);
 
