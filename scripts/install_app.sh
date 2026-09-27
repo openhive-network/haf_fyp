@@ -177,35 +177,13 @@ wait_for_postgres
 #    `condition: service_completed_successfully`, a mid-script abort would
 #    crash-loop the installer and keep the whole stack from ever starting.
 #
-#    An earlier install registered the HAF context as haf_admin (old step 10 ran
-#    as haf_admin, and hive.app_create_context stores current_user as the owner of
-#    the hafd.contexts row, the hafd.contexts_attachment row, the context table and
-#    all nine context views). That is NOT repairable with an UPDATE: rewriting only
-#    hafd.contexts.owner moves the failure into app_context_attach
-#    ("new row violates row-level security policy for table contexts_attachment"),
-#    and fixing that column too only reaches "must be owner of view blocks_view".
-#    Fail with the one command that does fix it. Any host in this state has never
-#    processed a block — under the previous NOLOGIN roles none of the runtime
-#    containers could connect — so dropping the context is safe.
-psql_cmd -v ON_ERROR_STOP=on -c "
-DO \$\$
-DECLARE __owner name;
-BEGIN
-    IF to_regclass('hafd.contexts') IS NULL THEN
-        RETURN;  -- not a HAF database yet; later steps report that properly
-    END IF;
-    SELECT owner INTO __owner FROM hafd.contexts WHERE name = 'haf_fyp';
-    IF __owner IS NOT NULL AND __owner <> 'haf_fyp_owner' THEN
-        RAISE EXCEPTION
-            'haf_fyp context is owned by % — an earlier install registered it as '
-            'haf_admin. Its attachment row, context table and context views are '
-            'owned by that role too, so the haf_fyp_owner block processor cannot '
-            'attach it and an UPDATE of hafd.contexts.owner will not help. Run '
-            'SELECT hive.app_remove_context(''haf_fyp''); as haf_admin, then re-run '
-            'this script. Nothing has been modified.', __owner;
-    END IF;
-END
-\$\$;"
+#    A haf_fyp context owned by any role but haf_fyp_owner is refused here: the block
+#    processor cannot attach it, and no UPDATE repairs it. What to DO about it depends on
+#    who made it -- an old install as haf_admin (remove it), another application in the
+#    HAF registry (do not: that is its context), or something else (find out first) -- so
+#    the check and its three messages live in db/install_preconditions.sql, where the
+#    integration lane can execute them (#75).
+run_sql_file "${SCRIPT_DIR}/../db/install_preconditions.sql"
 
 #    pgvector. db/create_tables.sql declares `interest_vector vector(1024)`, so the type
 #    is a hard prerequisite -- but it was documented only in comments here and in the

@@ -825,6 +825,16 @@ the context from that application, unregister it outright if it was its only one
 the context's state table — `hive.app_remove_context` ends in `DROP TABLE <schema>.<context>`
 — while its driver is still processing blocks.
 
+**At install time** the same state stops `install_app.sh` at step 0 when the context is owned
+by a different *role* as well: the install refuses, names the application, and changes
+nothing ([#75](https://gitlab.syncad.com/hive/haf_fyp/-/issues/75)). (When the role is
+haf_fyp's own, the install goes ahead and leaves itself unregistered, as above.) There is
+nothing to repair on haf_fyp's side: either leave haf_fyp off that node — stop
+`haf-fyp-setup`, or `haf-fyp-install` in haf_api_node — and let the other application
+process the context, or install haf_fyp on a HAF where it owns its context. Do **not**
+`hive.app_remove_context('haf_fyp')` to make the install pass; that is the teardown this
+section exists to prevent.
+
 To remove haf_fyp there, detach the context first. **Not** by re-registering the other
 application with fewer contexts: `hive.app_register` also sets `process_procedure` and
 `completed_block_function` from its arguments, so that blanks its driver wiring, and with an
