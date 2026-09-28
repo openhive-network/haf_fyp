@@ -1112,6 +1112,105 @@ the work up regardless.
 | T-0.7 — community custom_json format | ✅ Resolved | Double-encoded JSON array `["subscribe", {"community": "hive-NNNNNN"}]`; account from `required_posting_auths[0]` |
 | T-0.1 — HiveSense table and column names | ✅ Resolved | Live: `hivesense_app.posts_vectors.embedding halfvec(1024)`, keyed by **hivemind post id** (`hive_posts.id`), one row per chunk. haf_fyp's own post_id keyspace does not overlap, so the ranker bridges via (author, permlink) → hivemind → hivesense and averages chunks |
 
+## Checking that the pinned images still exist
+
+`scripts/check_pinned_images.sh` resolves every image this repository pins — everything the
+compose files **pull** (`docker/docker-compose.yml` and `docker/docker-compose-ci.yml`,
+through `docker/.env`), plus every `FROM` in `Dockerfile.*` — and fails when one of them no
+longer exists in its registry. Ten references today.
+
+It passes **only when every reference was positively resolved**
+([#71](https://gitlab.syncad.com/hive/haf_fyp/-/issues/71)), and says how many that was:
+`positively resolved 10 of 10`. Each is one manifest `HEAD` to the registry's HTTP API:
+
+- `200` with a `Docker-Content-Digest` — resolved; the digest is printed.
+- `404` from the registry itself (it carries `Docker-Distribution-Api-Version`) — `MISSING`:
+  the tag (or digest) is gone. A `404` without that header — a proxy, a misrouted ingress — is
+  not taken as a verdict.
+- refused on every try — `UNREADABLE`: the repository is gone, renamed or private, and an
+  operator's anonymous pull fails the same way. Docker Hub issues a token and then answers
+  the manifest `401`; `gitlab.syncad.com` refuses at the token service itself (`403 DENIED`).
+  A refusal that does not hold on every try is not taken as a verdict.
+- anything else (`429`, `5xx`, no response, a `200` with no digest, a token service that
+  fails) is asked again, and after three tries is `UNANSWERED` — which also fails the job,
+  with its own message and any rate-limit headers the registry sent, because an image nobody
+  could verify was not checked.
+
+Why `HEAD`: Docker Hub rate-limits anonymous `GET`s per source IP, which a shared runner
+reaches, and it rejects at the limiter **before** it looks the tag up — so a limited `GET` and
+a dead tag both answer `429`. The first attempt at this check (!77) used a `GET`, forgave
+`429` as inconclusive, and with it forgave dead pins: one run verified 3 of 10 images and
+reported success. Hub does not count `HEAD`s against the limit (measured: the remaining
+allowance stayed at 100 across `HEAD`s and dropped on one `GET`), so the sweep does not spend
+the budget it would trip over, and nothing needs forgiving.
+
+```bash
+sh scripts/check_pinned_images.sh
+# sha256:fb27b00a... pgvector/pgvector:pg14
+# sha256:4ea9e5ed... postgres:14-alpine
+# sha256:729bf65c... postgrest/postgrest:v12.2.3
+# ...
+# sha256:1b1d9202... registry.gitlab.syncad.com/hive/haf:1.29.0-rc2
+# ...
+# [check-pinned-images] positively resolved 10 of 10: 0 missing or unreadable, 0 unanswered
+```
+
+Needs `docker` (the CLI with the compose plugin, for `docker compose config`), `curl` and
+`jq`. It needs **no docker daemon** and **no login**: these are public repositories, and
+authenticating would keep the check green for a repository that has become unreadable to
+anyone without our credentials. It gives the whole sweep a budget
+(`HAF_FYP_RESOLVE_DEADLINE`, 420s) that the CI job's timeout sits above, so a hung registry
+ends in the script's own account of what it proved rather than a bare job timeout.
+
+It runs compose in an **emptied environment** (`env -i`, keeping only `PATH` and `HOME`).
+Compose reads the shell environment in preference to `--env-file` (`docker/.env` says so
+under `HAF_VERSION`), so otherwise a CI/CD variable named `HAF_VERSION` — or the documented
+`HAF_FYP_REWRITER_IMAGE` override, which `docker/.env` does not even define — would silently
+redirect the check away from the pin the repository actually ships.
+
+Nothing else notices a dead pin. `compose-validate` runs `docker compose config`, which
+parses YAML and never contacts a registry — and deliberately uses placeholder values, since
+a lane that cannot pull cannot tell a good reference from a dead one. `docker-compose-ci.yml`
+runs plain PostgreSQL with pgvector, so no test lane pulls HAF at all. The guards in
+`tests/unit/test_compose_contract.py` are offline by design: they keep the reference in the
+shape that resolved when it was last run. That combination is how
+[#56](https://gitlab.syncad.com/hive/haf_fyp/-/issues/56) lived — the stack asked for an
+image path nobody had ever published, and every pipeline stayed green until an operator hit
+it on a cold cache.
+
+### The scheduled lane
+
+CI runs it as `registry-resolution`, **on a schedule, or when asked for** — never in a push
+or merge-request pipeline ([#71](https://gitlab.syncad.com/hive/haf_fyp/-/issues/71)). Whether
+a tag still exists is a question whose answer changes without anyone touching this repository,
+so a merge request is the wrong moment to ask it and the wrong thing to block on a registry
+being reachable. It has no `allow_failure` of any kind, and it is not interruptible —
+otherwise a push to the default branch just after the tick cancels the sweep with no verdict.
+
+Create it under **Build → Pipeline schedules** (`/-/pipeline_schedules`) on the default
+branch; a daily or weekly cadence is plenty. To run it without waiting for a tick, run a
+pipeline with `RUN_REGISTRY_RESOLUTION=true` — that pipeline runs the sweep and nothing else.
+
+Worth knowing before creating it: a scheduled pipeline is a pipeline for the default branch's
+head, so it shows in that branch's status like any other. A red sweep turns `develop` red
+until the next push, and a green one can sit on top of a red push pipeline; its failure mail
+goes to the schedule's owner.
+
+Nothing else in `.gitlab-ci.yml` runs in a scheduled pipeline — every other lane carries
+`.standard-rules`, whose first rule is `$CI_PIPELINE_SOURCE == "schedule" → when: never`, and
+`publish_tag` carries the same exclusion of its own because a schedule may target a **tag**,
+where it would otherwise re-publish a release from unchanged source on a timer. That rule is
+load-bearing rather than tidy: a scheduled pipeline runs *on a branch*, so it sets `CI_COMMIT_BRANCH`, and a schedule on `develop` would
+otherwise match every lane's `$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH` — running the three
+`docker-build` jobs on a timer, republishing `:<short-sha>` and `:develop` from unchanged
+source, and moving the very digests this lane exists to watch.
+
+The job prints the **manifest-list digest** next to each reference, which is what
+`docker pull` records. A tag that is re-pointed upstream still resolves — `docker/.env`
+records `latest` sharing a digest with a develop build while the registry still reports it
+created months earlier — so the digest is what makes a re-point visible as a change between
+runs rather than another green tick.
+
 ## Running Tests
 
 ```bash
