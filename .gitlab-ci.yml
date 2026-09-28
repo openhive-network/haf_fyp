@@ -12,6 +12,28 @@ stages:
     paths:
       - .pip-cache/
 
+# The rules every lane below carries, as one definition rather than ten copies -- because
+# they now have to say something they did not before.
+#
+# A SCHEDULED pipeline runs on a branch, so it sets CI_COMMIT_BRANCH, and a schedule on
+# develop makes `$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH` TRUE. Without the first rule,
+# creating the schedule this MR adds would run the ENTIRE pipeline every time -- every lint,
+# every test, and all three docker-build jobs, which push `:<short-sha>` and `:develop`. That
+# would republish images from unchanged source and move the very digests registry-resolution
+# exists to watch, on a timer, for nothing. `when: never` first, because the first matching
+# rule decides.
+#
+# The same goes for the ON-DEMAND sweep. "Run pipeline" with RUN_REGISTRY_RESOLUTION=true
+# creates a `web` pipeline, and on develop that sets CI_COMMIT_BRANCH too -- so without the
+# second rule, asking for the registry check would rerun every lane and republish :develop.
+.standard-rules: &standard_rules
+  - if: $CI_PIPELINE_SOURCE == "schedule"
+    when: never
+  - if: $RUN_REGISTRY_RESOLUTION == "true"
+    when: never
+  - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
 sql-lint:
   stage: lint
   image: python:3.12-slim
@@ -29,9 +51,7 @@ sql-lint:
     # Excluding the layout rules keeps the parse check and every rule about meaning --
     # which is what would catch a broken predicate. db/ and endpoints/ stay strict.
     - sqlfluff lint scripts/ docker/ --dialect postgres --exclude-rules LT01,LT02,LT14
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *standard_rules
 
 shell-lint:
   stage: lint
@@ -50,9 +70,7 @@ shell-lint:
     # on ALL-CAPS names, and that edit has been reverted. The scope widening is worth
     # keeping on its own terms; it is future coverage, not a fix.
     - find scripts/ docker/ -name "*.sh" -exec shellcheck --severity=warning {} +
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *standard_rules
 
 python-lint:
   extends: .python-cache
@@ -68,9 +86,7 @@ python-lint:
     - pip install ruff==0.15.12 mypy types-redis -q
     - ruff check haf_fyp/
     - mypy haf_fyp/ --ignore-missing-imports
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *standard_rules
 
 hadolint:
   stage: lint
@@ -78,9 +94,7 @@ hadolint:
   image: hadolint/hadolint:v2.12.0-alpine
   script:
     - hadolint Dockerfile.python Dockerfile.sql Dockerfile.rewriter
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *standard_rules
 
 compose-validate:
   stage: lint
@@ -90,16 +104,78 @@ compose-validate:
     # contacts a registry, and the compose file interpolates every ${VAR} it names. They
     # are deliberately NOT the values docker/.env ships -- a lane that cannot pull cannot
     # tell a good reference from a dead one, which is how #56 stayed green here. The pin
-    # itself is checked offline by tests/unit/test_compose_contract.py.
+    # itself is checked offline by tests/unit/test_compose_contract.py, and whether it still
+    # RESOLVES by the scheduled registry-resolution job below (#71). The three are
+    # complements, not duplicates: syntax here, shape and release floor there, existence
+    # against the real registry on a timer.
     HAF_REGISTRY: "registry.example.com"
     HAF_VERSION: "latest"
     POSTGREST_VERSION: "latest"
     FYP_ADMIN_API_KEY: "dummy"
   script:
     - docker compose -f docker/docker-compose.yml config --quiet
+  rules: *standard_rules
+
+# Does what compose-validate CANNOT, and the two are complements, not duplicates.
+# compose-validate parses YAML with placeholder values and never contacts a registry; this
+# resolves the values docker/.env actually ships, against the real registries. #56 was green
+# in the first and would have been red here on the day it was written.
+#
+# SCHEDULED, not per-MR. The question -- "does this tag still exist?" -- has an answer that
+# changes without anyone touching this repository, so an MR is the wrong moment to ask it and
+# the wrong thing to block on a registry being reachable. Set the schedule up in
+# Build > Pipeline schedules on the default branch. Nothing else in this file runs in a
+# scheduled pipeline: every other lane carries .standard-rules, and publish_tag -- which is
+# not a branch lane and so does not -- carries the same exclusion of its own, because a
+# schedule may target a TAG.
+#
+# NO dind service and NO docker login. The references are resolved with manifest HEADs over
+# the registries' HTTP API (curl), and `docker compose config` -- which extracts them -- is
+# client-side; neither needs a daemon. These are public repositories, and anonymous is how an
+# operator pulls them: authenticating would mask a repository that has become unreadable to
+# everyone without our credentials.
+#
+# NO allow_failure, in any form (#71). The first attempt (!77) excused its "inconclusive" exit
+# code, and Docker Hub answers a rate-limited GET and a dead tag with the same 429 -- so it
+# excused dead pins, reporting success with 3 of 10 images verified. The script now uses HEAD
+# requests, which Hub does not count against that limit, and passes only when EVERY reference
+# was positively resolved. A registry that will not answer turns the pipeline red on a timer:
+# that is the intended cost, because a check that cannot fail is what #56 already had.
+registry-resolution:
+  stage: lint
+  image: docker:24
+  # NOT interruptible. This project has auto-cancel-redundant-pipelines on, so a push to the
+  # default branch shortly after the cron tick would otherwise cancel the sweep: no answer, no
+  # red, nothing. (A job still waiting for a runner counts as interruptible whatever it says,
+  # so that narrow window remains; once it runs, it finishes.) It is the only job in a
+  # scheduled pipeline and never runs in a push or MR pipeline, so holding it costs nothing
+  # elsewhere -- the same reasoning as publish_tag.
+  interruptible: false
+  # ABOVE the script's own budget, which the lane test holds it to: HAF_FYP_RESOLVE_DEADLINE
+  # (420s) plus one in-flight attempt (HEAD + token + HEAD at 20s each) plus the image pull and
+  # `apk add`. The script then reports what it proved and what it did not before the job is
+  # killed -- rather than the hung-registry case arriving as a bare "job timed out", which is
+  # how !77's 32-minute worst case met its 10-minute limit. Without a timeout the ceiling is
+  # the project default, an hour, holding a shared runner unattended.
+  timeout: 10m
+  # Infrastructure only, and the same single reason publish_tag uses. The script retries each
+  # request itself, and re-running the whole job on a real failure would print the same dead
+  # pin three times.
+  retry:
+    max: 2
+    when: runner_system_failure
+  before_script:
+    - apk add --no-cache curl jq
+  script:
+    - sh scripts/check_pinned_images.sh
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    # An on-demand hatch, because otherwise this job's FIRST EVER run would be a cron tick on
+    # develop after merge: "Run pipeline" creates a `web` pipeline, not a `schedule` one, so
+    # without this there is no way to exercise it -- and the debug loop for a lane that fails
+    # in a way only the real registry shows would be edit, merge, wait a day.
+    - if: $RUN_REGISTRY_RESOLUTION == "true"
+    - when: never
 
 openapi-drift:
   stage: lint
@@ -200,9 +276,7 @@ openapi-drift:
       sys.exit(1 if errs else 0)
       PYEOF
     - echo "served OpenAPI document is valid."
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *standard_rules
 
 python-tests:
   extends: .python-cache
@@ -223,12 +297,12 @@ python-tests:
     # python:3.11-slim does not ship one. That module FAILS rather than skips when git
     # is missing under CI, for the same reason the bash harness does: a silent skip
     # would put the gate itself back to uncovered.
-    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git >/dev/null
+    # curl and jq: tests/unit/test_check_pinned_images.py runs the registry check against a
+    # local fake registry, with the same tools the registry-resolution job installs.
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl jq >/dev/null
     - pip install -r requirements.txt pytest pytest-cov httpx pyyaml -q
     - PYTHONPATH=. pytest tests/unit/ -v -rfEs --cov=haf_fyp --cov-report=term-missing --cov-fail-under=40
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *standard_rules
 
 fastapi-tests:
   extends: .python-cache
@@ -285,9 +359,7 @@ fastapi-tests:
     - 'echo "  fastapi_url: $FASTAPI_URL" >> /tmp/tavern_cfg.yaml'
     - 'echo "  api_url: $API_URL" >> /tmp/tavern_cfg.yaml'
     - PYTHONPATH=. pytest tests/tavern/test_fastapi_endpoints.tavern.yaml --tavern-global-cfg=/tmp/tavern_cfg.yaml -v
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *standard_rules
 
 postgrest-tests:
   stage: test
@@ -313,9 +385,7 @@ postgrest-tests:
     # container, and a non-zero here would skip the `down -v` below.
     - docker compose -f docker/docker-compose-ci.yml logs haf-fyp-postgrest-rewriter || true
     - docker compose -f docker/docker-compose-ci.yml down -v
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *standard_rules
 
 .docker-build:
   stage: build
@@ -333,9 +403,7 @@ postgrest-tests:
     DOCKER_TLS_CERTDIR: "/certs"
   before_script:
     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *standard_rules
 
 # Push only from the default branch. Merge-request pipelines still BUILD -- that is
 # what catches a broken Dockerfile before review -- but publishing every MR commit
@@ -609,6 +677,18 @@ publish_tag:
   # hive/haf_api_node, which drives the release sweep, carries both spellings today
   # (`1.28.6-rc10` and `v1.28.6-rc11`), so both have to publish here.
   rules:
+    # A GitLab pipeline schedule can target a TAG, not only a branch -- so this lane needs the
+    # same exclusion .standard-rules carries, and for a sharper reason than the others: a
+    # schedule pointed at a release tag would re-pull `:<short-sha>` and re-push all three
+    # `:<tag>` images on a timer, republishing a release from unchanged source. Found by
+    # review; an earlier revision of #63 asserted "nothing else in this file runs there",
+    # which was true only for a BRANCH schedule.
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    # And a pipeline run for the on-demand registry sweep, which on a tag would otherwise
+    # re-publish that release too.
+    - if: $RUN_REGISTRY_RESOLUTION == "true"
+      when: never
     # The escape hatch haf_stats' publish lane carries: a tag that should not be
     # published can be stopped by re-running the pipeline with SKIP_DOCKER_PUBLISH set,
     # rather than by racing to cancel the job.
