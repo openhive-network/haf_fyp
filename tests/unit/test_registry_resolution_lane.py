@@ -266,13 +266,19 @@ def test_the_job_outlives_the_script_s_own_budget():
     32-minute worst case met a 10-minute limit.
 
     Margin: the deadline, plus one attempt already in flight when it passes (HEAD, token,
-    HEAD, each bounded by the request timeout), plus the image pull and `apk add`.
+    HEAD, each bounded by the request timeout), plus the image pull and the tool install --
+    read off the before_script line itself: every attempt at up to three of apk's per-fetch
+    timeouts (two indexes and a stalled package), and every sleep between them.
     """
     deadline = _script_default("HAF_FYP_RESOLVE_DEADLINE")
     request = _script_default("HAF_FYP_REQUEST_TIMEOUT")
     tries = _script_default("HAF_FYP_RESOLVE_TRIES")
     backoff = 5 * (tries - 1)        # the last sleep before the deadline check that ends it
-    setup = 90
+    install = _flatten(_resolve(_ci(), JOB, "before_script"), "before_script")[0]
+    attempts = re.findall(r"apk --timeout (\d+) add", install)
+    assert attempts, install
+    setup = 60 + sum(3 * int(t) for t in attempts) + sum(
+        int(s) for s in re.findall(r"sleep (\d+)", install))
     timeout = _seconds(_ci()[JOB]["timeout"])
     assert timeout <= 20 * 60, "job timeout %ss holds a shared runner far past need" % timeout
     assert timeout >= deadline + 3 * request + backoff + setup, (
@@ -286,7 +292,7 @@ def test_the_job_installs_what_the_script_calls():
     neither, and a missing one fails every reference in a way that looks like the network."""
     program = " ".join(_flatten(_resolve(_ci(), JOB, "before_script"), "before_script"))
     for tool in ("curl", "jq"):
-        assert re.search(r"apk add\b.*\b" + tool + r"\b", program), (
+        assert re.search(r"\bapk\b.*\badd\b.*\b" + tool + r"\b", program), (
             "registry-resolution's before_script does not install %s" % tool
         )
 
@@ -478,9 +484,24 @@ def test_only_true_asks_for_the_sweep():
 
 def test_before_script_only_installs_the_tools():
     """before_script shares the script's shell: an `export HAF_FYP_COMPOSE_FILES=...` there
-    narrows the check exactly as a variable would (found by review)."""
+    narrows the check exactly as a variable would (found by review). It holds the install and
+    its retries, and is pinned EXACTLY: a tokenising check let `|| sleep 0`, a dead first
+    branch and unbalanced braces through (found by review), so any change to this line is a
+    deliberate edit here too."""
+    install = "apk --timeout 15 add --no-cache curl jq"
     assert _flatten(_resolve(_ci(), JOB, "before_script"), "before_script") == [
-        "apk add --no-cache curl jq"]
+        "%s || { sleep 15; %s; } || { sleep 30; %s; }" % (install, install, install)]
+
+
+def test_the_install_survives_a_mirror_blip():
+    """The first real run of this job died in `apk add` on a mirror "temporary error"; a
+    single try turns develop red for a reason that has nothing to do with the pins."""
+    line = _flatten(_resolve(_ci(), JOB, "before_script"), "before_script")[0]
+    assert line.count("add --no-cache curl jq") >= 2, line
+    # Every attempt is capped: apk's default is 60s per fetch, and a hung mirror at that rate
+    # outlasts the margin the budget test allows.
+    assert line.count("add --no-cache curl jq") == line.count("apk --timeout "), line
+    assert re.search(r"\|\|\s*\{\s*sleep \d+", line), "the retries do not wait: %s" % line
 
 
 def test_a_variable_that_is_not_true_leaves_every_lane_as_it_was():
