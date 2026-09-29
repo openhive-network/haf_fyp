@@ -153,11 +153,12 @@ registry-resolution:
   interruptible: false
   # ABOVE the script's own budget, which the lane test holds it to: HAF_FYP_RESOLVE_DEADLINE
   # (420s) plus one in-flight attempt (HEAD + token + HEAD at 20s each) plus the image pull and
-  # `apk add`. The script then reports what it proved and what it did not before the job is
+  # the tool install below: three attempts, each capped by apk's per-fetch timeout, and 45s of
+  # backoff between them. The script then reports what it proved and what it did not before the job is
   # killed -- rather than the hung-registry case arriving as a bare "job timed out", which is
   # how !77's 32-minute worst case met its 10-minute limit. Without a timeout the ceiling is
   # the project default, an hour, holding a shared runner unattended.
-  timeout: 10m
+  timeout: 13m
   # Infrastructure only, and the same single reason publish_tag uses. The script retries each
   # request itself, and re-running the whole job on a real failure would print the same dead
   # pin three times.
@@ -165,7 +166,14 @@ registry-resolution:
     max: 2
     when: runner_system_failure
   before_script:
-    - apk add --no-cache curl jq
+    # Retried: the first real run of this job (on-demand pipeline 180731) died right here --
+    # fetching from dl-cdn.alpinelinux.org failed with "temporary error" after 5s, most likely
+    # a network blip on the runner -- a red job that said nothing about the pins. Three tries,
+    # 15s then 30s apart, each capped by `--timeout 15` so a hung (not refused) mirror cannot
+    # eat the job's budget at apk's default 60s per fetch; a mirror down for longer is still a
+    # red job, with apk's own error. Nothing else may go in this block: it shares the script's
+    # shell.
+    - apk --timeout 15 add --no-cache curl jq || { sleep 15; apk --timeout 15 add --no-cache curl jq; } || { sleep 30; apk --timeout 15 add --no-cache curl jq; }
   script:
     - sh scripts/check_pinned_images.sh
   rules:
