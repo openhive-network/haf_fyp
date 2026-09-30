@@ -28,8 +28,14 @@ services:
       POSTGRES_DB: haf_block_log
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
+    # Over TCP, not the socket. The image's first-boot init runs a TEMPORARY server that
+    # listens on the Unix socket only; a socket probe calls that healthy, `setup` starts,
+    # connects over the network and is refused (measured on pgvector:pg14: socket ready
+    # ~0.9s, TCP ~1.4s). On a slow runner the window is wider: postgrest-tests failed this
+    # way in jobs 3284523 (2026-09-25), 3291192 and 3291197 (2026-09-29), with the image
+    # unchanged. The temporary server never listens on TCP, so this probe cannot pass early.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d haf_block_log"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d haf_block_log"]
       interval: 3s
       timeout: 2s
       retries: 20
