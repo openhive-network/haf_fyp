@@ -386,6 +386,10 @@ postgrest-tests:
     - docker compose -f docker/docker-compose-ci.yml up --detach --build
     - docker compose -f docker/docker-compose-ci.yml wait tavern
   after_script:
+    # postgres too: a setup refused by it (the healthcheck race docker-compose-ci.yml
+    # describes) is otherwise
+    # diagnosed without the server's own account of what it was doing.
+    - docker compose -f docker/docker-compose-ci.yml logs postgres || true
     - docker compose -f docker/docker-compose-ci.yml logs setup
     - docker compose -f docker/docker-compose-ci.yml logs tavern
     # Turns "some path 404'd" into "that rule rewrote to X". `|| true` because

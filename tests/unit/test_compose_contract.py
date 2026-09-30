@@ -1679,3 +1679,52 @@ def test_lock_holders_are_stopped_before_setup_is_recreated(services, service):
     skips."""
     dep = services[service]["depends_on"][SETUP]
     assert dep.get("restart") is True, dep
+
+
+# One pg_isready, nothing around it: `||` or `;` could fall back to (or mask) a socket
+# probe, `#` could comment the host out, and a second host flag overrides the first.
+_SHELL_SYNTAX = re.compile(r"[|;&#()`<>\n]|\$\(")
+_HOST_FLAG = re.compile(r"(?:^|\s)(?:-h\s*|--host(?:=|\s+))([^\s\"']+|\"[^\"]*\"|'[^']*')")
+_TCP_HOST = re.compile(r"127\.0\.0\.1|localhost|::1")
+
+
+def _probe_command(test) -> str:
+    if isinstance(test, list):
+        if test[:1] == ["CMD-SHELL"]:
+            return " ".join(test[1:])
+        if test[:1] == ["CMD"]:
+            return " ".join(test[1:])
+        return " ".join(test)
+    return str(test or "")
+
+
+@pytest.mark.parametrize("path", [COMPOSE, CI_COMPOSE], ids=["compose", "compose-ci"])
+def test_postgres_healthchecks_probe_tcp_not_the_socket(path):
+    """A socket-only pg_isready passes during the postgres image's first-boot init, whose
+    temporary server listens on no TCP port (`listen_addresses=''`) -- so a dependant gated
+    on service_healthy connects over the network and is refused. That failed postgrest-tests
+    three times (2026-09-25, 09-29). docker-compose.yml's HAF probe was already TCP; its
+    case guards against a revert."""
+    doc = _require_yaml().safe_load(path.read_text(encoding="utf-8"))
+    probes = {}
+    for name, service in doc["services"].items():
+        healthcheck = service.get("healthcheck") or {}
+        command = _probe_command(healthcheck.get("test"))
+        if "pg_isready" in command or name == "postgres":
+            assert not healthcheck.get("disable"), (name, "healthcheck disabled")
+            probes[name] = command
+    assert probes, "%s has no postgres healthcheck left to check" % path.name
+    for name, command in probes.items():
+        assert command.split()[:1] == ["pg_isready"], (name, "probe is not pg_isready", command)
+        assert not _SHELL_SYNTAX.search(command), (name, "probe is not a single command", command)
+        hosts = _HOST_FLAG.findall(command)
+        assert len(hosts) == 1, (name, "needs exactly one host flag", command)
+        assert _TCP_HOST.fullmatch(hosts[0].strip("\"'")), (name, "host is not TCP", command)
+
+
+def test_ci_setup_waits_for_a_healthy_postgres():
+    """The probe above only matters if setup waits for it: `service_started` is the
+    original race with no probe at all."""
+    doc = _require_yaml().safe_load(CI_COMPOSE.read_text(encoding="utf-8"))
+    condition = doc["services"]["setup"]["depends_on"]["postgres"]["condition"]
+    assert condition == "service_healthy", condition
