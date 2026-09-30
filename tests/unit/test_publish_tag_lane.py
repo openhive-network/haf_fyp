@@ -244,15 +244,28 @@ def _matches(condition, env: dict) -> bool:
         return "\x00%d\x00" % (len(regexes) - 1)
 
     skeleton = _REGEX_LITERAL.sub(stash, condition)
-    for refused, why in (("||", "`||`"), ("null", "`null`"), ("'", "single-quoted strings")):
+    # `null` is modelled only as `$VAR == null` / `$VAR != null` (see _clause); anywhere
+    # else -- `null == $VAR`, `$A == null || ...` -- it is refused like everything unknown.
+    for refused, why in (("||", "`||`"), ("'", "single-quoted strings")):
         if refused in skeleton:
             raise Unmodelled("%s are not modelled, so %r cannot be evaluated" % (why, condition))
     clauses = [c.strip().strip("()").strip() for c in skeleton.split("&&")]
-    results = [_clause(c, env, regexes, condition) for c in clauses]  # validate them all
+    results = [_clause(c, env, regexes, condition, last=(i == len(clauses) - 1))
+               for i, c in enumerate(clauses)]  # validate them all
     return all(results)
 
 
-def _clause(clause: str, env: dict, regexes: list, condition: str) -> bool:
+def _clause(clause: str, env: dict, regexes: list, condition: str, last: bool = True) -> bool:
+    # GitLab's `null` is "not defined": `$X == null` is true exactly when X is undefined, and
+    # `$X != null` when it is defined -- even as "". It is how the mirror's credential gate
+    # tells an unset protected variable from a set one (#72).
+    against_null = re.fullmatch(r"\$(\w+)\s*(==|!=)\s*null", clause)
+    if against_null:
+        name, operator = against_null.groups()
+        return (name not in env) if operator == "==" else (name in env)
+    if "null" in clause:
+        raise Unmodelled("`null` is modelled only as `$VAR == null` or `$VAR != null`: %r"
+                         % condition)
     literal = re.fullmatch(r'\$(\w+)\s*(==|!=)\s*"([^"]*)"', clause)
     if literal:
         name, operator, value = literal.groups()
@@ -271,6 +284,13 @@ def _clause(clause: str, env: dict, regexes: list, condition: str) -> bool:
         return found if operator == "=~" else not found
     bare = re.fullmatch(r"\$(\w+)", clause)
     if bare:
+        # Measured with ci/lint on 2026-09-29: GitLab reads a bare `$E` as "non-empty" only
+        # when it is the whole condition or the last operand of `&&`. Before another operand
+        # it means "defined": with E="", `$E && $S == "x"` is TRUE. That is how haf_stats once
+        # created its mirror with an empty user. Other positions are not measured, so refused.
+        if not last:
+            raise Unmodelled("a bare variable before `&&` tests only that it is defined, not that "
+                             "it is non-empty; compare it explicitly: %r" % condition)
         return bool(env.get(bare.group(1)))
     raise Unmodelled(
         "this suite cannot evaluate %r (from %r), so it cannot tell whether the release "
@@ -451,10 +471,11 @@ def test_the_kill_switch_only_fires_when_it_is_set():
     assert _outcome(rules, stopped) in (None, ("never", False)), "the kill switch does not stop the job"
 
 
-def test_the_gate_is_not_protection_this_project_does_not_have():
+def test_the_gate_is_the_tag_shape_not_protection():
     conditions = " ".join(str(rule.get("if", "")) for rule in _job()["rules"])
     assert "CI_COMMIT_REF_PROTECTED" not in conditions, (
-        "hive/haf_fyp has no protected-tag rule, so gating on it would never fire"
+        "hive/haf_fyp protects only `1.*` and `v*`, so gating on protection would silently "
+        "skip a release shape they do not cover, such as `2.0.1`"
     )
 
 
@@ -622,7 +643,8 @@ def test_the_program_is_posix_shell():
     '$A == "x" || $B == "y"',          # `||` was split on `&&` only and mis-read
     '$CI_COMMIT_TAG =~ /^v/i',         # regex flags
     "$SKIP_DOCKER_PUBLISH == 'true'",  # single quotes
-    "$SKIP_DOCKER_PUBLISH != null",    # null
+    "null != $SKIP_DOCKER_PUBLISH",    # null on the left
+    '$A == null || $B == null',        # null inside an `||`
     '$CI_COMMIT_TAG =~ /^(?!x)/',      # lookaround, which RE2 rejects
     '$A == "x" && $B ~= "y"',          # an unknown operator after a clause that fails
 ])
@@ -638,6 +660,27 @@ def test_an_undefined_variable_is_not_the_empty_string():
     assert _matches('$SKIP_DOCKER_PUBLISH == ""', env) is False
     assert _matches("$SKIP_DOCKER_PUBLISH =~ /.+/", env) is False
     assert _matches("$SKIP_DOCKER_PUBLISH =~ /^(true)?$/", env) is True  # "" for =~
+
+
+def test_null_means_undefined():
+    """`!= null` is true for a variable set to "" -- the reason the mirror's gate also
+    compares `!= ""` (#72)."""
+    env = _tag_pipeline(TAG)
+    assert _matches("$BLOG_REGISTRY_USER == null", env) is True
+    assert _matches("$BLOG_REGISTRY_USER != null", env) is False
+    env["BLOG_REGISTRY_USER"] = ""
+    assert _matches("$BLOG_REGISTRY_USER == null", env) is False
+    assert _matches("$BLOG_REGISTRY_USER != null", env) is True
+
+
+def test_a_bare_variable_before_and_is_refused():
+    """GitLab (measured with ci/lint): with an empty user, `$BLOG_REGISTRY_USER && ...` is
+    TRUE -- the haf_stats trap. Only the last operand of `&&` reads as "non-empty"."""
+    env = dict(_tag_pipeline(TAG), BLOG_REGISTRY_USER="")
+    with pytest.raises(Unmodelled):
+        _matches('$BLOG_REGISTRY_USER && $CI_COMMIT_REF_PROTECTED == "false"', env)
+    assert _matches('$CI_COMMIT_REF_PROTECTED == "false" && $BLOG_REGISTRY_USER', env) is False
+    assert _matches("$BLOG_REGISTRY_USER", env) is False
 
 
 def test_a_rule_key_the_model_ignores_is_refused():
