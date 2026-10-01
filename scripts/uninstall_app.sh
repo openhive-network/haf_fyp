@@ -183,6 +183,123 @@ done
 wait_for_postgres
 
 # ---------------------------------------------------------------------------
+# 0. Which server actually answered (#69).
+# ---------------------------------------------------------------------------
+# Asked of the SERVER rather than echoed back from this script's own variables.
+# ${POSTGRES_HOST} is what was REQUESTED, and the reached server can differ without any
+# flag being wrong. Measured on two live PostgreSQL servers while fixing the same
+# defect in haf_stats (hive/haf_stats#75):
+#
+#   1. PGHOSTADDR. libpq connects to `hostaddr` when both are given and uses `host`
+#      -- what -h sets -- only for authentication and TLS matching. `PGHOSTADDR=<B>
+#      psql -h <A>` reached B while every message said A.
+#   2. A pg_service.conf carrying `hostaddr=` does the same and leaves no environment
+#      variable behind: `PGSERVICE=decoy psql -h A` reached B with PGHOSTADDR unset.
+#   3. PGOPTIONS can carry `-c role=...`, which changes current_user but not
+#      session_user, so a refusal that names a role can be wrong too.
+#
+# A literal newline, for the checks below. `$(printf '\n')` cannot carry one: command
+# substitution strips trailing newlines.
+_NEWLINE='
+'
+
+_server_identity() {
+    # host(), not ::text: the cast keeps a /32 that means nothing here.
+    #
+    # The cluster id is what identifies the server. Over a Unix socket
+    # inet_server_addr() is NULL, so without it the line is "LOCAL SOCKET:-/<db>" for
+    # any two clusters on one box -- which is where #40's empty --host= lands.
+    # pg_control_system() is executable by PUBLIC.
+    #
+    # -X: psql_cmd does not pass it, and a ~/.psqlrc `\echo` or `\timing` would write
+    # into this answer. No `|| true`: the caller tests the status.
+    psql_cmd -X -Atq -c "
+        SELECT coalesce(host(inet_server_addr()), 'LOCAL SOCKET')
+            || ':' || coalesce(inet_server_port()::text, '-')
+            || '/' || current_database()
+            || ' as ' || current_user
+            || CASE WHEN current_user <> session_user
+                    THEN ' (current_user differs from session_user ' || session_user || ')'
+                    ELSE '' END
+            || ' [cluster ' || (SELECT system_identifier FROM pg_control_system()) || ']'
+    "
+}
+
+# Resolved ONCE, into _reached, and reused by every later line.
+_resolve_target() {
+    # Status, then line count, then shape; each catches what the others miss.
+    #   status -- a failing psql can still have written to stdout.
+    #   line count -- -Atq on a one-row query emits exactly one line, so a second line
+    #     means something other than the query spoke (and a database named with an
+    #     embedded newline would put an unprefixed line in the log).
+    #   shape -- the query always ends ` [cluster <n>]`, so an answer that does not is
+    #     not this query's answer.
+    if ! _raw="$(_server_identity)"; then _raw=""; fi
+    case "${_raw}" in
+        *"${_NEWLINE}"*) _reached="" ;;
+        *)               _reached="${_raw% }" ;;
+    esac
+    case "${_reached}" in
+        *"[cluster "*"]") : ;;
+        *) _reached="" ;;
+    esac
+
+    log "  requested: ${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB} as ${POSTGRES_USER}"
+    if [ -n "${_reached}" ]; then
+        log "  reached  : ${_reached}"
+    else
+        log "  reached  : COULD NOT ASK THE SERVER."
+    fi
+
+    # Name whatever in the environment can redirect the connection. PGSERVICEFILE alone
+    # is inert (libpq reads a service file only when a service NAME is given), so it is
+    # reported only alongside PGSERVICE, where it says which file to go and read.
+    # Newline-joined: PGSERVICEFILE is a path and may contain spaces.
+    _redirect=""
+    [ -n "${PGHOSTADDR:-}" ] && _redirect="${_redirect}PGHOSTADDR=${PGHOSTADDR}${_NEWLINE}"
+    [ -n "${PGSERVICE:-}" ]  && _redirect="${_redirect}PGSERVICE=${PGSERVICE}${_NEWLINE}"
+    if [ -n "${PGSERVICE:-}" ] && [ -n "${PGSERVICEFILE:-}" ]; then
+        _redirect="${_redirect}PGSERVICEFILE=${PGSERVICEFILE}${_NEWLINE}"
+    fi
+    if [ -n "${_redirect}" ]; then
+        printf '%s' "${_redirect}" | while IFS= read -r _var; do
+            [ -n "${_var}" ] && log "  NOTE     : ${_var}"
+        done
+        log "             Any of PGHOSTADDR, PGSERVICE or PGSERVICEFILE can carry a"
+        log "             hostaddr, which libpq connects to INSTEAD of the --host /"
+        log "             POSTGRES_HOST above; those then apply only to authentication"
+        log "             and TLS. The 'reached' line is the server being destroyed."
+    fi
+
+    # A pooler that reaches PostgreSQL over the Unix socket reports LOCAL SOCKET to a
+    # client that connected over TCP from another machine. PgBouncer sits in the
+    # haf_api_node stack this app ships a module for.
+    case "${_reached}" in
+        "LOCAL SOCKET"*)
+            log "  NOTE     : 'LOCAL SOCKET' is the SERVER's end of the connection, not"
+            log "             yours. A pooler that reaches PostgreSQL over the socket"
+            log "             reports it to a remote client too, so the cluster id is the"
+            log "             reliable identity here." ;;
+    esac
+
+    # FAIL CLOSED, like every other probe in this script. If the server cannot say what
+    # it is, this run cannot name what it would destroy -- and --force would otherwise
+    # go ahead on nothing but the host that was typed. exit 1 ("refused, or a probe
+    # could not answer"), not 2 ("invoked wrong").
+    if [ -z "${_reached}" ]; then
+        log "ERROR: refusing to continue without knowing which server answered."
+        log "       Every other probe here fails closed; so does this one."
+        exit 1
+    fi
+}
+
+# BEFORE every guard, because each of them sends the operator somewhere -- "stop these
+# containers", "grant this role" -- and under a redirected connection that is the wrong
+# machine, while the only host in the log would be the one they typed.
+log "Target:"
+_resolve_target
+
+# ---------------------------------------------------------------------------
 # 1. Refuse while anything is connected as a haf_fyp role.
 # ---------------------------------------------------------------------------
 # Not just the block processor. haf-fyp-ranker, haf-fyp-api and haf-fyp-postgrest all hold
@@ -269,31 +386,16 @@ assert_no_active_sessions() {
 assert_no_active_sessions
 
 # ---------------------------------------------------------------------------
-# 2. Confirmation.
+# 2. No way to confirm? Refuse now.
 # ---------------------------------------------------------------------------
-# Typing the database name rather than 'yes': the mistake this guards against is the
-# right command against the wrong host.
-if [ "$FORCE" -ne 1 ]; then
-    if [ ! -t 0 ]; then
-        log "ERROR: refusing to run without a TTY and without --force."
-        log "       This drops schemas ${HAF_FYP_SCHEMAS} CASCADE and cannot be undone."
-        exit 2
-    fi
-    log "About to PERMANENTLY remove haf_fyp from ${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}:"
-    log "  context : ${HAF_FYP_CONTEXT}"
-    log "  schemas : ${HAF_FYP_SCHEMAS} (CASCADE -- all tables and all data)"
-    log "  roles   : ${HAF_FYP_ROLES}"
-    printf '[haf_fyp] Type the database name to confirm: '
-    read -r _reply
-    if [ "${_reply}" != "${POSTGRES_DB}" ]; then
-        log "Aborted -- nothing was changed."
-        exit 1
-    fi
-    # Re-checked AFTER the prompt. haf-fyp-sync is `restart: unless-stopped`, so any
-    # `docker compose up` while the operator was reading the prompt brings it back,
-    # and the guard above would be describing a database that no longer looks like
-    # that.
-    assert_no_active_sessions
+# Before the guards, because it is the cheapest refusal and says the command was
+# invoked wrong (exit 2). The inventory and the prompt themselves come AFTER the
+# guards, just above step 3: a run that a guard refuses destroys nothing, so it must
+# not print "About to PERMANENTLY remove".
+if [ "$FORCE" -ne 1 ] && [ ! -t 0 ]; then
+    log "ERROR: refusing to run without a TTY and without --force."
+    log "       This drops schemas ${HAF_FYP_SCHEMAS} CASCADE and cannot be undone."
+    exit 2
 fi
 
 # ---------------------------------------------------------------------------
@@ -386,9 +488,11 @@ _psql_destructive() {
 # PGUSER/PGSERVICE in the environment, a .pgpass-driven fallback, a service file). A
 # refusal that names the wrong role sends the operator to change the wrong thing.
 _report_connected_identity() {
-    _who="$(psql_cmd -Atq -c "SELECT current_user || ' on ' || current_database()" 2>/dev/null || echo "")"
-    if [ -n "${_who}" ]; then
-        log "       (connected as ${_who})"
+    # What section 0 resolved: the server's address, database, role and cluster id.
+    # It used to ask again for only `current_user on current_database()`, which over a
+    # Unix socket is identical for two clusters on one box.
+    if [ -n "${_reached:-}" ]; then
+        log "       (connected to ${_reached})"
     fi
 }
 
@@ -671,6 +775,50 @@ if [ "${_has_contexts}" = "t" ]; then
             exit 1
         fi
     fi
+fi
+
+# ---------------------------------------------------------------------------
+# Confirmation. Every guard above has passed, so destruction is actually next.
+# ---------------------------------------------------------------------------
+# Printed on BOTH paths (#69). It used to sit inside the no-force branch, and
+# docker/docker-compose.yml ships --force: the unattended run, the one most likely to
+# be pointed somewhere unexpected by its environment, left no record of what it
+# destroyed or where. The server line is what the server answered, not ${POSTGRES_HOST}.
+log "About to PERMANENTLY remove haf_fyp:"
+log "  server  : ${_reached}"
+log "  context : ${HAF_FYP_CONTEXT}"
+log "  schemas : ${HAF_FYP_SCHEMAS} (CASCADE -- all tables and all data)"
+log "  roles   : ${HAF_FYP_ROLES}"
+
+if [ "$FORCE" -ne 1 ]; then
+    # Typing the database name rather than 'yes': the mistake this guards against is the
+    # right command against the wrong host. Compared against what the SERVER answered,
+    # not against ${POSTGRES_DB}: that form compared the reply with this script's own
+    # variable, so it could only confirm that the operator can read. It still cannot
+    # tell apart two servers holding databases of the same name, which is what the
+    # server line above is for.
+    #
+    # The status is tested, not discarded: a failed query must reach the operator as
+    # "could not ask the server", not as "Aborted" after their reply fails to match noise.
+    if ! _target_db="$(psql_cmd -X -Atq -c "SELECT current_database()")"; then
+        _target_db=""
+    fi
+    case "${_target_db}" in
+        "" | *"${_NEWLINE}"*)
+            log "ERROR: could not ask the server which database this is; refusing to prompt."
+            exit 1 ;;
+    esac
+    printf '[haf_fyp] Type the database name to confirm: '
+    read -r _reply
+    if [ "${_reply}" != "${_target_db}" ]; then
+        log "Aborted -- nothing was changed."
+        exit 1
+    fi
+    # Re-checked AFTER the prompt. haf-fyp-sync is `restart: unless-stopped`, so any
+    # `docker compose up` while the operator was reading the prompt brings it back,
+    # and the guard above would be describing a database that no longer looks like
+    # that.
+    assert_no_active_sessions
 fi
 
 log "Removing HAF context '${HAF_FYP_CONTEXT}'..."

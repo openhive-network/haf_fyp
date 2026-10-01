@@ -39,6 +39,11 @@ SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "uninstall_app.sh"
 # under CPU contention on Windows, where every stub psql is a Git Bash process.
 TIMEOUT = 30
 
+# What the stubs answer to the section-0 identity query (#69). Deliberately NOT the
+# requested haf:5432/haf_block_log as haf_admin, so a line that echoes the request
+# back cannot be mistaken for one that reports what answered.
+STUB_SERVER_IDENTITY = "10.1.1.7:5432/somedb as someone [cluster 1234]"
+
 
 @pytest.fixture
 def bash():
@@ -48,7 +53,8 @@ def bash():
 def make_psql(tmp_path, *, sessions: str = "0", remaining: str = "",
               context_left: str = "", log: str = "sql.log",
               can_remove: str = "t", fail_on: str | None = None,
-              has_applications: str = "f", context_owners: str = "") -> Path:
+              has_applications: str = "f", context_owners: str = "",
+              server: str = STUB_SERVER_IDENTITY) -> Path:
     """A stub psql that records what it was asked and answers each of the script's reads.
 
     Dispatch is on the statement text AND on any -f file, because the verification is a
@@ -87,6 +93,9 @@ def make_psql(tmp_path, *, sessions: str = "0", remaining: str = "",
         # containing a space ("DROP SCHEMA", "hafd.contexts AS c") was a shell syntax
         # error and the stub died instead of simulating anything.
         + (f'  *"{fail_on}"*) echo "stub psql: simulated failure" >&2; exit 3 ;;\n' if fail_on else "")
+        # The section-0 identity query (#69). Without this arm the script reads "" and
+        # every test here stops at its fail-closed refusal before reaching its subject.
+        + f'  *inet_server_addr*)     printf "%s\\n" {server!r} ;;\n'
         # All three pre-flight probes mention is_superuser, so one arm answers them
         # all; _guarded_psql below separates them where a test needs to. Kept ahead of
         # *to_regclass* so a rewrite of the probe text cannot be swallowed by it.
@@ -439,7 +448,8 @@ def test_a_permitted_role_proceeds(bash, tmp_path):
 # --- the pre-flight, rewritten in round two ---------------------------------------
 
 def _guarded_psql(tmp_path, *, can_impersonate="t", createrole="t", has_contexts="t",
-                  group_member="t", admin_option="t", fail_on=None):
+                  group_member="t", admin_option="t", fail_on=None,
+                  server="10.1.1.7:5432/somedb as someone [cluster 7391424]"):
     """A psql that answers the three pre-flight probes independently."""
     stub_bin(tmp_path)
     logfile = tmp_path / "sql.log"
@@ -453,6 +463,9 @@ def _guarded_psql(tmp_path, *, can_impersonate="t", createrole="t", has_contexts
         '  prev="$a"\n'
         "done\n"
         f'printf "%s\\n---\\n" "$cmd" >> "{logfile.as_posix()}"\n'
+        # argv too, like make_psql: the refusal paths all use this stub, and they are the
+        # only ones that reach _report_connected_identity.
+        f'printf "%s\\n" "$(printf \'%s\' "$*" | tr \'\\n\' \' \')" >> "{(tmp_path / "argv.log").as_posix()}"\n'
         + (f'case "$cmd" in *{fail_on}*) echo "stub: failing" >&2; exit 2 ;; esac\n'
            if fail_on else "")
         + 'case "$cmd" in\n'
@@ -477,11 +490,14 @@ def _guarded_psql(tmp_path, *, can_impersonate="t", createrole="t", has_contexts
         f'  *can_impersonate*) printf "%s" {can_impersonate!r} ;;\n'
         f'  *rolcreaterole*)   printf "%s" {createrole!r} ;;\n'
         '  *pg_stat_activity*) printf "0" ;;\n'
-        # AFTER pg_stat_activity, and matched on the identity query's own
-        # distinctive text: the session-count query ALSO says current_database(),
-        # and `case` takes the first match, so a *current_database* arm above it
-        # fed this string to the session guard as a count.
-        '  *"current_user ||"*) printf "someone on somedb" ;;\n'
+        # The #69 identity query. Keyed on inet_server_addr, which appears in no other
+        # query: it describes the connection that was MADE. Derived from PGHOSTADDR when
+        # that is set, the way libpq behaves (hostaddr wins; -h is then only for
+        # authentication and TLS), so a test that sets it is testing retargeting rather
+        # than two constants made to match.
+        '  *inet_server_addr*) if [ -n "${PGHOSTADDR:-}" ]; then\n'
+        '                          printf "%s:5432/somedb as someone [cluster 1234]" "$PGHOSTADDR"\n'
+        f'                      else printf "%s\\n" {server!r}; fi ;;\n'
         "esac\n"
         "exit 0\n",
     )
@@ -787,6 +803,7 @@ def test_a_non_haf_database_completes_instead_of_aborting(bash, tmp_path):
         "done\n"
         f'printf "%s\\n---\\n" "$cmd" >> "{logfile.as_posix()}"\n'
         'case "$cmd" in\n'
+        f'  *inet_server_addr*) printf "%s" {STUB_SERVER_IDENTITY!r} ;;\n'
         '  *is_superuser*)     printf "t" ;;\n'
         # pg_stat_activity FIRST: the guard query mentions neither of the others.
         '  *pg_stat_activity*) printf "0" ;;\n'
@@ -902,6 +919,7 @@ def test_a_failing_destructive_statement_does_not_abort_the_run(bash, tmp_path):
         "done\n"
         f'printf "%s\\n---\\n" "$cmd" >> "{logfile.as_posix()}"\n'
         'case "$cmd$files" in\n'
+        f'  *inet_server_addr*)     printf "%s" {STUB_SERVER_IDENTITY!r} ;;\n'
         '  *is_superuser*)     printf "t" ;;\n'
         '  *pg_stat_activity*)     printf "0" ;;\n'
         '  *uninstall_verify.sql*) printf "" ;;\n'
@@ -944,6 +962,7 @@ def test_a_failing_verification_probe_does_not_report_success(bash, tmp_path):
         '  prev="$a"\n'
         "done\n"
         'case "$cmd$files" in\n'
+        f'  *inet_server_addr*) printf "%s" {STUB_SERVER_IDENTITY!r} ;;\n'
         '  *is_superuser*)     printf "t" ;;\n'
         '  *pg_stat_activity*) printf "0"; exit 0 ;;\n'
         # Fail the VERIFICATION FILE, not to_regclass. The new pre-flight uses the
@@ -1146,8 +1165,8 @@ def test_the_confirmation_variable_names_every_role_the_script_drops():
     roles as literals. Drop one from the variable and the operator consents to less than
     the script actually does, with every test green because the behaviour is unchanged.
 
-    Asserted on the SOURCE: the banner is inside the `[ ! -t 0 ]` interactive branch,
-    which this module's docstring records as uncovered (no pty here, POSIX-only).
+    Asserted on the SOURCE, so it holds for every path that prints the banner (since
+    #69 that includes --force) and for the DO block's literals at once.
     """
     body = SCRIPT.read_text()
     declared = set(body.split('HAF_FYP_ROLES="', 1)[1].split('"', 1)[0].split())
@@ -1223,4 +1242,336 @@ def test_a_refusal_names_the_role_the_database_actually_sees(bash, tmp_path):
     naming the wrong role sends the operator to change the wrong thing."""
     _guarded_psql(tmp_path, createrole="f")
     r = run(bash, tmp_path, "--force")
-    assert "connected as someone on somedb" in r.stdout
+    # Now the SERVER too (#69): its address, database, role and cluster id, which is the
+    # part that survives a socket connection.
+    assert "(connected to 10.1.1.7:5432/somedb as someone [cluster 7391424])" in r.stdout, r.stdout
+
+
+# --- naming the server that answered, not the one we asked for (#69) ---------------
+#
+# Ported from haf_stats (#75), where the premise was reproduced against two live
+# PostgreSQL servers: `PGHOSTADDR=<B> psql -h <A>` connected to B while every message the
+# script printed said A. libpq uses `hostaddr` for the connection and `host` only for
+# authentication and TLS, and -h sets `host`. No flag is wrong in that run, which is why
+# flag validation cannot close it.
+
+# Compared whole, like the other probes: the stubs answer on the token
+# `inet_server_addr`, and a comment mentioning it would satisfy that. Replacing
+# inet_server_addr()/inet_server_port() with '${POSTGRES_HOST}'/'${POSTGRES_PORT}' --
+# which reinstates the bug -- must not pass.
+EXPECTED_SERVER_IDENTITY = (
+    "SELECT coalesce(host(inet_server_addr()), 'LOCAL SOCKET') "
+    "|| ':' || coalesce(inet_server_port()::text, '-') "
+    "|| '/' || current_database() "
+    "|| ' as ' || current_user "
+    "|| CASE WHEN current_user <> session_user "
+    "THEN ' (current_user differs from session_user ' || session_user || ')' "
+    "ELSE '' END "
+    "|| ' [cluster ' || (SELECT system_identifier FROM pg_control_system()) || ']'"
+)
+
+
+def _server_identity_sql() -> str:
+    """The SQL _server_identity() actually sends, comments stripped and whitespace flat."""
+    body = SCRIPT.read_text(encoding="utf-8")
+    start = body.index("_server_identity() {")
+    frag = body[start:body.index("\n}", start)]
+    sql = frag.split('-c "', 1)[1].rsplit('"', 1)[0]
+    lines = [l.split("--")[0] for l in sql.splitlines()]
+    return " ".join(" ".join(lines).split())
+
+
+def _identity_calls(tmp_path) -> list[str]:
+    return [l for l in (tmp_path / "argv.log").read_text(encoding="utf-8").splitlines()
+            if "inet_server_addr" in l]
+
+
+def test_the_identity_query_asks_the_server_not_the_variables():
+    assert _server_identity_sql() == EXPECTED_SERVER_IDENTITY
+
+
+def test_the_target_block_names_what_was_requested_and_what_answered(bash, tmp_path):
+    _guarded_psql(tmp_path)
+    r = run(bash, tmp_path, "--force")
+    assert "requested: haf:5432/haf_block_log as haf_admin" in r.stdout, r.stdout
+    assert "reached  : 10.1.1.7:5432/somedb as someone [cluster 7391424]" in r.stdout, r.stdout
+
+
+def test_force_still_leaves_a_record_of_what_it_destroyed_and_where(bash, tmp_path):
+    """--force skips the PROMPT, not the account. docker-compose.yml ships --force, and
+    the banner used to sit inside the no-force branch, so the unattended run -- the one
+    most likely to be pointed somewhere unexpected -- printed nothing about its target."""
+    _guarded_psql(tmp_path)
+    r = run(bash, tmp_path, "--force")
+    reached = [l.split("reached  : ", 1)[1] for l in r.stdout.splitlines()
+               if "reached  : " in l]
+    server = [l.split("server  : ", 1)[1] for l in r.stdout.splitlines()
+              if "server  : " in l]
+    assert len(reached) == 1 and len(server) == 1, (reached, server)
+    # The banner's line carries what the SERVER said, not ${POSTGRES_HOST}.
+    assert server[0] == reached[0], (server[0], reached[0])
+    for expected in ("About to PERMANENTLY remove haf_fyp:",
+                     "context : haf_fyp",
+                     "schemas : haf_fyp_app haf_fyp_endpoints",
+                     "roles   : haf_fyp_user haf_fyp_owner"):
+        assert expected in r.stdout, (expected, r.stdout)
+    # ...and it comes before anything is destroyed, not after.
+    assert "DROP SCHEMA" in sql_of(tmp_path / "sql.log")
+
+
+def test_the_banner_no_longer_names_the_requested_host():
+    """`remove haf_fyp from ${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}` was the
+    line this issue is about. Pinned at source, comments stripped: on the --force path
+    the requested and reached values are equal in every stub run, so only the source can
+    tell which one the banner prints."""
+    live = "\n".join(l.split("#", 1)[0]
+                     for l in SCRIPT.read_text(encoding="utf-8").splitlines())
+    start = live.index('log "About to PERMANENTLY remove haf_fyp')
+    banner = live[start:live.index('if [ "$FORCE" -ne 1 ]', start)]
+    assert 'log "  server  : ${_reached}"' in banner, banner
+    for requested in ("POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DB", "POSTGRES_USER"):
+        assert requested not in banner, banner
+
+
+def test_a_refusal_never_falls_back_to_the_requested_target():
+    whole = SCRIPT.read_text(encoding="utf-8")
+    start = whole.index("_report_connected_identity() {")
+    fn = whole[start:whole.index("\n}", start)]
+    live = "\n".join(l.split("#", 1)[0] for l in fn.splitlines())
+    assert "${_reached" in live, fn
+    assert "psql" not in live, "the refusal asks the server again instead of reusing _reached: " + fn
+    for requested in ("POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DB", "POSTGRES_USER"):
+        assert requested not in live, fn
+
+
+def test_a_refusal_does_not_print_the_inventory(bash, tmp_path):
+    """The inventory means destruction is next. A run that refused destroyed nothing, so
+    the phrase an operator greps for must not appear."""
+    _guarded_psql(tmp_path, createrole="f")
+    r = run(bash, tmp_path, "--force")
+    assert r.returncode == 1
+    assert "PERMANENTLY" not in r.stdout, r.stdout
+    # the target block still printed, because it comes before every guard
+    assert "reached  : 10.1.1.7:5432/somedb as someone" in r.stdout, r.stdout
+
+
+def test_the_session_guard_refusal_comes_after_the_target_block(bash, tmp_path):
+    """The session guard is the refusal an operator hits routinely, and it tells them to
+    stop containers. Under a redirected connection that is the wrong machine, so the
+    server that answered has to be in the log before it."""
+    make_psql(tmp_path, sessions="2")
+    r = run(bash, tmp_path, "--force")
+    assert r.returncode == 1
+    assert r.stdout.index("reached  : ") < r.stdout.index("still connected"), r.stdout
+
+
+def test_pghostaddr_is_called_out_by_name(bash, tmp_path):
+    # The stub derives its answer from PGHOSTADDR the way libpq does, so this asserts
+    # retargeting rather than two constants made to match.
+    _guarded_psql(tmp_path)
+    r = run(bash, tmp_path, "--force", extra_env={"PGHOSTADDR": "10.9.9.9"})
+    assert "requested: haf:5432/haf_block_log" in r.stdout, r.stdout
+    assert "reached  : 10.9.9.9:5432/somedb as someone" in r.stdout, r.stdout
+    assert "10.1.1.7" not in r.stdout
+    assert "NOTE     : PGHOSTADDR=10.9.9.9" in r.stdout, r.stdout
+    assert "Any of PGHOSTADDR, PGSERVICE or PGSERVICEFILE" in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize("env_extra, expected", [
+    ({"PGHOSTADDR": "10.9.9.9"}, ["PGHOSTADDR=10.9.9.9"]),
+    ({"PGSERVICE": "decoy"}, ["PGSERVICE=decoy"]),
+    ({"PGSERVICE": "decoy", "PGSERVICEFILE": "/tmp/decoy.conf"},
+     ["PGSERVICE=decoy", "PGSERVICEFILE=/tmp/decoy.conf"]),
+])
+def test_every_redirect_channel_is_called_out_by_name(bash, tmp_path, env_extra, expected):
+    _guarded_psql(tmp_path)
+    r = run(bash, tmp_path, "--force", extra_env=env_extra)
+    for token in expected:
+        assert "NOTE     : %s" % token in r.stdout, (token, r.stdout)
+
+
+def test_a_service_file_without_a_service_name_is_not_called_out(bash, tmp_path):
+    """libpq reads a service file only when a service NAME is given, so PGSERVICEFILE
+    alone redirects nothing."""
+    _guarded_psql(tmp_path)
+    r = run(bash, tmp_path, "--force", extra_env={"PGSERVICEFILE": "/tmp/decoy.conf"})
+    assert "PGSERVICEFILE" not in r.stdout, r.stdout
+    assert "NOTE" not in r.stdout, r.stdout
+
+
+def test_a_service_file_path_with_spaces_is_named_once(bash, tmp_path):
+    _guarded_psql(tmp_path)
+    r = run(bash, tmp_path, "--force",
+            extra_env={"PGSERVICE": "decoy", "PGSERVICEFILE": "/etc/my conf/pg_service.conf"})
+    assert "NOTE     : PGSERVICEFILE=/etc/my conf/pg_service.conf" in r.stdout, r.stdout
+
+
+def test_the_note_is_absent_when_nothing_redirects_the_connection(bash, tmp_path):
+    _guarded_psql(tmp_path)
+    r = run(bash, tmp_path, "--force")
+    assert "NOTE" not in r.stdout, r.stdout
+    assert "PGHOSTADDR" not in r.stdout, r.stdout
+
+
+def test_a_redirect_is_still_named_when_the_identity_query_fails(bash, tmp_path):
+    """An operator whose PGHOSTADDR broke the connection must not get a bare refusal."""
+    _guarded_psql(tmp_path, fail_on="inet_server_addr")
+    r = run(bash, tmp_path, "--force", extra_env={"PGHOSTADDR": "10.9.9.9"})
+    assert "NOTE     : PGHOSTADDR=10.9.9.9" in r.stdout, r.stdout
+    assert "refusing to continue" in r.stdout, r.stdout
+    assert r.returncode == 1, r.returncode
+
+
+def test_a_local_socket_is_reported_with_its_cluster_id(bash, tmp_path):
+    """inet_server_addr() is NULL over a Unix socket, so the cluster id is the only thing
+    that tells two clusters on one box apart -- which is where #40's empty --host= lands."""
+    _guarded_psql(tmp_path, server="LOCAL SOCKET:-/somedb as someone [cluster 7391424]")
+    r = run(bash, tmp_path, "--force")
+    assert "reached  : LOCAL SOCKET:-/somedb as someone [cluster 7391424]" in r.stdout, r.stdout
+    assert "is the SERVER's end of the connection" in r.stdout, r.stdout
+
+
+def test_a_server_that_cannot_be_asked_refuses_rather_than_guessing(bash, tmp_path):
+    """Silence would read as agreement with the `requested` line, and --force would then
+    destroy on nothing but the host that was typed. exit 1: a probe could not answer."""
+    log = _guarded_psql(tmp_path, fail_on="inet_server_addr")
+    r = run(bash, tmp_path, "--force")
+    assert "COULD NOT ASK THE SERVER" in r.stdout, r.stdout
+    assert "refusing to continue" in r.stdout, r.stdout
+    assert r.returncode == 1, r.returncode
+    assert "DROP SCHEMA" not in sql_of(log)
+    assert "DROP ROLE" not in sql_of(log)
+    assert "app_remove_context" not in sql_of(log)
+
+
+def _identity_stub(tmp_path, identity_arm: str) -> None:
+    """A psql whose identity answer is the given shell fragment; everything else passes."""
+    make_psql(tmp_path)
+    write_exec(
+        tmp_path / "bin" / "psql",
+        "#!/bin/sh\n"
+        "cmd=''\n"
+        'prev=""\n'
+        'for a in "$@"; do\n'
+        '  if [ "$prev" = "-c" ]; then cmd="$a"; fi\n'
+        '  prev="$a"\n'
+        "done\n"
+        f'printf "%s\\n---\\n" "$cmd" >> "{(tmp_path / "sql.log").as_posix()}"\n'
+        'case "$cmd" in\n'
+        f"  *inet_server_addr*) {identity_arm} ;;\n"
+        '  *is_superuser*)     printf "t" ;;\n'
+        '  *pg_stat_activity*) printf "0" ;;\n'
+        '  *pg_class*)         printf "t" ;;\n'
+        "esac\n"
+        "exit 0\n",
+    )
+
+
+def _assert_refused_and_untouched(r, tmp_path):
+    assert "COULD NOT ASK THE SERVER" in r.stdout, r.stdout
+    assert r.returncode == 1, r.returncode
+    assert "DROP SCHEMA" not in sql_of(tmp_path / "sql.log")
+    assert "app_remove_context" not in sql_of(tmp_path / "sql.log")
+
+
+def test_a_well_formed_answer_from_a_FAILED_query_is_not_an_identity(bash, tmp_path):
+    """The one input that separates the status check from the shape check: psql exiting
+    non-zero after printing a perfectly good row."""
+    _identity_stub(tmp_path, 'printf "10.1.1.7:5432/somedb as someone [cluster 1234]"; exit 3')
+    r = run(bash, tmp_path, "--force")
+    _assert_refused_and_untouched(r, tmp_path)
+    assert "10.1.1.7" not in r.stdout, r.stdout
+
+
+def test_noise_before_the_answer_is_not_an_identity(bash, tmp_path):
+    """The shape check requires the answer to END in the cluster id, so it accepts
+    prepended junk; the line-count check is what rejects it."""
+    _identity_stub(
+        tmp_path, 'printf "Timing is on.\\n10.1.1.7:5432/somedb as x [cluster 1234]\\n"')
+    r = run(bash, tmp_path, "--force")
+    _assert_refused_and_untouched(r, tmp_path)
+    assert "Timing is on." not in r.stdout, r.stdout
+
+
+def test_an_answer_without_a_cluster_id_is_not_an_identity(bash, tmp_path):
+    _identity_stub(tmp_path, 'printf "Timing is on."')
+    r = run(bash, tmp_path, "--force")
+    _assert_refused_and_untouched(r, tmp_path)
+
+
+def test_the_identity_query_runs_once_on_the_connection_being_torn_down(bash, tmp_path):
+    """A bare `psql` inside _server_identity drops -h/-p/-U/-d, so the banner would
+    describe the LOCAL server while the teardown destroys the remote one. psql takes the
+    LAST -h/-p/-d, so the flags are counted, not just looked for."""
+    make_psql(tmp_path)
+    run(bash, tmp_path, "--force", "--host=elsewhere", "--port=6543", "--user=someadmin")
+    identity = _identity_calls(tmp_path)
+    assert len(identity) == 1, identity
+    argv = identity[0].split(" -c ", 1)[0].split()
+    for flag, value in (("-h", "elsewhere"), ("-p", "6543"), ("-U", "someadmin"),
+                        ("-d", "haf_block_log")):
+        assert argv.count(flag) == 1, (flag, identity[0])
+        assert argv[argv.index(flag) + 1] == value, (flag, value, identity[0])
+    assert "-Atq" in argv, identity[0]
+    # -X: psql_cmd does not pass it, and a ~/.psqlrc `\echo` would write into the answer.
+    assert "-X" in argv, identity[0]
+
+
+def test_every_psql_invocation_runs_on_the_connection_that_was_identified(bash, tmp_path):
+    """The identity is only worth printing if the statements that destroy run on the
+    same connection parameters. Counted, because psql takes the last -h/-p/-d."""
+    make_psql(tmp_path)
+    run(bash, tmp_path, "--force", "--host=elsewhere", "--port=6543", "--user=someadmin")
+    lines = [l for l in (tmp_path / "argv.log").read_text(encoding="utf-8").splitlines()
+             if l.strip()]
+    assert len(lines) > 5, lines
+    for line in lines:
+        argv = line.split(" -c ", 1)[0].split(" -f ", 1)[0].split()
+        for flag, value in (("-h", "elsewhere"), ("-p", "6543"), ("-U", "someadmin"),
+                            ("-d", "haf_block_log")):
+            assert argv.count(flag) == 1, (flag, line)
+            assert argv[argv.index(flag) + 1] == value, (flag, value, line)
+
+
+def test_a_refusal_resolves_the_identity_once(bash, tmp_path):
+    """_report_connected_identity runs only on a refusal. A second, flagless query there
+    would reach the local server while the teardown targets the remote one."""
+    _guarded_psql(tmp_path, createrole="f")
+    run(bash, tmp_path, "--force")
+    assert len(_identity_calls(tmp_path)) == 1, _identity_calls(tmp_path)
+
+
+# The interactive branch cannot be driven without a pty (see the module docstring), so
+# the typed-name gate is pinned at source, comments stripped.
+
+def _live_source() -> str:
+    return "\n".join(l.split("#", 1)[0]
+                     for l in SCRIPT.read_text(encoding="utf-8").splitlines())
+
+
+def test_the_confirmation_asks_the_server_which_database_this_is():
+    live = _live_source()
+    line = live[live.index('_target_db="$(psql_cmd'):].splitlines()[0]
+    assert line.split('-c "', 1)[1].split('"', 1)[0] == "SELECT current_database()", line
+    # No connection flags of its own: psql takes the last -h/-p/-d, so one here would ask
+    # a DIFFERENT server which database this is.
+    assert line.split("psql_cmd", 1)[1].split("-c", 1)[0].split() == ["-X", "-Atq"], line
+
+
+def test_the_confirmation_probe_tests_its_own_status():
+    """`|| true` would turn a failed query into "Aborted -- nothing was changed" (the
+    typed name not matching noise) instead of "could not ask the server"."""
+    live = _live_source()
+    # The WHOLE line: `|| true` appended inside the substitution keeps the `if !` and
+    # still discards the status.
+    assert '    if ! _target_db="$(psql_cmd -X -Atq -c "SELECT current_database()")"; then\n' in live
+    start = live.index('if ! _target_db="$(psql_cmd')
+    stanza = live[start:live.index("printf '[haf_fyp] Type the database name", start)]
+    assert '"" | *"${_NEWLINE}"*)' in stanza, stanza
+    assert "refusing to prompt" in stanza and "exit 1" in stanza, stanza
+
+
+def test_the_confirmation_compares_against_the_servers_answer():
+    live = _live_source()
+    assert '[ "${_reply}" != "${_target_db}" ]' in live
+    assert '[ "${_reply}" != "${POSTGRES_DB}" ]' not in live
