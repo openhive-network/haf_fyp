@@ -206,14 +206,15 @@ _NEWLINE='
 _server_identity() {
     # host(), not ::text: the cast keeps a /32 that means nothing here.
     #
-    # The cluster id is what identifies the server. Over a Unix socket
+    # The cluster id is what tells two clusters on one box apart. Over a Unix socket
     # inet_server_addr() is NULL, so without it the line is "LOCAL SOCKET:-/<db>" for
-    # any two clusters on one box -- which is where #40's empty --host= lands.
-    # pg_control_system() is executable by PUBLIC.
+    # both -- which is where #40's empty --host= lands. pg_control_system() is
+    # executable by PUBLIC. It is NOT unique across copies: a physical replica, a
+    # pg_basebackup or a snapshot clone of the data directory reports the same id.
     #
-    # -X: psql_cmd does not pass it, and a ~/.psqlrc `\echo` or `\timing` would write
-    # into this answer. No `|| true`: the caller tests the status.
-    psql_cmd -X -Atq -c "
+    # No `|| true`: the caller tests the status. psql_cmd passes -X, so a ~/.psqlrc
+    # cannot write into this answer; the checks in _resolve_target stay anyway.
+    psql_cmd -Atq -c "
         SELECT coalesce(host(inet_server_addr()), 'LOCAL SOCKET')
             || ':' || coalesce(inet_server_port()::text, '-')
             || '/' || current_database()
@@ -232,17 +233,16 @@ _resolve_target() {
     #   line count -- -Atq on a one-row query emits exactly one line, so a second line
     #     means something other than the query spoke (and a database named with an
     #     embedded newline would put an unprefixed line in the log).
-    #   shape -- the query always ends ` [cluster <n>]`, so an answer that does not is
-    #     not this query's answer.
+    #   shape -- the query always ends ` [cluster <digits>]`, so an answer that does not
+    #     is not this query's answer.
     if ! _raw="$(_server_identity)"; then _raw=""; fi
     case "${_raw}" in
         *"${_NEWLINE}"*) _reached="" ;;
-        *)               _reached="${_raw% }" ;;
+        *)               _reached="${_raw}" ;;
     esac
-    case "${_reached}" in
-        *"[cluster "*"]") : ;;
-        *) _reached="" ;;
-    esac
+    if ! [[ "${_reached}" =~ " [cluster "[0-9]+"]"$ ]]; then
+        _reached=""
+    fi
 
     log "  requested: ${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB} as ${POSTGRES_USER}"
     if [ -n "${_reached}" ]; then
@@ -262,13 +262,16 @@ _resolve_target() {
         _redirect="${_redirect}PGSERVICEFILE=${PGSERVICEFILE}${_NEWLINE}"
     fi
     if [ -n "${_redirect}" ]; then
+        # `[ -z ] ||`, not `[ -n ] &&`: a value ending in a newline leaves an empty last
+        # line, the `&&` form then returns 1 from the loop, and pipefail + set -e end
+        # the script right here with no message.
         printf '%s' "${_redirect}" | while IFS= read -r _var; do
-            [ -n "${_var}" ] && log "  NOTE     : ${_var}"
+            [ -z "${_var}" ] || log "  NOTE     : ${_var}"
         done
-        log "             Any of PGHOSTADDR, PGSERVICE or PGSERVICEFILE can carry a"
-        log "             hostaddr, which libpq connects to INSTEAD of the --host /"
-        log "             POSTGRES_HOST above; those then apply only to authentication"
-        log "             and TLS. The 'reached' line is the server being destroyed."
+        log "             PGHOSTADDR, or the service PGSERVICE names, can carry a hostaddr,"
+        log "             which libpq connects to INSTEAD of the --host / POSTGRES_HOST"
+        log "             above; those then apply only to authentication and TLS. The"
+        log "             'reached' line is the server that answered."
     fi
 
     # A pooler that reaches PostgreSQL over the Unix socket reports LOCAL SOCKET to a
@@ -278,8 +281,8 @@ _resolve_target() {
         "LOCAL SOCKET"*)
             log "  NOTE     : 'LOCAL SOCKET' is the SERVER's end of the connection, not"
             log "             yours. A pooler that reaches PostgreSQL over the socket"
-            log "             reports it to a remote client too, so the cluster id is the"
-            log "             reliable identity here." ;;
+            log "             reports it to a remote client too, so go by the cluster id"
+            log "             (which copies of one data directory share)." ;;
     esac
 
     # FAIL CLOSED, like every other probe in this script. If the server cannot say what
@@ -388,10 +391,10 @@ assert_no_active_sessions
 # ---------------------------------------------------------------------------
 # 2. No way to confirm? Refuse now.
 # ---------------------------------------------------------------------------
-# Before the guards, because it is the cheapest refusal and says the command was
-# invoked wrong (exit 2). The inventory and the prompt themselves come AFTER the
-# guards, just above step 3: a run that a guard refuses destroys nothing, so it must
-# not print "About to PERMANENTLY remove".
+# Where it has always been: after the session guard, before the privilege guards. It
+# says the command was invoked wrong (exit 2). The inventory and the prompt themselves
+# come AFTER the privilege guards, just above step 3: a run that one of those refuses
+# destroys nothing, so it must not print "About to PERMANENTLY remove".
 if [ "$FORCE" -ne 1 ] && [ ! -t 0 ]; then
     log "ERROR: refusing to run without a TTY and without --force."
     log "       This drops schemas ${HAF_FYP_SCHEMAS} CASCADE and cannot be undone."
@@ -780,6 +783,14 @@ fi
 # ---------------------------------------------------------------------------
 # Confirmation. Every guard above has passed, so destruction is actually next.
 # ---------------------------------------------------------------------------
+# The privilege guards are NOT re-run after the prompt (only the session guard is).
+# An accepted gap: a privilege revoked while the operator reads the prompt is not
+# noticed until a statement fails, and step 6 then reports what is left.
+#
+# What the server line does not promise: each psql call below opens its own
+# connection with the same parameters. With a multi-host POSTGRES_HOST, DNS
+# round-robin or a pooler with several backends, a later call can reach a different
+# server than the one that answered section 0.
 # Printed on BOTH paths (#69). It used to sit inside the no-force branch, and
 # docker/docker-compose.yml ships --force: the unattended run, the one most likely to
 # be pointed somewhere unexpected by its environment, left no record of what it
@@ -800,7 +811,7 @@ if [ "$FORCE" -ne 1 ]; then
     #
     # The status is tested, not discarded: a failed query must reach the operator as
     # "could not ask the server", not as "Aborted" after their reply fails to match noise.
-    if ! _target_db="$(psql_cmd -X -Atq -c "SELECT current_database()")"; then
+    if ! _target_db="$(psql_cmd -Atq -c "SELECT current_database()")"; then
         _target_db=""
     fi
     case "${_target_db}" in

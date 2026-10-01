@@ -997,10 +997,16 @@ on.
 Either way it first asks the server which server it is, and prints that next to what was
 requested: address, port, database, role and cluster id (`reached  : ...`). The two can
 differ without any flag being wrong, because `PGHOSTADDR` or a `pg_service.conf` entry
-redirects the connection while `--host` still says the original name; those variables are
-called out when set. If the server cannot answer, nothing is removed. The name you type at
-the prompt is compared with the database the server reports, and the inventory of what is
-about to be removed is printed on the `--force` path too.
+redirects the connection while `--host` still says the original name; `PGHOSTADDR` and
+`PGSERVICE` are called out when set. If the server cannot answer, nothing is removed. The
+name you type at the prompt is compared with the database the server reports, and the
+inventory of what is about to be removed is printed on the `--force` path too.
+
+Two limits. A redirected `--force` run is warned about, not refused. And each statement
+opens its own connection with the same settings, so with a multi-host `POSTGRES_HOST`, DNS
+round-robin or a pooler in front of several servers, a later statement can reach a
+different server than the one that answered; the cluster id is also shared by physical
+copies of one data directory (replicas, snapshot clones).
 
 It reports what it could not remove rather than stopping at the first error, so a
 partial teardown is visible instead of silent; re-running is safe.
