@@ -22,8 +22,13 @@ stages:
       method: GET
     response:
       status_code: 200
+      # database comes from a real query through the pool (#61). redis is listed
+      # (key checking is strict) but its value is not asserted: /health stays 200
+      # without a Redis by design, and this job runs without one.
       json:
         status: "ok"
+        database: "ok"
+        redis: !anything
 
 ---
 test_name: FastAPI metrics returns 200 (#15 embedding coverage)

@@ -6,7 +6,7 @@ Handles write operations and admin actions that PostgREST cannot serve:
   DELETE /v1/fyp/interests         — un-opt-in: clear declared interests (#10)
   POST   /v1/fyp/events            — impression / engagement telemetry (batched)
   POST   /v1/fyp/admin/algorithm   — activate an algorithm version (API-key gated)
-  GET    /health                   — service health check
+  GET    /health                   — can this container serve: database pool (503), Redis reported (#61)
   GET    /metrics                  — embedding coverage (#15) + credibility sources (#8) + ranking sources (#36)
   GET    /sync-status              — uniform HAF-app sync freshness (#16)
 
@@ -25,6 +25,7 @@ import ipaddress
 import json
 import logging
 import os
+import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
@@ -1027,15 +1028,20 @@ class SyncStatusResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _redis_client(**options) -> redis_lib.Redis:
+    """The Redis the refresh signal is published to (REDIS_HOST / REDIS_PORT)."""
+    return redis_lib.Redis(
+        host=os.environ.get("REDIS_HOST", "haf-fyp-redis"),
+        port=int(os.environ.get("REDIS_PORT", "6379")),
+        decode_responses=True,
+        **options,
+    )
+
+
 def _publish_refresh(username: str) -> None:
     """Fire-and-forget Redis signal so the ranker can refresh immediately."""
     try:
-        r = redis_lib.Redis(
-            host=os.environ.get("REDIS_HOST", "haf-fyp-redis"),
-            port=int(os.environ.get("REDIS_PORT", "6379")),
-            decode_responses=True,
-            socket_connect_timeout=1,
-        )
+        r = _redis_client(socket_connect_timeout=1)
         r.publish("haf_fyp:refresh", json.dumps({"username": username}))
     except Exception:
         pass  # ranker picks up interests on next scheduled cycle regardless
@@ -1046,9 +1052,97 @@ def _publish_refresh(username: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Health is real-time data, like /sync-status: never let a proxy serve a stale answer.
+_HEALTH_HEADERS = {"Cache-Control": "public, max-age=0"}
+
+# How long /health waits on Redis. Redis is not needed to serve (see below), so the
+# probe must not make /health slow: haf_api_node's container healthcheck gives the
+# whole request 2 seconds.
+_HEALTH_REDIS_TIMEOUT = 0.5
+
+# One database probe at a time. A probe stuck on a connection whose peer vanished
+# waits for the kernel to give up, which can take minutes; without this, every
+# further probe would park another worker thread and hold another of the pool's 5
+# connections, and /health itself would exhaust the pool it is checking. A healthy
+# probe takes milliseconds, so concurrent callers (HAProxy, the container
+# healthcheck, a monitor) only queue briefly.
+_health_db_probe = threading.Lock()
+_HEALTH_DB_PROBE_WAIT = 1.5
+
+
+def _probe_database() -> str:
+    """ "ok" if a pooled connection answers a query, else a short reason."""
+    if not _health_db_probe.acquire(timeout=_HEALTH_DB_PROBE_WAIT):
+        return "no answer: an earlier probe is still waiting on the database"
+    try:
+        # Two attempts: the pool keeps one idle connection, and after a HAF restart
+        # that connection is dead. The first query fails on it, the pool discards
+        # it, and the second attempt opens a fresh one -- which is the honest answer
+        # to "can the app serve now". Any other failure is final.
+        for attempt in (1, 2):
+            try:
+                with _db_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                        cur.fetchone()
+                return "ok"
+            except psycopg2.pool.PoolError:
+                return "connection pool exhausted"
+            except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                if attempt == 2:
+                    return "unreachable"
+            except Exception:
+                log.exception("health: database probe failed")
+                return "query failed"
+        return "unreachable"
+    finally:
+        _health_db_probe.release()
+
+
+def _probe_redis() -> str:
+    """ "ok" if Redis answers PING within the bound, else "unreachable"."""
+    try:
+        r = _redis_client(
+            socket_connect_timeout=_HEALTH_REDIS_TIMEOUT,
+            socket_timeout=_HEALTH_REDIS_TIMEOUT,
+        )
+        try:
+            r.ping()
+        finally:
+            r.close()
+        return "ok"
+    except Exception:
+        return "unreachable"
+
+
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+def health(response: Response):
+    """
+    Can this container serve? (#61)
+
+    503 when the database pool cannot answer a query: every endpoint here needs
+    it, so that is the failure a proxy should route around. haf_api_node's HAProxy
+    backend and container healthcheck both probe this path.
+
+    Redis is REPORTED, not gated on. The app is built to serve without it: the
+    rate limiter fails open (requests are served unmetered) and the refresh signal
+    is fire-and-forget (the ranker picks interests up on its next cycle). Answering
+    503 would turn that degraded state into a write outage.
+
+    Deliberately not sync-aware: this stays 200 while the app is behind the chain
+    or the HAF instance is in massive sync, when writes must still be accepted.
+    /sync-status is the endpoint that reports freshness.
+    """
+    response.headers.update(_HEALTH_HEADERS)
+    database = _probe_database()
+    body = {
+        "status": "ok" if database == "ok" else "unavailable",
+        "database": database,
+        "redis": _probe_redis(),
+    }
+    if database != "ok":
+        response.status_code = 503
+    return body
 
 
 # Real-time health data — never let a proxy or browser serve a stale answer. The

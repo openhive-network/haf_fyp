@@ -484,7 +484,7 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Service health check |
+| GET | `/health` | Can this container serve: `503` when the database pool cannot answer a query; Redis is reported in the body but never fails it (the app serves without Redis); not sync-aware (#61) |
 | GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why) — not feed analytics |
 | GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
 | POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10/min per IP, 60/min total) |
