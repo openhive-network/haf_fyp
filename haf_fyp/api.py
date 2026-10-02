@@ -1065,14 +1065,17 @@ _HEALTH_HEADERS = {"Cache-Control": "public, max-age=0"}
 #     waiting for an earlier database probe     _HEALTH_DB_PROBE_WAIT       0.5 s
 #     both Redis probes, run side by side       _HEALTH_REDIS_DEADLINE      1.0 s
 #
+# The Redis probes never queue: a request that finds one in flight joins it.
+#
 # NOT bounded: the database query of the probe that holds the lock. _db_kwargs sets no
 # connect_timeout or keepalives, so a connection to a peer that vanished waits for the
 # kernel. Every later probe is bounded by the wait above and answers 503.
 _HEALTH_DB_PROBE_WAIT = 0.5
 _HEALTH_REDIS_DEADLINE = 1.0
-# Socket timeouts for the refresh-signal ping. On their own they bound nothing: redis-py
-# 6+ retries three times with backoff and the timeouts apply per attempt (measured with
-# 7.4.0: 8 s against a dead Redis with 0.5 s timeouts), name resolution is outside them,
+# Socket timeouts for the refresh-signal ping. On their own they bound nothing: a client
+# built with redis.Redis(...) retries three times with backoff from redis-py 6 on, and
+# the timeouts apply per attempt (measured with 7.4.0: about 6-14 s against a dead Redis
+# with 0.5 s timeouts, jittered), name resolution is outside them,
 # and a host with several addresses gets one connect timeout each. The deadline above
 # is what holds; these just let the worker finish soon after.
 _HEALTH_REDIS_TIMEOUT = 0.3
@@ -1116,40 +1119,49 @@ def _probe_database() -> str:
 
 
 class _BoundedProbe:
-    """Run a blocking probe in a worker thread and wait for it only until a deadline.
+    """Run a blocking probe in a worker thread; callers wait for it only until a deadline.
 
-    One worker at a time. A worker that is stuck (retrying against a dead Redis,
-    waiting on name resolution) keeps the lock until it finishes, so later calls do not
-    each start another thread: they wait out their own deadline and report no answer,
-    which is the truth. When the server comes back the stuck worker ends, and the next
-    call starts a fresh one.
+    Single-flight. A caller that finds a worker already running does not wait for it to
+    finish and then start its own: it JOINS that worker and shares its answer. So
+    begin() never blocks, which matters because two probes share one deadline -- time
+    spent queueing behind a stuck refresh-signal probe would otherwise come out of the
+    rate-limit-store probe's share and report a healthy store as unreachable.
+
+    A worker that is stuck (in a 2 s socket timeout against a dead Redis, in name
+    resolution)
+    stays the current one until it ends, so later callers do not each start another
+    thread: they wait out their own deadline and report no answer, which is the truth.
+    When it ends, the next caller starts a fresh one; a finished answer is never reused.
     """
 
     def __init__(self, name: str, probe):
         self._name = name
         self._probe = probe
-        self._busy = threading.Lock()
+        self._guard = threading.Lock()      # held only to read or replace _current
+        self._current: tuple[threading.Thread, list[str]] | None = None
 
     def begin(self, end: float):
-        """Start the probe; returns a function that waits until `end` for its answer."""
-        if not self._busy.acquire(timeout=max(0.0, end - time.monotonic())):
-            return lambda: "unreachable"
-        answer: list[str] = []
+        """Start the probe, or join the one in flight; returns a function that waits
+        until `end` for the answer."""
+        with self._guard:
+            current = self._current
+            if current is None or not current[0].is_alive():
+                answer: list[str] = []
 
-        def work():
-            try:
-                answer.append(self._probe())
-            except Exception:
-                answer.append("unreachable")
-            finally:
-                self._busy.release()
+                def work():
+                    try:
+                        answer.append(self._probe())
+                    except Exception:
+                        answer.append("unreachable")
 
-        worker = threading.Thread(target=work, name=f"health-{self._name}", daemon=True)
-        try:
-            worker.start()
-        except Exception:
-            self._busy.release()
-            return lambda: "unreachable"
+                worker = threading.Thread(target=work, name=f"health-{self._name}", daemon=True)
+                try:
+                    worker.start()
+                except Exception:
+                    self._current = None
+                    return lambda: "unreachable"
+                current = self._current = (worker, answer)
+        worker, answer = current
 
         def finish() -> str:
             worker.join(max(0.0, end - time.monotonic()))
@@ -1175,15 +1187,22 @@ def _refresh_signal_state() -> str:
 def _rate_limit_store_state() -> str:
     """Ask the rate limiter's OWN storage whether it is healthy.
 
+    limiter._storage, not limiter.limiter.storage: the latter is a property that hands
+    out slowapi's in-memory fallback once the real storage has been marked dead, which
+    would report "memory" in the middle of a Redis outage.
+
     Not a second client built from REDIS_URL: the limiter's storage already holds the
     right server, credentials, TLS and scheme (limits accepts redis+sentinel://,
     redis+cluster://, redis+unix://, memcached:// and more, most of which redis-py's
-    from_url cannot parse), so asking it cannot disagree with what the limiter will do.
+    from_url cannot parse), so this asks the server the limiter will use, the way it
+    connects. It is still a PING: a Redis that answers pings and refuses writes (full
+    with noeviction, or a read-only replica) reads "ok" here while hit() fails.
     """
-    storage = limiter.limiter.storage
+    storage = limiter._storage
     if isinstance(storage, MemoryStorage):
         return "memory"
-    return "ok" if storage.check() else "unreachable"
+    # `is True`: limits' sync storages answer a bool; anything else is not a yes.
+    return "ok" if storage.check() is True else "unreachable"
 
 
 _signal_probe = _BoundedProbe("refresh-signal", lambda: _refresh_signal_state())
@@ -1192,8 +1211,8 @@ _store_probe = _BoundedProbe("rate-limit-store", lambda: _rate_limit_store_state
 
 def _probe_redis() -> tuple[str, str]:
     """(refresh-signal Redis, rate-limit store): "ok" / "unreachable", or "memory"."""
-    if isinstance(limiter.limiter.storage, MemoryStorage):
-        # nothing to wait for, and no thread to start
+    if isinstance(limiter._storage, MemoryStorage):
+        # the store needs no probe; only the signal ping runs
         end = time.monotonic() + _HEALTH_REDIS_DEADLINE
         return _signal_probe.begin(end)(), "memory"
     end = time.monotonic() + _HEALTH_REDIS_DEADLINE
@@ -1210,8 +1229,9 @@ def _rate_limiter_needs_its_store() -> bool:
     it empty -- the shipped default -- slowapi's own decorator does the metering, and a
     storage error there is a 500 on every limited route, unless slowapi itself was told
     to tolerate it: RATELIMIT_SWALLOW_ERRORS or RATELIMIT_IN_MEMORY_FALLBACK_ENABLED,
-    both read from the environment. tests/unit/test_health.py holds this function to
-    what a real request does in each of those cases.
+    both read from the environment (slowapi treats ANY non-empty value as on, "0" and
+    "false" included). tests/unit/test_health.py holds this function to what a real
+    request does in each of those cases.
     """
     return bool(
         limiter.enabled
@@ -1231,8 +1251,8 @@ def health(response: Response):
       * the rate limiter's storage is unreachable AND the limiter fails closed on that
         (see _rate_limiter_needs_its_store): every rate-limited route would 500.
     haf_api_node's HAProxy backend and container healthcheck both probe this path, so a
-    503 takes the whole overlay out of rotation -- including /metrics and /sync-status,
-    which have no limit and would still answer.
+    503 takes the whole overlay out of rotation -- including /sync-status, which has no
+    limit and would still answer.
 
     Otherwise Redis is REPORTED, not gated on. With TRUSTED_PROXY_IPS set the limiter
     fails open (requests are served unmetered), and the refresh signal is best-effort

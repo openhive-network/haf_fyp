@@ -6,13 +6,14 @@ API (the HAProxy http-check and the container healthcheck) stayed green with a
 dead database pool.
 
 Most tests drive the shipped app with a fake pool, a fake refresh-signal Redis and a
-fake limiter storage. Two groups do not, because fakes hid real defects in earlier
+fake limiter storage. Three groups do not, because fakes hid real defects in earlier
 versions of this change:
 
-  * the timing tests talk to real sockets through the real redis-py and the real
-    limits storage, whose retries turned a 0.5 s "bound" into 8 s;
+  * the timing tests talk to real sockets through the real redis-py and a real limits
+    storage: the first version's 0.5 s "bound" took 6-14 s with redis-py's retries;
   * the limiter tests send a real request through the real middleware, because
-    whether the limiter's storage is needed to serve depends on which path runs.
+    whether the limiter's storage is needed to serve depends on which path runs;
+  * slowapi's environment switches are set in a fresh process, as an operator would.
 """
 
 import socket
@@ -100,6 +101,8 @@ class FakeRedis:
         self.publish_error = None
 
     def ping(self):
+        if self.closed:
+            raise AssertionError("pinged a client that was already closed")
         self.pings += 1
         if self.ping_error is not None:
             raise self.ping_error
@@ -151,16 +154,14 @@ class Stack:
 
     def _signal_client(self, **options):
         self.signal.options = options
+        self.signal.closed = False       # each call builds a new client
         return self.signal
 
     def limiter_counts_in(self, storage):
         """Give the shipped limiter this storage, the way slowapi holds it."""
         self.storage = storage
-        # The strategy insists on a real Storage at construction, so a fake is attached
-        # afterwards, on the attribute the limiter and /health both read.
-        strategy = type(api.limiter._limiter)(MemoryStorage())
-        strategy.storage = storage
-        self.monkeypatch.setattr(api.limiter, "_limiter", strategy)
+        # limiter._storage is what slowapi built from REDIS_URL, and what /health asks.
+        self.monkeypatch.setattr(api.limiter, "_storage", storage)
         return storage
 
     def get(self):
@@ -283,19 +284,30 @@ def test_the_shipped_waits_fit_the_two_second_budget():
     assert api._HEALTH_DB_PROBE_WAIT + api._HEALTH_REDIS_DEADLINE < 2
 
 
+class BusyLock:
+    """A lock that is always held by someone else; records how it was asked."""
+
+    def __init__(self):
+        self.asked = []
+
+    def acquire(self, blocking=True, timeout=-1):
+        self.asked.append((blocking, timeout))
+        return False
+
+    def release(self):
+        raise AssertionError("released a lock that was never acquired")
+
+
 def test_a_stuck_probe_fails_the_next_one_without_taking_a_connection(stack, monkeypatch):
     # A probe waiting on a vanished peer can wait minutes. Later probes must not
     # each park a thread and hold a pooled connection behind it.
-    monkeypatch.setattr(api, "_HEALTH_DB_PROBE_WAIT", 0.25)
-    assert api._health_db_probe.acquire(blocking=False)
-    started = time.monotonic()
-    try:
-        r = stack.get()
-    finally:
-        api._health_db_probe.release()
-    elapsed = time.monotonic() - started
-    # it waited the configured bound: not a literal, and not a multiple of it
-    assert 0.2 <= elapsed < 0.45, elapsed
+    busy = BusyLock()
+    monkeypatch.setattr(api, "_health_db_probe", busy)
+    monkeypatch.setattr(api, "_HEALTH_DB_PROBE_WAIT", 0.123)
+    r = stack.get()
+    # Asked once, blocking, for the configured bound: not a literal and not a multiple.
+    # (Asserted on the call rather than the clock, which flaked on a loaded runner.)
+    assert busy.asked == [(True, 0.123)], busy.asked
     assert r.status_code == 503
     assert r.json() == dict(
         OK, status="unavailable",
@@ -467,7 +479,7 @@ def test_it_is_the_limiters_own_storage_that_is_asked(stack, monkeypatch):
     storage = stack.limiter_counts_in(FakeStorage(healthy=True))
     monkeypatch.setattr(api, "_REDIS_URL", "redis+sentinel://not-parseable-by-redis-py/x")
     monkeypatch.setenv("REDIS_URL", "redis://somewhere-else:1")
-    assert api.limiter.limiter.storage is storage
+    assert api.limiter._storage is storage
     r = stack.get()
     assert r.json() == dict(OK, rate_limit_store="ok")
     assert storage.checks == 1
@@ -489,40 +501,43 @@ def test_memory_storage_is_reported_without_starting_a_probe(stack, monkeypatch)
 
 def test_a_hung_storage_check_answers_at_the_deadline(stack, monkeypatch):
     _limiter_fails_closed(monkeypatch)
-    monkeypatch.setattr(api, "_HEALTH_REDIS_DEADLINE", 0.3)
+    monkeypatch.setattr(api, "_HEALTH_REDIS_DEADLINE", 0.5)
     storage = stack.limiter_counts_in(FakeStorage())
     storage.block = threading.Event()
     try:
         started = time.monotonic()
         r = stack.get()
         elapsed = time.monotonic() - started
-        assert 0.25 <= elapsed < 0.6, elapsed
+        assert 0.45 <= elapsed < 0.9, elapsed
         assert r.status_code == 503
         assert r.json() == {"status": "unavailable", "database": "ok", "redis": "ok",
                             "rate_limit_store": "unreachable"}
 
-        # While that worker is still stuck, later probes do not each start another.
+        # While that worker is still stuck, later probes do not each start another, and
+        # each still answers at ITS deadline (not at twice it).
         started = time.monotonic()
         assert stack.get().json()["rate_limit_store"] == "unreachable"
+        elapsed = time.monotonic() - started
+        assert 0.45 <= elapsed < 0.9, elapsed
         assert stack.get().json()["rate_limit_store"] == "unreachable"
-        assert time.monotonic() - started < 1.2
         assert storage.checks == 1, "a second worker was started behind a stuck one"
+        stuck = api._store_probe._current[0]
+        assert stuck.daemon, "a stuck worker must not hold the process open at shutdown"
     finally:
         storage.block.set()
 
-    # The stuck worker ends when the server answers again, and the next probe is fresh.
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        r = stack.get()
-        if r.status_code == 200:
-            break
-        time.sleep(0.05)
+    # The stuck worker ends when the server answers again. The FIRST request after that
+    # starts a fresh probe and is healthy: no polling, which would hide a slow recovery.
+    stuck.join(5)
+    assert not stuck.is_alive()
+    r = stack.get()
+    assert r.status_code == 200
     assert r.json() == dict(OK, rate_limit_store="ok")
     assert storage.checks == 2
 
 
 def test_a_hung_signal_ping_answers_at_the_deadline_and_does_not_gate(stack, monkeypatch):
-    monkeypatch.setattr(api, "_HEALTH_REDIS_DEADLINE", 0.3)
+    monkeypatch.setattr(api, "_HEALTH_REDIS_DEADLINE", 0.5)
     release = threading.Event()
 
     def hang(**options):
@@ -536,7 +551,7 @@ def test_a_hung_signal_ping_answers_at_the_deadline_and_does_not_gate(stack, mon
         elapsed = time.monotonic() - started
     finally:
         release.set()
-    assert 0.25 <= elapsed < 0.6, elapsed
+    assert 0.45 <= elapsed < 0.9, elapsed
     assert r.status_code == 200
     assert r.json() == dict(OK, redis="unreachable")
 
@@ -545,7 +560,7 @@ def test_the_two_redis_probes_run_side_by_side(stack, monkeypatch):
     """One deadline for both, not one each: with both hung, /health spends the deadline
     once."""
     _limiter_fails_open(monkeypatch)
-    monkeypatch.setattr(api, "_HEALTH_REDIS_DEADLINE", 0.3)
+    monkeypatch.setattr(api, "_HEALTH_REDIS_DEADLINE", 0.5)
     storage = stack.limiter_counts_in(FakeStorage())
     storage.block = threading.Event()
     release = threading.Event()
@@ -562,8 +577,126 @@ def test_the_two_redis_probes_run_side_by_side(stack, monkeypatch):
     finally:
         release.set()
         storage.block.set()
-    assert 0.25 <= elapsed < 0.55, elapsed
+    # one deadline (0.5 s), not two (1.0 s)
+    assert 0.45 <= elapsed < 0.9, elapsed
     assert r.json() == dict(OK, redis="unreachable", rate_limit_store="unreachable")
+
+    # A second request while BOTH are still stuck costs the deadline once as well.
+    storage.block = threading.Event()
+    release2 = threading.Event()
+
+    def hang2(**options):
+        assert release2.wait(20)
+        raise ConnectionError("gave up")
+
+    monkeypatch.setattr(api, "_redis_client", hang2)
+    try:
+        stack.get()
+        started = time.monotonic()
+        r = stack.get()
+        elapsed = time.monotonic() - started
+    finally:
+        release2.set()
+        storage.block.set()
+    assert 0.45 <= elapsed < 0.9, elapsed
+    assert r.json() == dict(OK, redis="unreachable", rate_limit_store="unreachable")
+
+
+# --- single flight: a busy probe is joined, never queued behind ---------------------
+
+def test_a_stuck_signal_probe_does_not_cost_the_storage_its_answer(stack, monkeypatch):
+    """The two probes share one deadline. If a request waited for a stuck signal probe to
+    finish before starting, the wait came out of the storage probe's time and a HEALTHY
+    storage was reported unreachable -- a false 503 in the shipped default, caused by the
+    one Redis that is documented as never gating."""
+    _limiter_fails_closed(monkeypatch)
+    monkeypatch.setattr(api, "_HEALTH_REDIS_DEADLINE", 0.3)
+    storage = stack.limiter_counts_in(FakeStorage(healthy=True))
+    release = threading.Event()
+    calls = []
+
+    def hang(**options):
+        calls.append(1)
+        assert release.wait(20)
+        raise ConnectionError("gave up")
+
+    monkeypatch.setattr(api, "_redis_client", hang)
+    try:
+        answers = [stack.get() for _ in range(4)]
+    finally:
+        release.set()
+    assert [r.status_code for r in answers] == [200] * 4
+    for r in answers:
+        assert r.json() == dict(OK, redis="unreachable", rate_limit_store="ok")
+    assert len(calls) == 1, "a second signal worker was started behind the stuck one"
+    assert storage.checks == 4
+
+
+def test_a_slow_healthy_storage_serves_concurrent_health_checks(stack, monkeypatch):
+    """HAProxy, the container healthcheck and a monitor asking at once, during a Redis
+    latency spike. Each caller joins the probe in flight; none is told "unreachable"
+    because it spent its deadline queueing."""
+    _limiter_fails_closed(monkeypatch)
+
+    class SlowStorage(FakeStorage):
+        def check(self):
+            time.sleep(0.25)
+            return super().check()
+
+    storage = stack.limiter_counts_in(SlowStorage(healthy=True))
+    results = []
+
+    def ask():
+        r = stack.get()
+        results.append((r.status_code, r.json()["rate_limit_store"]))
+
+    threads = [threading.Thread(target=ask) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert results == [(200, "ok")] * 10, results
+    # shared, not one check per caller
+    assert storage.checks < 10, storage.checks
+
+
+def test_a_finished_answer_is_not_reused(stack, monkeypatch):
+    _limiter_fails_closed(monkeypatch)
+    storage = stack.limiter_counts_in(FakeStorage(healthy=True))
+    assert stack.get().json()["rate_limit_store"] == "ok"
+    for _ in range(50):                       # let the first worker end
+        if not api._store_probe._current[0].is_alive():
+            break
+        time.sleep(0.01)
+    storage.healthy = False
+    r = stack.get()
+    assert r.status_code == 503
+    assert r.json()["rate_limit_store"] == "unreachable"
+    assert storage.checks == 2
+
+
+def test_the_configured_storage_is_asked_even_after_slowapi_falls_back(stack, monkeypatch):
+    """With the in-memory fallback on, limiter.limiter hands out the fallback strategy
+    (a MemoryStorage) once the real storage is marked dead. /health must still report the
+    real one: "memory" in the middle of a Redis outage would be a misreport."""
+    _limiter_fails_open(monkeypatch)
+    stack.limiter_counts_in(FakeStorage(healthy=False))
+    monkeypatch.setattr(api.limiter, "_limiter", type(api.limiter._limiter)(MemoryStorage()))
+    assert isinstance(api.limiter.limiter.storage, MemoryStorage)
+    assert stack.get().json()["rate_limit_store"] == "unreachable"
+
+
+def test_only_a_true_check_is_healthy(stack, monkeypatch):
+    """limits' synchronous storages answer a bool. Anything else that happens to be
+    truthy (an un-awaited coroutine from an async storage, say) is not a yes."""
+    _limiter_fails_closed(monkeypatch)
+    for answer in (object(), 1, "PONG", None, 0, False):
+        stack.limiter_counts_in(FakeStorage(healthy=answer))
+        r = stack.get()
+        assert r.status_code == 503, answer
+        assert r.json()["rate_limit_store"] == "unreachable", answer
+    stack.limiter_counts_in(FakeStorage(healthy=True))
+    assert stack.get().json()["rate_limit_store"] == "ok"
 
 
 # --- does the limiter really fail closed? Asked of the real app --------------------
@@ -615,10 +748,11 @@ def down(*a, **k):
     raise ConnectionError("redis is down")
 
 api.limiter.limiter.hit = down
+before = api._rate_limiter_needs_its_store()
 client = TestClient(api.app, raise_server_exceptions=False)
 status = client.post("/v1/fyp/admin/algorithm", json={"version": "1.0.0"},
-                     headers={"X-Real-IP": "203.0.113.77", "X-Admin-Key": "wrong"}).status_code
-print(json.dumps({"status": status, "needs": api._rate_limiter_needs_its_store()}))
+                     headers={"X-Real-IP": "203.0.113.77", "X-Admin-Key": "not-the-key"}).status_code
+print(json.dumps({"status": status, "before": before, "after": api._rate_limiter_needs_its_store()}))
 """
 
 
@@ -642,14 +776,46 @@ def test_health_follows_slowapis_environment_switches(switch, served):
         env[switch] = "1"
     out = subprocess.run([sys.executable, "-c", _SWITCH_SCRIPT], env=env, capture_output=True,
                          text=True, timeout=120, cwd=str(__import__("pathlib").Path(api.__file__).parents[1]))
-    result = json.loads(out.stdout.strip().splitlines()[-1]), out.stderr[-400:]
-    assert result[0] == {"status": 403 if served else 500, "needs": not served}, result
+    lines = out.stdout.strip().splitlines()
+    assert out.returncode == 0 and lines, "the child failed:\n" + out.stderr[-1500:]
+    assert json.loads(lines[-1]) == {
+        "status": 403 if served else 500, "before": not served, "after": not served,
+    }, (lines[-1], out.stderr[-400:])
 
 
-def test_a_disabled_limiter_never_needs_its_storage(monkeypatch):
-    monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset())
+@pytest.mark.parametrize("trusted", [frozenset(), frozenset({"172.18.0.0/16"})])
+def test_a_disabled_limiter_never_needs_its_storage(monkeypatch, trusted):
+    monkeypatch.setattr(api, "_TRUSTED_LITERALS", trusted)
     monkeypatch.setattr(api.limiter, "enabled", False)
     assert api._rate_limiter_needs_its_store() is False
+
+
+@pytest.mark.parametrize("switch", ["_swallow_errors", "_in_memory_fallback_enabled"])
+def test_a_slowapi_switch_counts_before_any_request_has_failed(monkeypatch, switch):
+    """slowapi sets _storage_dead only AFTER a request has hit the dead storage. A rule
+    keyed on that would answer 503 until then -- and a container HAProxy has taken out of
+    rotation receives no request to flip it, so it would never come back."""
+    monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset())
+    monkeypatch.setattr(api.limiter, "_storage_dead", False)
+    assert api._rate_limiter_needs_its_store() is True
+    monkeypatch.setattr(api.limiter, switch, True)
+    assert api._rate_limiter_needs_its_store() is False
+
+
+def test_a_worker_that_cannot_be_started_is_no_answer_and_does_not_break_the_probe(monkeypatch):
+    calls = []
+    probe = api._BoundedProbe("x", lambda: calls.append(1) or "ok")
+    real_start = threading.Thread.start
+
+    def no_threads(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", no_threads)
+    assert probe.begin(time.monotonic() + 1)() == "unreachable"
+    monkeypatch.setattr(threading.Thread, "start", real_start)
+    # ...and the next call is not stuck behind a worker that never ran
+    assert probe.begin(time.monotonic() + 1)() == "ok"
+    assert calls == [1]
 
 
 # --- real sockets, real redis-py, real limits storage ------------------------------
@@ -713,7 +879,7 @@ def test_the_whole_request_fits_the_budget_with_both_redis_roles_hung(monkeypatc
     monkeypatch.setenv("REDIS_PORT", str(port))
     storage = storage_from_string(f"redis://:secret@127.0.0.1:{port}/2",
                                   socket_timeout=2, socket_connect_timeout=2)
-    monkeypatch.setattr(api.limiter, "_limiter", type(api.limiter._limiter)(storage))
+    monkeypatch.setattr(api.limiter, "_storage", storage)
     monkeypatch.setattr(api, "_signal_probe",
                         api._BoundedProbe("signal", lambda: api._refresh_signal_state()))
     monkeypatch.setattr(api, "_store_probe",
@@ -740,7 +906,7 @@ def test_a_refused_storage_is_unreachable_whatever_its_url_looks_like(monkeypatc
     probe.close()                    # nothing listens here now
     storage = storage_from_string(f"redis://user:secret@127.0.0.1:{port}/3?socket_timeout=5",
                                   socket_connect_timeout=2)
-    monkeypatch.setattr(api.limiter, "_limiter", type(api.limiter._limiter)(storage))
+    monkeypatch.setattr(api.limiter, "_storage", storage)
     monkeypatch.setattr(api, "_store_probe",
                         api._BoundedProbe("store", lambda: api._rate_limit_store_state()))
     monkeypatch.setattr(api, "_signal_probe", api._BoundedProbe("signal", lambda: "ok"))
