@@ -65,7 +65,9 @@ def clean_env(bindir=None) -> dict:
     command such as `docker`, and ENV is read by interactive POSIX shells.
     """
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("HAF_FYP_", "POSTGRES_", "BASH_FUNC_"))
+           # PG*: libpq's own variables. psql is a stub here, so they redirect nothing,
+           # but uninstall_app.sh reports them, and a test must state the ones it means.
+           if not k.startswith(("HAF_FYP_", "POSTGRES_", "BASH_FUNC_", "PG"))
            and k not in ("BASH_ENV", "ENV",
                          # install_app.sh skips HAF's install-lock wrapper when set (#67).
                          "HAF_INSTALL_LOCK_HELD")}
