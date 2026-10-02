@@ -484,7 +484,7 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Can this container serve: `503` when the database pool cannot answer a query, or when the rate limiter's storage is unreachable and the limiter fails closed on that (`TRUSTED_PROXY_IPS` empty and neither slowapi switch set: limited routes would 500). Otherwise Redis is reported in the body (`redis`, `rate_limit_store`) without failing it. Not sync-aware (#61) |
+| GET | `/health` | Can this container serve: `503` when the database pool does not answer a query within 1.5 s, or when the rate limiter's storage is unreachable and the limiter fails closed on that (`TRUSTED_PROXY_IPS` empty and neither slowapi switch set: limited routes would 500). Otherwise Redis is reported in the body (`redis`, `rate_limit_store`) without failing it. A probe slower than its deadline (1.5 s database, 1.0 s Redis) counts as no answer. Not sync-aware (#61) |
 | GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why) — not feed analytics |
 | GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
 | POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10/min per IP, 60/min total) |

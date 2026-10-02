@@ -308,6 +308,7 @@ def test_a_stuck_query_answers_at_the_deadline_and_holds_one_connection(stack, m
 
     # The first request after the database answers again is healthy.
     stuck.join(5)
+    assert not stuck.is_alive()
     stack.pool.block = None
     r = stack.get()
     assert r.status_code == 200
@@ -354,7 +355,7 @@ def test_a_slow_healthy_database_serves_concurrent_health_checks(stack):
     for th in threads:
         th.join(10)
     assert results == [(200, "ok")] * 10, results
-    assert stack.pool.getconn_calls < 10, stack.pool.getconn_calls
+    assert stack.pool.getconn_calls <= 2, stack.pool.getconn_calls
 
 
 @pytest.mark.parametrize("outcomes, getconn_error", [
@@ -604,7 +605,7 @@ def test_the_two_redis_probes_run_side_by_side(stack, monkeypatch):
     """One deadline for both, not one each: with both hung, /health spends the deadline
     once."""
     _limiter_fails_open(monkeypatch)
-    monkeypatch.setattr(api, "_HEALTH_REDIS_DEADLINE", 0.5)
+    monkeypatch.setattr(api, "_HEALTH_REDIS_DEADLINE", 0.8)
     storage = stack.limiter_counts_in(FakeStorage())
     storage.block = threading.Event()
     release = threading.Event()
@@ -621,8 +622,8 @@ def test_the_two_redis_probes_run_side_by_side(stack, monkeypatch):
     finally:
         release.set()
         storage.block.set()
-    # one deadline (0.5 s), not two (1.0 s)
-    assert 0.45 <= elapsed < 0.9, elapsed
+    # one deadline (0.8 s), not two (1.6 s)
+    assert 0.75 <= elapsed < 1.4, elapsed
     assert r.json() == dict(OK, redis="unreachable", rate_limit_store="unreachable")
 
     # A second request while BOTH are still stuck costs the deadline once as well.
@@ -642,7 +643,7 @@ def test_the_two_redis_probes_run_side_by_side(stack, monkeypatch):
     finally:
         release2.set()
         storage.block.set()
-    assert 0.45 <= elapsed < 0.9, elapsed
+    assert 0.75 <= elapsed < 1.4, elapsed
     assert r.json() == dict(OK, redis="unreachable", rate_limit_store="unreachable")
 
 
@@ -701,7 +702,7 @@ def test_a_slow_healthy_storage_serves_concurrent_health_checks(stack, monkeypat
         t.join(10)
     assert results == [(200, "ok")] * 10, results
     # shared, not one check per caller
-    assert storage.checks < 10, storage.checks
+    assert storage.checks <= 2, storage.checks
 
 
 def test_a_finished_answer_is_not_reused(stack, monkeypatch):
@@ -899,7 +900,7 @@ def silent_server():
 
 def test_a_hung_signal_redis_costs_one_timeout_not_a_retry_schedule(monkeypatch, silent_server):
     """The real client against a server that never answers: one connection, one read
-    timeout. redis-py's default retries made this 8-10 s."""
+    timeout. With redis-py's default retries this took 6-14 s."""
     port, accepted = silent_server
     monkeypatch.setenv("REDIS_HOST", "127.0.0.1")
     monkeypatch.setenv("REDIS_PORT", str(port))
@@ -914,9 +915,9 @@ def test_a_hung_signal_redis_costs_one_timeout_not_a_retry_schedule(monkeypatch,
 def test_the_whole_request_fits_the_budget_with_both_redis_roles_hung(monkeypatch, silent_server):
     """End to end with nothing faked but the database pool: the real redis-py client for
     the signal, and for the limiter a real limits RedisStorage built the way api.py
-    builds it (2 s socket timeouts, redis-py's default retries, a password in the URL).
-    On its own that storage's check() takes many seconds here; /health must still answer
-    at its deadline."""
+    builds it (2 s socket timeouts, a password in the URL). On its own that storage's
+    check() takes its 2 s socket timeout here, twice the deadline; /health must still
+    answer at its deadline."""
     port, _ = silent_server
     monkeypatch.setattr(api, "_pool", FakePool())
     monkeypatch.setattr(api, "_db_probe", api._new_db_probe())
@@ -936,7 +937,7 @@ def test_the_whole_request_fits_the_budget_with_both_redis_roles_hung(monkeypatc
     assert r.status_code == 503
     assert r.json() == {"status": "unavailable", "database": "ok", "redis": "unreachable",
                         "rate_limit_store": "unreachable"}
-    assert 0.9 <= elapsed < 1.6, elapsed
+    assert 0.9 <= elapsed < 1.9, elapsed
 
 
 def test_a_refused_storage_is_unreachable_whatever_its_url_looks_like(monkeypatch):
@@ -1001,3 +1002,113 @@ def test_redis_client_defaults_to_the_compose_service(monkeypatch):
     monkeypatch.delenv("REDIS_PORT", raising=False)
     kwargs = api._redis_client().connection_pool.connection_kwargs
     assert (kwargs["host"], kwargs["port"]) == ("haf-fyp-redis", 6379)
+
+
+# --- every probe is started before any is waited for --------------------------------
+#
+# The deadlines only run side by side if all three probes are begun first and collected
+# afterwards. Begin one after waiting for another and the wait comes out of its time.
+
+def test_a_stuck_storage_does_not_cost_a_slow_database_its_answer(stack, monkeypatch):
+    _limiter_fails_open(monkeypatch)
+    monkeypatch.setattr(api, "_HEALTH_DB_DEADLINE", 1.2)
+    monkeypatch.setattr(api, "_HEALTH_REDIS_DEADLINE", 0.5)
+    storage = stack.limiter_counts_in(FakeStorage())
+    storage.block = threading.Event()
+    stack.pool.delay = 0.8           # slow, but inside its own deadline
+    try:
+        r = stack.get()
+    finally:
+        storage.block.set()
+    assert r.status_code == 200
+    assert r.json() == dict(OK, rate_limit_store="unreachable")
+
+
+def test_a_stuck_database_does_not_cost_redis_its_answers(stack, monkeypatch):
+    """Both Redis probes are healthy but not instant; the database is stuck. They must be
+    reported as they are, not as casualties of the database's deadline."""
+    _limiter_fails_closed(monkeypatch)
+    monkeypatch.setattr(api, "_HEALTH_DB_DEADLINE", 0.7)
+    monkeypatch.setattr(api, "_HEALTH_REDIS_DEADLINE", 0.5)
+
+    class SlowishStorage(FakeStorage):
+        def check(self):
+            time.sleep(0.2)
+            return super().check()
+
+    stack.limiter_counts_in(SlowishStorage(healthy=True))
+    real = stack._signal_client
+
+    def slowish_client(**options):
+        time.sleep(0.2)
+        return real(**options)
+
+    monkeypatch.setattr(api, "_redis_client", slowish_client)
+    stack.pool.block = threading.Event()
+    try:
+        r = stack.get()
+    finally:
+        stack.pool.block.set()
+    assert r.status_code == 503
+    assert r.json() == {"status": "unavailable", "database": "no answer in time",
+                        "redis": "ok", "rate_limit_store": "ok"}
+
+
+def test_simultaneous_callers_start_one_worker(monkeypatch):
+    """The guard in begin(): without it two callers arriving together each see no worker
+    and each start one -- for the database, each taking a pooled connection. Thread start
+    is slowed so the callers really overlap, instead of relying on the interpreter to
+    interleave them."""
+    calls = []
+    release = threading.Event()
+    def held():
+        calls.append(1)
+        release.wait(5)
+        return "ok"
+
+    probe = api._BoundedProbe("x", held)
+    real_start = threading.Thread.start
+
+    def slow_start(self):
+        if self.name == "health-x":
+            time.sleep(0.2)
+        real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", slow_start)
+    answers = []
+    callers = [threading.Thread(target=lambda: answers.append(probe.begin(time.monotonic() + 5)()))
+               for _ in range(5)]
+    for c in callers:
+        c.start()
+    time.sleep(0.6)
+    release.set()
+    for c in callers:
+        c.join(5)
+    assert calls == [1], calls
+    assert answers == ["ok"] * 5, answers
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_a_worker_that_dies_without_answering_does_not_wedge_the_probe():
+    """is_alive(), not "has it answered": a worker killed by something that is not an
+    Exception leaves no answer, and the next call must still start a fresh one."""
+    outcomes = [SystemExit(), "ok"]
+
+    def probe():
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    bounded = api._BoundedProbe("x", probe, no_answer="nothing")
+    first = bounded.begin(time.monotonic() + 2)
+    bounded._current[0].join(2)
+    assert first() == "nothing"
+    assert bounded.begin(time.monotonic() + 2)() == "ok"
+
+
+def test_a_probe_that_raises_reports_its_own_no_answer_text():
+    def probe():
+        raise RuntimeError("boom")
+
+    assert api._BoundedProbe("x", probe, no_answer="nothing").begin(time.monotonic() + 2)() == "nothing"

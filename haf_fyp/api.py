@@ -1088,6 +1088,8 @@ def _database_state() -> str:
     the pool it checks: a query stuck on a connection whose peer vanished waits for the
     kernel to give up (_db_kwargs sets no connect_timeout or keepalives), and it holds
     ONE of the pool's 5 connections while it does, however many requests arrive.
+    (A probe stuck while CONNECTING is worse, for any caller of the pool and not only
+    this one: psycopg2 opens the connection under the pool's own lock.)
     """
     # Two attempts: the pool keeps one idle connection, and after a HAF restart
     # that connection is dead. The first query fails on it, the pool discards
