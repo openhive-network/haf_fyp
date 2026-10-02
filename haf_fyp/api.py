@@ -1059,18 +1059,18 @@ def _publish_refresh(username: str) -> None:
 _HEALTH_HEADERS = {"Cache-Control": "public, max-age=0"}
 
 # THE TIME BUDGET. haf_api_node's container healthcheck opens this URL with a 2 second
-# timeout, and HAProxy's http-check has no longer to spare. What /health itself can
-# spend waiting is bounded to fit:
+# timeout, and HAProxy's http-check has no longer to spare. The three probes run side by
+# side, each in its own worker, and /health waits for them only this long:
 #
-#     waiting for an earlier database probe     _HEALTH_DB_PROBE_WAIT       0.5 s
-#     both Redis probes, run side by side       _HEALTH_REDIS_DEADLINE      1.0 s
+#     the database query                       _HEALTH_DB_DEADLINE         1.5 s
+#     the two Redis probes                     _HEALTH_REDIS_DEADLINE      1.0 s
 #
-# The Redis probes never queue: a request that finds one in flight joins it.
+# so the answer leaves within 1.5 s whatever the probes are stuck on. A probe that has
+# not answered by its deadline counts as no answer -- including one that is merely slow:
+# a database or a limiter storage that takes longer than its deadline reads as down.
 #
-# NOT bounded: the database query of the probe that holds the lock. _db_kwargs sets no
-# connect_timeout or keepalives, so a connection to a peer that vanished waits for the
-# kernel. Every later probe is bounded by the wait above and answers 503.
-_HEALTH_DB_PROBE_WAIT = 0.5
+# No probe queues: a request that finds one in flight joins it (see _BoundedProbe).
+_HEALTH_DB_DEADLINE = 1.5
 _HEALTH_REDIS_DEADLINE = 1.0
 # Socket timeouts for the refresh-signal ping. On their own they bound nothing: a client
 # built with redis.Redis(...) retries three times with backoff from redis-py 6 on, and
@@ -1080,42 +1080,35 @@ _HEALTH_REDIS_DEADLINE = 1.0
 # is what holds; these just let the worker finish soon after.
 _HEALTH_REDIS_TIMEOUT = 0.3
 
-# One database probe at a time. A probe stuck on a connection whose peer vanished
-# waits for the kernel to give up, which can take minutes; without this, every
-# further probe would park another worker thread and hold another of the pool's 5
-# connections, and /health itself would exhaust the pool it is checking. A healthy
-# probe takes milliseconds, so concurrent callers (HAProxy, the container
-# healthcheck, a monitor) only queue briefly.
-_health_db_probe = threading.Lock()
 
+def _database_state() -> str:
+    """ "ok" if a pooled connection answers a query, else a short reason.
 
-def _probe_database() -> str:
-    """ "ok" if a pooled connection answers a query, else a short reason."""
-    if not _health_db_probe.acquire(timeout=_HEALTH_DB_PROBE_WAIT):
-        return "no answer: an earlier probe is still waiting on the database"
-    try:
-        # Two attempts: the pool keeps one idle connection, and after a HAF restart
-        # that connection is dead. The first query fails on it, the pool discards
-        # it, and the second attempt opens a fresh one -- which is the honest answer
-        # to "can the app serve now". Any other failure is final.
-        for attempt in (1, 2):
-            try:
-                with _db_conn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("SELECT 1")
-                        cur.fetchone()
-                return "ok"
-            except psycopg2.pool.PoolError:
-                return "connection pool exhausted"
-            except (psycopg2.OperationalError, psycopg2.InterfaceError):
-                if attempt == 2:
-                    return "unreachable"
-            except Exception:
-                log.exception("health: database probe failed")
-                return "query failed"
-        return "unreachable"
-    finally:
-        _health_db_probe.release()
+    Runs in _db_probe's worker, one at a time. That is what keeps /health from draining
+    the pool it checks: a query stuck on a connection whose peer vanished waits for the
+    kernel to give up (_db_kwargs sets no connect_timeout or keepalives), and it holds
+    ONE of the pool's 5 connections while it does, however many requests arrive.
+    """
+    # Two attempts: the pool keeps one idle connection, and after a HAF restart
+    # that connection is dead. The first query fails on it, the pool discards
+    # it, and the second attempt opens a fresh one -- which is the honest answer
+    # to "can the app serve now". Any other failure is final.
+    for attempt in (1, 2):
+        try:
+            with _db_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+            return "ok"
+        except psycopg2.pool.PoolError:
+            return "connection pool exhausted"
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            if attempt == 2:
+                return "unreachable"
+        except Exception:
+            log.exception("health: database probe failed")
+            return "query failed"
+    return "unreachable"
 
 
 class _BoundedProbe:
@@ -1125,7 +1118,9 @@ class _BoundedProbe:
     finish and then start its own: it JOINS that worker and shares its answer. So
     begin() never blocks, which matters because two probes share one deadline -- time
     spent queueing behind a stuck refresh-signal probe would otherwise come out of the
-    rate-limit-store probe's share and report a healthy store as unreachable.
+    rate-limit-store probe's share and report a healthy store as unreachable. The same
+    goes for the database: callers queueing behind a slow query used to run out of wait
+    and answer 503 for a database that was merely slow.
 
     A worker that is stuck (in a 2 s socket timeout against a dead Redis, in name
     resolution)
@@ -1134,9 +1129,10 @@ class _BoundedProbe:
     When it ends, the next caller starts a fresh one; a finished answer is never reused.
     """
 
-    def __init__(self, name: str, probe):
+    def __init__(self, name: str, probe, no_answer: str = "unreachable"):
         self._name = name
         self._probe = probe
+        self._no_answer = no_answer
         self._guard = threading.Lock()      # held only to read or replace _current
         self._current: tuple[threading.Thread, list[str]] | None = None
 
@@ -1152,20 +1148,20 @@ class _BoundedProbe:
                     try:
                         answer.append(self._probe())
                     except Exception:
-                        answer.append("unreachable")
+                        answer.append(self._no_answer)
 
                 worker = threading.Thread(target=work, name=f"health-{self._name}", daemon=True)
                 try:
                     worker.start()
                 except Exception:
                     self._current = None
-                    return lambda: "unreachable"
+                    return lambda: self._no_answer
                 current = self._current = (worker, answer)
         worker, answer = current
 
         def finish() -> str:
             worker.join(max(0.0, end - time.monotonic()))
-            return answer[0] if answer else "unreachable"
+            return answer[0] if answer else self._no_answer
 
         return finish
 
@@ -1205,20 +1201,42 @@ def _rate_limit_store_state() -> str:
     return "ok" if storage.check() is True else "unreachable"
 
 
-_signal_probe = _BoundedProbe("refresh-signal", lambda: _refresh_signal_state())
-_store_probe = _BoundedProbe("rate-limit-store", lambda: _rate_limit_store_state())
+_DB_NO_ANSWER = "no answer in time"
+
+
+# Factories, so the tests build each probe exactly as the module does (they need a fresh
+# one per test: a worker left stuck by one test would otherwise still be "current" in
+# the next).
+def _new_db_probe() -> _BoundedProbe:
+    return _BoundedProbe("database", lambda: _database_state(), no_answer=_DB_NO_ANSWER)
+
+
+def _new_signal_probe() -> _BoundedProbe:
+    return _BoundedProbe("refresh-signal", lambda: _refresh_signal_state())
+
+
+def _new_store_probe() -> _BoundedProbe:
+    return _BoundedProbe("rate-limit-store", lambda: _rate_limit_store_state())
+
+
+_db_probe = _new_db_probe()
+_signal_probe = _new_signal_probe()
+_store_probe = _new_store_probe()
+
+
+def _begin_redis(end: float):
+    """Start (or join) both Redis probes; returns a function giving (signal, store)."""
+    signal = _signal_probe.begin(end)
+    if isinstance(limiter._storage, MemoryStorage):
+        # the store needs no probe; only the signal ping runs
+        return lambda: (signal(), "memory")
+    store = _store_probe.begin(end)
+    return lambda: (signal(), store())
 
 
 def _probe_redis() -> tuple[str, str]:
     """(refresh-signal Redis, rate-limit store): "ok" / "unreachable", or "memory"."""
-    if isinstance(limiter._storage, MemoryStorage):
-        # the store needs no probe; only the signal ping runs
-        end = time.monotonic() + _HEALTH_REDIS_DEADLINE
-        return _signal_probe.begin(end)(), "memory"
-    end = time.monotonic() + _HEALTH_REDIS_DEADLINE
-    signal = _signal_probe.begin(end)
-    store = _store_probe.begin(end)
-    return signal(), store()
+    return _begin_redis(time.monotonic() + _HEALTH_REDIS_DEADLINE)()
 
 
 def _rate_limiter_needs_its_store() -> bool:
@@ -1247,7 +1265,8 @@ def health(response: Response):
     Can this container serve? (#61)
 
     503 when it cannot:
-      * the database pool cannot answer a query -- every endpoint here needs it;
+      * the database pool does not answer a query within _HEALTH_DB_DEADLINE -- every
+        endpoint here needs it;
       * the rate limiter's storage is unreachable AND the limiter fails closed on that
         (see _rate_limiter_needs_its_store): every rate-limited route would 500.
     haf_api_node's HAProxy backend and container healthcheck both probe this path, so a
@@ -1264,8 +1283,11 @@ def health(response: Response):
     /sync-status is the endpoint that reports freshness.
     """
     response.headers.update(_HEALTH_HEADERS)
-    database = _probe_database()
-    signal, store = _probe_redis()
+    started = time.monotonic()
+    database_answer = _db_probe.begin(started + _HEALTH_DB_DEADLINE)
+    redis_answers = _begin_redis(started + _HEALTH_REDIS_DEADLINE)
+    database = database_answer()
+    signal, store = redis_answers()
     serving = database == "ok" and not (
         store == "unreachable" and _rate_limiter_needs_its_store()
     )

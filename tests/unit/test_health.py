@@ -45,6 +45,8 @@ class FakeCursor:
     def execute(self, sql):
         pool = self.conn.pool
         pool.queries.append(sql)
+        if pool.delay:
+            time.sleep(pool.delay)
         if pool.block is not None:
             pool.entered.set()
             assert pool.block.wait(10), "the test never released the blocked query"
@@ -76,6 +78,7 @@ class FakePool:
         self.checked_out = 0
         self.returned = 0
         self.block = None
+        self.delay = 0
         self.entered = threading.Event()
 
     def getconn(self):
@@ -145,10 +148,9 @@ class Stack:
         monkeypatch.setattr(api, "_redis_client", self._signal_client)
         # Fresh probe runners for every test: a worker left stuck by one test would
         # otherwise hold the module-level runner busy into the next.
-        monkeypatch.setattr(api, "_signal_probe",
-                            api._BoundedProbe("signal", lambda: api._refresh_signal_state()))
-        monkeypatch.setattr(api, "_store_probe",
-                            api._BoundedProbe("store", lambda: api._rate_limit_store_state()))
+        monkeypatch.setattr(api, "_db_probe", api._new_db_probe())
+        monkeypatch.setattr(api, "_signal_probe", api._new_signal_probe())
+        monkeypatch.setattr(api, "_store_probe", api._new_store_probe())
         self.limiter_counts_in(MemoryStorage())
         self.client = TestClient(api.app)
 
@@ -271,53 +273,51 @@ def test_a_pool_that_was_never_created_is_503_not_a_bare_500(stack, monkeypatch)
     assert r.json() == dict(OK, status="unavailable", database="query failed")
 
 
-# --- one database probe at a time --------------------------------------------------
+# --- the database probe: one at a time, joined, bounded -----------------------------
 
-def test_the_shipped_waits_fit_the_two_second_budget():
-    """haf_api_node's container healthcheck opens /health with a 2 second timeout. What
-    /health can spend waiting: for an earlier database probe, then for the two Redis
-    probes, which run side by side under one deadline. Pinned, so that changing one is a
-    decision."""
-    assert api._HEALTH_DB_PROBE_WAIT == 0.5
+def test_the_shipped_deadlines_fit_the_two_second_budget():
+    """haf_api_node's container healthcheck opens /health with a 2 second timeout. The
+    probes run side by side, so /health waits for the longest deadline, not their sum.
+    Pinned, so that changing one is a decision."""
+    assert api._HEALTH_DB_DEADLINE == 1.5
     assert api._HEALTH_REDIS_DEADLINE == 1.0
     assert api._HEALTH_REDIS_TIMEOUT == 0.3
-    assert api._HEALTH_DB_PROBE_WAIT + api._HEALTH_REDIS_DEADLINE < 2
+    assert max(api._HEALTH_DB_DEADLINE, api._HEALTH_REDIS_DEADLINE) < 2
 
 
-class BusyLock:
-    """A lock that is always held by someone else; records how it was asked."""
+def test_a_stuck_query_answers_at_the_deadline_and_holds_one_connection(stack, monkeypatch):
+    """A query on a connection whose peer vanished can wait minutes. /health answers at
+    its deadline, and later requests neither start another query nor take another of the
+    pool's connections."""
+    monkeypatch.setattr(api, "_HEALTH_DB_DEADLINE", 0.5)
+    stack.pool.block = threading.Event()
+    try:
+        timings = []
+        for _ in range(3):
+            started = time.monotonic()
+            r = stack.get()
+            timings.append(time.monotonic() - started)
+            assert r.status_code == 503
+            assert r.json() == dict(OK, status="unavailable", database="no answer in time")
+        assert all(0.45 <= e < 0.9 for e in timings), timings
+        assert (stack.pool.getconn_calls, stack.pool.queries) == (1, ["SELECT 1"])
+        stuck = api._db_probe._current[0]
+        assert stuck.daemon
+    finally:
+        stack.pool.block.set()
 
-    def __init__(self):
-        self.asked = []
-
-    def acquire(self, blocking=True, timeout=-1):
-        self.asked.append((blocking, timeout))
-        return False
-
-    def release(self):
-        raise AssertionError("released a lock that was never acquired")
-
-
-def test_a_stuck_probe_fails_the_next_one_without_taking_a_connection(stack, monkeypatch):
-    # A probe waiting on a vanished peer can wait minutes. Later probes must not
-    # each park a thread and hold a pooled connection behind it.
-    busy = BusyLock()
-    monkeypatch.setattr(api, "_health_db_probe", busy)
-    monkeypatch.setattr(api, "_HEALTH_DB_PROBE_WAIT", 0.123)
+    # The first request after the database answers again is healthy.
+    stuck.join(5)
+    stack.pool.block = None
     r = stack.get()
-    # Asked once, blocking, for the configured bound: not a literal and not a multiple.
-    # (Asserted on the call rather than the clock, which flaked on a loaded runner.)
-    assert busy.asked == [(True, 0.123)], busy.asked
-    assert r.status_code == 503
-    assert r.json() == dict(
-        OK, status="unavailable",
-        database="no answer: an earlier probe is still waiting on the database")
-    assert stack.pool.getconn_calls == 0
+    assert r.status_code == 200
+    assert r.json() == OK
+    assert stack.pool.returned == stack.pool.checked_out == 2
 
 
-def test_a_probe_that_arrives_during_another_waits_for_it(stack):
-    """HAProxy, the container healthcheck and a monitor can ask at the same moment.
-    The second must queue behind the first and then succeed -- not fail at once."""
+def test_a_probe_that_arrives_during_another_shares_its_answer(stack):
+    """HAProxy, the container healthcheck and a monitor can ask at the same moment. The
+    second joins the query in flight: it neither fails nor runs a query of its own."""
     stack.pool.block = threading.Event()
     results = []
 
@@ -329,12 +329,32 @@ def test_a_probe_that_arrives_during_another_waits_for_it(stack):
     assert stack.pool.entered.wait(5), "the first probe never reached the database"
     second = threading.Thread(target=ask)
     second.start()
-    time.sleep(0.15)                 # the second is now waiting on the lock
-    assert results == [], "a probe answered while the first still held the database"
+    time.sleep(0.15)                 # the second has joined the first's query
+    assert results == [], "a probe answered while the query was still running"
     stack.pool.block.set()
     first.join(5)
     second.join(5)
     assert results == [200, 200], results
+    assert stack.pool.queries == ["SELECT 1"]
+
+
+def test_a_slow_healthy_database_serves_concurrent_health_checks(stack):
+    """A database that takes 0.3 s to answer is slow, not down. Queueing behind a lock,
+    8 of 10 simultaneous checks used to run out of wait and answer 503."""
+    stack.pool.delay = 0.3
+    results = []
+
+    def ask():
+        r = stack.get()
+        results.append((r.status_code, r.json()["database"]))
+
+    threads = [threading.Thread(target=ask) for _ in range(10)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(10)
+    assert results == [(200, "ok")] * 10, results
+    assert stack.pool.getconn_calls < 10, stack.pool.getconn_calls
 
 
 @pytest.mark.parametrize("outcomes, getconn_error", [
@@ -342,13 +362,37 @@ def test_a_probe_that_arrives_during_another_waits_for_it(stack):
     ([psycopg2.ProgrammingError("boom")], None),
     ([], psycopg2.pool.PoolError("connection pool exhausted")),
 ])
-def test_a_failed_probe_releases_the_lock(stack, outcomes, getconn_error):
+def test_a_failed_probe_does_not_stick(stack, outcomes, getconn_error):
     stack.pool.outcomes = list(outcomes)
     stack.pool.getconn_error = getconn_error
-    assert stack.get().status_code == 503
-    assert not api._health_db_probe.locked()
+    r = stack.get()
+    assert r.status_code == 503 and r.json()["database"] != "ok"
     stack.pool.getconn_error = None
-    assert stack.get().status_code == 200
+    r = stack.get()
+    assert r.status_code == 200
+    assert r.json() == OK
+
+
+def test_the_database_and_redis_deadlines_run_side_by_side(stack, monkeypatch):
+    """With the database AND the limiter's storage stuck, /health waits for the longer
+    deadline once, not for one after the other."""
+    _limiter_fails_closed(monkeypatch)
+    monkeypatch.setattr(api, "_HEALTH_DB_DEADLINE", 0.6)
+    monkeypatch.setattr(api, "_HEALTH_REDIS_DEADLINE", 0.5)
+    storage = stack.limiter_counts_in(FakeStorage())
+    storage.block = threading.Event()
+    stack.pool.block = threading.Event()
+    try:
+        started = time.monotonic()
+        r = stack.get()
+        elapsed = time.monotonic() - started
+    finally:
+        storage.block.set()
+        stack.pool.block.set()
+    assert 0.55 <= elapsed < 1.0, elapsed          # 0.6, not 0.6 + 0.5
+    assert r.status_code == 503
+    assert r.json() == {"status": "unavailable", "database": "no answer in time",
+                        "redis": "ok", "rate_limit_store": "unreachable"}
 
 
 # --- the refresh-signal Redis: reported, never gated on ----------------------------
@@ -875,15 +919,14 @@ def test_the_whole_request_fits_the_budget_with_both_redis_roles_hung(monkeypatc
     at its deadline."""
     port, _ = silent_server
     monkeypatch.setattr(api, "_pool", FakePool())
+    monkeypatch.setattr(api, "_db_probe", api._new_db_probe())
     monkeypatch.setenv("REDIS_HOST", "127.0.0.1")
     monkeypatch.setenv("REDIS_PORT", str(port))
     storage = storage_from_string(f"redis://:secret@127.0.0.1:{port}/2",
                                   socket_timeout=2, socket_connect_timeout=2)
     monkeypatch.setattr(api.limiter, "_storage", storage)
-    monkeypatch.setattr(api, "_signal_probe",
-                        api._BoundedProbe("signal", lambda: api._refresh_signal_state()))
-    monkeypatch.setattr(api, "_store_probe",
-                        api._BoundedProbe("store", lambda: api._rate_limit_store_state()))
+    monkeypatch.setattr(api, "_signal_probe", api._new_signal_probe())
+    monkeypatch.setattr(api, "_store_probe", api._new_store_probe())
     monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset())
     client = TestClient(api.app)
 
@@ -907,8 +950,7 @@ def test_a_refused_storage_is_unreachable_whatever_its_url_looks_like(monkeypatc
     storage = storage_from_string(f"redis://user:secret@127.0.0.1:{port}/3?socket_timeout=5",
                                   socket_connect_timeout=2)
     monkeypatch.setattr(api.limiter, "_storage", storage)
-    monkeypatch.setattr(api, "_store_probe",
-                        api._BoundedProbe("store", lambda: api._rate_limit_store_state()))
+    monkeypatch.setattr(api, "_store_probe", api._new_store_probe())
     monkeypatch.setattr(api, "_signal_probe", api._BoundedProbe("signal", lambda: "ok"))
     started = time.monotonic()
     assert api._probe_redis() == ("ok", "unreachable")
