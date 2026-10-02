@@ -59,9 +59,8 @@ def make_psql(tmp_path, *, sessions: str = "0", remaining: str = "",
 
     Three logs, one entry per invocation: sql.log (the statement), argv.log (the whole
     command line, flattened) and flags.log. flags.log exists because argv.log cannot be
-    parsed back: the SQL is in it. It records every -h/-p/-U/-d WITH ITS VALUE wherever it
-    appears -- psql takes the last one, so a second `-h` after the statement retargets the
-    call -- plus how many times -X was given and the PGHOSTADDR the call ran under.
+    parsed back: the SQL is in it. It records the command line with only the payloads
+    replaced, and the PG* environment of the call (see the stub below).
 
     database answers the confirmation's `SELECT current_database()`. sessions_after, when
     given, is the session count from the SECOND time it is asked (the re-check after the
@@ -97,15 +96,24 @@ def make_psql(tmp_path, *, sessions: str = "0", remaining: str = "",
         # printf wrote one log line per SQL LINE -- which makes a per-invocation
         # assertion ("is -Atq on the call that counts sessions?") impossible to express.
         f'printf "%s\\n" "$(printf \'%s\' "$*" | tr \'\\n\' \' \')" >> "{(tmp_path / "argv.log").as_posix()}"\n'
-        "fl=''\n"
-        "nx=0\n"
-        'prev=""\n'
+        # flags.log: the WHOLE command line, in order, with only the payloads replaced --
+        # the statement after -c by <sql>, a -f path by its file name, a -v value by
+        # <name> (ON_ERROR_STOP keeps its value) -- then every PG* variable the call ran
+        # under. Nothing is filtered out, so an option this stub has never heard of
+        # (--host=x, -hx, --dbname=x) shows up as itself and fails the comparison.
+        "sig=''\n"
+        "skip=''\n"
         'for a in "$@"; do\n'
-        '  case "$prev" in -h|-p|-U|-d) fl="$fl$prev $a " ;; esac\n'
-        '  if [ "$a" = "-X" ]; then nx=$((nx + 1)); fi\n'
-        '  prev="$a"\n'
+        '  case "$skip" in\n'
+        '    c) sig="$sig<sql> "; skip=""; continue ;;\n'
+        '    f) sig="$sig${a##*/} "; skip=""; continue ;;\n'
+        '    v) case "$a" in ON_ERROR_STOP=*) sig="$sig$a " ;; *) sig="$sig<${a%%=*}> " ;; esac\n'
+        '       skip=""; continue ;;\n'
+        "  esac\n"
+        '  case "$a" in -c) skip=c ;; -f) skip=f ;; -v) skip=v ;; esac\n'
+        '  sig="$sig$a "\n'
         "done\n"
-        f'printf "%s| X=%s | PGHOSTADDR=%s\\n" "$fl" "$nx" "${{PGHOSTADDR-unset}}" >> "{(tmp_path / "flags.log").as_posix()}"\n'
+        f'printf "%s| %s\\n" "$sig" "$(env | grep \'^PG\' | sort | tr \'\\n\' \' \')" >> "{(tmp_path / "flags.log").as_posix()}"\n'
         + ('case "$cmd" in *"DROP SCHEMA"*|*app_remove_context*|*"DROP ROLE"*) '
            'echo "STUB-DESTRUCTIVE" >&2 ;; esac\n' if mark_destructive else "")
         + 'case "$cmd$files" in\n'
@@ -125,7 +133,9 @@ def make_psql(tmp_path, *, sessions: str = "0", remaining: str = "",
         # contain current_database() too.
         + f'  "SELECT current_database()") printf "%s\\n" {database!r} ;;\n'
         + f'  *is_superuser*)         printf "%s" {can_remove!r} ;;\n'
-        + (f'  *pg_stat_activity*)     printf "%s" {sessions!r} ;;\n' if sessions_after is None else
+        # With a newline, as a real psql ends each row: `while read` skips a last line
+        # that has none, so the session listing would be silently empty.
+        + (f'  *pg_stat_activity*)     printf "%s\\n" {sessions!r} ;;\n' if sessions_after is None else
            f'  *pg_stat_activity*)     if [ -f "{(tmp_path / "asked").as_posix()}" ]; then printf "%s" {sessions_after!r};\n'
            f'                          else : > "{(tmp_path / "asked").as_posix()}"; printf "%s" {sessions!r}; fi ;;\n')
         + f'  *uninstall_verify.sql*) printf "%s" {remaining!r} ;;\n'
@@ -178,7 +188,14 @@ def run_on_a_terminal(bash, tmp_path, reply: str, *args: str,
     and the tests that use this are skipped there. CI and the Linux container run them.
     """
     import os
-    pty = pytest.importorskip("pty")
+    try:
+        import pty
+    except ImportError:
+        # Like require_bash: a skip is right on a developer's Windows machine and wrong
+        # in CI, where it would mean the interactive branch silently went untested.
+        if os.environ.get("CI"):
+            pytest.fail("the pty module is unavailable in CI; the interactive tests cannot run")
+        pytest.skip("no pty module on this platform (POSIX only)")
 
     master, slave = pty.openpty()
     env = clean_env(stub_bin(tmp_path))
@@ -1438,6 +1455,7 @@ def test_pghostaddr_is_called_out_by_name(bash, tmp_path):
     assert "10.1.1.7" not in r.stdout
     assert "NOTE     : PGHOSTADDR=10.9.9.9" in r.stdout, r.stdout
     assert "which libpq connects to INSTEAD of the --host / POSTGRES_HOST" in r.stdout, r.stdout
+    assert "About to PERMANENTLY remove haf_fyp:" in r.stdout, r.stdout   # it ran to the end
 
 
 @pytest.mark.parametrize("env_extra, expected", [
@@ -1451,6 +1469,7 @@ def test_every_redirect_channel_is_called_out_by_name(bash, tmp_path, env_extra,
     r = run(bash, tmp_path, "--force", extra_env=env_extra)
     for token in expected:
         assert "NOTE     : %s" % token in r.stdout, (token, r.stdout)
+    assert "About to PERMANENTLY remove haf_fyp:" in r.stdout, r.stdout   # it ran to the end
 
 
 def test_a_service_file_without_a_service_name_is_not_called_out(bash, tmp_path):
@@ -1481,8 +1500,12 @@ def test_the_note_is_absent_when_nothing_redirects_the_connection(bash, tmp_path
 def test_a_redirect_is_still_named_when_the_identity_query_fails(bash, tmp_path):
     """An operator whose PGHOSTADDR broke the connection must not get a bare refusal."""
     _guarded_psql(tmp_path, fail_on="inet_server_addr")
-    r = run(bash, tmp_path, "--force", extra_env={"PGHOSTADDR": "10.9.9.9"})
-    assert "NOTE     : PGHOSTADDR=10.9.9.9" in r.stdout, r.stdout
+    r = run(bash, tmp_path, "--force",
+            extra_env={"PGHOSTADDR": "10.9.9.9", "PGSERVICE": "decoy",
+                       "PGSERVICEFILE": "/tmp/decoy.conf"})
+    notes = [l for l in _lines(r.stdout) if l.startswith("  NOTE     : ")]
+    assert notes == ["  NOTE     : PGHOSTADDR=10.9.9.9", "  NOTE     : PGSERVICE=decoy",
+                     "  NOTE     : PGSERVICEFILE=/tmp/decoy.conf"], r.stdout
     assert "refusing to continue" in r.stdout, r.stdout
     assert r.returncode == 1, r.returncode
 
@@ -1492,8 +1515,16 @@ def test_a_local_socket_is_reported_with_its_cluster_id(bash, tmp_path):
     that tells two clusters on one box apart -- which is where #40's empty --host= lands."""
     _guarded_psql(tmp_path, server="LOCAL SOCKET:-/somedb as someone [cluster 7391424]")
     r = run(bash, tmp_path, "--force")
-    assert "reached  : LOCAL SOCKET:-/somedb as someone [cluster 7391424]" in r.stdout, r.stdout
-    assert "is the SERVER's end of the connection" in r.stdout, r.stdout
+    body = _lines(r.stdout)
+    assert "  reached  : LOCAL SOCKET:-/somedb as someone [cluster 7391424]" in body, r.stdout
+    # The note, whole: its advice (go by the cluster id) is the point of it.
+    start = body.index("  NOTE     : 'LOCAL SOCKET' is the SERVER's end of the connection, not")
+    assert body[start + 1:start + 4] == [
+        "             yours. A pooler that reaches PostgreSQL over the socket",
+        "             reports it to a remote client too, so go by the cluster id",
+        "             (which copies of one data directory share).",
+    ], body[start:start + 4]
+    assert "About to PERMANENTLY remove haf_fyp:" in body, r.stdout       # it ran to the end
 
 
 def test_a_server_that_cannot_be_asked_refuses_rather_than_guessing(bash, tmp_path):
@@ -1570,6 +1601,7 @@ def test_the_identity_query_runs_once_on_the_connection_being_torn_down(bash, tm
     LAST -h/-p/-d, so the flags are counted, not just looked for."""
     make_psql(tmp_path)
     run(bash, tmp_path, "--force", "--host=elsewhere", "--port=6543", "--user=someadmin")
+    assert "DROP SCHEMA" in sql_of(tmp_path / "sql.log")     # the run went all the way
     identity = _identity_calls(tmp_path)
     assert len(identity) == 1, identity
     argv = identity[0].split(" -c ", 1)[0].split()
@@ -1661,8 +1693,11 @@ def test_typing_the_servers_database_name_confirms(bash, tmp_path):
     make_psql(tmp_path, database="somedb")
     r = run_on_a_terminal(bash, tmp_path, "somedb")
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "Type the database name to confirm" in r.stdout
+    # The prompt, whole, straight into the next log line: it must not show the answer.
+    assert "[haf_fyp] Type the database name to confirm: [haf_fyp " in r.stdout, r.stdout
     assert "DROP SCHEMA" in sql_of(tmp_path / "sql.log")
+    # ...and it comes AFTER the inventory the operator is confirming.
+    assert r.stdout.index("roles   : ") < r.stdout.index("Type the database name"), r.stdout
     # the inventory is printed on this path too, with what the server said
     body = _lines(r.stdout)
     assert "About to PERMANENTLY remove haf_fyp:" in body, r.stdout
@@ -1674,6 +1709,9 @@ def test_typing_the_servers_database_name_confirms(bash, tmp_path):
     "",                  # just Enter
     "haf_block_log",     # the REQUESTED name; the server says it is somedb
     "somedb2",
+    "s",                 # a prefix is not the name
+    "somed",
+    "SOMEDB",            # nor is another case: PostgreSQL names are case-sensitive
 ])
 def test_any_other_reply_aborts_and_destroys_nothing(bash, tmp_path, reply):
     make_psql(tmp_path, database="somedb")
@@ -1745,31 +1783,44 @@ def test_the_inventory_lines_are_exactly_what_is_removed(bash, tmp_path):
         assert body.count(line) == 1, (line, r.stdout)
 
 
-EXPECTED_FLAGS = "-h elsewhere -p 6543 -U someadmin -d haf_block_log | X=1 | PGHOSTADDR=10.9.9.9"
+# What every psql call of the run must look like: psql_cmd's fixed front, in order,
+# then only the options the script is known to use. Anything else on the line -- a
+# second -h in any spelling, --dbname, a missing ON_ERROR_STOP -- is a different
+# connection or a different failure mode than the identity query ran with.
+_CALL_FRONT = "-X -h elsewhere -p 6543 -U someadmin -d otherdb -v ON_ERROR_STOP=on "
+_CALL_REST = re.compile(r"(?:(?:-Atq|-c <sql>|-f [\w.]+|-v ON_ERROR_STOP=off|-v <\w+>) )*")
+_TARGET_ARGS = ("--host=elsewhere", "--port=6543", "--user=someadmin")
+_TARGET_ENV = {"POSTGRES_DB": "otherdb", "PGHOSTADDR": "10.9.9.9", "PGSERVICE": "decoy"}
+_CALL_ENV = "PGHOSTADDR=10.9.9.9 PGSERVICE=decoy "
 
 
 def _assert_every_call_is_on_target(tmp_path, at_least: int):
     lines = [l for l in (tmp_path / "flags.log").read_text(encoding="utf-8").splitlines()
              if l.strip()]
     assert len(lines) >= at_least, lines
+    # every invocation was logged: the three logs are written by the same stub run
+    argv = [l for l in (tmp_path / "argv.log").read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(lines) == len(argv), (len(lines), len(argv))
     for i, line in enumerate(lines):
-        assert line == EXPECTED_FLAGS, (
-            "psql call %d ran with other connection settings than the one that identified "
-            "the server: %r" % (i, line))
-
-
-_TARGET_ARGS = ("--host=elsewhere", "--port=6543", "--user=someadmin")
-_TARGET_ENV = {"PGHOSTADDR": "10.9.9.9"}
+        call, _, env = line.partition("| ")
+        assert call.startswith(_CALL_FRONT), (
+            "psql call %d does not start with psql_cmd's connection settings: %r" % (i, line))
+        assert _CALL_REST.fullmatch(call[len(_CALL_FRONT):]), (
+            "psql call %d carries an option the script is not known to use: %r" % (i, line))
+        assert env == _CALL_ENV, (
+            "psql call %d ran under a different PG* environment than the identity query: %r"
+            % (i, line))
 
 
 def test_every_call_of_a_full_teardown_runs_on_the_identified_connection(bash, tmp_path):
-    """Exactly one each of -h/-p/-U/-d, at the requested values, wherever they sit on the
-    command line (psql takes the LAST, so one after the statement would retarget it);
-    -X exactly once; and the environment the identity query ran under."""
+    """The whole command line of every call, and every PG* variable it ran under. psql
+    takes the LAST -h/-d in any spelling, and PGSERVICE or PGOPTIONS changed for one call
+    retargets it as surely as a flag does."""
     make_psql(tmp_path)
     r = run(bash, tmp_path, "--force", *_TARGET_ARGS, extra_env=_TARGET_ENV)
     assert "DROP SCHEMA" in sql_of(tmp_path / "sql.log"), r.stdout
-    _assert_every_call_is_on_target(tmp_path, at_least=6)
+    assert r.returncode == 0, r.stdout + r.stderr
+    _assert_every_call_is_on_target(tmp_path, at_least=10)
 
 
 def test_every_call_of_a_session_refusal_runs_on_the_identified_connection(bash, tmp_path):
@@ -1785,13 +1836,35 @@ def test_every_call_of_an_interactive_run_runs_on_the_identified_connection(bash
     make_psql(tmp_path, database="somedb")
     r = run_on_a_terminal(bash, tmp_path, "somedb", *_TARGET_ARGS, extra_env=_TARGET_ENV)
     assert r.returncode == 0, r.stdout + r.stderr
-    _assert_every_call_is_on_target(tmp_path, at_least=7)
+    _assert_every_call_is_on_target(tmp_path, at_least=12)
+
+
+def test_every_call_with_an_application_registry_runs_on_the_identified_connection(bash, tmp_path):
+    """A HAF with hafd.applications adds the context-ownership probe, a -f call with its
+    own -v variables that no other path issues."""
+    make_psql(tmp_path, has_applications="t", context_owners="")
+    r = run(bash, tmp_path, "--force", *_TARGET_ARGS, extra_env=_TARGET_ENV)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "uninstall_foreign_context.sql" in (tmp_path / "flags.log").read_text(encoding="utf-8")
+    _assert_every_call_is_on_target(tmp_path, at_least=11)
+
+
+def test_the_overridden_foreign_context_path_runs_on_the_identified_connection(bash, tmp_path):
+    make_psql(tmp_path, has_applications="t", context_owners="embedding_app")
+    r = run(bash, tmp_path, "--force", "--allow-foreign-context", *_TARGET_ARGS,
+            extra_env=_TARGET_ENV)
+    assert "DROP SCHEMA" in sql_of(tmp_path / "sql.log"), r.stdout
+    _assert_every_call_is_on_target(tmp_path, at_least=11)
 
 
 def test_the_requested_line_reports_the_flags_not_the_environment(bash, tmp_path):
     make_psql(tmp_path)
-    r = run(bash, tmp_path, "--force", *_TARGET_ARGS, extra_env={"PGUSER": "from_env"})
-    assert "  requested: elsewhere:6543/haf_block_log as someadmin" in _lines(r.stdout), r.stdout
+    r = run(bash, tmp_path, "--force", *_TARGET_ARGS,
+            extra_env={"PGUSER": "from_env", "POSTGRES_DB": "otherdb", "PGDATABASE": "from_env"})
+    body = _lines(r.stdout)
+    assert body.count("Target:") == 1, r.stdout
+    assert "  requested: elsewhere:6543/otherdb as someadmin" in body, r.stdout
+    assert "About to PERMANENTLY remove haf_fyp:" in body, r.stdout      # it ran to the end
 
 
 @pytest.mark.parametrize("answer", [
@@ -1816,6 +1889,7 @@ def test_names_with_spaces_and_brackets_are_still_an_identity(bash, tmp_path):
     _guarded_psql(tmp_path, server=odd)
     r = run(bash, tmp_path, "--force")
     assert "  reached  : " + odd in _lines(r.stdout), r.stdout
+    assert "  server  : " + odd in _lines(r.stdout), r.stdout
 
 
 def test_the_reason_the_server_could_not_be_asked_is_not_hidden(bash, tmp_path):
@@ -1865,3 +1939,60 @@ def test_a_redirect_value_ending_in_a_newline_does_not_end_the_run_silently(bash
     assert "  NOTE     : PGSERVICE=decoy" in _lines(r.stdout), r.stdout
     assert "About to PERMANENTLY remove haf_fyp:" in _lines(r.stdout), r.stdout
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+# --- round three: the second reviewer's mutations (20 of 23 survived) ---------------
+
+def test_a_name_with_a_backslash_is_compared_as_typed(bash, tmp_path):
+    r"""`read -r`: without -r the shell eats backslashes, so a database called some\db
+    could never be confirmed (and a different name could be typed to match another)."""
+    # The stub prints its Python repr, so the server's answer here is some\\db (two
+    # backslashes) and that is what has to be typed. Without -r the shell would turn the
+    # typed text into some\db, which does not match.
+    make_psql(tmp_path, database="some\\db")
+    r = run_on_a_terminal(bash, tmp_path, "some\\\\db")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "DROP SCHEMA" in sql_of(tmp_path / "sql.log")
+
+
+def test_a_terminal_on_stderr_does_not_make_piped_stdin_a_prompt(bash, tmp_path):
+    """The check is on stdin, where the reply is read. With stdin piped and only stderr on
+    a terminal there is nobody to answer, so this must refuse like any other no-TTY run."""
+    import os
+    try:
+        import pty
+    except ImportError:
+        if os.environ.get("CI"):
+            pytest.fail("the pty module is unavailable in CI")
+        pytest.skip("no pty module on this platform (POSIX only)")
+    make_psql(tmp_path)
+    master, slave = pty.openpty()
+    try:
+        r = subprocess.run([bash, str(SCRIPT)], env=clean_env(stub_bin(tmp_path)), input="somedb\n",
+                           stdout=subprocess.PIPE, stderr=slave, text=True, timeout=TIMEOUT)
+    finally:
+        os.close(slave)
+        os.close(master)
+    assert r.returncode == 2, r.stdout
+    assert "without --force" in r.stdout
+    assert _nothing_destroyed(tmp_path)
+
+
+def test_the_session_refusal_lists_the_sessions(bash, tmp_path):
+    """The listing is what tells the operator WHICH container to stop."""
+    make_psql(tmp_path, sessions="7")
+    r = run(bash, tmp_path, "--force")
+    body = _lines(r.stdout)
+    start = body.index("ERROR: 7 session(s) are still connected as a haf_fyp role:")
+    assert body[start + 1] == "         7", body[start:start + 3]   # the stub's one-line listing
+
+
+def test_redirect_values_are_printed_as_given(bash, tmp_path):
+    r"""`IFS= read -r`: a leading space or a backslash in a path must survive into the
+    NOTE, which exists to tell the operator which file to go and read."""
+    _guarded_psql(tmp_path)
+    r = run(bash, tmp_path, "--force",
+            extra_env={"PGSERVICE": " lead", "PGSERVICEFILE": "/etc/back\\slash.conf"})
+    notes = [l for l in _lines(r.stdout) if l.startswith("  NOTE     : ")]
+    assert notes == ["  NOTE     : PGSERVICE= lead",
+                     "  NOTE     : PGSERVICEFILE=/etc/back\\slash.conf"], r.stdout

@@ -96,7 +96,7 @@ wait_for_postgres() {
     log "PostgreSQL is ready."
 }
 
-# -X (--no-psqlrc) on every call: these scripts PARSE psql's stdout, and an operator's
+# -X (--no-psqlrc) on every psql_cmd call: these scripts PARSE psql's stdout, and an operator's
 # ~/.psqlrc writes to it at connection time. Measured in haf_stats with `\timing` there:
 # the session count read "Timing is on." followed by the number, and the teardown died
 # on it.

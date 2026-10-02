@@ -1002,9 +1002,9 @@ redirects the connection while `--host` still says the original name; `PGHOSTADD
 name you type at the prompt is compared with the database the server reports, and the
 inventory of what is about to be removed is printed on the `--force` path too.
 
-Two limits. A redirected `--force` run is warned about, not refused. And each statement
+Two limits. A redirected `--force` run is warned about, not refused. And each `psql` call
 opens its own connection with the same settings, so with a multi-host `POSTGRES_HOST`, DNS
-round-robin or a pooler in front of several servers, a later statement can reach a
+round-robin or a pooler in front of several servers, a later call can reach a
 different server than the one that answered; the cluster id is also shared by physical
 copies of one data directory (replicas, snapshot clones).
 
