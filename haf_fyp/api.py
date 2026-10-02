@@ -6,7 +6,7 @@ Handles write operations and admin actions that PostgREST cannot serve:
   DELETE /v1/fyp/interests         — un-opt-in: clear declared interests (#10)
   POST   /v1/fyp/events            — impression / engagement telemetry (batched)
   POST   /v1/fyp/admin/algorithm   — activate an algorithm version (API-key gated)
-  GET    /health                   — can this container serve: database pool (503), Redis reported (#61)
+  GET    /health                   — can this container serve: 503 on the database pool, or on Redis when the limiter needs it (#61)
   GET    /metrics                  — embedding coverage (#15) + credibility sources (#8) + ranking sources (#36)
   GET    /sync-status              — uniform HAF-app sync freshness (#16)
 
@@ -37,6 +37,8 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 import redis as redis_lib
+import redis.backoff
+import redis.retry
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -1055,10 +1057,18 @@ def _publish_refresh(username: str) -> None:
 # Health is real-time data, like /sync-status: never let a proxy serve a stale answer.
 _HEALTH_HEADERS = {"Cache-Control": "public, max-age=0"}
 
-# How long /health waits on Redis. Redis is not needed to serve (see below), so the
-# probe must not make /health slow: haf_api_node's container healthcheck gives the
-# whole request 2 seconds.
-_HEALTH_REDIS_TIMEOUT = 0.5
+# THE TIME BUDGET. haf_api_node's container healthcheck gives the request 2 seconds,
+# and HAProxy's http-check has no longer to spare, so the worst case here has to fit:
+#
+#     wait for an earlier database probe      _HEALTH_DB_PROBE_WAIT          0.5 s
+#     two Redis servers, each connect + read  4 x _HEALTH_REDIS_TIMEOUT      1.2 s
+#
+# The Redis probes disable redis-py's retries. From redis-py 6 the default is three
+# retries with exponential backoff, and the socket timeouts apply PER ATTEMPT: measured
+# with 7.4.0, a 0.5 s "bound" took 8 s against a dead Redis -- which would time out both
+# checks and take a serving container out of rotation.
+_HEALTH_REDIS_TIMEOUT = 0.3
+_HEALTH_DB_PROBE_WAIT = 0.5
 
 # One database probe at a time. A probe stuck on a connection whose peer vanished
 # waits for the kernel to give up, which can take minutes; without this, every
@@ -1067,7 +1077,6 @@ _HEALTH_REDIS_TIMEOUT = 0.5
 # probe takes milliseconds, so concurrent callers (HAProxy, the container
 # healthcheck, a monitor) only queue briefly.
 _health_db_probe = threading.Lock()
-_HEALTH_DB_PROBE_WAIT = 1.5
 
 
 def _probe_database() -> str:
@@ -1099,20 +1108,74 @@ def _probe_database() -> str:
         _health_db_probe.release()
 
 
-def _probe_redis() -> str:
-    """ "ok" if Redis answers PING within the bound, else "unreachable"."""
+def _limiter_store_client(**options) -> redis_lib.Redis | None:
+    """The Redis the rate limiter counts in (REDIS_URL); None when it counts in memory."""
+    if not _REDIS_URL:
+        return None
+    return redis_lib.Redis.from_url(_REDIS_URL, **options)
+
+
+def _rate_limiter_needs_its_store() -> bool:
+    """True when a rate-limited request FAILS if the limiter's Redis is down.
+
+    The limiter only fails open through RateLimitBeforeValidationMiddleware, and that
+    middleware only meters when TRUSTED_PROXY_IPS is set (_early_charge_is_safe). With
+    it empty -- the shipped default -- slowapi's own decorator does the metering, with
+    swallow_errors off and no in-memory fallback, so a storage error is a 500 on every
+    limited route. tests/unit/test_health.py holds this function to that behaviour.
+    """
+    return bool(limiter.enabled and _REDIS_URL and not _TRUSTED_LITERALS)
+
+
+def _redis_endpoint(client) -> tuple | None:
+    """Which server a client points at, or None if that cannot be told."""
     try:
-        r = _redis_client(
-            socket_connect_timeout=_HEALTH_REDIS_TIMEOUT,
-            socket_timeout=_HEALTH_REDIS_TIMEOUT,
-        )
+        kwargs = client.connection_pool.connection_kwargs
+    except AttributeError:
+        return None
+    endpoint = (kwargs.get("host"), kwargs.get("port"), kwargs.get("path"))
+    return endpoint if any(endpoint) else None
+
+
+def _ping(client) -> str:
+    try:
         try:
-            r.ping()
+            client.ping()
         finally:
-            r.close()
+            client.close()
         return "ok"
     except Exception:
         return "unreachable"
+
+
+def _probe_redis() -> tuple[str, str]:
+    """(refresh-signal Redis, rate-limit store): "ok" / "unreachable", or "memory"."""
+    options = dict(
+        socket_connect_timeout=_HEALTH_REDIS_TIMEOUT,
+        socket_timeout=_HEALTH_REDIS_TIMEOUT,
+        retry=redis_lib.retry.Retry(redis_lib.backoff.NoBackoff(), 0),
+    )
+    try:
+        signal = _redis_client(**options)
+    except Exception:
+        signal = None
+    try:
+        store = _limiter_store_client(**options)
+        store_broken = False
+    except Exception:
+        store, store_broken = None, True
+
+    signal_state = _ping(signal) if signal is not None else "unreachable"
+    if store_broken:
+        return signal_state, "unreachable"
+    if store is None:
+        return signal_state, "memory"
+    # The shipped compose points both at one server; one ping answers for both.
+    endpoint = _redis_endpoint(store)
+    if signal is not None and endpoint is not None and endpoint == _redis_endpoint(signal):
+        store.close()
+        return signal_state, signal_state
+    return signal_state, _ping(store)
 
 
 @app.get("/health")
@@ -1120,29 +1183,35 @@ def health(response: Response):
     """
     Can this container serve? (#61)
 
-    503 when the database pool cannot answer a query: every endpoint here needs
-    it, so that is the failure a proxy should route around. haf_api_node's HAProxy
-    backend and container healthcheck both probe this path.
+    503 when it cannot:
+      * the database pool cannot answer a query -- every endpoint here needs it;
+      * the rate limiter's Redis is unreachable AND the limiter fails closed on that
+        (see _rate_limiter_needs_its_store): every rate-limited route would 500.
+    haf_api_node's HAProxy backend and container healthcheck both probe this path.
 
-    Redis is REPORTED, not gated on. The app is built to serve without it: the
-    rate limiter fails open (requests are served unmetered) and the refresh signal
-    is fire-and-forget (the ranker picks interests up on its next cycle). Answering
-    503 would turn that degraded state into a write outage.
+    Otherwise Redis is REPORTED, not gated on. With TRUSTED_PROXY_IPS set the limiter
+    fails open (requests are served unmetered), and the refresh signal is best-effort
+    either way (the ranker picks interests up on its next cycle). Answering 503 there
+    would turn a degraded state into a write outage.
 
-    Deliberately not sync-aware: this stays 200 while the app is behind the chain
-    or the HAF instance is in massive sync, when writes must still be accepted.
+    Deliberately not sync-aware: this stays 200 while the app is behind the chain or
+    the HAF instance is in massive sync, when writes must still be accepted.
     /sync-status is the endpoint that reports freshness.
     """
     response.headers.update(_HEALTH_HEADERS)
     database = _probe_database()
-    body = {
-        "status": "ok" if database == "ok" else "unavailable",
-        "database": database,
-        "redis": _probe_redis(),
-    }
-    if database != "ok":
+    signal, store = _probe_redis()
+    serving = database == "ok" and not (
+        store == "unreachable" and _rate_limiter_needs_its_store()
+    )
+    if not serving:
         response.status_code = 503
-    return body
+    return {
+        "status": "ok" if serving else "unavailable",
+        "database": database,
+        "redis": signal,
+        "rate_limit_store": store,
+    }
 
 
 # Real-time health data — never let a proxy or browser serve a stale answer. The
