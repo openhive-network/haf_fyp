@@ -22,8 +22,14 @@ stages:
       method: GET
     response:
       status_code: 200
+      # database comes from a real query through the pool (#61). This job runs
+      # without a Redis and without REDIS_URL, so the limiter counts in memory and
+      # needs no Redis: /health stays 200 with the refresh-signal Redis unreachable.
       json:
         status: "ok"
+        database: "ok"
+        redis: "unreachable"
+        rate_limit_store: "memory"
 
 ---
 test_name: FastAPI metrics returns 200 (#15 embedding coverage)

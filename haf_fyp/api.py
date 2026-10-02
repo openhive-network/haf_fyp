@@ -6,7 +6,7 @@ Handles write operations and admin actions that PostgREST cannot serve:
   DELETE /v1/fyp/interests         — un-opt-in: clear declared interests (#10)
   POST   /v1/fyp/events            — impression / engagement telemetry (batched)
   POST   /v1/fyp/admin/algorithm   — activate an algorithm version (API-key gated)
-  GET    /health                   — service health check
+  GET    /health                   — can this container serve: 503 on the database pool, or on Redis when the limiter needs it (#61)
   GET    /metrics                  — embedding coverage (#15) + credibility sources (#8) + ranking sources (#36)
   GET    /sync-status              — uniform HAF-app sync freshness (#16)
 
@@ -25,6 +25,7 @@ import ipaddress
 import json
 import logging
 import os
+import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
@@ -38,6 +39,8 @@ import psycopg2.pool
 import redis as redis_lib
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 # Route matching only -- NOT SlowAPIMiddleware itself, which exempts every route
@@ -50,6 +53,7 @@ from starlette.concurrency import run_in_threadpool
 
 from limits import RateLimitItem
 from limits import parse as parse_rate_limit
+from limits.storage import MemoryStorage
 
 from .auth import KeyLookupUnavailable, verify_interests, verify_interests_delete
 from .metrics import (
@@ -1027,15 +1031,20 @@ class SyncStatusResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _redis_client(**options) -> redis_lib.Redis:
+    """The Redis the refresh signal is published to (REDIS_HOST / REDIS_PORT)."""
+    return redis_lib.Redis(
+        host=os.environ.get("REDIS_HOST", "haf-fyp-redis"),
+        port=int(os.environ.get("REDIS_PORT", "6379")),
+        decode_responses=True,
+        **options,
+    )
+
+
 def _publish_refresh(username: str) -> None:
     """Fire-and-forget Redis signal so the ranker can refresh immediately."""
     try:
-        r = redis_lib.Redis(
-            host=os.environ.get("REDIS_HOST", "haf-fyp-redis"),
-            port=int(os.environ.get("REDIS_PORT", "6379")),
-            decode_responses=True,
-            socket_connect_timeout=1,
-        )
+        r = _redis_client(socket_connect_timeout=1)
         r.publish("haf_fyp:refresh", json.dumps({"username": username}))
     except Exception:
         pass  # ranker picks up interests on next scheduled cycle regardless
@@ -1046,9 +1055,252 @@ def _publish_refresh(username: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Health is real-time data, like /sync-status: never let a proxy serve a stale answer.
+_HEALTH_HEADERS = {"Cache-Control": "public, max-age=0"}
+
+# THE TIME BUDGET. haf_api_node's container healthcheck opens this URL with a 2 second
+# timeout, and HAProxy's http-check has no longer to spare. The three probes run side by
+# side, each in its own worker, and /health waits for them only this long:
+#
+#     the database query                       _HEALTH_DB_DEADLINE         1.5 s
+#     the two Redis probes                     _HEALTH_REDIS_DEADLINE      1.0 s
+#
+# so the answer leaves within 1.5 s whatever the probes are stuck on. A probe that has
+# not answered by its deadline counts as no answer -- including one that is merely slow:
+# a database or a limiter storage that takes longer than its deadline reads as down.
+#
+# No probe queues: a request that finds one in flight joins it (see _BoundedProbe).
+_HEALTH_DB_DEADLINE = 1.5
+_HEALTH_REDIS_DEADLINE = 1.0
+# Socket timeouts for the refresh-signal ping. On their own they bound nothing: a client
+# built with redis.Redis(...) retries three times with backoff from redis-py 6 on, and
+# the timeouts apply per attempt (measured with 7.4.0: about 6-14 s against a dead Redis
+# with 0.5 s timeouts, jittered), name resolution is outside them,
+# and a host with several addresses gets one connect timeout each. The deadline above
+# is what holds; these just let the worker finish soon after.
+_HEALTH_REDIS_TIMEOUT = 0.3
+
+
+def _database_state() -> str:
+    """ "ok" if a pooled connection answers a query, else a short reason.
+
+    Runs in _db_probe's worker, one at a time. That is what keeps /health from draining
+    the pool it checks: a query stuck on a connection whose peer vanished waits for the
+    kernel to give up (_db_kwargs sets no connect_timeout or keepalives), and it holds
+    ONE of the pool's 5 connections while it does, however many requests arrive.
+    (A probe stuck while CONNECTING is worse, for any caller of the pool and not only
+    this one: psycopg2 opens the connection under the pool's own lock.)
+    """
+    # Two attempts: the pool keeps one idle connection, and after a HAF restart
+    # that connection is dead. The first query fails on it, the pool discards
+    # it, and the second attempt opens a fresh one -- which is the honest answer
+    # to "can the app serve now". Any other failure is final.
+    for attempt in (1, 2):
+        try:
+            with _db_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+            return "ok"
+        except psycopg2.pool.PoolError:
+            return "connection pool exhausted"
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            if attempt == 2:
+                return "unreachable"
+        except Exception:
+            log.exception("health: database probe failed")
+            return "query failed"
+    return "unreachable"
+
+
+class _BoundedProbe:
+    """Run a blocking probe in a worker thread; callers wait for it only until a deadline.
+
+    Single-flight. A caller that finds a worker already running does not wait for it to
+    finish and then start its own: it JOINS that worker and shares its answer. So
+    begin() never blocks, which matters because two probes share one deadline -- time
+    spent queueing behind a stuck refresh-signal probe would otherwise come out of the
+    rate-limit-store probe's share and report a healthy store as unreachable. The same
+    goes for the database: callers queueing behind a slow query used to run out of wait
+    and answer 503 for a database that was merely slow.
+
+    A worker that is stuck (in a 2 s socket timeout against a dead Redis, in name
+    resolution)
+    stays the current one until it ends, so later callers do not each start another
+    thread: they wait out their own deadline and report no answer, which is the truth.
+    When it ends, the next caller starts a fresh one; a finished answer is never reused.
+    """
+
+    def __init__(self, name: str, probe, no_answer: str = "unreachable"):
+        self._name = name
+        self._probe = probe
+        self._no_answer = no_answer
+        self._guard = threading.Lock()      # held only to read or replace _current
+        self._current: tuple[threading.Thread, list[str]] | None = None
+
+    def begin(self, end: float):
+        """Start the probe, or join the one in flight; returns a function that waits
+        until `end` for the answer."""
+        with self._guard:
+            current = self._current
+            if current is None or not current[0].is_alive():
+                answer: list[str] = []
+
+                def work():
+                    try:
+                        answer.append(self._probe())
+                    except Exception:
+                        answer.append(self._no_answer)
+
+                worker = threading.Thread(target=work, name=f"health-{self._name}", daemon=True)
+                try:
+                    worker.start()
+                except Exception:
+                    self._current = None
+                    return lambda: self._no_answer
+                current = self._current = (worker, answer)
+        worker, answer = current
+
+        def finish() -> str:
+            worker.join(max(0.0, end - time.monotonic()))
+            return answer[0] if answer else self._no_answer
+
+        return finish
+
+
+def _refresh_signal_state() -> str:
+    """Ping the Redis the refresh signal is published to (REDIS_HOST / REDIS_PORT)."""
+    client = _redis_client(
+        socket_connect_timeout=_HEALTH_REDIS_TIMEOUT,
+        socket_timeout=_HEALTH_REDIS_TIMEOUT,
+        retry=Retry(NoBackoff(), 0),
+    )
+    try:
+        client.ping()
+    finally:
+        client.close()
+    return "ok"
+
+
+def _rate_limit_store_state() -> str:
+    """Ask the rate limiter's OWN storage whether it is healthy.
+
+    limiter._storage, not limiter.limiter.storage: the latter is a property that hands
+    out slowapi's in-memory fallback once the real storage has been marked dead, which
+    would report "memory" in the middle of a Redis outage.
+
+    Not a second client built from REDIS_URL: the limiter's storage already holds the
+    right server, credentials, TLS and scheme (limits accepts redis+sentinel://,
+    redis+cluster://, redis+unix://, memcached:// and more, most of which redis-py's
+    from_url cannot parse), so this asks the server the limiter will use, the way it
+    connects. It is still a PING: a Redis that answers pings and refuses writes (full
+    with noeviction, or a read-only replica) reads "ok" here while hit() fails.
+    """
+    storage = limiter._storage
+    if isinstance(storage, MemoryStorage):
+        return "memory"
+    # `is True`: limits' sync storages answer a bool; anything else is not a yes.
+    return "ok" if storage.check() is True else "unreachable"
+
+
+_DB_NO_ANSWER = "no answer in time"
+
+
+# Factories, so the tests build each probe exactly as the module does (they need a fresh
+# one per test: a worker left stuck by one test would otherwise still be "current" in
+# the next).
+def _new_db_probe() -> _BoundedProbe:
+    return _BoundedProbe("database", lambda: _database_state(), no_answer=_DB_NO_ANSWER)
+
+
+def _new_signal_probe() -> _BoundedProbe:
+    return _BoundedProbe("refresh-signal", lambda: _refresh_signal_state())
+
+
+def _new_store_probe() -> _BoundedProbe:
+    return _BoundedProbe("rate-limit-store", lambda: _rate_limit_store_state())
+
+
+_db_probe = _new_db_probe()
+_signal_probe = _new_signal_probe()
+_store_probe = _new_store_probe()
+
+
+def _begin_redis(end: float):
+    """Start (or join) both Redis probes; returns a function giving (signal, store)."""
+    signal = _signal_probe.begin(end)
+    if isinstance(limiter._storage, MemoryStorage):
+        # the store needs no probe; only the signal ping runs
+        return lambda: (signal(), "memory")
+    store = _store_probe.begin(end)
+    return lambda: (signal(), store())
+
+
+def _probe_redis() -> tuple[str, str]:
+    """(refresh-signal Redis, rate-limit store): "ok" / "unreachable", or "memory"."""
+    return _begin_redis(time.monotonic() + _HEALTH_REDIS_DEADLINE)()
+
+
+def _rate_limiter_needs_its_store() -> bool:
+    """True when a rate-limited request FAILS if the limiter's storage is down.
+
+    The limiter fails open through RateLimitBeforeValidationMiddleware, and that
+    middleware only meters when TRUSTED_PROXY_IPS is set (_early_charge_is_safe). With
+    it empty -- the shipped default -- slowapi's own decorator does the metering, and a
+    storage error there is a 500 on every limited route, unless slowapi itself was told
+    to tolerate it: RATELIMIT_SWALLOW_ERRORS or RATELIMIT_IN_MEMORY_FALLBACK_ENABLED,
+    both read from the environment (slowapi treats ANY non-empty value as on, "0" and
+    "false" included). tests/unit/test_health.py holds this function to what a real
+    request does in each of those cases.
+    """
+    return bool(
+        limiter.enabled
+        and not _TRUSTED_LITERALS
+        and not limiter._swallow_errors
+        and not limiter._in_memory_fallback_enabled
+    )
+
+
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+def health(response: Response):
+    """
+    Can this container serve? (#61)
+
+    503 when it cannot:
+      * the database pool does not answer a query within _HEALTH_DB_DEADLINE -- every
+        endpoint here needs it;
+      * the rate limiter's storage is unreachable AND the limiter fails closed on that
+        (see _rate_limiter_needs_its_store): every rate-limited route would 500.
+    haf_api_node's HAProxy backend and container healthcheck both probe this path, so a
+    503 takes the whole overlay out of rotation -- including /sync-status, which has no
+    limit and would still answer.
+
+    Otherwise Redis is REPORTED, not gated on. With TRUSTED_PROXY_IPS set the limiter
+    fails open (requests are served unmetered), and the refresh signal is best-effort
+    either way (the ranker picks interests up on its next cycle). Answering 503 there
+    would turn a degraded state into a write outage.
+
+    Deliberately not sync-aware: this stays 200 while the app is behind the chain or
+    the HAF instance is in massive sync, when writes must still be accepted.
+    /sync-status is the endpoint that reports freshness.
+    """
+    response.headers.update(_HEALTH_HEADERS)
+    started = time.monotonic()
+    database_answer = _db_probe.begin(started + _HEALTH_DB_DEADLINE)
+    redis_answers = _begin_redis(started + _HEALTH_REDIS_DEADLINE)
+    database = database_answer()
+    signal, store = redis_answers()
+    serving = database == "ok" and not (
+        store == "unreachable" and _rate_limiter_needs_its_store()
+    )
+    if not serving:
+        response.status_code = 503
+    return {
+        "status": "ok" if serving else "unavailable",
+        "database": database,
+        "redis": signal,
+        "rate_limit_store": store,
+    }
 
 
 # Real-time health data — never let a proxy or browser serve a stale answer. The

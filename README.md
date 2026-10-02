@@ -484,7 +484,7 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Service health check |
+| GET | `/health` | Can this container serve: `503` when the database pool does not answer a query within 1.5 s, or when the rate limiter's storage is unreachable and the limiter fails closed on that (`TRUSTED_PROXY_IPS` empty and neither slowapi switch set: limited routes would 500). Otherwise Redis is reported in the body (`redis`, `rate_limit_store`) without failing it. A probe slower than its deadline (1.5 s database, 1.0 s Redis) counts as no answer. Not sync-aware (#61) |
 | GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why) — not feed analytics |
 | GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
 | POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10/min per IP, 60/min total) |
@@ -1039,13 +1039,21 @@ code change:
 | Variable | Effect |
 |---|---|
 | `RATELIMIT_ENABLED=false` | Turns *all* rate limiting off — the per-IP limits, the shared ceilings, and the pre-validation charging. Note this also restores the #28 amplifier: malformed batches become free again. |
-| `RATELIMIT_SWALLOW_ERRORS=1` | Only affects slowapi's own paths; this app already fails **open** on a limiter-storage error by design (see below), so it changes little here. |
+| `RATELIMIT_SWALLOW_ERRORS=1` | Makes slowapi's own path tolerate a limiter-storage error. That path is the one in use while `TRUSTED_PROXY_IPS` is empty (see below), so there it turns a 500 into an unmetered request. slowapi treats **any non-empty value** as on, `0` and `false` included. |
+| `RATELIMIT_IN_MEMORY_FALLBACK_ENABLED=1` | Same path, same rule about values: on a storage error slowapi counts in process memory instead, so requests are still served and still limited, per worker. |
 
-**Failure policy: the limiter fails open.** If Redis is unreachable or slow, a request
-is served *unmetered* rather than rejected — limits protect against abuse, they are not
-part of answering correctly, so a Redis incident degrades limiting instead of the
-service. Storage failures are logged once per minute with a suppressed-occurrence
-count, and again immediately if a *different* kind of failure appears.
+**Failure policy: the limiter fails open only when `TRUSTED_PROXY_IPS` is set.** Then, if
+Redis is unreachable or slow, a request is served *unmetered* rather than rejected —
+limits protect against abuse, they are not part of answering correctly, so a Redis
+incident degrades limiting instead of the service. Storage failures are logged once per
+minute with a suppressed-occurrence count, and again immediately if a *different* kind of
+failure appears.
+
+With `TRUSTED_PROXY_IPS` empty, which is the default, the pre-validation middleware that
+implements that policy does not meter; slowapi's own decorator does, and a storage error
+there is a **500 on every rate-limited route**, unless one of the two slowapi switches
+above is set. `/health` answers 503 while the limiter's storage is unreachable in that
+configuration.
 
 **Redis coupling.** Limiter buckets live on the same Redis as the ranker's
 `haf_fyp:refresh` pub/sub. There is no key collision (`LIMITER/…` vs a channel) and no
