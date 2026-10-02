@@ -257,7 +257,36 @@ def global_key() -> str:
 
 _REDIS_URL = os.environ.get("REDIS_URL", "")
 
-limiter = Limiter(
+
+class _FailOpenLimiter(Limiter):
+    """slowapi's Limiter, failing OPEN on a storage error on its own path too (#78).
+
+    The app's policy is that the limiter protects against abuse and is not part of
+    answering correctly, so a storage outage degrades limiting rather than the service.
+    RateLimitBeforeValidationMiddleware implements that, but it only meters while
+    TRUSTED_PROXY_IPS is set (see _early_charge_is_safe). With it empty -- the shipped
+    default -- the metering happens here, in slowapi's decorator, which re-raises a
+    storage error: a 500 on every rate-limited route for as long as Redis was down.
+
+    Same policy as the middleware, same throttled log. Not slowapi's swallow_errors:
+    that logs a full traceback per request, which during an outage is per request.
+    RateLimitExceeded is a verdict, not an error, and passes through untouched.
+    The signature is the one the middleware's startup check pins.
+    """
+
+    def _check_request_limit(self, request, endpoint_func, in_middleware=True):
+        try:
+            return super()._check_request_limit(request, endpoint_func, in_middleware)
+        except RateLimitExceeded:
+            raise
+        except Exception as exc:
+            RateLimitBeforeValidationMiddleware.log_storage_failure(exc)
+            # slowapi assigns this only after its loop, and reads it on the way out.
+            request.state.view_rate_limit = None
+            return None
+
+
+limiter = _FailOpenLimiter(
     key_func=client_ip_key,
     storage_uri=_REDIS_URL or "memory://",
     key_style="url",
@@ -1241,44 +1270,20 @@ def _probe_redis() -> tuple[str, str]:
     return _begin_redis(time.monotonic() + _HEALTH_REDIS_DEADLINE)()
 
 
-def _rate_limiter_needs_its_store() -> bool:
-    """True when a rate-limited request FAILS if the limiter's storage is down.
-
-    The limiter fails open through RateLimitBeforeValidationMiddleware, and that
-    middleware only meters when TRUSTED_PROXY_IPS is set (_early_charge_is_safe). With
-    it empty -- the shipped default -- slowapi's own decorator does the metering, and a
-    storage error there is a 500 on every limited route, unless slowapi itself was told
-    to tolerate it: RATELIMIT_SWALLOW_ERRORS or RATELIMIT_IN_MEMORY_FALLBACK_ENABLED,
-    both read from the environment (slowapi treats ANY non-empty value as on, "0" and
-    "false" included). tests/unit/test_health.py holds this function to what a real
-    request does in each of those cases.
-    """
-    return bool(
-        limiter.enabled
-        and not _TRUSTED_LITERALS
-        and not limiter._swallow_errors
-        and not limiter._in_memory_fallback_enabled
-    )
-
-
 @app.get("/health")
 def health(response: Response):
     """
     Can this container serve? (#61)
 
-    503 when it cannot:
-      * the database pool does not answer a query within _HEALTH_DB_DEADLINE -- every
-        endpoint here needs it;
-      * the rate limiter's storage is unreachable AND the limiter fails closed on that
-        (see _rate_limiter_needs_its_store): every rate-limited route would 500.
-    haf_api_node's HAProxy backend and container healthcheck both probe this path, so a
-    503 takes the whole overlay out of rotation -- including /sync-status, which has no
-    limit and would still answer.
+    503 when the database pool does not answer a query within _HEALTH_DB_DEADLINE: every
+    endpoint here needs it. haf_api_node's HAProxy backend and container healthcheck
+    both probe this path, so a 503 takes the whole overlay out of rotation.
 
-    Otherwise Redis is REPORTED, not gated on. With TRUSTED_PROXY_IPS set the limiter
-    fails open (requests are served unmetered), and the refresh signal is best-effort
-    either way (the ranker picks interests up on its next cycle). Answering 503 there
-    would turn a degraded state into a write outage.
+    Redis is REPORTED, never gated on. The rate limiter fails open on a storage error
+    (requests are served unmetered; see _FailOpenLimiter), and the refresh signal is
+    best-effort (the ranker picks interests up on its next cycle), so the app serves
+    without Redis and a 503 would turn a degraded state into a write outage.
+    tests/unit/test_health.py holds the limiter to that.
 
     Deliberately not sync-aware: this stays 200 while the app is behind the chain or
     the HAF instance is in massive sync, when writes must still be accepted.
@@ -1290,9 +1295,7 @@ def health(response: Response):
     redis_answers = _begin_redis(started + _HEALTH_REDIS_DEADLINE)
     database = database_answer()
     signal, store = redis_answers()
-    serving = database == "ok" and not (
-        store == "unreachable" and _rate_limiter_needs_its_store()
-    )
+    serving = database == "ok"
     if not serving:
         response.status_code = 503
     return {
