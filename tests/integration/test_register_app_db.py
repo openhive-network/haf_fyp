@@ -175,6 +175,75 @@ def test_a_haf_without_the_registry_is_tolerated(conn):
         f"a HAF with no registry was told it had registered; {notices}")
 
 
+def _server_version(conn) -> int:
+    with conn.cursor() as cur:
+        cur.execute("SHOW server_version_num")
+        return int(cur.fetchone()[0])
+
+
+def _old_guard_raises(conn) -> bool:
+    """Whether the probe this file used before #68 raises in the database's present state.
+
+    Run under a savepoint, so the raise does not cost the test its transaction.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SAVEPOINT old_guard")
+        try:
+            cur.execute("SELECT to_regprocedure("
+                        "'hive.app_register(text, hive.contexts_group, text, text)')")
+        except psycopg2.Error:
+            cur.execute("ROLLBACK TO SAVEPOINT old_guard")
+            return True
+        cur.execute("RELEASE SAVEPOINT old_guard")
+        return False
+
+
+@pytest.mark.parametrize("missing", ["the type", "the schema"])
+def test_a_database_without_the_registrys_types_is_tolerated(conn, missing):
+    """#68: neither a missing hive.contexts_group nor a missing `hive` schema may raise.
+
+    On PostgreSQL 15 and older, to_regprocedure cannot resolve the argument type and
+    raises (42704, or 3F000 with no schema) instead of returning NULL, which failed the
+    install where this file promises a warning. CI runs PostgreSQL 14, so the old probe is
+    asserted to raise there: without that, this test would pass against the unfixed file
+    on any server new enough to have made to_regprocedure quiet.
+    """
+    with conn.cursor() as cur:
+        if missing == "the type":
+            cur.execute("DROP DOMAIN hive.contexts_group CASCADE")
+        else:
+            cur.execute("DROP SCHEMA hive CASCADE")
+    if _server_version(conn) < 160000:
+        assert _old_guard_raises(conn), (
+            "the state this test builds no longer makes the pre-#68 probe raise, so it "
+            "proves nothing about the fix")
+
+    notices = run_register(conn)          # must not raise
+
+    assert any("registry not available" in n and "WARNING" in n for n in notices), notices
+    assert not any("registered in the HAF application registry" in n for n in notices), (
+        f"a database with no registry was told it had registered; {notices}")
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM hafd.applications WHERE name = 'haf_fyp'")
+        assert cur.fetchone()[0] == 0, notices
+
+
+def test_a_changed_app_register_signature_is_not_called(conn):
+    """The type exists, the function exists, the signature is not the one this file calls.
+
+    The probe names the whole signature so that drift lands on the tolerant path, not on
+    a call that fails to resolve.
+    """
+    with conn.cursor() as cur:
+        cur.execute("DROP FUNCTION hive.app_register(TEXT, hive.contexts_group, TEXT, TEXT)")
+        cur.execute("CREATE FUNCTION hive.app_register(_name TEXT) RETURNS void "
+                    "LANGUAGE plpgsql AS $f$ BEGIN "
+                    "RAISE EXCEPTION 'the drifted overload was called'; END $f$")
+    notices = run_register(conn)          # must not raise
+    assert any("registry not available" in n for n in notices), notices
+    assert not registered(conn), notices
+
+
 def test_a_raising_refusal_still_fails_the_install(conn):
     """The refusals that DO raise must keep raising: no EXCEPTION handler may appear here.
 

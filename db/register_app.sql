@@ -30,6 +30,19 @@ DO $$
 DECLARE
     __taken_by TEXT;
 BEGIN
+    -- The type first, as a statement of its own (#68). On PostgreSQL 15 and older
+    -- to_regprocedure resolves the argument types before it can report the function
+    -- missing, and RAISES when it cannot: 3F000 with no `hive` schema, 42704 with the
+    -- schema but no hive.contexts_group. Under ON_ERROR_STOP that fails the install on
+    -- exactly the database this guard exists to tolerate. to_regtype returns NULL for
+    -- both. PostgreSQL 16 made to_regprocedure return NULL there too, so this matters
+    -- on 15 and older only. Two IFs, not one OR: SQL does not promise the order an OR
+    -- is evaluated in.
+    IF to_regtype('hive.contexts_group') IS NULL THEN
+        RAISE WARNING 'HAF application registry not available (hive.contexts_group); haf_fyp runs unregistered on the legacy loop';
+        RETURN;
+    END IF;
+
     IF to_regprocedure('hive.app_register(text, hive.contexts_group, text, text)') IS NULL THEN
         RAISE WARNING 'HAF application registry not available (hive.app_register); haf_fyp runs unregistered on the legacy loop';
         RETURN;
