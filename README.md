@@ -1039,7 +1039,7 @@ code change:
 | Variable | Effect |
 |---|---|
 | `RATELIMIT_ENABLED=false` | Turns *all* rate limiting off — the per-IP limits, the shared ceilings, and the pre-validation charging. Note this also restores the #28 amplifier: malformed batches become free again. |
-| `RATELIMIT_SWALLOW_ERRORS=1` | Not needed: this app already fails **open** on a limiter-storage error on every path (see below), and logs it once a minute rather than per request. slowapi treats **any non-empty value** as on, `0` and `false` included. |
+| `RATELIMIT_SWALLOW_ERRORS` | **Leave unset.** This app already fails **open** on a limiter-storage error on every path (see below) and logs it once a minute. Set, slowapi swallows the error itself, before the app's handler sees it, and logs a full traceback for every request. slowapi treats **any non-empty value** as on, `0` and `false` included. |
 | `RATELIMIT_IN_MEMORY_FALLBACK_ENABLED=1` | Same rule about values. On a storage error slowapi then counts in process memory, so requests are still limited, per worker, instead of served unmetered. |
 
 **Failure policy: the limiter fails open.** If Redis is unreachable or slow, a request is

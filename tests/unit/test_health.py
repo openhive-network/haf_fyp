@@ -436,7 +436,7 @@ def test_the_signal_ping_is_bounded_unretried_and_closed(stack):
     assert (stack.signal.pings, stack.signal.closed) == (1, True)
 
 
-# --- the limiter's storage: gated on only when the limiter fails closed ------------
+# --- the limiter's storage: reported, never gated on (#78) ------------------------
 
 @pytest.mark.parametrize("trust", [_trust_list_empty, _trust_list_set])
 def test_storage_down_is_reported_and_never_gated(stack, monkeypatch, trust):
@@ -1120,3 +1120,88 @@ def test_a_probe_that_raises_reports_its_own_no_answer_text():
         raise RuntimeError("boom")
 
     assert api._BoundedProbe("x", probe, no_answer="nothing").begin(time.monotonic() + 2)() == "nothing"
+
+
+# --- the middleware's drift guard still sees slowapi (#78) -------------------------
+
+def _middleware_with(limiter_obj):
+    return api.RateLimitBeforeValidationMiddleware(app=lambda *a: None, limiter=limiter_obj)
+
+
+def test_the_drift_guard_checks_slowapis_method_not_just_the_override(monkeypatch):
+    """The override always has the pinned shape. If slowapi's own method changes
+    underneath it, the guard must still refuse to start."""
+    import slowapi.extension
+
+    real = slowapi.extension.Limiter._check_request_limit
+    assert _middleware_with(api.limiter)       # today: starts
+
+    async def now_async(self, request, endpoint_func, in_middleware=True):
+        return real(self, request, endpoint_func, in_middleware)
+
+    monkeypatch.setattr(slowapi.extension.Limiter, "_check_request_limit", now_async)
+    with pytest.raises(RuntimeError, match=r"slowapi\.extension\.Limiter\._check_request_limit"):
+        _middleware_with(api.limiter)
+
+    def renamed(self, request, endpoint_func, middleware=True):
+        return real(self, request, endpoint_func, middleware)
+
+    monkeypatch.setattr(slowapi.extension.Limiter, "_check_request_limit", renamed)
+    with pytest.raises(RuntimeError, match="changed shape"):
+        _middleware_with(api.limiter)
+
+
+def test_the_drift_guard_checks_the_override_too(monkeypatch):
+    def renamed(self, request, endpoint_func, middleware=True):
+        return None
+
+    monkeypatch.setattr(api._FailOpenLimiter, "_check_request_limit", renamed)
+    with pytest.raises(RuntimeError, match="_FailOpenLimiter._check_request_limit"):
+        _middleware_with(api.limiter)
+
+
+def test_the_override_passes_in_middleware_by_name(monkeypatch):
+    """Positional would silently bind to whatever slowapi puts third."""
+    import slowapi.extension
+
+    seen = {}
+
+    def spy(self, request, endpoint_func, *args, **kwargs):
+        seen.update(args=args, kwargs=kwargs)
+
+    monkeypatch.setattr(slowapi.extension.Limiter, "_check_request_limit", spy)
+    api.limiter._check_request_limit(object(), api.post_events, False)
+    assert seen == {"args": (), "kwargs": {"in_middleware": False}}, seen
+
+
+def test_a_check_the_middleware_already_gave_up_on_is_not_counted_twice(monkeypatch):
+    """The middleware abandons a slow check at its wait bound, logs the timeout and marks
+    the request complete. When the abandoned check then fails inside the override, that
+    is the same failure, already counted."""
+    from starlette.requests import Request
+
+    calls = []
+    monkeypatch.setattr(api.RateLimitBeforeValidationMiddleware, "log_storage_failure",
+                        classmethod(lambda cls, exc: calls.append(exc)))
+    monkeypatch.setattr(api.limiter, "_limiter", type(api.limiter._limiter)(MemoryStorage()))
+    monkeypatch.setattr(
+        api.limiter.limiter, "hit",
+        lambda *a, **k: (_ for _ in ()).throw(ConnectionError("redis is down")),
+    )
+    api._GLOBAL_CEILINGS.clear()
+
+    def request():
+        return Request({"type": "http", "method": "POST", "path": "/v1/fyp/events",
+                        "headers": [], "client": ("203.0.113.9", 1), "app": api.app})
+
+    fresh = request()
+    api.limiter._check_request_limit(fresh, api.post_events, False)
+    assert len(calls) == 1                        # a fresh failure is counted
+
+    abandoned = request()
+    abandoned.state._rate_limiting_complete = True
+    # in_middleware=False, as RateLimitBeforeValidationMiddleware calls it (with True
+    # slowapi skips decorator-marked routes and never reaches the storage)
+    api.limiter._check_request_limit(abandoned, api.post_events, False)
+    assert len(calls) == 1                        # the abandoned one is not
+    assert abandoned.state.view_rate_limit is None

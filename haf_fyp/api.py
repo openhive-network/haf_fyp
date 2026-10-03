@@ -6,7 +6,7 @@ Handles write operations and admin actions that PostgREST cannot serve:
   DELETE /v1/fyp/interests         — un-opt-in: clear declared interests (#10)
   POST   /v1/fyp/events            — impression / engagement telemetry (batched)
   POST   /v1/fyp/admin/algorithm   — activate an algorithm version (API-key gated)
-  GET    /health                   — can this container serve: 503 on the database pool, or on Redis when the limiter needs it (#61)
+  GET    /health                   — can this container serve: 503 on the database pool; Redis reported, never gated (#61, #78)
   GET    /metrics                  — embedding coverage (#15) + credibility sources (#8) + ranking sources (#36)
   GET    /sync-status              — uniform HAF-app sync freshness (#16)
 
@@ -276,11 +276,18 @@ class _FailOpenLimiter(Limiter):
 
     def _check_request_limit(self, request, endpoint_func, in_middleware=True):
         try:
-            return super()._check_request_limit(request, endpoint_func, in_middleware)
+            # By keyword, for the reason the middleware gives: the parameter's NAME is
+            # what its startup check pins.
+            return super()._check_request_limit(
+                request, endpoint_func, in_middleware=in_middleware)
         except RateLimitExceeded:
             raise
         except Exception as exc:
-            RateLimitBeforeValidationMiddleware.log_storage_failure(exc)
+            # A check the middleware ran and then abandoned at its wait bound ends here
+            # after the middleware has already logged the timeout and marked the request
+            # complete. Counting it again would inflate the suppressed-occurrence count.
+            if not getattr(request.state, "_rate_limiting_complete", False):
+                RateLimitBeforeValidationMiddleware.log_storage_failure(exc)
             # slowapi assigns this only after its loop, and reads it on the way out.
             request.state.view_rate_limit = None
             return None
@@ -537,16 +544,27 @@ class RateLimitBeforeValidationMiddleware:
         # load-bearing). A re-keyed _route_limits is not detectable here; the honest
         # guard against that is tests/unit/test_ratelimit_ordering.py, which asserts
         # the behaviour rather than the internals.
-        check = type(self.limiter)._check_request_limit
-        params = list(inspect.signature(check).parameters)
-        if inspect.iscoroutinefunction(check) or params[:4] != [
-            "self", "request", "endpoint_func", "in_middleware",
-        ]:
-            raise RuntimeError(
-                "slowapi's _check_request_limit has changed shape "
-                f"(async={inspect.iscoroutinefunction(check)}, params={params[:4]}); "
-                "RateLimitBeforeValidationMiddleware would stop metering silently."
-            )
+        #
+        # BOTH the limiter's own method and slowapi's. Since #78 this module's limiter
+        # is _FailOpenLimiter, whose override always has this shape and always catches:
+        # checking only type(limiter) would pass while slowapi underneath had drifted,
+        # and the drift would surface as a "storage failed" line once a minute with
+        # every route unmetered. Every Limiter in the MRO that defines the method is
+        # checked.
+        for owner in type(self.limiter).__mro__:
+            check = owner.__dict__.get("_check_request_limit")
+            if check is None:
+                continue
+            params = list(inspect.signature(check).parameters)
+            if inspect.iscoroutinefunction(check) or params[:4] != [
+                "self", "request", "endpoint_func", "in_middleware",
+            ]:
+                raise RuntimeError(
+                    f"{owner.__module__}.{owner.__qualname__}._check_request_limit has "
+                    f"changed shape (async={inspect.iscoroutinefunction(check)}, "
+                    f"params={params[:4]}); RateLimitBeforeValidationMiddleware would "
+                    "stop metering silently."
+                )
 
     def _early_charge_is_safe(self) -> bool:
         """Only meter before validation when the bucket can tell callers apart.
