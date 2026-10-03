@@ -176,12 +176,13 @@ def stack(monkeypatch):
     return Stack(monkeypatch)
 
 
-def _limiter_fails_closed(monkeypatch):
-    """The shipped default: TRUSTED_PROXY_IPS empty."""
+def _trust_list_empty(monkeypatch):
+    """The shipped default: slowapi's own decorator does the metering."""
     monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset())
 
 
-def _limiter_fails_open(monkeypatch):
+def _trust_list_set(monkeypatch):
+    """The pre-validation middleware does the metering."""
     monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset({"172.18.0.0/16"}))
 
 
@@ -377,7 +378,7 @@ def test_a_failed_probe_does_not_stick(stack, outcomes, getconn_error):
 def test_the_database_and_redis_deadlines_run_side_by_side(stack, monkeypatch):
     """With the database AND the limiter's storage stuck, /health waits for the longer
     deadline once, not for one after the other."""
-    _limiter_fails_closed(monkeypatch)
+    _trust_list_empty(monkeypatch)
     monkeypatch.setattr(api, "_HEALTH_DB_DEADLINE", 0.6)
     monkeypatch.setattr(api, "_HEALTH_REDIS_DEADLINE", 0.5)
     storage = stack.limiter_counts_in(FakeStorage())
@@ -406,7 +407,7 @@ def test_the_database_and_redis_deadlines_run_side_by_side(stack, monkeypatch):
 ])
 def test_refresh_signal_redis_down_is_reported_but_still_200(stack, monkeypatch, error):
     # The refresh signal is best-effort: the ranker picks interests up on its next cycle.
-    _limiter_fails_closed(monkeypatch)
+    _trust_list_empty(monkeypatch)
     stack.signal.ping_error = error
     r = stack.get()
     assert r.status_code == 200
@@ -435,24 +436,13 @@ def test_the_signal_ping_is_bounded_unretried_and_closed(stack):
     assert (stack.signal.pings, stack.signal.closed) == (1, True)
 
 
-# --- the limiter's storage: gated on only when the limiter fails closed ------------
+# --- the limiter's storage: reported, never gated on (#78) ------------------------
 
-def test_storage_down_is_503_when_the_limiter_fails_closed(stack, monkeypatch):
-    """The shipped default. Every rate-limited route would 500, so the container cannot
-    serve its writes and a proxy should route around it."""
-    _limiter_fails_closed(monkeypatch)
-    stack.limiter_counts_in(FakeStorage(healthy=False))
-    r = stack.get()
-    assert r.status_code == 503
-    assert r.json() == {"status": "unavailable", "database": "ok", "redis": "ok",
-                        "rate_limit_store": "unreachable"}
-    assert r.headers["cache-control"] == NO_CACHE
-
-
-def test_storage_down_is_only_reported_when_the_limiter_fails_open(stack, monkeypatch):
-    """With TRUSTED_PROXY_IPS set, requests are served unmetered. A 503 would turn that
-    degraded state into a write outage."""
-    _limiter_fails_open(monkeypatch)
+@pytest.mark.parametrize("trust", [_trust_list_empty, _trust_list_set])
+def test_storage_down_is_reported_and_never_gated(stack, monkeypatch, trust):
+    """The limiter fails open on a storage error on every path (#78), so the app serves
+    without its storage and a 503 would turn a degraded state into a write outage."""
+    trust(monkeypatch)
     stack.limiter_counts_in(FakeStorage(healthy=False))
     r = stack.get()
     assert r.status_code == 200
@@ -462,7 +452,7 @@ def test_storage_down_is_only_reported_when_the_limiter_fails_open(stack, monkey
 
 
 def test_storage_up_is_200_in_the_shipped_default(stack, monkeypatch):
-    _limiter_fails_closed(monkeypatch)
+    _trust_list_empty(monkeypatch)
     storage = stack.limiter_counts_in(FakeStorage(healthy=True))
     r = stack.get()
     assert r.status_code == 200
@@ -471,20 +461,19 @@ def test_storage_up_is_200_in_the_shipped_default(stack, monkeypatch):
 
 
 def test_a_storage_check_that_raises_counts_as_unreachable(stack, monkeypatch):
-    _limiter_fails_closed(monkeypatch)
+    _trust_list_empty(monkeypatch)
     storage = stack.limiter_counts_in(FakeStorage())
     storage.error = RuntimeError("the storage object itself is broken")
     r = stack.get()
-    assert r.status_code == 503
-    assert r.json() == {"status": "unavailable", "database": "ok", "redis": "ok",
-                        "rate_limit_store": "unreachable"}
+    assert r.status_code == 200
+    assert r.json() == dict(OK, rate_limit_store="unreachable")
 
 
 def test_the_signal_redis_does_not_stand_in_for_the_storage(stack, monkeypatch):
     """Two roles, asked separately. The signal Redis being down says nothing about the
     limiter's storage (it may be another server, or the same one with other credentials),
     and must not fail /health on its behalf."""
-    _limiter_fails_closed(monkeypatch)
+    _trust_list_empty(monkeypatch)
     storage = stack.limiter_counts_in(FakeStorage(healthy=True))
     stack.signal.ping_error = ConnectionError("down")
     r = stack.get()
@@ -494,7 +483,7 @@ def test_the_signal_redis_does_not_stand_in_for_the_storage(stack, monkeypatch):
 
 
 def test_an_unbuildable_signal_client_does_not_touch_the_storage_answer(stack, monkeypatch):
-    _limiter_fails_closed(monkeypatch)
+    _trust_list_empty(monkeypatch)
     stack.limiter_counts_in(FakeStorage(healthy=True))
 
     def broken(**options):
@@ -507,7 +496,7 @@ def test_an_unbuildable_signal_client_does_not_touch_the_storage_answer(stack, m
 
 
 def test_a_database_failure_still_reports_redis(stack, monkeypatch):
-    _limiter_fails_open(monkeypatch)
+    _trust_list_set(monkeypatch)
     stack.limiter_counts_in(FakeStorage(healthy=False))
     stack.pool.getconn_error = psycopg2.pool.PoolError("connection pool exhausted")
     r = stack.get()
@@ -520,7 +509,7 @@ def test_it_is_the_limiters_own_storage_that_is_asked(stack, monkeypatch):
     """Not a client rebuilt from REDIS_URL: that would miss credentials, TLS and every
     scheme redis-py cannot parse. Whatever storage the limiter holds is the one asked,
     and REDIS_URL is not consulted."""
-    _limiter_fails_closed(monkeypatch)
+    _trust_list_empty(monkeypatch)
     storage = stack.limiter_counts_in(FakeStorage(healthy=True))
     monkeypatch.setattr(api, "_REDIS_URL", "redis+sentinel://not-parseable-by-redis-py/x")
     monkeypatch.setenv("REDIS_URL", "redis://somewhere-else:1")
@@ -531,7 +520,7 @@ def test_it_is_the_limiters_own_storage_that_is_asked(stack, monkeypatch):
 
 
 def test_memory_storage_is_reported_without_starting_a_probe(stack, monkeypatch):
-    _limiter_fails_closed(monkeypatch)
+    _trust_list_empty(monkeypatch)
 
     def no_store_probe():
         raise AssertionError("a probe was started for an in-memory store")
@@ -545,7 +534,7 @@ def test_memory_storage_is_reported_without_starting_a_probe(stack, monkeypatch)
 # --- the deadline: a probe that hangs costs one deadline, once ---------------------
 
 def test_a_hung_storage_check_answers_at_the_deadline(stack, monkeypatch):
-    _limiter_fails_closed(monkeypatch)
+    _trust_list_empty(monkeypatch)
     monkeypatch.setattr(api, "_HEALTH_REDIS_DEADLINE", 0.5)
     storage = stack.limiter_counts_in(FakeStorage())
     storage.block = threading.Event()
@@ -554,9 +543,8 @@ def test_a_hung_storage_check_answers_at_the_deadline(stack, monkeypatch):
         r = stack.get()
         elapsed = time.monotonic() - started
         assert 0.45 <= elapsed < 0.9, elapsed
-        assert r.status_code == 503
-        assert r.json() == {"status": "unavailable", "database": "ok", "redis": "ok",
-                            "rate_limit_store": "unreachable"}
+        assert r.status_code == 200
+        assert r.json() == dict(OK, rate_limit_store="unreachable")
 
         # While that worker is still stuck, later probes do not each start another, and
         # each still answers at ITS deadline (not at twice it).
@@ -604,7 +592,7 @@ def test_a_hung_signal_ping_answers_at_the_deadline_and_does_not_gate(stack, mon
 def test_the_two_redis_probes_run_side_by_side(stack, monkeypatch):
     """One deadline for both, not one each: with both hung, /health spends the deadline
     once."""
-    _limiter_fails_open(monkeypatch)
+    _trust_list_set(monkeypatch)
     monkeypatch.setattr(api, "_HEALTH_REDIS_DEADLINE", 0.8)
     storage = stack.limiter_counts_in(FakeStorage())
     storage.block = threading.Event()
@@ -654,7 +642,7 @@ def test_a_stuck_signal_probe_does_not_cost_the_storage_its_answer(stack, monkey
     finish before starting, the wait came out of the storage probe's time and a HEALTHY
     storage was reported unreachable -- a false 503 in the shipped default, caused by the
     one Redis that is documented as never gating."""
-    _limiter_fails_closed(monkeypatch)
+    _trust_list_empty(monkeypatch)
     monkeypatch.setattr(api, "_HEALTH_REDIS_DEADLINE", 0.3)
     storage = stack.limiter_counts_in(FakeStorage(healthy=True))
     release = threading.Event()
@@ -681,7 +669,7 @@ def test_a_slow_healthy_storage_serves_concurrent_health_checks(stack, monkeypat
     """HAProxy, the container healthcheck and a monitor asking at once, during a Redis
     latency spike. Each caller joins the probe in flight; none is told "unreachable"
     because it spent its deadline queueing."""
-    _limiter_fails_closed(monkeypatch)
+    _trust_list_empty(monkeypatch)
 
     class SlowStorage(FakeStorage):
         def check(self):
@@ -706,7 +694,7 @@ def test_a_slow_healthy_storage_serves_concurrent_health_checks(stack, monkeypat
 
 
 def test_a_finished_answer_is_not_reused(stack, monkeypatch):
-    _limiter_fails_closed(monkeypatch)
+    _trust_list_empty(monkeypatch)
     storage = stack.limiter_counts_in(FakeStorage(healthy=True))
     assert stack.get().json()["rate_limit_store"] == "ok"
     for _ in range(50):                       # let the first worker end
@@ -715,8 +703,7 @@ def test_a_finished_answer_is_not_reused(stack, monkeypatch):
         time.sleep(0.01)
     storage.healthy = False
     r = stack.get()
-    assert r.status_code == 503
-    assert r.json()["rate_limit_store"] == "unreachable"
+    assert r.json() == dict(OK, rate_limit_store="unreachable")
     assert storage.checks == 2
 
 
@@ -724,7 +711,7 @@ def test_the_configured_storage_is_asked_even_after_slowapi_falls_back(stack, mo
     """With the in-memory fallback on, limiter.limiter hands out the fallback strategy
     (a MemoryStorage) once the real storage is marked dead. /health must still report the
     real one: "memory" in the middle of a Redis outage would be a misreport."""
-    _limiter_fails_open(monkeypatch)
+    _trust_list_set(monkeypatch)
     stack.limiter_counts_in(FakeStorage(healthy=False))
     monkeypatch.setattr(api.limiter, "_limiter", type(api.limiter._limiter)(MemoryStorage()))
     assert isinstance(api.limiter.limiter.storage, MemoryStorage)
@@ -734,54 +721,131 @@ def test_the_configured_storage_is_asked_even_after_slowapi_falls_back(stack, mo
 def test_only_a_true_check_is_healthy(stack, monkeypatch):
     """limits' synchronous storages answer a bool. Anything else that happens to be
     truthy (an un-awaited coroutine from an async storage, say) is not a yes."""
-    _limiter_fails_closed(monkeypatch)
+    _trust_list_empty(monkeypatch)
     for answer in (object(), 1, "PONG", None, 0, False):
         stack.limiter_counts_in(FakeStorage(healthy=answer))
         r = stack.get()
-        assert r.status_code == 503, answer
-        assert r.json()["rate_limit_store"] == "unreachable", answer
+        assert r.json() == dict(OK, rate_limit_store="unreachable"), answer
     stack.limiter_counts_in(FakeStorage(healthy=True))
     assert stack.get().json()["rate_limit_store"] == "ok"
 
 
-# --- does the limiter really fail closed? Asked of the real app --------------------
+# --- the limiter fails open on every path (#78): asked of the real app --------------
 
-def _limited_request_with_the_storage_down(monkeypatch):
-    """A rate-limited request through the real middleware, with every limiter-storage
-    call failing. 403 means it was served (the admin key is wrong); 500 means it was not."""
+def _limited_request_with_the_storage_down(monkeypatch, client=None,
+                                           error=ConnectionError("redis is down")):
+    """A rate-limited request through the real middleware and slowapi's decorator, with
+    every limiter-storage call failing. 403 means it was served (the admin key is wrong);
+    500 means it was not."""
     monkeypatch.setattr(api.limiter, "_limiter", type(api.limiter._limiter)(MemoryStorage()))
     monkeypatch.setattr(api.limiter, "_storage_dead", False)
+    monkeypatch.setattr(api.limiter.limiter, "hit", lambda *a, **k: (_ for _ in ()).throw(error))
+    api._GLOBAL_CEILINGS.clear()
+    client = client or TestClient(api.app, raise_server_exceptions=False)
+    return client.post("/v1/fyp/admin/algorithm", json={"version": "1.0.0"},
+                       headers={"X-Real-IP": "203.0.113.77", "X-Admin-Key": "not-the-key"}).status_code
+
+
+@pytest.mark.parametrize("error", [
+    ConnectionError("redis is down"),
+    # What redis-py really raises: RedisError subclasses, NOT the builtin
+    # ConnectionError or OSError, so a catch narrowed to those would let them through.
+    redis.exceptions.ConnectionError("Error 111 connecting to haf-fyp-redis:6379"),
+    redis.exceptions.TimeoutError("Timeout reading from socket"),
+    redis.exceptions.ResponseError("READONLY You can't write against a read only replica."),
+], ids=["builtin", "redis-connection", "redis-timeout", "redis-readonly"])
+@pytest.mark.parametrize("trusted", [
+    frozenset(),                  # the shipped default: slowapi's decorator meters (#78)
+    frozenset({"testclient"}),    # the pre-validation middleware meters
+])
+def test_a_storage_outage_never_fails_a_limited_request(monkeypatch, trusted, error):
+    """Whichever path does the metering, a storage error serves the request unmetered.
+    This is what lets /health report the limiter's storage without gating on it: if it
+    ever answers 500 again, /health would be green over a write outage."""
+    monkeypatch.setattr(api, "_TRUSTED_LITERALS", trusted)
+    monkeypatch.setattr(api, "_TRUSTED_NETS", ())
+    assert _limited_request_with_the_storage_down(monkeypatch, error=error) == 403
+
+
+def test_a_limited_request_succeeds_end_to_end_during_an_outage():
+    """Every request above is refused by its endpoint (403), before slowapi's wrapper reads
+    request.state on the way out. This one SUCCEEDS: a fail-open limiter on a tiny app,
+    storage failing, and the response must be the endpoint's 200, not the wrapper's 500."""
+    from fastapi import FastAPI
+    from starlette.requests import Request
+
+    lim = api._FailOpenLimiter(key_func=lambda: "k", storage_uri="memory://")
+    tiny = FastAPI()
+    tiny.state.limiter = lim
+
+    @tiny.get("/limited")
+    @lim.limit("5/minute")
+    def limited(request: Request):
+        return {"ok": True}
+
+    def down(*a, **k):
+        raise redis.exceptions.ConnectionError("redis is down")
+
+    lim.limiter.hit = down
+    r = TestClient(tiny, raise_server_exceptions=False).get("/limited")
+    assert (r.status_code, r.json()) == (200, {"ok": True})
+
+
+def test_an_outage_on_the_decorator_path_is_logged_once_not_per_request(monkeypatch, caplog):
+    """slowapi's own swallow_errors would log a traceback per request; the outage is
+    logged through the same once-a-minute throttle as the middleware's."""
+    monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset())
+    monkeypatch.setattr(api, "_TRUSTED_NETS", ())
+    monkeypatch.setattr(api.RateLimitBeforeValidationMiddleware, "_last_storage_failure_log", -1e9)
+    monkeypatch.setattr(api.RateLimitBeforeValidationMiddleware, "_last_storage_failure_kind", None)
+    monkeypatch.setattr(api.RateLimitBeforeValidationMiddleware, "_suppressed_storage_failures", 0)
+    client = TestClient(api.app, raise_server_exceptions=False)
+    statuses = [_limited_request_with_the_storage_down(monkeypatch, client) for _ in range(5)]
+    assert statuses == [403] * 5
+    lines = [r for r in caplog.records if "rate-limit storage failed" in r.getMessage()]
+    assert len(lines) == 1, [r.getMessage() for r in lines]
+    assert not any(r.exc_info for r in lines), "a traceback per outage line is the flood #78 avoids"
+    assert not any("Swallowing error" in r.getMessage() for r in caplog.records)
+
+
+def test_the_decorator_path_still_enforces_its_limits(monkeypatch):
+    """Failing open is for storage ERRORS. A request over its limit is a verdict, and is
+    still refused, on the decorator path that #78 changed."""
+    monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset())
+    monkeypatch.setattr(api, "_TRUSTED_NETS", ())
+    monkeypatch.setattr(api.limiter, "_limiter", type(api.limiter._limiter)(MemoryStorage()))
+    api._GLOBAL_CEILINGS.clear()
+    client = TestClient(api.app, raise_server_exceptions=False)
+    # POST /v1/fyp/admin/algorithm is 5/minute per caller
+    codes = [client.post("/v1/fyp/admin/algorithm", json={"version": "1.0.0"},
+                         headers={"X-Admin-Key": "not-the-key"}).status_code for _ in range(6)]
+    assert codes == [403] * 5 + [429], codes
+
+
+def test_a_served_request_can_still_finish_after_a_storage_error(monkeypatch):
+    """slowapi's wrapper reads request.state.view_rate_limit after the endpoint returns,
+    and its own loop assigns it only after every limit was hit. A storage error skips
+    that assignment, so the fail-open path sets it itself: without that, a request that
+    SUCCEEDS during an outage dies on the way out with a 500. (The admin-key test above
+    is refused inside the endpoint, before that read, so it cannot see this.)"""
+    from starlette.requests import Request
+
+    monkeypatch.setattr(api.limiter, "_limiter", type(api.limiter._limiter)(MemoryStorage()))
     monkeypatch.setattr(
         api.limiter.limiter, "hit",
         lambda *a, **k: (_ for _ in ()).throw(ConnectionError("redis is down")),
     )
+    request = Request({"type": "http", "method": "POST", "path": "/v1/fyp/events",
+                       "headers": [], "client": ("203.0.113.9", 1), "app": api.app})
     api._GLOBAL_CEILINGS.clear()
-    client = TestClient(api.app, raise_server_exceptions=False)
-    return client.post("/v1/fyp/admin/algorithm", json={"version": "1.0.0"},
-                       headers={"X-Real-IP": "203.0.113.77", "X-Admin-Key": "wrong"}).status_code
+    assert api.limiter._check_request_limit(request, api.post_events, False) is None
+    assert request.state.view_rate_limit is None
 
 
-@pytest.mark.parametrize("trusted, slowapi_setting, served", [
-    (frozenset(), None, False),              # the shipped default: slowapi's decorator raises
-    (frozenset({"testclient"}), None, True), # the middleware meters, and fails open
-    # slowapi's own switches, read from RATELIMIT_SWALLOW_ERRORS and
-    # RATELIMIT_IN_MEMORY_FALLBACK_ENABLED: with either, its decorator tolerates the error
-    (frozenset(), "_swallow_errors", True),
-])
-def test_health_agrees_with_what_the_limiter_actually_does(monkeypatch, trusted,
-                                                           slowapi_setting, served):
-    """/health gates on the storage when a limited request would fail without it, in
-    each configuration listed here. The request is real (the shipped middleware and
-    slowapi's decorator, with the limiter's hit() raising); the predicate must say the
-    same. If the limiter is ever made to fail open in the default configuration, this
-    fails until /health stops gating."""
-    monkeypatch.setattr(api, "_TRUSTED_LITERALS", trusted)
-    monkeypatch.setattr(api, "_TRUSTED_NETS", ())
-    if slowapi_setting:
-        monkeypatch.setattr(api.limiter, slowapi_setting, True)
-    status = _limited_request_with_the_storage_down(monkeypatch)
-    assert status == (403 if served else 500), status
-    assert api._rate_limiter_needs_its_store() is (not served)
+def test_the_limiter_is_the_fail_open_one():
+    """The module's limiter, the one every decorator and the middleware use."""
+    assert isinstance(api.limiter, api._FailOpenLimiter)
+    assert api.app.state.limiter is api.limiter
 
 
 _SWITCH_SCRIPT = """
@@ -793,23 +857,18 @@ def down(*a, **k):
     raise ConnectionError("redis is down")
 
 api.limiter.limiter.hit = down
-before = api._rate_limiter_needs_its_store()
 client = TestClient(api.app, raise_server_exceptions=False)
 status = client.post("/v1/fyp/admin/algorithm", json={"version": "1.0.0"},
                      headers={"X-Real-IP": "203.0.113.77", "X-Admin-Key": "not-the-key"}).status_code
-print(json.dumps({"status": status, "before": before, "after": api._rate_limiter_needs_its_store()}))
+print(json.dumps({"status": status}))
 """
 
 
-@pytest.mark.parametrize("switch, served", [
-    (None, False),
-    ("RATELIMIT_SWALLOW_ERRORS", True),
-    ("RATELIMIT_IN_MEMORY_FALLBACK_ENABLED", True),
-])
-def test_health_follows_slowapis_environment_switches(switch, served):
-    """slowapi reads these two at construction, so they are set the way an operator sets
-    them: in the environment of a fresh process, with TRUSTED_PROXY_IPS empty. Either one
-    makes its decorator tolerate a storage error, and /health must then stop gating."""
+@pytest.mark.parametrize("switch", [None, "RATELIMIT_SWALLOW_ERRORS",
+                                    "RATELIMIT_IN_MEMORY_FALLBACK_ENABLED"])
+def test_a_storage_outage_is_served_in_a_fresh_process_too(switch):
+    """The module as an operator starts it, with TRUSTED_PROXY_IPS empty, and with or
+    without slowapi's own switches set in the environment: served every time."""
     import json
     import os
     import subprocess
@@ -819,32 +878,18 @@ def test_health_follows_slowapis_environment_switches(switch, served):
            if not k.startswith(("RATELIMIT_", "REDIS_", "TRUSTED_PROXY", "ADMIN_API_KEY"))}
     if switch:
         env[switch] = "1"
-    out = subprocess.run([sys.executable, "-c", _SWITCH_SCRIPT], env=env, capture_output=True,
-                         text=True, timeout=120, cwd=str(__import__("pathlib").Path(api.__file__).parents[1]))
+    import tempfile
+    from pathlib import Path
+
+    # Run from an empty directory: slowapi also reads a .env file in the working
+    # directory, which the scrub above cannot reach.
+    env["PYTHONPATH"] = str(Path(api.__file__).parents[1])
+    with tempfile.TemporaryDirectory() as empty:
+        out = subprocess.run([sys.executable, "-c", _SWITCH_SCRIPT], env=env, capture_output=True,
+                             text=True, timeout=120, cwd=empty)
     lines = out.stdout.strip().splitlines()
     assert out.returncode == 0 and lines, "the child failed:\n" + out.stderr[-1500:]
-    assert json.loads(lines[-1]) == {
-        "status": 403 if served else 500, "before": not served, "after": not served,
-    }, (lines[-1], out.stderr[-400:])
-
-
-@pytest.mark.parametrize("trusted", [frozenset(), frozenset({"172.18.0.0/16"})])
-def test_a_disabled_limiter_never_needs_its_storage(monkeypatch, trusted):
-    monkeypatch.setattr(api, "_TRUSTED_LITERALS", trusted)
-    monkeypatch.setattr(api.limiter, "enabled", False)
-    assert api._rate_limiter_needs_its_store() is False
-
-
-@pytest.mark.parametrize("switch", ["_swallow_errors", "_in_memory_fallback_enabled"])
-def test_a_slowapi_switch_counts_before_any_request_has_failed(monkeypatch, switch):
-    """slowapi sets _storage_dead only AFTER a request has hit the dead storage. A rule
-    keyed on that would answer 503 until then -- and a container HAProxy has taken out of
-    rotation receives no request to flip it, so it would never come back."""
-    monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset())
-    monkeypatch.setattr(api.limiter, "_storage_dead", False)
-    assert api._rate_limiter_needs_its_store() is True
-    monkeypatch.setattr(api.limiter, switch, True)
-    assert api._rate_limiter_needs_its_store() is False
+    assert json.loads(lines[-1]) == {"status": 403}, (lines[-1], out.stderr[-400:])
 
 
 def test_a_worker_that_cannot_be_started_is_no_answer_and_does_not_break_the_probe(monkeypatch):
@@ -934,8 +979,8 @@ def test_the_whole_request_fits_the_budget_with_both_redis_roles_hung(monkeypatc
     started = time.monotonic()
     r = client.get("/health")
     elapsed = time.monotonic() - started
-    assert r.status_code == 503
-    assert r.json() == {"status": "unavailable", "database": "ok", "redis": "unreachable",
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok", "database": "ok", "redis": "unreachable",
                         "rate_limit_store": "unreachable"}
     assert 0.9 <= elapsed < 1.9, elapsed
 
@@ -1010,7 +1055,7 @@ def test_redis_client_defaults_to_the_compose_service(monkeypatch):
 # afterwards. Begin one after waiting for another and the wait comes out of its time.
 
 def test_a_stuck_storage_does_not_cost_a_slow_database_its_answer(stack, monkeypatch):
-    _limiter_fails_open(monkeypatch)
+    _trust_list_set(monkeypatch)
     monkeypatch.setattr(api, "_HEALTH_DB_DEADLINE", 1.2)
     monkeypatch.setattr(api, "_HEALTH_REDIS_DEADLINE", 0.5)
     storage = stack.limiter_counts_in(FakeStorage())
@@ -1027,7 +1072,7 @@ def test_a_stuck_storage_does_not_cost_a_slow_database_its_answer(stack, monkeyp
 def test_a_stuck_database_does_not_cost_redis_its_answers(stack, monkeypatch):
     """Both Redis probes are healthy but not instant; the database is stuck. They must be
     reported as they are, not as casualties of the database's deadline."""
-    _limiter_fails_closed(monkeypatch)
+    _trust_list_empty(monkeypatch)
     monkeypatch.setattr(api, "_HEALTH_DB_DEADLINE", 0.7)
     monkeypatch.setattr(api, "_HEALTH_REDIS_DEADLINE", 0.5)
 
@@ -1112,3 +1157,88 @@ def test_a_probe_that_raises_reports_its_own_no_answer_text():
         raise RuntimeError("boom")
 
     assert api._BoundedProbe("x", probe, no_answer="nothing").begin(time.monotonic() + 2)() == "nothing"
+
+
+# --- the middleware's drift guard still sees slowapi (#78) -------------------------
+
+def _middleware_with(limiter_obj):
+    return api.RateLimitBeforeValidationMiddleware(app=lambda *a: None, limiter=limiter_obj)
+
+
+def test_the_drift_guard_checks_slowapis_method_not_just_the_override(monkeypatch):
+    """The override always has the pinned shape. If slowapi's own method changes
+    underneath it, the guard must still refuse to start."""
+    import slowapi.extension
+
+    real = slowapi.extension.Limiter._check_request_limit
+    assert _middleware_with(api.limiter)       # today: starts
+
+    async def now_async(self, request, endpoint_func, in_middleware=True):
+        return real(self, request, endpoint_func, in_middleware)
+
+    monkeypatch.setattr(slowapi.extension.Limiter, "_check_request_limit", now_async)
+    with pytest.raises(RuntimeError, match=r"slowapi\.extension\.Limiter\._check_request_limit"):
+        _middleware_with(api.limiter)
+
+    def renamed(self, request, endpoint_func, middleware=True):
+        return real(self, request, endpoint_func, middleware)
+
+    monkeypatch.setattr(slowapi.extension.Limiter, "_check_request_limit", renamed)
+    with pytest.raises(RuntimeError, match="changed shape"):
+        _middleware_with(api.limiter)
+
+
+def test_the_drift_guard_checks_the_override_too(monkeypatch):
+    def renamed(self, request, endpoint_func, middleware=True):
+        return None
+
+    monkeypatch.setattr(api._FailOpenLimiter, "_check_request_limit", renamed)
+    with pytest.raises(RuntimeError, match="_FailOpenLimiter._check_request_limit"):
+        _middleware_with(api.limiter)
+
+
+def test_the_override_passes_in_middleware_by_name(monkeypatch):
+    """Positional would silently bind to whatever slowapi puts third."""
+    import slowapi.extension
+
+    seen = {}
+
+    def spy(self, request, endpoint_func, *args, **kwargs):
+        seen.update(args=args, kwargs=kwargs)
+
+    monkeypatch.setattr(slowapi.extension.Limiter, "_check_request_limit", spy)
+    api.limiter._check_request_limit(object(), api.post_events, False)
+    assert seen == {"args": (), "kwargs": {"in_middleware": False}}, seen
+
+
+def test_a_check_the_middleware_already_gave_up_on_is_not_counted_twice(monkeypatch):
+    """The middleware abandons a slow check at its wait bound, logs the timeout and marks
+    the request complete. When the abandoned check then fails inside the override, that
+    is the same failure, already counted."""
+    from starlette.requests import Request
+
+    calls = []
+    monkeypatch.setattr(api.RateLimitBeforeValidationMiddleware, "log_storage_failure",
+                        classmethod(lambda cls, exc: calls.append(exc)))
+    monkeypatch.setattr(api.limiter, "_limiter", type(api.limiter._limiter)(MemoryStorage()))
+    monkeypatch.setattr(
+        api.limiter.limiter, "hit",
+        lambda *a, **k: (_ for _ in ()).throw(ConnectionError("redis is down")),
+    )
+    api._GLOBAL_CEILINGS.clear()
+
+    def request():
+        return Request({"type": "http", "method": "POST", "path": "/v1/fyp/events",
+                        "headers": [], "client": ("203.0.113.9", 1), "app": api.app})
+
+    fresh = request()
+    api.limiter._check_request_limit(fresh, api.post_events, False)
+    assert len(calls) == 1                        # a fresh failure is counted
+
+    abandoned = request()
+    abandoned.state._rate_limiting_complete = True
+    # in_middleware=False, as RateLimitBeforeValidationMiddleware calls it (with True
+    # slowapi skips decorator-marked routes and never reaches the storage)
+    api.limiter._check_request_limit(abandoned, api.post_events, False)
+    assert len(calls) == 1                        # the abandoned one is not
+    assert abandoned.state.view_rate_limit is None

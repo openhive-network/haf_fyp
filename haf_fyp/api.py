@@ -6,7 +6,7 @@ Handles write operations and admin actions that PostgREST cannot serve:
   DELETE /v1/fyp/interests         — un-opt-in: clear declared interests (#10)
   POST   /v1/fyp/events            — impression / engagement telemetry (batched)
   POST   /v1/fyp/admin/algorithm   — activate an algorithm version (API-key gated)
-  GET    /health                   — can this container serve: 503 on the database pool, or on Redis when the limiter needs it (#61)
+  GET    /health                   — can this container serve: 503 on the database pool; Redis reported, never gated (#61, #78)
   GET    /metrics                  — embedding coverage (#15) + credibility sources (#8) + ranking sources (#36)
   GET    /sync-status              — uniform HAF-app sync freshness (#16)
 
@@ -257,7 +257,43 @@ def global_key() -> str:
 
 _REDIS_URL = os.environ.get("REDIS_URL", "")
 
-limiter = Limiter(
+
+class _FailOpenLimiter(Limiter):
+    """slowapi's Limiter, failing OPEN on a storage error on its own path too (#78).
+
+    The app's policy is that the limiter protects against abuse and is not part of
+    answering correctly, so a storage outage degrades limiting rather than the service.
+    RateLimitBeforeValidationMiddleware implements that, but it only meters while
+    TRUSTED_PROXY_IPS is set (see _early_charge_is_safe). With it empty -- the shipped
+    default -- the metering happens here, in slowapi's decorator, which re-raises a
+    storage error: a 500 on every rate-limited route for as long as Redis was down.
+
+    Same policy as the middleware, same throttled log. Not slowapi's swallow_errors:
+    that logs a full traceback per request, which during an outage is per request.
+    RateLimitExceeded is a verdict, not an error, and passes through untouched.
+    The signature is the one the middleware's startup check pins.
+    """
+
+    def _check_request_limit(self, request, endpoint_func, in_middleware=True):
+        try:
+            # By keyword, for the reason the middleware gives: the parameter's NAME is
+            # what its startup check pins.
+            return super()._check_request_limit(
+                request, endpoint_func, in_middleware=in_middleware)
+        except RateLimitExceeded:
+            raise
+        except Exception as exc:
+            # A check the middleware ran and then abandoned at its wait bound ends here
+            # after the middleware has already logged the timeout and marked the request
+            # complete. Counting it again would inflate the suppressed-occurrence count.
+            if not getattr(request.state, "_rate_limiting_complete", False):
+                RateLimitBeforeValidationMiddleware.log_storage_failure(exc)
+            # slowapi assigns this only after its loop, and reads it on the way out.
+            request.state.view_rate_limit = None
+            return None
+
+
+limiter = _FailOpenLimiter(
     key_func=client_ip_key,
     storage_uri=_REDIS_URL or "memory://",
     key_style="url",
@@ -508,16 +544,27 @@ class RateLimitBeforeValidationMiddleware:
         # load-bearing). A re-keyed _route_limits is not detectable here; the honest
         # guard against that is tests/unit/test_ratelimit_ordering.py, which asserts
         # the behaviour rather than the internals.
-        check = type(self.limiter)._check_request_limit
-        params = list(inspect.signature(check).parameters)
-        if inspect.iscoroutinefunction(check) or params[:4] != [
-            "self", "request", "endpoint_func", "in_middleware",
-        ]:
-            raise RuntimeError(
-                "slowapi's _check_request_limit has changed shape "
-                f"(async={inspect.iscoroutinefunction(check)}, params={params[:4]}); "
-                "RateLimitBeforeValidationMiddleware would stop metering silently."
-            )
+        #
+        # BOTH the limiter's own method and slowapi's. Since #78 this module's limiter
+        # is _FailOpenLimiter, whose override always has this shape and always catches:
+        # checking only type(limiter) would pass while slowapi underneath had drifted,
+        # and the drift would surface as a "storage failed" line once a minute with
+        # every route unmetered. Every Limiter in the MRO that defines the method is
+        # checked.
+        for owner in type(self.limiter).__mro__:
+            check = owner.__dict__.get("_check_request_limit")
+            if check is None:
+                continue
+            params = list(inspect.signature(check).parameters)
+            if inspect.iscoroutinefunction(check) or params[:4] != [
+                "self", "request", "endpoint_func", "in_middleware",
+            ]:
+                raise RuntimeError(
+                    f"{owner.__module__}.{owner.__qualname__}._check_request_limit has "
+                    f"changed shape (async={inspect.iscoroutinefunction(check)}, "
+                    f"params={params[:4]}); RateLimitBeforeValidationMiddleware would "
+                    "stop metering silently."
+                )
 
     def _early_charge_is_safe(self) -> bool:
         """Only meter before validation when the bucket can tell callers apart.
@@ -1241,44 +1288,20 @@ def _probe_redis() -> tuple[str, str]:
     return _begin_redis(time.monotonic() + _HEALTH_REDIS_DEADLINE)()
 
 
-def _rate_limiter_needs_its_store() -> bool:
-    """True when a rate-limited request FAILS if the limiter's storage is down.
-
-    The limiter fails open through RateLimitBeforeValidationMiddleware, and that
-    middleware only meters when TRUSTED_PROXY_IPS is set (_early_charge_is_safe). With
-    it empty -- the shipped default -- slowapi's own decorator does the metering, and a
-    storage error there is a 500 on every limited route, unless slowapi itself was told
-    to tolerate it: RATELIMIT_SWALLOW_ERRORS or RATELIMIT_IN_MEMORY_FALLBACK_ENABLED,
-    both read from the environment (slowapi treats ANY non-empty value as on, "0" and
-    "false" included). tests/unit/test_health.py holds this function to what a real
-    request does in each of those cases.
-    """
-    return bool(
-        limiter.enabled
-        and not _TRUSTED_LITERALS
-        and not limiter._swallow_errors
-        and not limiter._in_memory_fallback_enabled
-    )
-
-
 @app.get("/health")
 def health(response: Response):
     """
     Can this container serve? (#61)
 
-    503 when it cannot:
-      * the database pool does not answer a query within _HEALTH_DB_DEADLINE -- every
-        endpoint here needs it;
-      * the rate limiter's storage is unreachable AND the limiter fails closed on that
-        (see _rate_limiter_needs_its_store): every rate-limited route would 500.
-    haf_api_node's HAProxy backend and container healthcheck both probe this path, so a
-    503 takes the whole overlay out of rotation -- including /sync-status, which has no
-    limit and would still answer.
+    503 when the database pool does not answer a query within _HEALTH_DB_DEADLINE: every
+    endpoint here needs it. haf_api_node's HAProxy backend and container healthcheck
+    both probe this path, so a 503 takes the whole overlay out of rotation.
 
-    Otherwise Redis is REPORTED, not gated on. With TRUSTED_PROXY_IPS set the limiter
-    fails open (requests are served unmetered), and the refresh signal is best-effort
-    either way (the ranker picks interests up on its next cycle). Answering 503 there
-    would turn a degraded state into a write outage.
+    Redis is REPORTED, never gated on. The rate limiter fails open on a storage error
+    (requests are served unmetered; see _FailOpenLimiter), and the refresh signal is
+    best-effort (the ranker picks interests up on its next cycle), so the app serves
+    without Redis and a 503 would turn a degraded state into a write outage.
+    tests/unit/test_health.py holds the limiter to that.
 
     Deliberately not sync-aware: this stays 200 while the app is behind the chain or
     the HAF instance is in massive sync, when writes must still be accepted.
@@ -1290,9 +1313,7 @@ def health(response: Response):
     redis_answers = _begin_redis(started + _HEALTH_REDIS_DEADLINE)
     database = database_answer()
     signal, store = redis_answers()
-    serving = database == "ok" and not (
-        store == "unreachable" and _rate_limiter_needs_its_store()
-    )
+    serving = database == "ok"
     if not serving:
         response.status_code = 503
     return {
