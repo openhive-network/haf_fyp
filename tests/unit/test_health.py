@@ -732,33 +732,63 @@ def test_only_a_true_check_is_healthy(stack, monkeypatch):
 
 # --- the limiter fails open on every path (#78): asked of the real app --------------
 
-def _limited_request_with_the_storage_down(monkeypatch, client=None):
+def _limited_request_with_the_storage_down(monkeypatch, client=None,
+                                           error=ConnectionError("redis is down")):
     """A rate-limited request through the real middleware and slowapi's decorator, with
     every limiter-storage call failing. 403 means it was served (the admin key is wrong);
     500 means it was not."""
     monkeypatch.setattr(api.limiter, "_limiter", type(api.limiter._limiter)(MemoryStorage()))
     monkeypatch.setattr(api.limiter, "_storage_dead", False)
-    monkeypatch.setattr(
-        api.limiter.limiter, "hit",
-        lambda *a, **k: (_ for _ in ()).throw(ConnectionError("redis is down")),
-    )
+    monkeypatch.setattr(api.limiter.limiter, "hit", lambda *a, **k: (_ for _ in ()).throw(error))
     api._GLOBAL_CEILINGS.clear()
     client = client or TestClient(api.app, raise_server_exceptions=False)
     return client.post("/v1/fyp/admin/algorithm", json={"version": "1.0.0"},
                        headers={"X-Real-IP": "203.0.113.77", "X-Admin-Key": "not-the-key"}).status_code
 
 
+@pytest.mark.parametrize("error", [
+    ConnectionError("redis is down"),
+    # What redis-py really raises: RedisError subclasses, NOT the builtin
+    # ConnectionError or OSError, so a catch narrowed to those would let them through.
+    redis.exceptions.ConnectionError("Error 111 connecting to haf-fyp-redis:6379"),
+    redis.exceptions.TimeoutError("Timeout reading from socket"),
+    redis.exceptions.ResponseError("READONLY You can't write against a read only replica."),
+], ids=["builtin", "redis-connection", "redis-timeout", "redis-readonly"])
 @pytest.mark.parametrize("trusted", [
     frozenset(),                  # the shipped default: slowapi's decorator meters (#78)
     frozenset({"testclient"}),    # the pre-validation middleware meters
 ])
-def test_a_storage_outage_never_fails_a_limited_request(monkeypatch, trusted):
+def test_a_storage_outage_never_fails_a_limited_request(monkeypatch, trusted, error):
     """Whichever path does the metering, a storage error serves the request unmetered.
     This is what lets /health report the limiter's storage without gating on it: if it
     ever answers 500 again, /health would be green over a write outage."""
     monkeypatch.setattr(api, "_TRUSTED_LITERALS", trusted)
     monkeypatch.setattr(api, "_TRUSTED_NETS", ())
-    assert _limited_request_with_the_storage_down(monkeypatch) == 403
+    assert _limited_request_with_the_storage_down(monkeypatch, error=error) == 403
+
+
+def test_a_limited_request_succeeds_end_to_end_during_an_outage():
+    """Every request above is refused by its endpoint (403), before slowapi's wrapper reads
+    request.state on the way out. This one SUCCEEDS: a fail-open limiter on a tiny app,
+    storage failing, and the response must be the endpoint's 200, not the wrapper's 500."""
+    from fastapi import FastAPI
+    from starlette.requests import Request
+
+    lim = api._FailOpenLimiter(key_func=lambda: "k", storage_uri="memory://")
+    tiny = FastAPI()
+    tiny.state.limiter = lim
+
+    @tiny.get("/limited")
+    @lim.limit("5/minute")
+    def limited(request: Request):
+        return {"ok": True}
+
+    def down(*a, **k):
+        raise redis.exceptions.ConnectionError("redis is down")
+
+    lim.limiter.hit = down
+    r = TestClient(tiny, raise_server_exceptions=False).get("/limited")
+    assert (r.status_code, r.json()) == (200, {"ok": True})
 
 
 def test_an_outage_on_the_decorator_path_is_logged_once_not_per_request(monkeypatch, caplog):
@@ -848,8 +878,15 @@ def test_a_storage_outage_is_served_in_a_fresh_process_too(switch):
            if not k.startswith(("RATELIMIT_", "REDIS_", "TRUSTED_PROXY", "ADMIN_API_KEY"))}
     if switch:
         env[switch] = "1"
-    out = subprocess.run([sys.executable, "-c", _SWITCH_SCRIPT], env=env, capture_output=True,
-                         text=True, timeout=120, cwd=str(__import__("pathlib").Path(api.__file__).parents[1]))
+    import tempfile
+    from pathlib import Path
+
+    # Run from an empty directory: slowapi also reads a .env file in the working
+    # directory, which the scrub above cannot reach.
+    env["PYTHONPATH"] = str(Path(api.__file__).parents[1])
+    with tempfile.TemporaryDirectory() as empty:
+        out = subprocess.run([sys.executable, "-c", _SWITCH_SCRIPT], env=env, capture_output=True,
+                             text=True, timeout=120, cwd=empty)
     lines = out.stdout.strip().splitlines()
     assert out.returncode == 0 and lines, "the child failed:\n" + out.stderr[-1500:]
     assert json.loads(lines[-1]) == {"status": 403}, (lines[-1], out.stderr[-400:])
