@@ -47,11 +47,17 @@ def conn():
     Autocommit until #65, which made this fixture load db/haf_fyp_app.sql as well -- and
     autocommit then left the haf_fyp_app schema COMMITTED in the database the tavern suite
     uses later in the same job. Nothing here needs a commit: register_app.sql is one DO
-    block, and the one test that drops hive.app_register is undone by the rollback.
+    block, and the tests that drop hive.app_register, its type or the whole hive schema
+    are undone by the rollback.
     """
     try:
         c = _connect()
     except Exception:  # noqa: BLE001
+        # Skipping is right on a developer's machine and wrong in CI, where this file is
+        # the only thing that executes db/register_app.sql: tests/integration/
+        # test_servability_db.py does the same, for the same reason.
+        if os.environ.get("CI"):
+            raise
         pytest.skip("no postgres available")
     c.autocommit = False
     try:
@@ -169,7 +175,8 @@ def test_a_haf_without_the_registry_is_tolerated(conn):
     with conn.cursor() as cur:
         cur.execute("DROP FUNCTION hive.app_register(TEXT, hive.contexts_group, TEXT, TEXT)")
     notices = run_register(conn)
-    assert any("registry not available" in n for n in notices), notices
+    assert any("registry not available (hive.app_register)" in n and "WARNING" in n
+               for n in notices), notices
     assert not [c for c in calls(conn) if c[0] == "app_add_dependency"], notices
     assert not any("registered in the HAF application registry" in n for n in notices), (
         f"a HAF with no registry was told it had registered; {notices}")
@@ -191,8 +198,11 @@ def _old_guard_raises(conn) -> bool:
         try:
             cur.execute("SELECT to_regprocedure("
                         "'hive.app_register(text, hive.contexts_group, text, text)')")
-        except psycopg2.Error:
+        except psycopg2.Error as exc:
             cur.execute("ROLLBACK TO SAVEPOINT old_guard")
+            # undefined_object / invalid_schema_name: the two raises #68 is about, and
+            # nothing else (a permission error here would be a different finding).
+            assert exc.pgcode in ("42704", "3F000"), (exc.pgcode, str(exc))
             return True
         cur.execute("RELEASE SAVEPOINT old_guard")
         return False
@@ -206,13 +216,19 @@ def test_a_database_without_the_registrys_types_is_tolerated(conn, missing):
     raises (42704, or 3F000 with no schema) instead of returning NULL, which failed the
     install where this file promises a warning. CI runs PostgreSQL 14, so the old probe is
     asserted to raise there: without that, this test would pass against the unfixed file
-    on any server new enough to have made to_regprocedure quiet.
+    on any server new enough to have made to_regprocedure quiet. That makes the image
+    tag in .gitlab-ci.yml part of this test: on PostgreSQL 16 and newer nothing can make
+    the old probe raise, so there only the message below tells the two guards apart.
+
+    A `contexts_group` in another schema is left lying around in both states: the guard
+    asks for hive's, and a look-up by bare type name would be satisfied by this one.
     """
     with conn.cursor() as cur:
         if missing == "the type":
             cur.execute("DROP DOMAIN hive.contexts_group CASCADE")
         else:
             cur.execute("DROP SCHEMA hive CASCADE")
+        cur.execute("CREATE DOMAIN hafd.contexts_group AS TEXT[]")
     if _server_version(conn) < 160000:
         assert _old_guard_raises(conn), (
             "the state this test builds no longer makes the pre-#68 probe raise, so it "
@@ -220,12 +236,14 @@ def test_a_database_without_the_registrys_types_is_tolerated(conn, missing):
 
     notices = run_register(conn)          # must not raise
 
-    assert any("registry not available" in n and "WARNING" in n for n in notices), notices
+    # The type guard's own message, and only it: the procedure guard's would mean the
+    # run got past the type guard, and on PostgreSQL 16+ that is the only visible sign.
+    warnings = [n for n in notices if "WARNING" in n]
+    assert len(warnings) == 1 and "no hive.contexts_group type" in warnings[0], notices
+    assert "legacy loop" not in warnings[0], (
+        f"the legacy loop needs the same schema; it cannot be promised here: {notices}")
     assert not any("registered in the HAF application registry" in n for n in notices), (
         f"a database with no registry was told it had registered; {notices}")
-    with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM hafd.applications WHERE name = 'haf_fyp'")
-        assert cur.fetchone()[0] == 0, notices
 
 
 def test_a_changed_app_register_signature_is_not_called(conn):
@@ -236,11 +254,15 @@ def test_a_changed_app_register_signature_is_not_called(conn):
     """
     with conn.cursor() as cur:
         cur.execute("DROP FUNCTION hive.app_register(TEXT, hive.contexts_group, TEXT, TEXT)")
-        cur.execute("CREATE FUNCTION hive.app_register(_name TEXT) RETURNS void "
+        # Three parameters, so the file's own three-argument call WOULD resolve to it:
+        # a probe by name alone finds this overload and calls it.
+        cur.execute("CREATE FUNCTION hive.app_register("
+                    "_name TEXT, _contexts hive.contexts_group, _proc TEXT) RETURNS void "
                     "LANGUAGE plpgsql AS $f$ BEGIN "
                     "RAISE EXCEPTION 'the drifted overload was called'; END $f$")
     notices = run_register(conn)          # must not raise
-    assert any("registry not available" in n for n in notices), notices
+    assert any("registry not available (hive.app_register)" in n and "WARNING" in n
+               for n in notices), notices
     assert not registered(conn), notices
 
 
