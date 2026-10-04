@@ -809,11 +809,23 @@ In either deployment a processor killed mid-statement keeps the lock until Postg
 finishes that statement; this repo gives `haf-fyp-sync` two minutes to stop cleanly.
 
 The processor's lock on `hivemind` means the same for hivemind: its installer skips while
-haf_fyp is processing, as it already does for hivesense. That includes a **first** install:
-on a new haf_api_node node where haf_fyp's processor starts before `hivemind-install` has
-run, hivemind's schema build is skipped (hivesense's module avoids this with a `depends_on`
-on `hivemind-install`; haf_fyp's is hive/haf_api_node#47). Stop haf_fyp's processor before
-installing or re-installing hivemind.
+haf_fyp is processing, as it already does for hivesense. Stop haf_fyp's processor before
+re-installing hivemind.
+
+The processor takes that lock only where hivemind's tables exist
+(`hivemind_app.hive_posts`), so a **first** install of hivemind is not blocked: on a new
+haf_api_node node haf_fyp's processor can start before `hivemind-install` has run, and it
+used to hold the lock there and keep hivemind from ever installing (#79). Two things still
+need doing by hand on such a node, until haf_api_node's module orders the two installs
+(hive/haf_api_node#47; hivesense's module does it with a `depends_on` on
+`hivemind-install`):
+
+- the lock names are decided when the processor starts, so it holds `hivemind` only from
+  its next start;
+- haf_fyp declares hivemind a dependency only if hivemind is registered when haf_fyp is
+  installed, so the install has to run again.
+
+One sequence does both: stop the processor, re-run the install, start the processor.
 
 **Stopping the processor releases the lock.** The legacy `CALL main()` loop cancels its own
 statement on SIGTERM, so its session — and the lock — end with the container; if it is

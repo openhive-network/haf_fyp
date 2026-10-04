@@ -339,8 +339,31 @@ $$;
 --                db/register_app.sql declares hivemind_app a dependency. Hivemind's
 --                installer and sync use the name 'hivemind', as hivesense's processor
 --                does for the same reason.
--- scripts/process_blocks.sh passes the SAME names to haf_app_driver.py as --lock flags;
--- tests/integration/test_block_processor_locks_db.py holds the two lists together.
+-- scripts/process_blocks.sh passes the SAME names to haf_app_driver.py as --lock flags: it
+-- asks block_processor_lock_names() below, so there is one list, not two.
+--
+-- 'hivemind' ONLY WHILE HIVEMIND IS INSTALLED (#79). A shared lock on an application that
+-- does not exist yet protects nothing and blocks the one thing that would create it: on a
+-- fresh node this processor started first, held 'hivemind', and hivemind's installer
+-- skipped itself ("lock on hivemind held by haf_fyp_legacy_main"), so hivemind never
+-- installed and `docker compose up` aborted. "Installed" is hivemind_app.hive_posts, the
+-- relation db/process_posts.sql reads -- so until hivemind's tables exist (no schema, or
+-- the empty schema its failed first install left behind) its installer can run.
+--
+-- Asked of the CATALOG, not with to_regclass(). to_regclass resolves the schema, and that
+-- raises `permission denied for schema hivemind_app` for a role without USAGE on it --
+-- which is this processor's role exactly when it matters: db/cross_schema_grants.sql
+-- grants haf_fyp_owner USAGE only if hivemind_app existed when haf_fyp was installed. A
+-- probe that raised would stop the legacy loop on its first statement, and send the
+-- driver path to its both-names fallback: the bug again. pg_class and pg_namespace need
+-- no such check (scripts/uninstall_app.sh's guards do the same, for the same reason).
+--
+-- What this does NOT do:
+--   * The names are decided once, when the processor starts. A hivemind installed later
+--     is locked from the next restart; one uninstalled later stays locked until then.
+--   * It does not add the dependency gate. db/register_app.sql declares hivemind_app a
+--     dependency only if hivemind is registered when haf_fyp is INSTALLED, so on a node
+--     where haf_fyp went first: stop the processor, re-run the install, start it again.
 --
 -- Session-level, so the lock outlives every COMMIT and ROLLBACK in main() and is
 -- released when the connection closes. It WAITS while an installer holds the lock --
@@ -350,16 +373,40 @@ $$;
 -- there is nothing to take: skipped, not refused. to_regprocedure with a text[]
 -- signature resolves on every PostgreSQL (the #68 failure needs an unknown type), and
 -- the PERFORM is planned only when reached, so it never resolves the missing function.
+CREATE OR REPLACE FUNCTION haf_fyp_app.block_processor_lock_names()
+RETURNS text []
+LANGUAGE plpgsql
+STABLE
+AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_class AS c
+        INNER JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
+        WHERE n.nspname = 'hivemind_app' AND c.relname = 'hive_posts'
+    ) THEN
+        RETURN ARRAY['haf_fyp', 'hivemind'];
+    END IF;
+    RETURN ARRAY['haf_fyp'];
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION haf_fyp_app.take_block_processor_locks()
 RETURNS void
 LANGUAGE plpgsql
 AS $$
+DECLARE
+    _names text[];
 BEGIN
     IF to_regprocedure('hive.acquire_app_block_processor_locks(text[])') IS NULL THEN
         RAISE NOTICE 'This HAF has no application locks (hive.acquire_app_block_processor_locks); none taken.';
         RETURN;
     END IF;
-    PERFORM hive.acquire_app_block_processor_locks(ARRAY['haf_fyp', 'hivemind']);
+    _names := haf_fyp_app.block_processor_lock_names();
+    IF NOT ('hivemind' = ANY (_names)) THEN
+        RAISE NOTICE 'hivemind is not installed (no hivemind_app.hive_posts): its lock is not taken, so its installer can run. Once it is installed: stop block processing, re-run the haf_fyp install, start it again.';
+    END IF;
+    PERFORM hive.acquire_app_block_processor_locks(_names);
 END;
 $$;
 

@@ -354,6 +354,34 @@ refuse_if_another_application_owns_the_context() {
     while true; do sleep 3600; done
 }
 
+# The --lock flags for haf_app_driver.py: haf_fyp_app.block_processor_lock_names(), the
+# list the legacy loop takes, so the two paths cannot disagree. It leaves 'hivemind' out
+# while hivemind is not installed (#79) -- see that function for why.
+#
+# If the question cannot be asked, BOTH names are passed: that is the list before #79, and
+# a processor holding one lock too many is safer than one reading hivemind_app unlocked.
+# Sets the array `lock_flags`; an answer that is not plain names is treated as a failure.
+block_processor_lock_flags() {
+    local names name err
+    lock_flags=()
+    err=$(mktemp)
+    if names=$(psql_cmd -Atq -c "SELECT array_to_string(haf_fyp_app.block_processor_lock_names(), ' ')" 2>"$err") \
+       && [[ "$names" =~ ^[a-z_]+(\ [a-z_]+)*$ ]]; then
+        :
+    else
+        log "WARNING: could not ask which application locks to hold ($(tr '\n' ' ' < "$err")); holding haf_fyp and hivemind"
+        names="haf_fyp hivemind"
+    fi
+    rm -f "$err"
+    for name in $names; do
+        lock_flags+=("--lock=${name}")
+    done
+    case " $names " in
+        *" hivemind "*) ;;
+        *) log "hivemind is not installed (no hivemind_app.hive_posts): its lock is not taken, so its installer can run. Once it is installed: stop block processing, re-run the haf_fyp install, start it again." ;;
+    esac
+}
+
 if command -v haf_app_driver.py >/dev/null 2>&1 \
    && [ "${HAF_FYP_USE_LEGACY_LOOP:-false}" != "true" ]; then
     if registry_has_haf_fyp; then
@@ -361,15 +389,17 @@ if command -v haf_app_driver.py >/dev/null 2>&1 \
         # --lock: HAF's shared block-processor locks (#67), held on the driver's own
         # connection and re-taken on every reconnect, so install_app.sh cannot run over a
         # live processor. The same names as haf_fyp_app.take_block_processor_locks(),
-        # which the legacy loop below takes -- see there for why each one. This path runs
-        # only on a HAF with the registry, and every such HAF has the lock functions.
+        # which the legacy loop below takes -- block_processor_lock_flags asks the database
+        # for them. This path runs only on a HAF with the registry, and every such HAF has
+        # the lock functions.
         #
         # The "starting" reason goes now: from here the driver's heartbeat is the signal
         # (#76). A registered haf_fyp owns its context, so there is nothing to refuse.
+        block_processor_lock_flags
         rm -f "${PARKED_FILE}"
         exec haf_app_driver.py --app=haf_fyp \
             --postgres-url="postgresql://${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}?application_name=haf_fyp_block_processing" \
-            --lock=haf_fyp --lock=hivemind \
+            "${lock_flags[@]}" \
             --startup-marker=
     fi
     log "WARNING: haf_app_driver.py is on PATH but haf_fyp is not in the HAF application registry"

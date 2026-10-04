@@ -99,8 +99,9 @@ BEGIN
     -- The processors read hivemind_app (post/engagement resolution), so declare
     -- the dependency: hive.app_next_iteration then withholds every block hivemind
     -- has not committed. This is a point-in-time check at install: hivemind must
-    -- already be registered, which holds on a haf_api_node (its install runs
-    -- first) and is repaired by any later re-install of haf_fyp. Note the gate
+    -- already be registered. Nothing orders haf_fyp's install after hivemind's on
+    -- a haf_api_node -- on a fresh node haf_fyp went first (#79) -- so where it
+    -- did, the gate is missing until haf_fyp is re-installed. Note the gate
     -- makes haf_fyp trail hivemind exactly, so its /sync-status follows a
     -- lagging hivemind down.
     --

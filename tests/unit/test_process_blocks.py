@@ -18,6 +18,7 @@ run on Debian and nothing in CI starts the image.
 from __future__ import annotations
 
 import os
+import shlex
 import re
 import signal
 import subprocess
@@ -46,7 +47,8 @@ def bash():
 def make_psql(tmp_path, registry: str = "t", taken_by: str | None = None,
               ownership_failures: int = 0,
               ownership_error: str = "psql: stub ownership failure",
-              varying_error: bool = False, blocking_main: bool = False) -> Path:
+              varying_error: bool = False, blocking_main: bool = False,
+              lock_names: str | None = "haf_fyp hivemind") -> Path:
     """A stub psql: answers `SELECT now()`, the two application-registry probes and the
     ownership probe, records every -c, and never blocks.
 
@@ -67,6 +69,14 @@ def make_psql(tmp_path, registry: str = "t", taken_by: str | None = None,
     real psql accepts: combined (-Atq), separate (-A -t), or long (--no-align
     --tuples-only). Without them it prints a header and "(1 row)", which is never an empty
     string, so a probe that lost its flags would read "somebody owns it" on every node.
+
+    lock_names: what haf_fyp_app.block_processor_lock_names() answers (#79) -- both names
+    where hivemind is installed, "haf_fyp" where it is not; None makes the query fail.
+    Answered as real psql would: the plain names only for the exact query, joined with
+    array_to_string(..., ' '), and only with -A and -t. Without array_to_string psql prints
+    the array literal ({haf_fyp,hivemind}); without the flags, a header and "(1 row)". A
+    script that lost either gets something it must refuse -- and then holds both locks,
+    which on a node without hivemind is the bug again.
 
     `sleep` is replaced too: it records the seconds asked for in sleeps.log and returns at
     once, so a test can check the whole backoff sequence without waiting it out."""
@@ -106,7 +116,22 @@ def make_psql(tmp_path, registry: str = "t", taken_by: str | None = None,
             f'  *"to_regclass(\'hafd.applications\')"*) printf "%s" {table} ;;\n'
             f'  *"FROM hafd.applications"*) {lookup} ;;\n'
         )
-    probe = ownership + probe
+    if lock_names is None:
+        names = '  *"block_processor_lock_names"*) echo "psql: stub lock-names failure" >&2; exit 1 ;;\n'
+    else:
+        # shlex.quote, not repr: a newline in the answer has to BE a newline in the stub.
+        plain = shlex.quote(lock_names)
+        literal = shlex.quote("{" + ",".join(lock_names.split()) + "}")
+        names = (
+            '  *"SELECT array_to_string(haf_fyp_app.block_processor_lock_names(), \' \')"*)\n'
+            '    if [ -n "$bare" ]; then\n'
+            f'      printf "%s\\n" {plain}\n'
+            '    else\n'
+            f'      printf " array_to_string \\n-----------------\\n %s\\n(1 row)\\n" {plain}\n'
+            '    fi ;;\n'
+            f'  *"block_processor_lock_names"*) printf "%s\\n" {literal} ;;\n'
+        )
+    probe = names + ownership + probe
     if blocking_main:
         # CALL main() as it really is: one statement that does not return until the server
         # cancels it. The cancel is a pg_cancel_backend from another psql; it names the
@@ -515,8 +540,67 @@ def test_the_driver_holds_haf_s_block_processor_locks(bash, tmp_path):
     make_psql(tmp_path)
     argv_log = make_driver_stub(tmp_path)
     run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    result = run_env(bash, tmp_path, startup_file=tmp_path / "startup2.txt")
     args = argv_log.read_text().split()
-    assert "--lock=haf_fyp" in args and "--lock=hivemind" in args, args
+    assert [a for a in args if a.startswith("--lock")][:2] == ["--lock=haf_fyp", "--lock=hivemind"], args
+    # Neither message belongs on a node where hivemind is installed and the question was answered.
+    out = result.stdout + result.stderr
+    assert "hivemind is not installed" not in out and "could not ask" not in out, out
+
+
+def test_the_driver_does_not_hold_hivemind_s_lock_before_hivemind_is_installed(bash, tmp_path):
+    """#79: on a fresh node this processor starts before hivemind was ever installed. Holding
+    'hivemind' then makes hivemind's installer skip itself -- for good. The names come from
+    the database; where hivemind is absent it answers haf_fyp alone."""
+    make_psql(tmp_path, lock_names="haf_fyp")
+    argv_log = make_driver_stub(tmp_path)
+    result = run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    args = argv_log.read_text().split()
+    assert [a for a in args if a.startswith("--lock")] == ["--lock=haf_fyp"], args
+    out = result.stdout + result.stderr
+    assert "hivemind is not installed" in out and "could not ask" not in out, out
+
+
+@pytest.mark.parametrize("answer", [None, "", "haf_fyp; DROP", "haf_fyp\nhivemind", "HAF_FYP"])
+def test_an_unusable_answer_holds_both_locks(bash, tmp_path, answer):
+    """If the names cannot be had -- the query fails, or what comes back is not plain names
+    -- the driver gets both, the list before #79: one lock too many is safer than reading
+    hivemind_app unlocked. Nothing from the answer reaches the driver's argv."""
+    make_psql(tmp_path, lock_names=answer)
+    argv_log = make_driver_stub(tmp_path)
+    result = run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    args = argv_log.read_text().split()
+    assert [a for a in args if a.startswith("--lock")] == ["--lock=haf_fyp", "--lock=hivemind"], args
+    assert "DROP" not in args
+    out = result.stdout + result.stderr
+    assert "could not ask which application locks to hold" in out
+    if answer is None:
+        assert "psql: stub lock-names failure" in out, "the WARNING must carry psql's own error"
+
+
+def test_the_question_is_asked_so_that_psql_answers_with_bare_names(bash, tmp_path):
+    """The stub answers as real psql does, so this fails if the script drops -A/-t or
+    array_to_string: it would then read a header or `{haf_fyp}`, refuse it, and hold both
+    locks -- on a node without hivemind, #79 again, with every other test still green."""
+    make_psql(tmp_path, lock_names="haf_fyp")
+    argv_log = make_driver_stub(tmp_path)
+    run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    asked = [c for c in (tmp_path / "sql.log").read_text().split("\n---\n")
+             if "block_processor_lock_names" in c]
+    assert asked == ["SELECT array_to_string(haf_fyp_app.block_processor_lock_names(), ' ')"], asked
+    flags = next(line for line in (tmp_path / "argv.log").read_text().splitlines()
+                 if "block_processor_lock_names" in line).split()
+    joined = "".join(f for f in flags if f.startswith("-") and not f.startswith("--"))
+    assert "A" in joined and "t" in joined, flags
+    assert [a for a in argv_log.read_text().split() if a.startswith("--lock")] == ["--lock=haf_fyp"]
+
+
+def test_the_names_are_asked_of_the_database_not_written_twice(bash, tmp_path):
+    """One list: the script holds no --lock literal of its own, only the fallback pair."""
+    script = SCRIPT.read_text(encoding="utf-8")
+    code = [ln for ln in script.splitlines() if not ln.lstrip().startswith("#")]
+    assert not any("--lock=haf_fyp" in ln or "--lock=hivemind" in ln for ln in code)
+    assert sum("haf_fyp_app.block_processor_lock_names()" in ln for ln in code) == 1
 
 
 def test_the_marker_is_written_before_the_driver_runs(bash, tmp_path):

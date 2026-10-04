@@ -75,6 +75,15 @@ def installer():
         c.close()
 
 
+@pytest.fixture()
+def hivemind(conn):
+    """Hivemind as an installed application: the relation haf_fyp reads. Created in the
+    processor's own transaction, which is rolled back, so no test leaves it behind."""
+    with conn.cursor() as cur:
+        cur.execute("CREATE SCHEMA IF NOT EXISTS hivemind_app")
+        cur.execute("CREATE TABLE IF NOT EXISTS hivemind_app.hive_posts (id integer)")
+
+
 def install_lock_free(installer, name) -> bool:
     """What an installer sees. Released at once when taken, so the check changes nothing."""
     with installer.cursor() as cur:
@@ -110,14 +119,92 @@ def test_an_install_cannot_run_under_the_processor(conn, installer):
     assert not install_lock_free(installer, "haf_fyp")
 
 
-def test_nor_can_hivemind_s_whose_schema_it_reads(conn, installer):
+def test_nor_can_hivemind_s_whose_schema_it_reads(conn, installer, hivemind):
     """db/process_posts.sql reads hivemind_app while processing; 'hivemind' is the name
     hivemind's own installer takes."""
     take(conn)
     assert not install_lock_free(installer, "hivemind")
 
 
-def test_it_does_not_hold_applications_it_does_not_read(conn, installer):
+def test_hivemind_can_install_while_it_does_not_exist(conn, installer):
+    """#79. On a fresh node the processor starts before hivemind was ever installed. Its
+    lock on 'hivemind' made hivemind's installer skip itself, so hivemind never installed.
+    haf_fyp's own lock is still held."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('hivemind_app.hive_posts') IS NULL")
+        assert cur.fetchone()[0], "this database has a hivemind; the test needs one without"
+    del conn.notices[:]
+    take(conn)
+    assert install_lock_free(installer, "hivemind")
+    assert not install_lock_free(installer, "haf_fyp")
+    assert any("hivemind is not installed" in n for n in conn.notices), conn.notices
+
+
+@pytest.mark.parametrize("state,names", [
+    ("no schema", ["haf_fyp"]),
+    ("empty schema", ["haf_fyp"]),
+    ("other tables only", ["haf_fyp"]),
+    ("hive_posts elsewhere", ["haf_fyp"]),
+    ("installed", ["haf_fyp", "hivemind"]),
+])
+def test_the_probe_needs_no_access_to_hivemind_s_schema(conn, installer, state, names):
+    """As the processor really runs: a role with NO USAGE on hivemind_app, which another
+    role owns. db/cross_schema_grants.sql grants it only if hivemind existed when haf_fyp
+    was installed -- so on the fresh node of #79 it has none. to_regclass() raises
+    `permission denied for schema` there, which stopped the legacy loop on its first
+    statement; the catalog answers. "empty schema" is what hivemind's failed first install
+    left behind: its installer must still be able to finish. The two states after it pin
+    BOTH halves of the probe -- the relation (other hivemind tables are not enough) and
+    the schema (a hive_posts somewhere else is not hivemind's)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_namespace WHERE nspname = 'hivemind_app'")
+        assert cur.fetchone() is None, "this database has a hivemind_app; the test needs one without"
+        cur.execute("CREATE ROLE fyp79_hivemind NOLOGIN")
+        cur.execute("CREATE ROLE fyp79_processor NOLOGIN")
+        cur.execute("GRANT USAGE ON SCHEMA haf_fyp_app, hive TO fyp79_processor")
+        if state not in ("no schema", "hive_posts elsewhere"):
+            cur.execute("CREATE SCHEMA hivemind_app AUTHORIZATION fyp79_hivemind")
+        if state == "installed":
+            cur.execute("CREATE TABLE hivemind_app.hive_posts (id integer)")
+            cur.execute("ALTER TABLE hivemind_app.hive_posts OWNER TO fyp79_hivemind")
+        if state == "other tables only":
+            cur.execute("CREATE TABLE hivemind_app.hive_accounts (id integer)")
+            cur.execute("ALTER TABLE hivemind_app.hive_accounts OWNER TO fyp79_hivemind")
+        if state == "hive_posts elsewhere":
+            cur.execute("CREATE SCHEMA fyp79_other AUTHORIZATION fyp79_hivemind")
+            cur.execute("CREATE TABLE fyp79_other.hive_posts (id integer)")
+        cur.execute("SET LOCAL ROLE fyp79_processor")
+        if state not in ("no schema", "hive_posts elsewhere"):
+            cur.execute("SELECT has_schema_privilege('hivemind_app', 'USAGE')")
+            assert not cur.fetchone()[0], "the role can see into hivemind_app; the test proves nothing"
+        cur.execute("SELECT haf_fyp_app.block_processor_lock_names()")
+        assert cur.fetchone()[0] == names
+    take(conn)
+    for name in ("haf_fyp", "hivemind"):
+        assert install_lock_free(installer, name) == (name not in names), name
+
+
+@pytest.mark.parametrize("installed,names", [(False, ["haf_fyp"]), (True, ["haf_fyp", "hivemind"])])
+def test_the_names_function_is_what_take_holds(conn, installer, installed, names):
+    """scripts/process_blocks.sh asks block_processor_lock_names() for the driver's --lock
+    flags; take() must hold exactly that list, or the two paths lock differently."""
+    if installed:
+        with conn.cursor() as cur:
+            cur.execute("CREATE SCHEMA IF NOT EXISTS hivemind_app")
+            cur.execute("CREATE TABLE IF NOT EXISTS hivemind_app.hive_posts (id integer)")
+    with conn.cursor() as cur:
+        cur.execute("SELECT haf_fyp_app.block_processor_lock_names()")
+        assert cur.fetchone()[0] == names
+    del conn.notices[:]
+    take(conn)
+    for name in ("haf_fyp", "hivemind"):
+        assert install_lock_free(installer, name) == (name not in names), name
+    # The message is for the node without hivemind, and only for it.
+    said = any("hivemind is not installed" in n for n in conn.notices)
+    assert said == ("hivemind" not in names), conn.notices
+
+
+def test_it_does_not_hold_applications_it_does_not_read(conn, installer, hivemind):
     """A lock on an application haf_fyp's processing never reads would block that
     application's installs for nothing."""
     take(conn)
@@ -135,7 +222,7 @@ def test_the_locks_are_released_with_the_session(conn, installer):
 
 
 @pytest.mark.parametrize("name", ["haf_fyp", "hivemind"])
-def test_the_processor_waits_out_an_install_in_progress(conn, installer, name):
+def test_the_processor_waits_out_an_install_in_progress(conn, installer, hivemind, name):
     """The point of taking it FIRST: a processor started mid-install must not start -- over
     haf_fyp's install, or hivemind's, whose tables it reads. An installer holds the lock;
     take() must still be waiting, in HAF's wait loop, when the timeout cuts it off."""
@@ -151,7 +238,7 @@ def test_the_processor_waits_out_an_install_in_progress(conn, installer, name):
     assert any(f"Waiting for advisory lock on {name}" in n for n in conn.notices), conn.notices
 
 
-def test_the_locks_are_shared_with_other_processors(conn, installer):
+def test_the_locks_are_shared_with_other_processors(conn, installer, hivemind):
     """SHARED, not exclusive: hivesense's processor holds 'hivemind' too, and haf_fyp's
     must be able to take it alongside -- an exclusive lock would wait on hivesense
     forever. The second session plays that other processor."""
@@ -172,7 +259,7 @@ def test_a_haf_without_the_lock_functions_is_tolerated(conn, installer):
     assert any("no application locks" in n for n in conn.notices), conn.notices
 
 
-def test_main_holds_the_locks_while_it_runs(conn, installer):
+def test_main_holds_the_locks_while_it_runs(conn, installer, hivemind):
     """Behaviour, not position: CALL main() itself, in the processor's session, and the
     installer refused from another. (The loop never ends against the stub -- no blocks --
     so a statement_timeout ends it; the session's locks outlive the cancelled statement,
@@ -199,14 +286,15 @@ def test_main_takes_the_locks_before_anything_else(conn):
         statements[begin:begin + 3])
 
 
-def test_the_lock_names_are_the_ones_the_driver_is_given():
-    """scripts/process_blocks.sh's --lock flags and this function's ARRAY: one list in two
-    places, held together here. (That the flags actually reach the driver is asserted on
-    its argv in tests/unit/test_process_blocks.py.)"""
-    app_sql = open(APP_SQL, encoding="utf-8").read()
-    fn = app_sql[app_sql.index("FUNCTION haf_fyp_app.take_block_processor_locks()"):]
-    sql_names = re.findall(r"'([a-z_]+)'", re.search(r"ARRAY\[([^\]]*)\]", fn).group(1))
+def test_the_driver_asks_the_same_function(conn, hivemind):
+    """One list, not two: scripts/process_blocks.sh builds the driver's --lock flags from
+    block_processor_lock_names(), which is what take() holds. Its fallback, used only when
+    the question cannot be asked, is the full list that function can return. (That the
+    flags reach the driver is asserted on its argv in tests/unit/test_process_blocks.py.)"""
     script = open(os.path.join(HERE, "..", "..", "scripts", "process_blocks.sh"),
                   encoding="utf-8").read()
-    driver_names = re.findall(r"--lock=([a-z_]+)", script)
-    assert sql_names == driver_names == ["haf_fyp", "hivemind"], (sql_names, driver_names)
+    assert "haf_fyp_app.block_processor_lock_names()" in script
+    fallback = re.search(r'^\s*names="([a-z_ ]+)"$', script, re.M).group(1).split()
+    with conn.cursor() as cur:
+        cur.execute("SELECT haf_fyp_app.block_processor_lock_names()")
+        assert cur.fetchone()[0] == fallback == ["haf_fyp", "hivemind"]
