@@ -8,9 +8,9 @@ that stopped a full-chain sync, read back from a node:
     block 36467091, posting auth ["test-safari"]
     ["subscribe",{"community":"Windows 95 aficionados"}]
 
-db/process_communities.sql and db/process_posts.sql cast that field to int. The cast
-raised, the batch rolled back, and the driver retried the range holding that block
-forever.
+db/process_communities.sql and db/process_posts.sql used to cast that field to int.
+The cast raised, the batch rolled back, and the driver retried the range holding that
+block forever.
 
 Nothing in the repo executed process_subscribe, process_unsubscribe or process_posts
 before this file, which is how a statement that cannot survive the real chain shipped.
@@ -44,7 +44,8 @@ BLOCK = 36467091
 
 # What the processors read, and nothing else. hive.operations_view is a view over HAF's
 # own tables on a real node; a table with the same three columns the SQL selects (plus
-# the id process_posts uses as post_id) is enough for the statements to run unchanged.
+# the id, which process_posts uses as post_id and process_communities orders by) is
+# enough for the statements to run unchanged.
 # The haf_fyp_app tables are created IF NOT EXISTS and widened IF NOT EXISTS because the
 # fastapi lane (tests/ci_fastapi_setup.sql) already has a three-column post_candidates.
 SCAFFOLD = """
@@ -158,13 +159,16 @@ _next_id = iter(range(1, 100_000))
 
 
 def custom_json(cur, payload, *, posting=("mallory",), active=(), json_id="community",
-                block=BLOCK, op_type=CUSTOM_JSON):
-    """A custom_json as the chain stores it: `json` is a STRING holding the payload."""
+                block=BLOCK, op_type=CUSTOM_JSON, op_id=None):
+    """A custom_json as the chain stores it: `json` is a STRING holding the payload.
+
+    Ids rise in the order the helpers are called, as HAF's rise along the chain; op_id
+    overrides that for the test that inserts rows out of order."""
     body = {"type": "custom_json_operation",
             "value": {"required_auths": list(active), "required_posting_auths": list(posting),
                       "id": json_id, "json": payload}}
     cur.execute("INSERT INTO hive.operations_view VALUES (%s, %s, %s, %s)",
-                (next(_next_id), block, op_type, json.dumps(body)))
+                (next(_next_id) if op_id is None else op_id, block, op_type, json.dumps(body)))
 
 
 def community_op(cur, user, action, community, **kwargs):
@@ -292,6 +296,8 @@ def test_only_subscribe_ops_of_the_community_protocol_in_range_subscribe(conn):
     with conn.cursor() as cur:
         name = {"community": "hive-123456"}
         community_op(cur, "wrongid", "subscribe", "hive-123456", json_id="follow")
+        community_op(cur, "wrongid", "subscribe", "hive-123456", json_id="community2")
+        community_op(cur, "wrongid", "subscribe", "hive-123456", json_id="Community")
         community_op(cur, "wrongop", "subscribe", "hive-123456", op_type=VOTE)
         community_op(cur, "before", "subscribe", "hive-123456", block=BLOCK - 1)
         community_op(cur, "after", "subscribe", "hive-123456", block=BLOCK + 1)
@@ -347,6 +353,7 @@ def test_only_unsubscribe_ops_of_the_community_protocol_in_range_unsubscribe(con
         for user in users:
             cur.execute("INSERT INTO haf_fyp_app.user_communities VALUES (%s, 123456, now())", (user,))
         community_op(cur, "wrongid", "unsubscribe", "hive-123456", json_id="follow")
+        community_op(cur, "wrongid", "unsubscribe", "hive-123456", json_id="community2")
         community_op(cur, "wrongop", "unsubscribe", "hive-123456", op_type=VOTE)
         community_op(cur, "before", "unsubscribe", "hive-123456", block=BLOCK - 1)
         community_op(cur, "after", "unsubscribe", "hive-123456", block=BLOCK + 1)
@@ -375,6 +382,206 @@ def test_the_dispatcher_runs_both(conn):
 
         assert subscriptions(cur) == {("alice", 123456)}
 
+
+# --- the last operation in the range decides (#82) ---------------------------------
+
+BLOCK_TIMES = {BLOCK - 1: "2019-09-20 11:59:57", BLOCK: "2019-09-20 12:00:00",
+               BLOCK + 1: "2019-09-20 12:00:03"}
+LONG_AGO = "2001-01-01 00:00:00"
+
+# (was subscribed before the range, operations in chain order) -> subscribed after.
+# S = subscribe, U = unsubscribe.
+SEQUENCES = [
+    (False, "S", True),
+    (False, "U", False),
+    (False, "SU", False),
+    (False, "US", True),            # the #82 case: left and came back
+    (False, "SUS", True),
+    (False, "USU", False),
+    (False, "SS", True),
+    (False, "SSS", True),
+    (False, "USS", True),
+    (True, "S", True),
+    (True, "U", False),
+    (True, "SU", False),
+    (True, "US", True),             # the #82 case, for a user an earlier range subscribed
+    (True, "USUS", True),
+    (True, "SUSS", True),
+    (True, "SUSU", False),
+    (True, "UU", False),
+]
+
+
+@pytest.mark.parametrize("spread", ["one block", "several blocks"])
+@pytest.mark.parametrize("before, ops, after", SEQUENCES, ids=lambda v: str(v))
+def test_the_last_operation_in_the_range_decides(conn, before, ops, after, spread):
+    """Until #82 every subscribe was applied and then every unsubscribe, so 'US' ended
+    unsubscribed. One block or several: the range is one batch either way."""
+    with conn.cursor() as cur:
+        if before:
+            cur.execute("INSERT INTO haf_fyp_app.user_communities VALUES ('alice', 123456, %s)",
+                        (LONG_AGO,))
+        blocks = [BLOCK] * len(ops) if spread == "one block" else \
+            [BLOCK - 1 + min(i, 2) for i in range(len(ops))]
+        for op, block in zip(ops, blocks):
+            community_op(cur, "alice", "subscribe" if op == "S" else "unsubscribe",
+                         "hive-123456", block=block)
+
+        run(cur, "process_communities", BLOCK - 1, BLOCK + 1)
+
+        cur.execute("SELECT subscribed_at::text FROM haf_fyp_app.user_communities "
+                    "WHERE username = 'alice' AND community_id = 123456")
+        rows = [r[0] for r in cur.fetchall()]
+        if not after:
+            assert rows == []
+        elif before and "U" not in ops:
+            assert rows == [LONG_AGO], "a subscribe to a community already joined kept its time"
+        else:
+            # Joined in this range, or left and came back: the subscription dates from
+            # the FIRST subscribe after the last unsubscribe. Subscribing twice does not
+            # restart it.
+            first = ops.rindex("U") + 1 if "U" in ops else 0
+            assert rows == [BLOCK_TIMES[blocks[first]]]
+
+
+def test_last_means_last_on_the_chain_not_last_in_the_table(conn):
+    """The order is the operation id's. Rows are written here newest first, so a
+    processor that took the order the table happens to return would get both wrong.
+    (All four are in one block: that the id, not the block, breaks a tie is the 'USUS'
+    sequence above, whose last two operations share a block.)"""
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO haf_fyp_app.user_communities VALUES ('bob', 123456, %s)", (LONG_AGO,))
+        # alice: unsubscribe (id 900001) then subscribe (id 900002) -> subscribed
+        community_op(cur, "alice", "subscribe", "hive-123456", op_id=900002)
+        community_op(cur, "alice", "unsubscribe", "hive-123456", op_id=900001)
+        # bob: subscribe (id 900003) then unsubscribe (id 900004) -> not subscribed
+        community_op(cur, "bob", "unsubscribe", "hive-123456", op_id=900004)
+        community_op(cur, "bob", "subscribe", "hive-123456", op_id=900003)
+
+        run(cur, "process_communities")
+
+        assert subscriptions(cur) == {("alice", 123456)}
+
+
+def test_only_the_same_user_and_community_can_have_the_last_word(conn):
+    """alice's final subscribe to 123456 is followed by things that are not about that
+    pair: another user, another community, a name that is not one, an op with no posting
+    auth, another protocol. None of them is her last operation on 123456."""
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO haf_fyp_app.user_communities VALUES ('alice', 777, %s)", (LONG_AGO,))
+        community_op(cur, "alice", "unsubscribe", "hive-123456")
+        community_op(cur, "alice", "subscribe", "hive-123456")
+        community_op(cur, "bob", "unsubscribe", "hive-123456")
+        community_op(cur, "alice", "unsubscribe", "hive-888")
+        community_op(cur, "alice", "unsubscribe", "Windows 95 aficionados")
+        community_op(cur, "alice", "unsubscribe", " hive-123456")
+        custom_json(cur, json.dumps(["unsubscribe", {"community": "hive-123456"}]),
+                    posting=(), active=("alice",))
+        community_op(cur, "alice", "unsubscribe", "hive-123456", json_id="follow")
+        custom_json(cur, json.dumps(["Unsubscribe", {"community": "hive-123456"}]), posting=("alice",))
+
+        run(cur, "process_communities")
+
+        assert subscriptions(cur) == {("alice", 123456), ("alice", 777)}
+
+
+def joined(cur) -> dict:
+    cur.execute("SELECT username, community_id, subscribed_at::text FROM haf_fyp_app.user_communities")
+    return {(u, c): at for u, c, at in cur.fetchall()}
+
+
+def test_each_pair_is_dated_by_its_own_operations(conn):
+    """Two users on one community and one user on two, interleaved across three blocks.
+    Each row's time comes from that pair's own first subscribe after its own last
+    unsubscribe, not from a neighbour's."""
+    with conn.cursor() as cur:
+        early, mid, late = BLOCK - 1, BLOCK, BLOCK + 1
+        community_op(cur, "alice", "subscribe", "hive-123456", block=early)
+        community_op(cur, "bob", "unsubscribe", "hive-123456", block=early)
+        community_op(cur, "alice", "unsubscribe", "hive-777", block=early)
+        community_op(cur, "bob", "subscribe", "hive-123456", block=mid)
+        community_op(cur, "alice", "subscribe", "hive-777", block=mid)
+        community_op(cur, "carol", "unsubscribe", "hive-123456", block=mid)
+        community_op(cur, "carol", "subscribe", "hive-123456", block=late)
+        community_op(cur, "alice", "subscribe", "hive-123456", block=late)
+
+        run(cur, "process_communities", early, late)
+
+        assert joined(cur) == {
+            ("alice", 123456): BLOCK_TIMES[early],   # never left: her first subscribe
+            ("alice", 777): BLOCK_TIMES[mid],
+            ("bob", 123456): BLOCK_TIMES[mid],
+            ("carol", 123456): BLOCK_TIMES[late],
+        }
+
+
+def test_the_range_gives_each_pair_exactly_one_row(conn):
+    """What both steps read: one row per pair is the function's contract. Compared as a
+    list, not a set, so a second row for a pair shows."""
+    with conn.cursor() as cur:
+        early, mid, late = BLOCK - 1, BLOCK, BLOCK + 1
+        for block in (early, mid, late):
+            community_op(cur, "stays", "subscribe", "hive-123456", block=block)
+        community_op(cur, "leaves", "subscribe", "hive-123456", block=early)
+        community_op(cur, "leaves", "unsubscribe", "hive-123456", block=mid)
+        community_op(cur, "returns", "unsubscribe", "hive-123456", block=early)
+        community_op(cur, "returns", "subscribe", "hive-123456", block=mid)
+        community_op(cur, "returns", "subscribe", "hive-123456", block=late)
+        community_op(cur, "returns", "subscribe", "hive-777", block=late)
+
+        cur.execute("SELECT username, community_id, left_in_range, joined_block "
+                    "FROM haf_fyp_app.community_membership_changes(%s, %s) ORDER BY 1, 2, 4",
+                    (early, late))
+        assert cur.fetchall() == [
+            ("leaves", 123456, True, None),
+            ("returns", 777, False, late),
+            ("returns", 123456, True, mid),
+            ("stays", 123456, False, early),
+        ]
+
+
+def test_the_account_is_the_first_posting_auth(conn):
+    with conn.cursor() as cur:
+        # First by position, not by name: "zed" sorts after "alice".
+        custom_json(cur, json.dumps(["subscribe", {"community": "hive-123456"}]),
+                    posting=("zed", "alice"))
+
+        run(cur, "process_communities")
+
+        assert subscriptions(cur) == {("zed", 123456)}
+
+
+@pytest.mark.parametrize("order, expected", [
+    (("process_unsubscribe", "process_subscribe"), {("joiner", 123456), ("returner", 123456)}),
+    # The other way round the returning user's old row survives the insert and is then
+    # removed. That is why the dispatcher's order is fixed, and what this pins.
+    (("process_subscribe", "process_unsubscribe"), {("joiner", 123456)}),
+], ids=["as the dispatcher calls them", "the other way round"])
+def test_the_two_steps_agree_on_every_pair_but_their_order_matters(conn, order, expected):
+    """Both steps read the pair's ONE outcome: leaver and passer end unsubscribed and
+    only the unsubscribe step touches them, joiner ends subscribed and only the
+    subscribe step does. The returning user needs both, in the dispatcher's order. The
+    other order is not one production runs; it is here to show why."""
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO haf_fyp_app.user_communities VALUES "
+                    "('leaver', 123456, %s), ('returner', 123456, %s)", (LONG_AGO, LONG_AGO))
+        community_op(cur, "joiner", "subscribe", "hive-123456")
+        community_op(cur, "leaver", "subscribe", "hive-123456")
+        community_op(cur, "leaver", "unsubscribe", "hive-123456")
+        community_op(cur, "returner", "unsubscribe", "hive-123456")
+        community_op(cur, "returner", "subscribe", "hive-123456")
+        community_op(cur, "passer", "subscribe", "hive-123456")
+        community_op(cur, "passer", "unsubscribe", "hive-123456")
+
+        for step in order:
+            run(cur, step)
+
+        assert subscriptions(cur) == expected
+        if ("returner", 123456) in expected:
+            assert joined(cur)[("returner", 123456)] == BLOCK_TIMES[BLOCK]
+
+
+# --- payloads of the wrong shape, through the dispatcher ---------------------------
 
 @pytest.mark.parametrize("action", ["subscribe", "unsubscribe"])
 @pytest.mark.parametrize("payload", [
