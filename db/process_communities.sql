@@ -7,6 +7,7 @@
 --   hafd.operation_types          — op type id lookup (name includes hive::protocol:: prefix)
 --   hafd.blocks                   — block timestamps for subscribed_at
 --   haf_fyp_app.safe_parse_json() — defined in process_posts.sql
+--   haf_fyp_app.community_id_from_name() — defined in process_posts.sql
 --
 -- T-0.7 confirmed: custom_json_operation community format:
 --   id   = "community"
@@ -30,13 +31,7 @@ BEGIN
     WITH events AS (
         SELECT
             ov.body::jsonb -> 'value' -> 'required_posting_auths' ->> 0 AS username,
-            NULLIF(
-                REPLACE(
-                    COALESCE(cj.parsed -> 1 ->> 'community', ''),
-                    'hive-', ''
-                ),
-                ''
-            )::INT AS community_id,
+            haf_fyp_app.community_id_from_name(cj.parsed -> 1 ->> 'community') AS community_id,
             b.created_at AS subscribed_at
         FROM hive.operations_view ov
         JOIN hafd.blocks b ON b.num = ov.block_num
@@ -75,13 +70,7 @@ BEGIN
     WITH events AS (
         SELECT
             ov.body::jsonb -> 'value' -> 'required_posting_auths' ->> 0 AS username,
-            NULLIF(
-                REPLACE(
-                    COALESCE(cj.parsed -> 1 ->> 'community', ''),
-                    'hive-', ''
-                ),
-                ''
-            )::INT AS community_id
+            haf_fyp_app.community_id_from_name(cj.parsed -> 1 ->> 'community') AS community_id
         FROM hive.operations_view ov
         CROSS JOIN LATERAL (
             SELECT haf_fyp_app.safe_parse_json(

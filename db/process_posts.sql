@@ -29,6 +29,23 @@ END;
 $$;
 
 -- ---------------------------------------------------------------------------
+-- Community name → numeric id ("hive-123456" → 123456)
+-- ---------------------------------------------------------------------------
+-- The chain accepts any JSON here, and real ops carry community titles
+-- ("Windows 95 aficionados") and whole community objects in place of the name,
+-- and a root post's parent_permlink is any tag, which can look like hive-<huge number>.
+-- Anything that is not a well-formed name maps to NULL and is skipped, as
+-- hivemind skips it; a bare ::int cast raises and stalls block processing.
+
+CREATE OR REPLACE FUNCTION haf_fyp_app.community_id_from_name(_name text)
+RETURNS int
+LANGUAGE sql
+IMMUTABLE
+AS $$
+    SELECT CASE WHEN _name ~ '^hive-[1-9][0-9]{0,8}$' THEN substr(_name, 6)::int END;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- process_posts: ingest root posts from a block range
 -- ---------------------------------------------------------------------------
 
@@ -65,11 +82,7 @@ BEGIN
             -- parent_permlink is the community account 'hive-NNNNNN' (the number
             -- is the community id, matching user_communities). NULL otherwise
             -- (non-community posts, where parent_permlink is just the first tag).
-            CASE
-                WHEN (ov.body::jsonb -> 'value' ->> 'parent_permlink') ~ '^hive-[0-9]+$'
-                THEN REPLACE(ov.body::jsonb -> 'value' ->> 'parent_permlink', 'hive-', '')::INT
-                ELSE NULL
-            END,
+            haf_fyp_app.community_id_from_name(ov.body::jsonb -> 'value' ->> 'parent_permlink'),
             ov.body::jsonb -> 'value' ->> 'title',
             -- tags: only extract if json_metadata.tags is a JSON array
             CASE
