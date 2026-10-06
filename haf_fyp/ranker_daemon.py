@@ -23,10 +23,18 @@ Force-refresh:
   rotation membership against current state (_evict_unsubscribed), which is
   what lets a user actually LEAVE the rotation — and what stops a lost signal
   or a fast re-opt-in from getting it wrong.
+
+Readers first (#81):
+  get_personalized_feed notifies the Postgres channel haf_fyp_feed_read when an
+  account's first page is requested. The main loop hears it on its own session,
+  stamps active_users.last_read_at, re-ranks a reader whose feed is old through the
+  same targeted cycle, and takes recent readers at the front of every scheduled
+  cycle. The rest of the rotation is ranked as before, in what is left of the cycle.
 """
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import os
@@ -94,24 +102,53 @@ MAX_USERS_PER_CYCLE = int(os.environ.get("MAX_USERS_PER_CYCLE", "200"))
 # READ_REFRESH_MIN_AGE_SECONDS straight away, and gives accounts that read within
 # READER_WINDOW_SECONDS the front of every scheduled cycle.
 #
-# Every one of these is a ceiling on work a caller can cause: the feed endpoint is
-# public and takes any username, so "a read" is not evidence of a person.
+# Every setting below is a ceiling on work a caller can cause. The feed endpoint is
+# public and takes any username, so "a read" is not evidence of a person: anyone can
+# request every account's first page and put the whole rotation in the reader lane.
+# That costs real readers their advantage (they are back to the old round-robin) and
+# costs everyone else at most the share. It cannot be prevented without knowing who
+# is asking; what these settings guarantee is that it buys nothing worse.
 FEED_READ_CHANNEL = "haf_fyp_feed_read"
-READER_WINDOW_SECONDS = int(os.environ.get("READER_WINDOW_SECONDS", str(7 * 24 * 60 * 60)))
+# A day, not a week: someone who comes back after longer still gets the immediate
+# re-rank on their first read, and a short window keeps the lane to people who are
+# actually around. A reader in the window is re-ranked EVERY cycle while the lane has
+# room, so the window is also how long one stray read keeps costing a slot.
+READER_WINDOW_SECONDS = max(0, int(os.environ.get("READER_WINDOW_SECONDS", str(24 * 60 * 60))))
 # Share of MAX_USERS_PER_CYCLE that recent readers may take. The remainder always goes
-# to the stalest of everyone else, so a flood of reads slows the rotation by at most
-# 1 / (1 - share) and can never stop it. 0 turns the reader lane off.
-READER_CYCLE_SHARE = min(1.0, max(0.0, float(os.environ.get("READER_CYCLE_SHARE", "0.5"))))
-READ_REFRESH_MIN_AGE_SECONDS = int(os.environ.get("READ_REFRESH_MIN_AGE_SECONDS", "600"))
-# Immediate re-ranks per pass of the main loop. Readers beyond it are not lost: they
-# are stamped, so the next scheduled cycle takes them first.
-READ_REFRESH_MAX_PER_PASS = int(os.environ.get("READ_REFRESH_MAX_PER_PASS", "50"))
-# Distinct usernames kept from one drain. Notifications pile up on the connection for
-# the length of a cycle; this bounds the array handed to the UPDATE below.
+# to the stalest of everyone else, so a full lane slows the rotation by 1 / (1 - share)
+# and cannot stop it -- which is why the share is capped below 1: at 1.0 a full lane
+# would leave the rotation nothing at all. 0 turns the reader lane off.
+READER_CYCLE_SHARE = min(0.9, max(0.0, float(os.environ.get("READER_CYCLE_SHARE", "0.5"))))
+READ_REFRESH_MIN_AGE_SECONDS = max(0, int(os.environ.get("READ_REFRESH_MIN_AGE_SECONDS", "600")))
+# Immediate re-ranks between two scheduled cycles. A budget per cycle, not per pass of
+# the main loop: a pass is five seconds, so a per-pass limit let one caller keep the
+# ranker busy continuously. By default readers can add at most their share of a cycle
+# on top of the cycle itself. Readers past the budget are not lost: they are stamped,
+# so the reader lane takes them. 0 turns immediate re-ranks off.
+READ_REFRESH_MAX_PER_CYCLE = max(0, int(os.environ.get(
+    "READ_REFRESH_MAX_PER_CYCLE", str(int(MAX_USERS_PER_CYCLE * READER_CYCLE_SHARE)),
+)))
+# Distinct usernames kept from one drain: bounds the array handed to the UPDATE.
 _FEED_READ_MAX_PER_DRAIN = 5000
-# A Hive account name. The payload comes out of feed_cache, so this never rejects a
-# real one; it is here so nothing else can ride the channel into a query parameter.
+# Notifications held on the connection between drains. psycopg2 appends to
+# conn.notifies whenever it reads the socket, i.e. during every query of a cycle, and
+# nothing else bounds that list; the oldest are discarded past this.
+_FEED_READ_BACKLOG_MAX = 20000
+# A Hive account name. The payload is a username that has a cached feed, so this never
+# rejects a real one; it is here so nothing else can ride the channel into a query
+# parameter.
 _USERNAME_RE = re.compile(r"[a-z0-9.-]{3,16}")
+
+# False while the installed schema predates active_users.last_read_at. An install run
+# while the ranker holds HAF's lock installs nothing, and the SQL and Python images are
+# versioned separately, so a new ranker on old SQL is a state that happens. Without
+# this the reader query would raise on every scheduled cycle and no personalized feed
+# would be refreshed at all, while the global feed went on looking healthy.
+_reads_supported = False
+# Since the last scheduled cycle, for the one log line that says whether this works.
+_reads_heard = 0
+_reads_reranked = 0
+_feed_read_failure_logged_at = 0.0
 
 
 # Rotation eviction + #9-invariant repair (#10), on the hourly maintenance cadence.
@@ -275,19 +312,49 @@ def _connect() -> psycopg2.extensions.connection:
 def _listen_for_feed_reads(conn) -> None:
     """LISTEN on the session main() uses, so no second connection and no thread: the
     notifications wait on this socket and _drain_feed_reads collects them between
-    passes. LISTEN belongs to the session, which is why every reconnect repeats it."""
+    passes. LISTEN belongs to the session, which is why every reconnect repeats it.
+
+    Also decides, once per connection, whether the schema has last_read_at."""
+    global _reads_supported
     with conn.cursor() as cur:
-        cur.execute(f"LISTEN {FEED_READ_CHANNEL}")
+        cur.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM pg_attribute
+                 WHERE attrelid = to_regclass('haf_fyp_app.active_users')
+                   AND attname = 'last_read_at' AND NOT attisdropped)
+            """
+        )
+        _reads_supported = bool(cur.fetchone()[0])
+        if _reads_supported:
+            cur.execute(f"LISTEN {FEED_READ_CHANNEL}")
+        else:
+            log.warning(
+                "haf_fyp_app.active_users has no last_read_at column: the installed SQL "
+                "is older than this ranker. Ranking continues without the reader lane; "
+                "stop haf-fyp-sync and haf-fyp-ranker and re-run the install to enable it."
+            )
     conn.commit()
+    # psycopg2 lets this be any object with append(); a bounded deque is what keeps a
+    # flood of reads during a long cycle from growing without limit.
+    conn.notifies = collections.deque(maxlen=_FEED_READ_BACKLOG_MAX)
 
 
 def _drain_feed_reads(conn) -> set[str]:
     """Usernames whose feed was requested since the last drain (#81)."""
+    # Postgres does not deliver a notification to a session that is inside a
+    # transaction. Several paths end a pass with one open and nothing to commit (no
+    # candidates, a refresh whose targets were all non-members), and the session would
+    # then hear nothing until the next commit. A no-op when no transaction is open.
+    conn.rollback()
     conn.poll()
+    notes = list(conn.notifies)
+    conn.notifies.clear()
+    if not _reads_supported:
+        return set()
     names: set[str] = set()
     dropped = 0
-    while conn.notifies:
-        note = conn.notifies.pop(0)
+    for note in notes:
         if note.channel != FEED_READ_CHANNEL or not _USERNAME_RE.fullmatch(note.payload or ""):
             continue
         if note.payload not in names and len(names) >= _FEED_READ_MAX_PER_DRAIN:
@@ -296,24 +363,26 @@ def _drain_feed_reads(conn) -> set[str]:
         names.add(note.payload)
     if dropped:
         log.warning(
-            "feed-read signals: kept %d distinct accounts, dropped %d more (ceiling %d)",
+            "feed-read signals: kept %d distinct accounts, dropped %d further "
+            "notification(s) (ceiling %d)",
             len(names), dropped, _FEED_READ_MAX_PER_DRAIN,
         )
     return names
 
 
-def _note_feed_reads(conn, usernames: set[str]) -> set[str]:
+def _note_feed_reads(conn, usernames: set[str], rerank_limit: int) -> set[str]:
     """
     Stamp last_read_at for the rotation members among `usernames`, and return the ones
-    whose feed is old enough to re-rank now (at most READ_REFRESH_MAX_PER_PASS, stalest
-    first).
+    whose feed is old enough to re-rank now (at most `rerank_limit`, stalest first).
+    Everyone is stamped whatever the limit: a data-modifying CTE runs to completion.
 
     Rows are taken FOR UPDATE SKIP LOCKED before they are updated. The block processor
     upserts many active_users rows per batch in its own order, and a second multi-row
     writer on the same table is how two sessions end up each holding a row the other
-    wants; skipping a locked row cannot wait, so it cannot deadlock. A skipped account
-    only misses this one stamp. An account with no row is not a member and is left out,
-    the same rule _run_targeted_refresh applies.
+    wants. This statement only ever updates rows it has already locked without
+    waiting, so it never waits for a row while holding another. A skipped account only
+    misses this one stamp. An account with no row is not a member and is left out, the
+    same rule _run_targeted_refresh applies.
     """
     if not usernames:
         return set()
@@ -324,7 +393,6 @@ def _note_feed_reads(conn, usernames: set[str]) -> set[str]:
                 SELECT username, last_scored_at
                   FROM haf_fyp_app.active_users
                  WHERE username = ANY(%s)
-                 ORDER BY username
                    FOR UPDATE SKIP LOCKED
             ), stamped AS (
                 UPDATE haf_fyp_app.active_users au
@@ -340,11 +408,43 @@ def _note_feed_reads(conn, usernames: set[str]) -> set[str]:
              ORDER BY last_scored_at ASC NULLS FIRST
              LIMIT %s
             """,
-            (sorted(usernames), READ_REFRESH_MIN_AGE_SECONDS, READ_REFRESH_MAX_PER_PASS),
+            (sorted(usernames), READ_REFRESH_MIN_AGE_SECONDS, max(0, rerank_limit)),
         )
         stale = {r[0] for r in cur.fetchall()}
     conn.commit()
     return stale
+
+
+def _handle_feed_reads(conn, rerank_budget: int) -> set[str]:
+    """One pass of #81: hear the reads, stamp them, and return the accounts to re-rank
+    now (never more than `rerank_budget`)."""
+    global _reads_heard, _reads_reranked
+    heard = _drain_feed_reads(conn)
+    stale = _note_feed_reads(conn, heard, rerank_budget)
+    _reads_heard += len(heard)
+    _reads_reranked += len(stale)
+    return stale
+
+
+def _log_feed_read_summary() -> None:
+    """One line per scheduled cycle. Zero forever means reads are not arriving; a count
+    near the size of the rotation means someone is requesting everyone's feed."""
+    global _reads_heard, _reads_reranked
+    if _reads_supported:
+        log.info(
+            "feed reads since the last cycle: %d account(s) heard, %d re-ranked at once",
+            _reads_heard, _reads_reranked,
+        )
+    _reads_heard = _reads_reranked = 0
+
+
+def _log_feed_read_failure() -> None:
+    """A standing fault here would otherwise write a traceback every POLL_SECONDS."""
+    global _feed_read_failure_logged_at
+    now = time.monotonic()
+    if now - _feed_read_failure_logged_at >= CYCLE_SECONDS or not _feed_read_failure_logged_at:
+        _feed_read_failure_logged_at = now
+        log.exception("feed-read handling failed (logged at most once per cycle)")
 
 
 def _redis_subscriber(refresh_q: "queue.Queue[str]") -> None:
@@ -485,7 +585,7 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
     treat a symptom eviction removes.
     """
     readers: list[str] = []
-    reader_slots = int(limit * READER_CYCLE_SHARE)
+    reader_slots = int(limit * READER_CYCLE_SHARE) if _reads_supported else 0
     with conn.cursor() as cur:
         if reader_slots > 0:
             # #81: accounts whose feed was requested recently come first, stalest feed
@@ -824,7 +924,8 @@ def run_cycle(conn) -> None:
 def _run_targeted_refresh(conn, usernames: set[str]) -> None:
     """
     Score and write feed_cache for specific users only — no global feed update.
-    Called when force-refresh signals arrive from the FastAPI overlay via Redis.
+    Called when force-refresh signals arrive from the FastAPI overlay via Redis, and
+    when a feed read finds a stale feed (#81).
     Users who have un-opted-in are evicted from the rotation instead of ranked (#10).
     """
     targets = sorted(usernames)
@@ -1081,9 +1182,17 @@ def main() -> None:
 
     conn = _connect()
     next_full_cycle = 0.0  # run immediately on startup
+    read_budget = READ_REFRESH_MAX_PER_CYCLE  # #81: immediate re-ranks left until the next cycle
     next_feed_maint = 0.0  # run feed_events rollup/prune immediately on startup
 
     while True:
+        # A session can end up closed without an OperationalError ever reaching the
+        # handlers below (a rollback on a dead connection raises InterfaceError, which
+        # they treat as an ordinary failure). Nothing else would replace it.
+        if conn.closed:
+            log.warning("database connection is closed — reconnecting")
+            conn = _reconnect(conn)
+
         # Drain pending force-refresh requests
         pending: set[str] = set()
         while True:
@@ -1093,14 +1202,19 @@ def main() -> None:
                 break
 
         # #81: feed reads. Stamp them, and re-rank now the readers whose feed is old.
-        # Best-effort like the Redis path: a failure here costs freshness, not a cycle.
+        # Best-effort like the Redis path: a failure here never costs the cycle below.
+        # InterfaceError too: that, not OperationalError, is what poll() raises on a
+        # connection that is already closed, and without it this would retry a dead
+        # session every POLL_SECONDS and never replace it.
         try:
-            pending |= _note_feed_reads(conn, _drain_feed_reads(conn))
-        except psycopg2.OperationalError:
+            stale = _handle_feed_reads(conn, read_budget)
+            read_budget -= len(stale)
+            pending |= stale
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
             log.warning("database connection lost (feed reads) — reconnecting")
             conn = _reconnect(conn)
         except Exception:
-            log.exception("feed-read handling failed")
+            _log_feed_read_failure()
             _safe_rollback(conn)
 
         if pending:
@@ -1118,6 +1232,8 @@ def main() -> None:
             try:
                 run_cycle(conn)
                 next_full_cycle = time.monotonic() + CYCLE_SECONDS
+                read_budget = READ_REFRESH_MAX_PER_CYCLE
+                _log_feed_read_summary()
             except psycopg2.OperationalError:
                 log.warning("database connection lost — reconnecting")
                 conn = _reconnect(conn)

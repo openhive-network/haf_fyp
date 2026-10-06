@@ -645,6 +645,82 @@ stored. See
 (Before #41, steps 1, 3 and 4 *raised* rather than finding nothing, so affected
 users got no cached feed at all; all four call sites now share one guard.)
 
+### How fresh a feed is
+
+Feeds are computed ahead of time and served from `feed_cache`; a request never ranks
+anything. So a feed is as old as the last time the ranker reached that account.
+
+The ranker's rotation holds every account there is something to personalize for, which
+on a full node is tens of thousands, and a scheduled cycle ranks `MAX_USERS_PER_CYCLE`
+of them, then waits `CYCLE_SECONDS` (300). Ranked round-robin, an account was reached
+once per full rotation: about 22 hours at 45,000 accounts and the default 200.
+
+**Readers go first (#81).** Requesting the first page of a feed tells the ranker, which
+
+1. records the read (`active_users.last_read_at`);
+2. re-ranks that account straight away if its feed is older than
+   `READ_REFRESH_MIN_AGE_SECONDS`, so the *next* load is current;
+3. takes accounts that read within `READER_WINDOW_SECONDS` at the front of every
+   scheduled cycle, stalest first, in at most `READER_CYCLE_SHARE` of the cycle.
+
+The rest of each cycle goes to everyone else in the old order. The first request after
+a long absence is still served the old feed; it is the one that triggers the refresh.
+
+These are environment variables of the `haf-fyp-ranker` service. Neither compose file
+passes them through, so add them to that service's `environment:` to change one.
+
+| Variable | Default | What it bounds |
+|---|---|---|
+| `MAX_USERS_PER_CYCLE` | 200 | Accounts ranked per scheduled cycle. At about 0.2 s each the default uses a fraction of the cycle; raising it shortens the rotation for everyone. |
+| `READER_CYCLE_SHARE` | 0.5 | Share of a cycle recent readers may take (capped at 0.9). 0 turns the reader lane off. |
+| `READER_WINDOW_SECONDS` | 86400 | How long one read keeps an account in the reader lane. |
+| `READ_REFRESH_MIN_AGE_SECONDS` | 600 | A feed younger than this is not re-ranked on read. |
+| `READ_REFRESH_MAX_PER_CYCLE` | `MAX_USERS_PER_CYCLE` x `READER_CYCLE_SHARE` | Immediate re-ranks between two scheduled cycles. 0 turns them off. |
+
+What to expect, and what this does not do:
+
+* **It is not immediate.** The ranker hears reads between passes of its loop, so a read
+  that arrives during a scheduled cycle is handled when that cycle ends: under a minute
+  at the default cycle size, several minutes on a node that ranks thousands per cycle.
+* **Everyone else rotates more slowly while the reader lane is in use**, by up to
+  `1 / (1 - READER_CYCLE_SHARE)`: twice as slowly at the default when the lane is full.
+* **A read is not proof of a reader.** The feed endpoint is public and takes any
+  username. Someone who requests every account's first page puts the whole rotation in
+  the reader lane, and real readers are back to the old round-robin for the length of
+  the window. It cannot make anything worse than that, and it shows in the log (below).
+  Telling a reader from a crawler needs an authenticated read, which this app does not
+  have.
+* **Paging.** A feed rewritten while someone scrolls can repeat or skip a post between
+  page 1 and page 2. Readers' feeds are rewritten more often than others'.
+* **The signal is visible inside the database.** It is a Postgres notification on the
+  channel `haf_fyp_feed_read` carrying the username, and any role with a session on the
+  database can listen to it. `last_read_at` is not exposed by any endpoint.
+
+The ranker logs one line per scheduled cycle:
+`feed reads since the last cycle: N account(s) heard, M re-ranked at once`. Zero on a
+node whose feed is being used means the signal is not arriving; a count near the size
+of the rotation means someone is requesting everyone's feed.
+
+A notifying request takes a transaction id and a brief cluster-wide lock at commit, so
+the feed function rations it: first page only, and at most once per account per ten
+minutes. To switch it off without reinstalling:
+
+```sql
+ALTER ROLE haf_fyp_user SET haf_fyp.feed_read_notify = 'off';
+```
+
+(it applies to new database sessions; restart `haf-fyp-postgrest`, and PgBouncer where
+one sits in between, to apply it at once). With `READER_CYCLE_SHARE=0` and `READ_REFRESH_MAX_PER_CYCLE=0` as well, the
+ranker behaves exactly as it did before #81. `pg_notification_queue_usage()` is the
+thing to watch if a ranker is ever left paused for days: a listener that stops reading
+pins the cluster's notification queue.
+
+**Upgrading.** The ranker needs the `last_read_at` column, which the install adds in
+place. A ranker started against SQL that predates it logs one warning, ranks without
+the reader lane, and picks the column up on its next connection after the install has
+run (see [Re-installing while the stack runs](#re-installing-while-the-stack-runs-hafs-application-locks):
+an install run while the ranker is up installs nothing).
+
 ## Database Schema
 
 ```

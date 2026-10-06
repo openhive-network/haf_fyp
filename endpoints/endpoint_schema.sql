@@ -1570,10 +1570,31 @@ BEGIN
     ) THEN
         -- #81: tell the ranker this feed is being read, so readers are ranked ahead
         -- of the accounts nobody looks at. A GET runs in a read-only transaction and
-        -- cannot write, but it can notify. First page only: one signal per visit,
-        -- not one per scroll. Inside the EXISTS branch, so the payload is always a
-        -- username that already has a feed, never caller-supplied text.
-        IF _offset = 0 THEN
+        -- cannot change a table, but it can notify. The function stays STABLE in
+        -- spite of that side effect: PostgREST keeps a STABLE function read-only on
+        -- POST as well, which is what this endpoint should be.
+        --
+        -- A notifying commit is not free (it takes a transaction id and a brief
+        -- cluster-wide lock), so this is rationed:
+        --   * first page only: one signal per visit, not one per scroll;
+        --   * only when the last read the ranker recorded is over ten minutes old.
+        --     The ranker stamps last_read_at when it hears, so a client that reloads
+        --     costs one signal per ten minutes, not one per request;
+        --   * never on a standby, where NOTIFY is an error and would fail the read;
+        --   * not at all when an operator sets haf_fyp.feed_read_notify = off
+        --     (ALTER ROLE haf_fyp_user SET haf_fyp.feed_read_notify = 'off').
+        -- Inside the EXISTS branch, so the payload is always the name of an account
+        -- that has a cached feed.
+        IF _offset = 0
+           AND NOT pg_is_in_recovery()
+           AND COALESCE(current_setting('haf_fyp.feed_read_notify', true), 'on') <> 'off'
+           AND EXISTS (
+               SELECT 1 FROM haf_fyp_app.active_users au
+               WHERE au.username = get_personalized_feed.username
+                 AND (au.last_read_at IS NULL
+                      OR au.last_read_at < (NOW() AT TIME ZONE 'utc') - INTERVAL '10 minutes')
+           )
+        THEN
             PERFORM pg_notify('haf_fyp_feed_read', get_personalized_feed.username);
         END IF;
         -- Observer context makes active_votes / muted state account-aware,

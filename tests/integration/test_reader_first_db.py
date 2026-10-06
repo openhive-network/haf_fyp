@@ -12,12 +12,34 @@ reaches the session that listens.
 """
 
 import os
+import re
 import time
 
 import psycopg2
+import psycopg2.extensions
+import psycopg2.extras
 import pytest
 
 from haf_fyp import ranker_daemon as rd
+
+REPO = os.path.join(os.path.dirname(__file__), "..", "..")
+ENDPOINT_SQL = os.path.join(REPO, "endpoints", "endpoint_schema.sql")
+CREATE_TABLES_SQL = os.path.join(REPO, "db", "create_tables.sql")
+
+
+def _unreachable():
+    """Skip locally, FAIL in CI: a mistyped POSTGRES_* there would otherwise turn every
+    test in this file into a green skip."""
+    if os.environ.get("CI"):
+        raise
+    pytest.skip("no postgres available")
+
+
+@pytest.fixture(autouse=True)
+def _schema_has_the_read_column(monkeypatch):
+    # What _listen_for_feed_reads finds on this database. Set here so the tests that
+    # never listen exercise the reader lane too, and restored after each test.
+    monkeypatch.setattr(rd, "_reads_supported", True)
 
 
 def _connect():
@@ -37,7 +59,7 @@ def conn():
     try:
         c = _connect()
     except Exception:  # noqa: BLE001
-        pytest.skip("no postgres available")
+        _unreachable()
     try:
         with c.cursor() as cur:
             cur.execute("TRUNCATE haf_fyp_app.active_users")
@@ -54,7 +76,7 @@ def other():
     try:
         c = _connect()
     except Exception:  # noqa: BLE001
-        pytest.skip("no postgres available")
+        _unreachable()
     try:
         yield c
     finally:
@@ -101,7 +123,7 @@ def test_a_read_stamps_the_member_and_nobody_else(conn):
     _user(conn, "reader", scored="1 minute")
     _user(conn, "bystander", scored="1 minute")
 
-    rd._note_feed_reads(conn, {"reader", "stranger"})
+    rd._note_feed_reads(conn, {"reader", "stranger"}, 10)
 
     assert 0 <= _read_age_seconds(conn, "reader") < 60
     assert _read_age_seconds(conn, "bystander") is None
@@ -118,7 +140,7 @@ def test_only_a_stale_feed_is_reranked_at_once(conn, monkeypatch):
     _user(conn, "stale", scored="11 minutes")
     _user(conn, "never", scored=None)
 
-    stale = rd._note_feed_reads(conn, {"fresh", "stale", "never"})
+    stale = rd._note_feed_reads(conn, {"fresh", "stale", "never"}, 10)
 
     assert stale == {"stale", "never"}
     # ...but all three are stamped: the fresh one still joins the reader lane.
@@ -128,18 +150,25 @@ def test_only_a_stale_feed_is_reranked_at_once(conn, monkeypatch):
 
 def test_the_immediate_reranks_are_capped_and_take_the_stalest(conn, monkeypatch):
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
-    monkeypatch.setattr(rd, "READ_REFRESH_MAX_PER_PASS", 2)
     _user(conn, "old1", scored="3 hours")
     _user(conn, "old2", scored="2 hours")
     _user(conn, "old3", scored="1 hour")
     _user(conn, "never", scored=None)
 
-    stale = rd._note_feed_reads(conn, {"old1", "old2", "old3", "never"})
+    stale = rd._note_feed_reads(conn, {"old1", "old2", "old3", "never"}, 2)
 
     assert stale == {"never", "old1"}
-    # The ones past the cap are not lost: they are stamped, so the next cycle's
-    # reader lane takes them.
+    # The ones past the limit are not lost: they are stamped, so the reader lane
+    # takes them.
     assert _read_age_seconds(conn, "old3") is not None
+
+
+def test_a_spent_budget_still_stamps_every_reader(conn, monkeypatch):
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    _user(conn, "old", scored="3 hours")
+
+    assert rd._note_feed_reads(conn, {"old"}, 0) == set()
+    assert _read_age_seconds(conn, "old") is not None
 
 
 def test_a_row_locked_by_another_writer_is_skipped_not_waited_for(conn, other):
@@ -154,7 +183,7 @@ def test_a_row_locked_by_another_writer_is_skipped_not_waited_for(conn, other):
         cur.execute("SET LOCAL lock_timeout = '2s'")
 
     started = time.monotonic()
-    stale = rd._note_feed_reads(conn, {"busy", "free"})
+    stale = rd._note_feed_reads(conn, {"busy", "free"}, 10)
 
     assert time.monotonic() - started < 2
     assert stale == {"free"}
@@ -166,7 +195,7 @@ def test_a_row_locked_by_another_writer_is_skipped_not_waited_for(conn, other):
 def test_the_stamp_is_committed(conn, other):
     _user(conn, "reader", scored="1 minute")
 
-    rd._note_feed_reads(conn, {"reader"})
+    rd._note_feed_reads(conn, {"reader"}, 10)
 
     assert _read_age_seconds(other, "reader") is not None
 
@@ -280,12 +309,366 @@ def test_a_notification_from_a_read_only_transaction_reaches_the_listener(conn, 
     assert got == {"alice", "bob"}
 
 
-def test_a_rolled_back_read_sends_nothing(conn, other):
+def _drain_for(conn, seconds, until=None):
+    got, deadline = set(), time.monotonic() + seconds
+    while time.monotonic() < deadline and (until is None or got != until):
+        got |= rd._drain_feed_reads(conn)
+        time.sleep(0.05)
+    return got
+
+
+def _notify(session, name):
+    with session.cursor() as cur:
+        cur.execute("SELECT pg_notify(%s, %s)", (rd.FEED_READ_CHANNEL, name))
+
+
+def test_a_rolled_back_read_sends_nothing_and_the_next_committed_one_arrives(conn, other):
     rd._listen_for_feed_reads(conn)
 
-    with other.cursor() as cur:
-        cur.execute("SELECT pg_notify(%s, 'alice')", (rd.FEED_READ_CHANNEL,))
+    _notify(other, "alice")
     other.rollback()
-    time.sleep(0.3)
+    _notify(other, "bobby")
+    other.commit()
 
-    assert rd._drain_feed_reads(conn) == set()
+    # The committed one is the control: the listener works, and nothing came before it.
+    assert _drain_for(conn, 2) == {"bobby"}
+
+
+def test_reads_are_heard_even_if_the_session_was_left_inside_a_transaction(conn, other):
+    """Postgres delivers a notification only to a session that is outside a transaction.
+    run_cycle's "no candidates" return and _run_targeted_refresh's "no member left"
+    return both leave the ranker's session with a SELECT's transaction open, through
+    every five-second sleep until the next commit. The drain ends it first."""
+    rd._listen_for_feed_reads(conn)
+    rd._rotation_members(conn, ["nobody"])  # a SELECT and no commit: as the ranker leaves it
+    assert conn.info.transaction_status == psycopg2.extensions.TRANSACTION_STATUS_INTRANS
+
+    _notify(other, "alice")
+    other.commit()
+
+    assert _drain_for(conn, 3, until={"alice"}) == {"alice"}
+
+
+def test_the_drain_works_on_a_session_using_the_stop_handlers_wait_callback(conn, other):
+    # main() installs psycopg2's wait_select callback before it connects, so the session
+    # that polls in production is a "green" one. Every other test polls a plain session.
+    psycopg2.extensions.set_wait_callback(psycopg2.extras.wait_select)
+    try:
+        rd._listen_for_feed_reads(conn)
+        _notify(other, "alice")
+        other.commit()
+
+        assert _drain_for(conn, 3, until={"alice"}) == {"alice"}
+    finally:
+        psycopg2.extensions.set_wait_callback(None)
+
+
+def test_the_connection_holds_a_bounded_backlog(conn, other, monkeypatch):
+    monkeypatch.setattr(rd, "_FEED_READ_BACKLOG_MAX", 3)
+    rd._listen_for_feed_reads(conn)
+
+    for name in ("user1", "user2", "user3", "user4", "user5"):
+        _notify(other, name)
+        other.commit()
+    time.sleep(0.3)
+    conn.poll()
+
+    # psycopg2 appends to whatever conn.notifies is; the oldest fall off the deque.
+    assert [n.payload for n in conn.notifies] == ["user3", "user4", "user5"]
+
+
+# --------------------------------------------------------------------------
+# A server that is not on UTC
+# --------------------------------------------------------------------------
+# _user and _read_age_seconds write and read naive UTC whatever the zone, which is why
+# on the UTC server CI runs, dropping `AT TIME ZONE 'utc'` from any of the ranker's
+# three expressions changes nothing. A server ahead of UTC is a real deployment.
+
+
+@pytest.fixture()
+def tokyo(conn):
+    with conn.cursor() as cur:
+        cur.execute("SET TIME ZONE 'Asia/Tokyo'")
+    conn.commit()
+    return conn
+
+
+def test_the_stamp_and_the_staleness_test_are_utc_on_a_server_that_is_not(tokyo, monkeypatch):
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    _user(tokyo, "fresh", scored="5 minutes")
+    _user(tokyo, "stale", scored="11 minutes")
+
+    stale = rd._note_feed_reads(tokyo, {"fresh", "stale"}, 10)
+
+    # NOW() without AT TIME ZONE reads last_scored_at as Tokyo time, nine hours older
+    # than it is, and re-ranks the fresh feed too.
+    assert stale == {"stale"}
+    # ...and stamps nine hours into the future, which keeps the account in the reader
+    # lane nine hours longer than READER_WINDOW_SECONDS says.
+    assert 0 <= _read_age_seconds(tokyo, "fresh") < 60
+
+
+def test_the_reader_window_is_utc_on_a_server_that_is_not(tokyo, monkeypatch):
+    monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
+    monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 3600)
+    _user(tokyo, "lapsed", scored="1 minute", read="2 hours")
+    _user(tokyo, "reader", scored="1 minute", read="2 minutes")
+    _user(tokyo, "idle", scored="20 hours")
+
+    # Read as Tokyo time the window would reach nine hours further back and take the
+    # lapsed reader as well.
+    assert rd._fetch_personalised_users(tokyo, 2) == ["reader", "idle"]
+
+
+# --------------------------------------------------------------------------
+# Reader-lane order beyond "stalest first"
+# --------------------------------------------------------------------------
+
+
+def test_among_never_ranked_readers_the_latest_read_goes_first_and_ahead_of_ranked_ones(
+    conn, monkeypatch
+):
+    monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
+    monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
+    _user(conn, "earlier", scored=None, read="3 days")
+    _user(conn, "latest", scored=None, read="1 minute")
+    _user(conn, "ranked", scored="1 hour", read="1 minute")
+
+    # Four slots, two for readers: both never-ranked readers, latest read first; the
+    # ranked reader is left to the remainder.
+    assert rd._fetch_personalised_users(conn, 4) == ["latest", "earlier", "ranked"]
+
+
+# --------------------------------------------------------------------------
+# A ranker newer than the installed SQL
+# --------------------------------------------------------------------------
+
+
+def test_a_schema_without_the_read_column_ranks_without_the_reader_lane(conn, other, caplog):
+    """An install run while the ranker holds HAF's lock installs nothing, and the two
+    images are versioned separately, so this state happens. The reader query would
+    raise UndefinedColumn on every scheduled cycle."""
+    _user(conn, "idle", scored="20 hours")
+    with other.cursor() as cur:
+        cur.execute("ALTER TABLE haf_fyp_app.active_users RENAME COLUMN last_read_at TO renamed_away")
+    other.commit()
+    try:
+        with caplog.at_level("WARNING"):
+            rd._listen_for_feed_reads(conn)
+
+        assert rd._reads_supported is False
+        assert "no last_read_at column" in caplog.text
+        assert rd._fetch_personalised_users(conn, 10) == ["idle"]
+        conn.commit()
+        _notify(other, "idle")
+        other.commit()
+        assert _drain_for(conn, 0.5) == set()
+    finally:
+        conn.rollback()
+        with other.cursor() as cur:
+            cur.execute("ALTER TABLE haf_fyp_app.active_users RENAME COLUMN renamed_away TO last_read_at")
+        other.commit()
+
+    rd._listen_for_feed_reads(conn)
+    assert rd._reads_supported is True
+
+
+# --------------------------------------------------------------------------
+# The shipped function, not a stand-in
+# --------------------------------------------------------------------------
+# The CI database has no hivemind schema, so get_personalized_feed cannot be created
+# where it lives. Its text can: every relation it names is schema-qualified, so the
+# shipped body is re-homed into a throwaway schema holding the objects it touches.
+# What runs is the function as written in endpoints/endpoint_schema.sql, in a READ ONLY
+# transaction, which is how PostgREST calls it.
+
+_FEED_SCHEMA = "fyp81_shipped_feed"
+
+
+def _shipped_feed_function():
+    sql = open(ENDPOINT_SQL, encoding="utf-8").read()
+    start = sql.index("CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_personalized_feed(")
+    ddl = sql[start : sql.index("\n$$;", start) + len("\n$$;")]
+    for home in ("haf_fyp_endpoints.", "haf_fyp_app.", "hivemind_app."):
+        ddl = ddl.replace(home, f"{_FEED_SCHEMA}.")
+    assert "pg_notify" in ddl, "the shipped function no longer notifies; these tests are void"
+    return ddl
+
+
+@pytest.fixture()
+def shipped_feed(other):
+    s = _FEED_SCHEMA
+    with other.cursor() as cur:
+        cur.execute(f"DROP SCHEMA IF EXISTS {s} CASCADE")
+        cur.execute(f"CREATE SCHEMA {s}")
+        cur.execute(
+            f"""
+            CREATE TABLE {s}.feed_cache (
+                username varchar(16), post_id bigint, rank int, final_score float,
+                score_relevance float, score_recency float, score_engagement float,
+                score_credibility float, community_boost_applied boolean,
+                boost_source text, algorithm_version text);
+            CREATE TABLE {s}.active_users (
+                username varchar(16) PRIMARY KEY, last_scored_at timestamp,
+                last_read_at timestamp);
+            CREATE TABLE {s}.global_feed_cache (post_id bigint);
+            CREATE TABLE {s}.post_candidates (post_id bigint, hive_post_id int);
+            CREATE TABLE {s}.post_bridge_cache (post_id bigint, bridge jsonb);
+            CREATE TABLE {s}.hive_accounts (id int, name text);
+            CREATE FUNCTION {s}.get_bridge_post(int, int, int) RETURNS jsonb
+                LANGUAGE sql STABLE AS 'SELECT NULL::jsonb';
+            INSERT INTO {s}.feed_cache (username, post_id, rank, final_score)
+                 VALUES ('alice', 1, 1, 1.0);
+            INSERT INTO {s}.active_users (username) VALUES ('alice');
+            INSERT INTO {s}.post_candidates VALUES (1, 101);
+            INSERT INTO {s}.post_bridge_cache VALUES (1, '{{"body": "x"}}');
+            """
+        )
+        cur.execute(_shipped_feed_function())
+    other.commit()
+    try:
+        yield other
+    finally:
+        other.rollback()
+        other.set_session(readonly=False)
+        with other.cursor() as cur:
+            cur.execute(f"DROP SCHEMA IF EXISTS {s} CASCADE")
+        other.commit()
+
+
+def _last_read(session, when):
+    session.set_session(readonly=False)
+    with session.cursor() as cur:
+        cur.execute(
+            f"UPDATE {_FEED_SCHEMA}.active_users "
+            f"SET last_read_at = (NOW() AT TIME ZONE 'utc') - INTERVAL '{when}'"
+        )
+    session.commit()
+
+
+def _get_feed(session, username, page, *, switch=None):
+    """One GET: the shipped function, in its own READ ONLY transaction."""
+    session.set_session(readonly=True)
+    with session.cursor() as cur:
+        if switch is not None:
+            cur.execute("SELECT set_config('haf_fyp.feed_read_notify', %s, true)", (switch,))
+        cur.execute(f"SELECT {_FEED_SCHEMA}.get_personalized_feed(%s, %s)", (username, page))
+        posts = cur.fetchone()[0]
+        cur.execute("SHOW transaction_read_only")
+        assert cur.fetchone()[0] == "on"
+    session.commit()
+    return posts
+
+
+def _silent_then_control(conn, session):
+    """Nothing has arrived, shown by a control sent last that does."""
+    session.set_session(readonly=False)
+    _notify(session, "control")
+    session.commit()
+    return _drain_for(conn, 2, until={"control"}) == {"control"}
+
+
+def test_the_shipped_function_notifies_the_ranker_on_a_page_one_read(conn, shipped_feed):
+    rd._listen_for_feed_reads(conn)
+
+    posts = _get_feed(shipped_feed, "alice", 1)
+
+    assert [p["fyp"]["source"] for p in posts] == ["personalized"]
+    assert _drain_for(conn, 3, until={"alice"}) == {"alice"}
+
+
+def test_the_shipped_function_is_silent_on_a_scroll_and_for_an_account_without_a_feed(
+    conn, shipped_feed
+):
+    rd._listen_for_feed_reads(conn)
+
+    _get_feed(shipped_feed, "alice", 2)  # page 2 of a cached feed
+    assert _get_feed(shipped_feed, "nobody", 1) == []  # no cached feed, no global one
+
+    assert _silent_then_control(conn, shipped_feed)
+
+
+def test_the_shipped_function_does_not_notify_again_within_ten_minutes(conn, shipped_feed):
+    rd._listen_for_feed_reads(conn)
+    _last_read(shipped_feed, "9 minutes")
+
+    _get_feed(shipped_feed, "alice", 1)
+
+    assert _silent_then_control(conn, shipped_feed)
+
+
+def test_the_shipped_function_notifies_again_once_ten_minutes_have_passed(conn, shipped_feed):
+    rd._listen_for_feed_reads(conn)
+    _last_read(shipped_feed, "11 minutes")
+
+    _get_feed(shipped_feed, "alice", 1)
+
+    assert _drain_for(conn, 3, until={"alice"}) == {"alice"}
+
+
+def test_an_operator_can_switch_the_notify_off_without_reinstalling(conn, shipped_feed):
+    rd._listen_for_feed_reads(conn)
+
+    posts = _get_feed(shipped_feed, "alice", 1, switch="off")
+
+    assert len(posts) == 1, "the feed is served either way"
+    assert _silent_then_control(conn, shipped_feed)
+
+
+def test_any_other_value_of_the_switch_leaves_the_notify_on(conn, shipped_feed):
+    rd._listen_for_feed_reads(conn)
+
+    _get_feed(shipped_feed, "alice", 1, switch="on")
+
+    assert _drain_for(conn, 3, until={"alice"}) == {"alice"}
+
+
+# --------------------------------------------------------------------------
+# The in-place upgrade, as shipped
+# --------------------------------------------------------------------------
+
+
+def _shipped_reader_ddl(schema):
+    sql = open(CREATE_TABLES_SQL, encoding="utf-8").read()
+    alter = re.search(
+        r"ALTER TABLE haf_fyp_app\.active_users\s+ADD COLUMN IF NOT EXISTS last_read_at[^;]*;", sql
+    )
+    index = re.search(r"CREATE INDEX IF NOT EXISTS idx_active_users_last_read_at[^;]*;", sql)
+    assert alter and index, "db/create_tables.sql no longer upgrades active_users in place"
+    return [m.group(0).replace("haf_fyp_app.", f"{schema}.") for m in (alter, index)]
+
+
+def test_the_shipped_upgrade_adds_the_column_and_its_index_to_an_installed_table(other):
+    s = "fyp81_upgrade"
+    with other.cursor() as cur:  # one transaction, rolled back by the fixture
+        cur.execute(f"CREATE SCHEMA {s}")
+        cur.execute(
+            f"""
+            CREATE TABLE {s}.active_users (
+                username varchar(16) NOT NULL PRIMARY KEY,
+                last_interaction_at timestamp, last_block int, last_scored_at timestamp);
+            INSERT INTO {s}.active_users (username) VALUES ('installed');
+            """
+        )
+        for _ in range(2):  # install_app re-runs the file: must be idempotent
+            for statement in _shipped_reader_ddl(s):
+                cur.execute(statement)
+
+        cur.execute(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = 'active_users' "
+            "AND column_name = 'last_read_at'",
+            (s,),
+        )
+        # Naive, like last_scored_at: the ranker compares both against
+        # NOW() AT TIME ZONE 'utc'.
+        assert cur.fetchone() == ("timestamp without time zone",)
+        cur.execute(f"SELECT username, last_read_at FROM {s}.active_users")
+        assert cur.fetchall() == [("installed", None)]
+        cur.execute(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = %s "
+            "AND indexname = 'idx_active_users_last_read_at'",
+            (s,),
+        )
+        (indexdef,) = cur.fetchone()
+        assert "(last_read_at)" in indexdef and "WHERE (last_read_at IS NOT NULL)" in indexdef

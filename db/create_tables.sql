@@ -506,7 +506,7 @@ REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.feed_metrics_daily   FROM haf_fyp_u
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.embedding_coverage_daily FROM haf_fyp_user;
 REVOKE UPDATE               ON haf_fyp_app.feed_events_rollup_state FROM haf_fyp_user;
 REVOKE DELETE               ON haf_fyp_app.feed_events            FROM haf_fyp_user;
--- active_users: UPDATE is the ranker's (last_scored_at, as owner);
+-- active_users: UPDATE is the ranker's (last_scored_at and last_read_at, as owner);
 -- DELETE is the #10 rotation eviction, also owner-only. Both are REVOKEd rather
 -- than merely left ungranted, so an older deployment that ever received a blanket
 -- grant is narrowed too and the un-opt-in endpoint cannot quietly acquire them.
