@@ -1568,6 +1568,14 @@ BEGIN
         SELECT 1 FROM haf_fyp_app.feed_cache fc
         WHERE fc.username = get_personalized_feed.username
     ) THEN
+        -- #81: tell the ranker this feed is being read, so readers are ranked ahead
+        -- of the accounts nobody looks at. A GET runs in a read-only transaction and
+        -- cannot write, but it can notify. First page only: one signal per visit,
+        -- not one per scroll. Inside the EXISTS branch, so the payload is always a
+        -- username that already has a feed, never caller-supplied text.
+        IF _offset = 0 THEN
+            PERFORM pg_notify('haf_fyp_feed_read', get_personalized_feed.username);
+        END IF;
         -- Observer context makes active_votes / muted state account-aware,
         -- exactly as a logged-in trending feed would be.
         _observer_id := COALESCE(

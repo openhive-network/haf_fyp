@@ -172,6 +172,7 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.active_users (
     last_interaction_at timestamp,   -- NULL = opted in but never interacted
     last_block int,                  -- NULL = opted in but never interacted
     last_scored_at timestamp,        -- when the ranker last built this user's feed (NULL = never)
+    last_read_at timestamp,          -- when this user's feed was last requested (NULL = never), UTC
     PRIMARY KEY (username)
 );
 
@@ -180,6 +181,19 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.active_users (
 ALTER TABLE haf_fyp_app.active_users
 ALTER COLUMN last_interaction_at DROP NOT NULL,
 ALTER COLUMN last_block DROP NOT NULL;
+
+-- #81: the rotation holds every account we can personalize for (tens of thousands),
+-- while a few hundred ever open their feed. last_read_at is how the ranker tells them
+-- apart: get_personalized_feed notifies on a page-1 read, the ranker stamps the row,
+-- and the scheduled cycle takes recent readers first. In-place upgrade for installs
+-- that predate the column. The partial index keeps "who read recently" proportional
+-- to the readership, not to the rotation.
+ALTER TABLE haf_fyp_app.active_users
+ADD COLUMN IF NOT EXISTS last_read_at timestamp;
+
+CREATE INDEX IF NOT EXISTS idx_active_users_last_read_at
+ON haf_fyp_app.active_users (last_read_at)
+WHERE last_read_at IS NOT NULL;
 
 -- #10: rows LEAVE the rotation now. Until then a row could only ever be added, so a
 -- cleared or abandoned interest-picker opt-in held one of the shared

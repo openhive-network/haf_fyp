@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import queue
+import re
 import signal
 import threading
 import time
@@ -84,6 +85,33 @@ CANDIDATE_LIMIT = 5000
 # (i.e. active) users fresh, oldest-first, capped at MAX_USERS_PER_CYCLE so each
 # pass stays bounded no matter how large the subscriber base grows.
 MAX_USERS_PER_CYCLE = int(os.environ.get("MAX_USERS_PER_CYCLE", "200"))
+
+# Readers first (#81). The rotation holds every account there is something to
+# personalize for; almost none of them ever open their feed. Ranked round-robin, a
+# reader's feed was as old as the whole rotation takes (22 h at 45k accounts and 200
+# per cycle). get_personalized_feed notifies FEED_READ_CHANNEL on a page-1 read; this
+# daemon stamps active_users.last_read_at, re-ranks a reader whose feed is older than
+# READ_REFRESH_MIN_AGE_SECONDS straight away, and gives accounts that read within
+# READER_WINDOW_SECONDS the front of every scheduled cycle.
+#
+# Every one of these is a ceiling on work a caller can cause: the feed endpoint is
+# public and takes any username, so "a read" is not evidence of a person.
+FEED_READ_CHANNEL = "haf_fyp_feed_read"
+READER_WINDOW_SECONDS = int(os.environ.get("READER_WINDOW_SECONDS", str(7 * 24 * 60 * 60)))
+# Share of MAX_USERS_PER_CYCLE that recent readers may take. The remainder always goes
+# to the stalest of everyone else, so a flood of reads slows the rotation by at most
+# 1 / (1 - share) and can never stop it. 0 turns the reader lane off.
+READER_CYCLE_SHARE = min(1.0, max(0.0, float(os.environ.get("READER_CYCLE_SHARE", "0.5"))))
+READ_REFRESH_MIN_AGE_SECONDS = int(os.environ.get("READ_REFRESH_MIN_AGE_SECONDS", "600"))
+# Immediate re-ranks per pass of the main loop. Readers beyond it are not lost: they
+# are stamped, so the next scheduled cycle takes them first.
+READ_REFRESH_MAX_PER_PASS = int(os.environ.get("READ_REFRESH_MAX_PER_PASS", "50"))
+# Distinct usernames kept from one drain. Notifications pile up on the connection for
+# the length of a cycle; this bounds the array handed to the UPDATE below.
+_FEED_READ_MAX_PER_DRAIN = 5000
+# A Hive account name. The payload comes out of feed_cache, so this never rejects a
+# real one; it is here so nothing else can ride the channel into a query parameter.
+_USERNAME_RE = re.compile(r"[a-z0-9.-]{3,16}")
 
 
 # Rotation eviction + #9-invariant repair (#10), on the hourly maintenance cadence.
@@ -232,6 +260,7 @@ def _connect() -> psycopg2.extensions.connection:
             log.info("connected to database")
             _current_conn = conn
             _take_app_locks(conn)
+            _listen_for_feed_reads(conn)
             return conn
         except psycopg2.OperationalError as exc:
             log.warning("database not ready (%s) — retrying in 5s", exc)
@@ -241,6 +270,81 @@ def _connect() -> psycopg2.extensions.connection:
         if conn is not None:
             conn.close()
         time.sleep(5)
+
+
+def _listen_for_feed_reads(conn) -> None:
+    """LISTEN on the session main() uses, so no second connection and no thread: the
+    notifications wait on this socket and _drain_feed_reads collects them between
+    passes. LISTEN belongs to the session, which is why every reconnect repeats it."""
+    with conn.cursor() as cur:
+        cur.execute(f"LISTEN {FEED_READ_CHANNEL}")
+    conn.commit()
+
+
+def _drain_feed_reads(conn) -> set[str]:
+    """Usernames whose feed was requested since the last drain (#81)."""
+    conn.poll()
+    names: set[str] = set()
+    dropped = 0
+    while conn.notifies:
+        note = conn.notifies.pop(0)
+        if note.channel != FEED_READ_CHANNEL or not _USERNAME_RE.fullmatch(note.payload or ""):
+            continue
+        if note.payload not in names and len(names) >= _FEED_READ_MAX_PER_DRAIN:
+            dropped += 1
+            continue
+        names.add(note.payload)
+    if dropped:
+        log.warning(
+            "feed-read signals: kept %d distinct accounts, dropped %d more (ceiling %d)",
+            len(names), dropped, _FEED_READ_MAX_PER_DRAIN,
+        )
+    return names
+
+
+def _note_feed_reads(conn, usernames: set[str]) -> set[str]:
+    """
+    Stamp last_read_at for the rotation members among `usernames`, and return the ones
+    whose feed is old enough to re-rank now (at most READ_REFRESH_MAX_PER_PASS, stalest
+    first).
+
+    Rows are taken FOR UPDATE SKIP LOCKED before they are updated. The block processor
+    upserts many active_users rows per batch in its own order, and a second multi-row
+    writer on the same table is how two sessions end up each holding a row the other
+    wants; skipping a locked row cannot wait, so it cannot deadlock. A skipped account
+    only misses this one stamp. An account with no row is not a member and is left out,
+    the same rule _run_targeted_refresh applies.
+    """
+    if not usernames:
+        return set()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH picked AS (
+                SELECT username, last_scored_at
+                  FROM haf_fyp_app.active_users
+                 WHERE username = ANY(%s)
+                 ORDER BY username
+                   FOR UPDATE SKIP LOCKED
+            ), stamped AS (
+                UPDATE haf_fyp_app.active_users au
+                   SET last_read_at = (NOW() AT TIME ZONE 'utc')
+                  FROM picked
+                 WHERE au.username = picked.username
+             RETURNING au.username, picked.last_scored_at
+            )
+            SELECT username
+              FROM stamped
+             WHERE last_scored_at IS NULL
+                OR last_scored_at < (NOW() AT TIME ZONE 'utc') - make_interval(secs => %s)
+             ORDER BY last_scored_at ASC NULLS FIRST
+             LIMIT %s
+            """,
+            (sorted(usernames), READ_REFRESH_MIN_AGE_SECONDS, READ_REFRESH_MAX_PER_PASS),
+        )
+        stale = {r[0] for r in cur.fetchall()}
+    conn.commit()
+    return stale
 
 
 def _redis_subscriber(refresh_q: "queue.Queue[str]") -> None:
@@ -365,7 +469,12 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
     to NULLS FIRST, which would hand never-interacted lurkers priority over
     engaged users at equal staleness — engagement signal should win ties.
 
-    This stays a single ORDER BY on purpose. #10 considered reserving a share of
+    #81 puts recent readers ahead of that order, in at most READER_CYCLE_SHARE of the
+    cycle; the remainder is filled exactly as before, from everyone else. The round-
+    robin argument below therefore still holds for the remainder, at a rate reduced
+    by the share actually used.
+
+    The remainder stays a single ORDER BY on purpose. #10 considered reserving a share of
     each cycle for never-interacted opt-ins, but the ordering above is ALREADY a
     round-robin — a scored user goes to the back of the queue, so every account
     is reached within ceil(N / limit) cycles and nothing starves. The only real
@@ -375,18 +484,36 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
     table; a quota would have cost every engaged user a third of the cycle to
     treat a symptom eviction removes.
     """
+    readers: list[str] = []
+    reader_slots = int(limit * READER_CYCLE_SHARE)
     with conn.cursor() as cur:
+        if reader_slots > 0:
+            # #81: accounts whose feed was requested recently come first, stalest feed
+            # first. last_scored_at and last_read_at are both naive UTC.
+            cur.execute(
+                """
+                SELECT username
+                  FROM haf_fyp_app.active_users
+                 WHERE last_read_at >= (NOW() AT TIME ZONE 'utc') - make_interval(secs => %s)
+                 ORDER BY last_scored_at ASC NULLS FIRST,
+                          last_read_at DESC
+                 LIMIT %s
+                """,
+                (READER_WINDOW_SECONDS, reader_slots),
+            )
+            readers = [r[0] for r in cur.fetchall()]
         cur.execute(
             """
             SELECT username
               FROM haf_fyp_app.active_users
+             WHERE NOT (username = ANY(%s))
              ORDER BY last_scored_at ASC NULLS FIRST,
                       last_interaction_at DESC NULLS LAST
              LIMIT %s
             """,
-            (limit,),
+            (readers, limit - len(readers)),
         )
-        return [r[0] for r in cur.fetchall()]
+        return readers + [r[0] for r in cur.fetchall()]
 
 
 def _rotation_members(conn, usernames: list[str]) -> set[str]:
@@ -964,6 +1091,17 @@ def main() -> None:
                 pending.add(_refresh_queue.get_nowait())
             except queue.Empty:
                 break
+
+        # #81: feed reads. Stamp them, and re-rank now the readers whose feed is old.
+        # Best-effort like the Redis path: a failure here costs freshness, not a cycle.
+        try:
+            pending |= _note_feed_reads(conn, _drain_feed_reads(conn))
+        except psycopg2.OperationalError:
+            log.warning("database connection lost (feed reads) — reconnecting")
+            conn = _reconnect(conn)
+        except Exception:
+            log.exception("feed-read handling failed")
+            _safe_rollback(conn)
 
         if pending:
             try:
