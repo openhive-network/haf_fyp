@@ -18,8 +18,11 @@ The operations are modelled here as rows in a stand-in hive.operations_view and 
 shipped SQL runs over them unchanged.
 
 What this file does NOT prove: the constraints a wrong statement trips over here (NOT
-NULL, the primary keys, the unique index) are this file's own DDL, written to match
-db/create_tables.sql. Nothing holds the two together.
+NULL, the primary keys, the unique index) are this file's own DDL. It is a SUBSET of
+db/create_tables.sql, not a copy: user_communities matches, but post_candidates has
+nullable author and permlink and a unique index where the real table has a constraint,
+and post_lookup and engagement_metrics carry no foreign keys or counters. Nothing holds
+the two together. The block times are invented.
 
 Runs in the fastapi-tests job, which already has a real postgres and already runs
 tests/integration/. Everything this file creates is rolled back.
@@ -99,8 +102,9 @@ def _connect():
         user=os.environ.get("POSTGRES_USER", "haf_fyp_user"),
         password=os.environ.get("POSTGRES_PASSWORD", ""),
         connect_timeout=3,
-        # The scaffold takes ACCESS EXCLUSIVE locks (ALTER TABLE). Behind a session that
-        # never lets go, that is a job hung until its timeout; with these it is a failure.
+        # The stub and the scaffold take ACCESS EXCLUSIVE locks (ALTER TABLE). Behind a
+        # session that never lets go, that is a job hung until its timeout; with these it
+        # is a failure.
         options="-c lock_timeout=10000 -c statement_timeout=30000",
     )
 
@@ -122,11 +126,20 @@ def conn():
             # Never on a real HAF. There hive.operations_view is a VIEW, the tables below
             # hold a node's data, and this fixture would lock them and delete from them
             # (rolled back, but a block processor would wait on it meanwhile).
-            cur.execute("SELECT relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-                        "WHERE n.nspname = 'hive' AND c.relname = 'operations_view'")
-            row = cur.fetchone()
-            if row is not None and row[0] != "r":
-                pytest.skip("this database is a real HAF; these tests only run against the stub")
+            # An installed haf_fyp without HAF's view is refused the same way: nothing in
+            # the stub lane creates user_communities, so one that is already there is
+            # somebody's data.
+            cur.execute("SELECT n.nspname || '.' || c.relname FROM pg_class c "
+                        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                        "WHERE (n.nspname = 'hive' AND c.relname = 'operations_view' AND c.relkind <> 'r') "
+                        "   OR (n.nspname = 'haf_fyp_app' AND c.relname = 'user_communities')")
+            real = [r[0] for r in cur.fetchall()]
+            if real:
+                reason = f"not the stub database ({', '.join(real)} already there)"
+                # In CI that is a lane that changed shape, and a skip would keep it green.
+                if os.environ.get("CI"):
+                    pytest.fail(reason)
+                pytest.skip(reason)
             cur.execute(open(STUB_SQL).read())
             cur.execute(SCAFFOLD)
             # In the order scripts/install_app.sh loads them: process_communities.sql
@@ -158,13 +171,14 @@ def community_op(cur, user, action, community, **kwargs):
     custom_json(cur, json.dumps([action, {"community": community}]), posting=(user,), **kwargs)
 
 
-def comment(cur, author, permlink, parent_permlink, *, parent_author="", block=BLOCK):
+def comment(cur, author, permlink, parent_permlink, *, parent_author="", block=BLOCK,
+            json_metadata="{}", op_type=COMMENT):
     body = {"type": "comment_operation",
             "value": {"parent_author": parent_author, "parent_permlink": parent_permlink,
-                      "author": author, "permlink": permlink, "title": "t",
-                      "body": "b", "json_metadata": "{}"}}
+                      "author": author, "permlink": permlink, "title": f"title of {permlink}",
+                      "body": "four", "json_metadata": json_metadata}}
     cur.execute("INSERT INTO hive.operations_view VALUES (%s, %s, %s, %s)",
-                (next(_next_id), block, COMMENT, json.dumps(body)))
+                (next(_next_id), block, op_type, json.dumps(body)))
 
 
 def subscriptions(cur) -> set:
@@ -256,6 +270,10 @@ def test_subscribing_again_is_not_an_error(conn):
         run(cur, "process_subscribe")
 
         assert subscriptions(cur) == {("alice", 123456), ("carol", 123456)}
+        # alice's row carries the block's time; carol's is the one she already had.
+        cur.execute("SELECT username, subscribed_at = '2019-09-20 12:00:00' "
+                    "FROM haf_fyp_app.user_communities")
+        assert dict(cur.fetchall()) == {"alice": True, "carol": False}
 
 
 def test_a_community_op_signed_with_the_active_key_is_skipped(conn):
@@ -278,13 +296,30 @@ def test_only_subscribe_ops_of_the_community_protocol_in_range_subscribe(conn):
         community_op(cur, "before", "subscribe", "hive-123456", block=BLOCK - 1)
         community_op(cur, "after", "subscribe", "hive-123456", block=BLOCK + 1)
         community_op(cur, "leaving", "unsubscribe", "hive-123456")
-        for action in ("setRole", "updateProps", "resubscribe", "Subscribe"):
+        for action in ("setRole", "updateProps", "resubscribe", "Subscribe", "subscribeAll"):
             custom_json(cur, json.dumps([action, name]), posting=("other",))
         community_op(cur, "alice", "subscribe", "hive-123456")
 
         run(cur, "process_subscribe")
 
         assert subscriptions(cur) == {("alice", 123456)}
+
+
+def test_a_range_of_several_blocks_is_processed_whole(conn):
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO haf_fyp_app.user_communities VALUES "
+                    "('x', 777, now()), ('y', 777, now()), ('z', 777, now())")
+        for user, block in (("a", BLOCK - 1), ("b", BLOCK), ("c", BLOCK + 1)):
+            community_op(cur, user, "subscribe", "hive-123456", block=block)
+            comment(cur, user, "post", "hive-123456", block=block)
+        for user, block in (("x", BLOCK - 1), ("y", BLOCK), ("z", BLOCK + 1)):
+            community_op(cur, user, "unsubscribe", "hive-777", block=block)
+
+        run(cur, "process_communities", BLOCK - 1, BLOCK + 1)
+        run(cur, "process_posts", BLOCK - 1, BLOCK + 1)
+
+        assert subscriptions(cur) == {("a", 123456), ("b", 123456), ("c", 123456)}
+        assert {p[0] for p in posts(cur)} == {"a", "b", "c"}
 
 
 # --- unsubscribe -------------------------------------------------------------------
@@ -316,6 +351,11 @@ def test_only_unsubscribe_ops_of_the_community_protocol_in_range_unsubscribe(con
         community_op(cur, "before", "unsubscribe", "hive-123456", block=BLOCK - 1)
         community_op(cur, "after", "unsubscribe", "hive-123456", block=BLOCK + 1)
         community_op(cur, "joining", "subscribe", "hive-123456")
+        for action in ("Unsubscribe", "unsubscribeAll", "xunsubscribe"):
+            custom_json(cur, json.dumps([action, {"community": "hive-123456"}]), posting=("joining",))
+        # Signed with the active key only: no posting auth, so nobody to unsubscribe.
+        custom_json(cur, json.dumps(["unsubscribe", {"community": "hive-123456"}]),
+                    posting=(), active=("wrongid",))
         community_op(cur, "alice", "unsubscribe", "hive-123456")
 
         run(cur, "process_unsubscribe")
@@ -343,16 +383,24 @@ def test_the_dispatcher_runs_both(conn):
     '["{action}", "hive-123456"]',          # second element is not an object
     '["{action}", null]',
     '["{action}", {{"name": "hive-123456"}}]',   # an object without the key
-    '{{"community": "hive-123456"}}',       # an object where the array belongs
+    '{{"{action}": {{"community": "hive-123456"}}}}',   # an object where the array belongs
+    '["{action}", {{"community": "hive-123456"}}',       # not JSON: the array never closes
+    '{action} hive-123456',                 # not JSON at all
+    '',
 ], ids=repr)
 def test_a_payload_of_the_wrong_shape_changes_nothing(conn, action, payload):
+    """eve holds 777 and sends the junk. A lenient subscribe would add (eve, 123456); a
+    lenient unsubscribe is tried against a row she does hold, below."""
     with conn.cursor() as cur:
-        cur.execute("INSERT INTO haf_fyp_app.user_communities VALUES ('mallory', 123456, now())")
-        custom_json(cur, payload.format(action=action))
+        cur.execute("INSERT INTO haf_fyp_app.user_communities VALUES "
+                    "('eve', 777, now()), ('eve', 123456, now())" if action == "unsubscribe"
+                    else "INSERT INTO haf_fyp_app.user_communities VALUES ('eve', 777, now())")
+        before = subscriptions(cur)
+        custom_json(cur, payload.format(action=action), posting=("eve",))
 
         run(cur, "process_communities")
 
-        assert subscriptions(cur) == {("mallory", 123456)}
+        assert subscriptions(cur) == before
 
 
 # --- posts -------------------------------------------------------------------------
@@ -384,7 +432,8 @@ def test_a_post_keeps_its_tag_when_the_tag_only_looks_like_a_community(conn):
 
 def test_only_root_posts_in_range_become_candidates_and_an_edit_is_not_an_error(conn):
     """An edit is the same (author, permlink) again: in one range, and for a post an
-    earlier range already wrote. Neither may raise, and the first one stands."""
+    earlier range already wrote. Neither may raise, and what an earlier range wrote
+    stands (the two in one range are identical, so which of them wins is not checked)."""
     with conn.cursor() as cur:
         comment(cur, "early", "post", "hive-123456", block=BLOCK - 1)
         run(cur, "process_posts", BLOCK - 1, BLOCK - 1)
@@ -395,10 +444,44 @@ def test_only_root_posts_in_range_become_candidates_and_an_edit_is_not_an_error(
         comment(cur, "alice", "post", "hive-123456")          # edited in the same range
         comment(cur, "bob", "re-post", "post", parent_author="alice")   # a reply
         comment(cur, "late", "post", "hive-123456", block=BLOCK + 1)
+        comment(cur, "notacomment", "post", "hive-123456", op_type=VOTE)
 
         run(cur, "process_posts")
 
         assert posts(cur) == {
             ("early", "post", 123456, "hive-123456"),
             ("alice", "post", 123456, "hive-123456"),
+        }
+
+
+def test_a_post_is_written_whole_whatever_its_metadata_holds(conn):
+    """json_metadata is as unvalidated as the community field. What cannot be parsed
+    costs the post its tags, not the batch."""
+    with conn.cursor() as cur:
+        comment(cur, "alice", "tagged", "hive-123456",
+                json_metadata=json.dumps({"tags": ["photo", "travel"]}))
+        comment(cur, "bob", "tags-not-a-list", "photography", json_metadata='{"tags": "photo"}')
+        comment(cur, "carol", "not-json", "photography", json_metadata='{"tags": ["photo"')
+        comment(cur, "dave", "empty", "photography", json_metadata="")
+
+        run(cur, "process_posts")
+
+        cur.execute("SELECT author, title, tags, body_length, created_at = '2019-09-20 12:00:00' "
+                    "FROM haf_fyp_app.post_candidates")
+        assert {(a, t, tuple(g), n, at) for a, t, g, n, at in cur.fetchall()} == {
+            ("alice", "title of tagged", ("photo", "travel"), 4, True),
+            ("bob", "title of tags-not-a-list", (), 4, True),
+            ("carol", "title of not-json", (), 4, True),
+            ("dave", "title of empty", (), 4, True),
+        }
+        # The two tables every later processor joins through.
+        cur.execute("SELECT pc.author, pl.author, pl.permlink, em.post_id IS NOT NULL "
+                    "FROM haf_fyp_app.post_candidates pc "
+                    "LEFT JOIN haf_fyp_app.post_lookup pl USING (post_id) "
+                    "LEFT JOIN haf_fyp_app.engagement_metrics em USING (post_id)")
+        assert set(cur.fetchall()) == {
+            ("alice", "alice", "tagged", True),
+            ("bob", "bob", "tags-not-a-list", True),
+            ("carol", "carol", "not-json", True),
+            ("dave", "dave", "empty", True),
         }
