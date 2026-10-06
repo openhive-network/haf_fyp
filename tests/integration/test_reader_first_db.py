@@ -40,6 +40,7 @@ def _schema_has_the_read_column(monkeypatch):
     # What _listen_for_feed_reads finds on this database. Set here so the tests that
     # never listen exercise the reader lane too, and restored after each test.
     monkeypatch.setattr(rd, "_reads_supported", True)
+    monkeypatch.setattr(rd, "_missing_column_warned", False)
 
 
 def _connect():
@@ -163,6 +164,18 @@ def test_the_immediate_reranks_are_capped_and_take_the_stalest(conn, monkeypatch
     assert _read_age_seconds(conn, "old3") is not None
 
 
+def test_a_later_read_moves_the_stamp_and_can_trigger_a_rerank(conn, monkeypatch):
+    # Without this the reader window never slides, and someone who comes back is never
+    # re-ranked on read again.
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    _user(conn, "returning", scored="1 hour", read="3 hours")
+
+    stale = rd._note_feed_reads(conn, {"returning"}, 10)
+
+    assert stale == {"returning"}
+    assert 0 <= _read_age_seconds(conn, "returning") < 60
+
+
 def test_a_spent_budget_still_stamps_every_reader(conn, monkeypatch):
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
     _user(conn, "old", scored="3 hours")
@@ -208,9 +221,10 @@ def test_the_stamp_is_committed(conn, other):
 def test_recent_readers_are_ranked_ahead_of_a_staler_rotation(conn, monkeypatch):
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
-    # The whole point of #81: this reader was ranked a minute ago and would be LAST
-    # in the round-robin, behind accounts nobody has ever opened a feed for.
-    _user(conn, "reader", scored="1 minute", read="2 minutes")
+    # The whole point of #81: this reader was ranked twenty minutes ago and would be
+    # LAST in the round-robin, behind accounts nobody has ever opened a feed for.
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    _user(conn, "reader", scored="20 minutes", read="2 minutes")
     _user(conn, "idle_a", scored="20 hours")
     _user(conn, "idle_b", scored="10 hours")
     _user(conn, "idle_c", scored="5 hours")
@@ -230,7 +244,8 @@ def test_a_read_outside_the_window_earns_no_priority(conn, monkeypatch):
 def test_readers_are_capped_and_the_stalest_reader_goes_first(conn, monkeypatch):
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
-    for name, scored in (("r_old", "50 minutes"), ("r_mid", "30 minutes"), ("r_new", "1 minute")):
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    for name, scored in (("r_old", "50 minutes"), ("r_mid", "30 minutes"), ("r_new", "15 minutes")):
         _user(conn, name, scored=scored, read="1 minute")
     _user(conn, "idle_a", scored="20 hours")
     _user(conn, "idle_b", scored="10 hours")
@@ -241,15 +256,40 @@ def test_readers_are_capped_and_the_stalest_reader_goes_first(conn, monkeypatch)
     assert rd._fetch_personalised_users(conn, 4) == ["r_old", "r_mid", "idle_a", "idle_b"]
 
 
-def test_nobody_is_returned_twice_and_the_cycle_is_filled(conn, monkeypatch):
+def test_a_reader_is_returned_once_although_both_queries_could_take_it(conn, monkeypatch):
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
-    _user(conn, "reader", scored="1 minute", read="1 minute")
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    _user(conn, "reader", scored="20 minutes", read="1 minute")
     _user(conn, "idle", scored="20 hours")
 
-    got = rd._fetch_personalised_users(conn, 10)
+    assert rd._fetch_personalised_users(conn, 10) == ["reader", "idle"]
 
-    assert sorted(got) == ["idle", "reader"]
+
+def test_a_reader_ranked_a_moment_ago_does_not_take_a_lane_slot(conn, monkeypatch):
+    """The lane would otherwise re-rank the same accounts every cycle however fresh
+    their feed, and a full lane holds everyone else at half speed for nothing."""
+    monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
+    monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    _user(conn, "just_ranked", scored="5 minutes", read="2 minutes")
+    _user(conn, "idle_a", scored="20 hours")
+    _user(conn, "idle_b", scored="10 hours")
+
+    # One lane slot, and nobody qualifies for it: the cycle goes to the rotation.
+    assert rd._fetch_personalised_users(conn, 2) == ["idle_a", "idle_b"]
+    assert (rd._lane_taken, rd._lane_slots) == (0, 1)
+
+
+def test_a_never_ranked_reader_takes_a_lane_slot_whatever_the_minimum_age(conn, monkeypatch):
+    monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
+    monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    _user(conn, "new_reader", scored=None, read="2 minutes")
+    _user(conn, "idle", scored="20 hours")
+
+    assert rd._fetch_personalised_users(conn, 2) == ["new_reader", "idle"]
+    assert (rd._lane_taken, rd._lane_slots) == (1, 1)
 
 
 def test_without_readers_the_rotation_is_exactly_what_it_was(conn, monkeypatch):
@@ -370,8 +410,12 @@ def test_the_connection_holds_a_bounded_backlog(conn, other, monkeypatch):
     for name in ("user1", "user2", "user3", "user4", "user5"):
         _notify(other, name)
         other.commit()
-    time.sleep(0.3)
-    conn.poll()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        conn.poll()
+        if conn.notifies and conn.notifies[-1].payload == "user5":
+            break
+        time.sleep(0.05)
 
     # psycopg2 appends to whatever conn.notifies is; the oldest fall off the deque.
     assert [n.payload for n in conn.notifies] == ["user3", "user4", "user5"]
@@ -411,13 +455,32 @@ def test_the_stamp_and_the_staleness_test_are_utc_on_a_server_that_is_not(tokyo,
 def test_the_reader_window_is_utc_on_a_server_that_is_not(tokyo, monkeypatch):
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 3600)
-    _user(tokyo, "lapsed", scored="1 minute", read="2 hours")
-    _user(tokyo, "reader", scored="1 minute", read="2 minutes")
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    _user(tokyo, "reader", scored="20 minutes", read="2 minutes")
     _user(tokyo, "idle", scored="20 hours")
 
-    # Read as Tokyo time the window would reach nine hours further back and take the
-    # lapsed reader as well.
+    # Compared as Tokyo time the read looks nine hours old, outside the hour's window.
     assert rd._fetch_personalised_users(tokyo, 2) == ["reader", "idle"]
+
+
+def test_the_lanes_minimum_age_is_utc_on_a_server_that_is_not(tokyo, monkeypatch):
+    monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
+    monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    _user(tokyo, "just_ranked", scored="5 minutes", read=None)
+    with tokyo.cursor() as cur:
+        # A read stamped the way the ranker stamps it, so only the age test is in play.
+        cur.execute(
+            "UPDATE haf_fyp_app.active_users "
+            "SET last_read_at = (NOW() AT TIME ZONE 'utc') WHERE username = 'just_ranked'"
+        )
+    tokyo.commit()
+    _user(tokyo, "idle_a", scored="20 hours")
+    _user(tokyo, "idle_b", scored="10 hours")
+
+    # Compared as Tokyo time the five-minute-old feed looks nine hours old and takes
+    # the slot.
+    assert rd._fetch_personalised_users(tokyo, 2) == ["idle_a", "idle_b"]
 
 
 # --------------------------------------------------------------------------
@@ -615,10 +678,22 @@ def test_an_operator_can_switch_the_notify_off_without_reinstalling(conn, shippe
     assert _silent_then_control(conn, shipped_feed)
 
 
-def test_any_other_value_of_the_switch_leaves_the_notify_on(conn, shipped_feed):
+@pytest.mark.parametrize("spelling", ["OFF", " off ", "false", "False", "no", "0"])
+def test_the_switch_is_off_however_an_operator_spells_it(conn, shipped_feed, spelling):
+    # A switch that only understood lower-case "off" would fail open, silently, on the
+    # day someone needed it.
     rd._listen_for_feed_reads(conn)
 
-    _get_feed(shipped_feed, "alice", 1, switch="on")
+    _get_feed(shipped_feed, "alice", 1, switch=spelling)
+
+    assert _silent_then_control(conn, shipped_feed)
+
+
+@pytest.mark.parametrize("value", ["on", "true", "", "anything"])
+def test_any_other_value_of_the_switch_leaves_the_notify_on(conn, shipped_feed, value):
+    rd._listen_for_feed_reads(conn)
+
+    _get_feed(shipped_feed, "alice", 1, switch=value)
 
     assert _drain_for(conn, 3, until={"alice"}) == {"alice"}
 

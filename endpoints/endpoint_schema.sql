@@ -1578,16 +1578,20 @@ BEGIN
         -- cluster-wide lock), so this is rationed:
         --   * first page only: one signal per visit, not one per scroll;
         --   * only when the last read the ranker recorded is over ten minutes old.
-        --     The ranker stamps last_read_at when it hears, so a client that reloads
-        --     costs one signal per ten minutes, not one per request;
+        --     The ranker stamps last_read_at when it hears, so once it has, a client
+        --     that reloads costs one signal per ten minutes, not one per request.
+        --     Until it has (a few seconds normally, a whole cycle if one is running,
+        --     and for as long as the ranker is stopped) every first-page read notifies;
         --   * never on a standby, where NOTIFY is an error and would fail the read;
-        --   * not at all when an operator sets haf_fyp.feed_read_notify = off
-        --     (ALTER ROLE haf_fyp_user SET haf_fyp.feed_read_notify = 'off').
+        --   * not at all when an operator sets haf_fyp.feed_read_notify to off
+        --     (ALTER ROLE haf_fyp_user SET haf_fyp.feed_read_notify = 'off'), which is
+        --     what to do if the ranker is going to be down for long.
         -- Inside the EXISTS branch, so the payload is always the name of an account
         -- that has a cached feed.
         IF _offset = 0
            AND NOT pg_is_in_recovery()
-           AND COALESCE(current_setting('haf_fyp.feed_read_notify', true), 'on') <> 'off'
+           AND lower(btrim(COALESCE(current_setting('haf_fyp.feed_read_notify', true), 'on')))
+               NOT IN ('off', 'false', 'no', '0')
            AND EXISTS (
                SELECT 1 FROM haf_fyp_app.active_users au
                WHERE au.username = get_personalized_feed.username

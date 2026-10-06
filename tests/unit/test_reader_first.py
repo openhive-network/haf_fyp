@@ -8,6 +8,7 @@ tests/integration/test_reader_first_db.py; these pin the wiring around it.
 
 import collections
 import json
+import logging
 import os
 import re
 import subprocess
@@ -15,6 +16,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pandas as pd
 import psycopg2
 import pytest
 
@@ -31,6 +33,9 @@ def _reader_state(monkeypatch):
     monkeypatch.setattr(rd, "_reads_heard", 0)
     monkeypatch.setattr(rd, "_reads_reranked", 0)
     monkeypatch.setattr(rd, "_feed_read_failure_logged_at", 0.0)
+    monkeypatch.setattr(rd, "_missing_column_warned", False)
+    monkeypatch.setattr(rd, "_lane_taken", 0)
+    monkeypatch.setattr(rd, "_lane_slots", 0)
 
 
 def _note(payload, channel=rd.FEED_READ_CHANNEL):
@@ -131,20 +136,6 @@ def test_drain_keeps_real_shaped_account_names(name):
     assert rd._drain_feed_reads(_conn_with_notifies([_note(name)])) == {name}
 
 
-def test_drain_is_bounded_and_says_so(monkeypatch, caplog):
-    monkeypatch.setattr(rd, "_FEED_READ_MAX_PER_DRAIN", 3)
-    notes = [_note(f"user{i}") for i in range(5)] + [_note("user0")]
-    conn = _conn_with_notifies(notes)
-
-    with caplog.at_level("WARNING"):
-        got = rd._drain_feed_reads(conn)
-
-    assert got == {"user0", "user1", "user2"}
-    assert len(conn.notifies) == 0, "the excess is dropped, not left on the connection"
-    # A repeat of an account already kept is not a notification dropped.
-    assert "dropped 2 further notification(s)" in caplog.text
-
-
 def test_drain_lets_a_dead_connection_propagate():
     conn = _conn_with_notifies([])
     conn.poll.side_effect = psycopg2.OperationalError("server closed the connection")
@@ -215,12 +206,13 @@ def test_note_does_not_commit_when_the_statement_fails():
 def test_readers_come_first_and_the_rest_fills_the_cycle(monkeypatch):
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 3600)
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 77)
     conn, cur = _mock_conn([[("r1",), ("r2",)], [("s1",), ("s2",), ("s3",)]])
 
     assert rd._fetch_personalised_users(conn, 10) == ["r1", "r2", "s1", "s2", "s3"]
 
     reader_call, rest_call = cur.execute.call_args_list
-    assert reader_call.args[1] == (3600, 5), "readers may take at most the share"
+    assert reader_call.args[1] == (3600, 77, 5), "readers may take at most the share"
     # The remainder excludes the readers already taken and fills what is left of the
     # cycle, so two readers leave eight slots, not five.
     assert rest_call.args[1] == (["r1", "r2"], 8)
@@ -259,7 +251,7 @@ def test_the_reader_share_of_an_odd_cycle_rounds_down(monkeypatch, limit, slots)
 
     rd._fetch_personalised_users(conn, limit)
 
-    assert cur.execute.call_args_list[0].args[1][1] == slots
+    assert cur.execute.call_args_list[0].args[1][2] == slots
 
 
 def test_a_cycle_of_one_goes_to_the_rotation_not_to_a_reader(monkeypatch):
@@ -282,6 +274,28 @@ def test_even_the_largest_share_leaves_the_rotation_a_slot(monkeypatch):
     rd._fetch_personalised_users(conn, 10)
 
     assert cur.execute.call_args_list[1].args[1][1] == 1
+
+
+def test_the_lane_leaves_out_a_feed_that_was_ranked_a_moment_ago():
+    # Otherwise the lane re-ranks the same accounts every cycle however fresh they are,
+    # and a full lane holds everyone else at half speed for nothing.
+    conn, cur = _mock_conn([[], []])
+
+    rd._fetch_personalised_users(conn, 10)
+
+    assert (
+        "AND (last_scored_at IS NULL OR last_scored_at < (NOW() AT TIME ZONE 'utc') "
+        "- make_interval(secs => %s))" in _sql(cur.execute.call_args_list[0])
+    )
+
+
+def test_the_cycle_remembers_how_full_the_reader_lane_was(monkeypatch):
+    monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
+    conn, _cur = _mock_conn([[("r1",), ("r2",)], []])
+
+    rd._fetch_personalised_users(conn, 10)
+
+    assert (rd._lane_taken, rd._lane_slots) == (2, 5)
 
 
 def test_the_remainder_keeps_the_rotation_order():
@@ -348,12 +362,49 @@ def test_a_schema_without_the_read_column_is_reported_once_and_not_listened_to(c
 
     with caplog.at_level("WARNING"):
         rd._listen_for_feed_reads(conn)
+        rd._listen_for_feed_reads(conn)  # the schema is looked at again after each cycle
 
     assert rd._reads_supported is False
     assert not any("LISTEN" in c.args[0] for c in cur.execute.call_args_list)
-    assert "no last_read_at column" in caplog.text
+    assert caplog.text.count("no last_read_at column") == 1
     assert "re-run the install" in caplog.text
-    conn.commit.assert_called_once()
+    assert conn.commit.call_count == 2
+
+
+def test_the_reader_lane_is_announced_when_the_column_appears(caplog):
+    old, _ = _mock_conn([], fetchone=(False,))
+    new, cur = _mock_conn([], fetchone=(True,))
+
+    with caplog.at_level("INFO"):
+        rd._listen_for_feed_reads(old)
+        rd._listen_for_feed_reads(new)
+
+    assert rd._reads_supported is True
+    assert cur.execute.call_args_list[-1].args[0] == f"LISTEN {rd.FEED_READ_CHANNEL}"
+    assert "reader lane enabled" in caplog.text
+
+
+def test_a_failure_to_listen_is_not_reported_as_a_lock_failure(monkeypatch, caplog):
+    fake = MagicMock()
+    connects = []
+
+    def _connect(_dsn):
+        connects.append(1)
+        return fake
+
+    def _listen(_conn):
+        if len(connects) == 1:
+            raise psycopg2.ProgrammingError("permission denied")
+
+    monkeypatch.setattr(rd.psycopg2, "connect", _connect)
+    monkeypatch.setattr(rd, "_take_app_locks", lambda c: None)
+    monkeypatch.setattr(rd, "_listen_for_feed_reads", _listen)
+    monkeypatch.setattr(rd.time, "sleep", lambda _s: None)
+
+    with caplog.at_level("ERROR"):
+        assert rd._connect() is fake
+
+    assert "or listen for feed reads" in caplog.text
 
 
 # --------------------------------------------------------------------------
@@ -365,7 +416,20 @@ class _StopLoop(BaseException):
     """Ends main()'s `while True` from the sleep at the bottom of a pass."""
 
 
-def _drive_main(monkeypatch, *, passes=1, drain, note, queued=(), first_closed=0, cycle_every_pass=False):
+class _Clock:
+    """time.monotonic() for main(): each pass of the loop is POLL_SECONDS long."""
+
+    def __init__(self, start=1000.0):
+        self.now = start
+
+    def __call__(self):
+        return self.now
+
+
+def _drive_main(
+    monkeypatch, *, passes=1, drain, note, queued=(), first_closed=0,
+    cycle_every_pass=False, cycle=(), clock=None,
+):
     """Run main() for `passes` passes with everything but the feed-read block stubbed.
     `drain` and `note` are lists of per-pass results; an exception instance is raised.
     `queued` is what the Redis subscriber has put on the refresh queue."""
@@ -373,8 +437,9 @@ def _drive_main(monkeypatch, *, passes=1, drain, note, queued=(), first_closed=0
     first.closed, second.closed = first_closed, 0
     seen = SimpleNamespace(
         first=first, second=second, note=[], limits=[], targeted=[], cycle=[],
-        reconnect=[], rollback=[],
+        reconnect=[], rollback=[], listened=[],
     )
+    cycle = list(cycle)
 
     def _next(results):
         value = results.pop(0) if results else set()
@@ -393,7 +458,14 @@ def _drive_main(monkeypatch, *, passes=1, drain, note, queued=(), first_closed=0
 
     slept = []
 
+    def _run_cycle(conn):
+        seen.cycle.append(conn)
+        if cycle:
+            _next(cycle)
+
     def _sleep(_seconds):
+        if clock is not None:
+            clock.now += _seconds
         slept.append(1)
         if len(slept) >= passes:
             raise _StopLoop
@@ -416,7 +488,10 @@ def _drive_main(monkeypatch, *, passes=1, drain, note, queued=(), first_closed=0
     monkeypatch.setattr(
         rd, "_run_targeted_refresh", lambda conn, names: seen.targeted.append((conn, set(names)))
     )
-    monkeypatch.setattr(rd, "run_cycle", lambda conn: seen.cycle.append(conn))
+    monkeypatch.setattr(rd, "run_cycle", _run_cycle)
+    monkeypatch.setattr(rd, "_listen_for_feed_reads", lambda conn: seen.listened.append(conn))
+    if clock is not None:
+        monkeypatch.setattr(rd.time, "monotonic", clock)
     if cycle_every_pass:
         monkeypatch.setattr(rd, "CYCLE_SECONDS", -1)
     for maintenance in (
@@ -518,14 +593,6 @@ def test_main_reconnects_on_the_error_a_closed_connection_raises(monkeypatch):
     assert seen.cycle == [seen.second]
 
 
-def test_main_replaces_a_connection_it_finds_closed(monkeypatch):
-    seen = _drive_main(monkeypatch, drain=[{"alice"}], note=[set()], first_closed=2)
-
-    assert seen.reconnect == [seen.first]
-    assert seen.note == [(seen.second, {"alice"})]
-    assert seen.cycle == [seen.second]
-
-
 def test_main_survives_a_failed_stamp_and_still_runs_the_cycle(monkeypatch):
     boom = psycopg2.ProgrammingError("permission denied for table active_users")
     seen = _drive_main(monkeypatch, drain=[{"alice"}], note=[boom])
@@ -538,20 +605,160 @@ def test_main_survives_a_failed_stamp_and_still_runs_the_cycle(monkeypatch):
     assert seen.cycle == [seen.first]
 
 
-def test_a_standing_feed_read_fault_is_not_logged_on_every_pass(monkeypatch, caplog):
-    boom = [RuntimeError("boom") for _ in range(4)]
+@pytest.mark.parametrize("closed", [1, 2])
+def test_main_replaces_a_connection_that_is_closed_or_broken(monkeypatch, closed):
+    # psycopg2 sets closed to 1 after close() and to 2 for a broken connection.
+    seen = _drive_main(monkeypatch, drain=[{"alice"}], note=[set()], first_closed=closed)
+
+    assert seen.reconnect == [seen.first]
+    assert seen.note == [(seen.second, {"alice"})]
+    assert seen.cycle == [seen.second]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("no active algorithm version"),
+        psycopg2.OperationalError("gone"),
+        psycopg2.InterfaceError("connection already closed"),
+    ],
+)
+def test_a_failed_cycle_still_renews_the_budget_and_writes_the_summary(
+    monkeypatch, caplog, failure
+):
+    # The budget is a ceiling per cycle PERIOD. Renewed only after a good cycle, a
+    # standing cycle failure left immediate re-ranks off once it was spent, and the
+    # summary silent exactly when someone would be looking for it.
+    monkeypatch.setattr(rd, "READ_REFRESH_MAX_PER_CYCLE", 5)
+    with caplog.at_level("INFO"):
+        seen = _drive_main(
+            monkeypatch, passes=2, drain=[{"a"}, {"b"}], note=[{"a1", "a2"}, set()],
+            cycle=[failure],
+        )
+
+    assert seen.limits == [5, 5]
+    assert "feed reads since the last cycle: 1 account(s) heard, 2 re-ranked at once" in caplog.text
+    assert len(seen.cycle) == 1, "and the next cycle waits its turn, it is not retried at once"
+
+
+@pytest.mark.parametrize(
+    "failure, reconnects",
+    [(psycopg2.InterfaceError("connection already closed"), 1), (RuntimeError("boom"), 0)],
+)
+def test_a_closed_connection_in_the_cycle_is_replaced_not_logged_as_a_failed_cycle(
+    monkeypatch, caplog, failure, reconnects
+):
     with caplog.at_level("ERROR"):
-        _drive_main(monkeypatch, passes=4, drain=boom, note=[])
+        seen = _drive_main(monkeypatch, drain=[set()], note=[], cycle=[failure])
+
+    assert len(seen.reconnect) == reconnects
+    assert ("ranking cycle failed" in caplog.text) == (reconnects == 0)
+
+
+def test_a_standing_fault_is_logged_once_per_cycle_of_real_time(monkeypatch, caplog):
+    # 130 passes of 5 s = 650 s: the first failure, then one at 300 s and one at 600 s.
+    passes = 130
+    with caplog.at_level("ERROR"):
+        _drive_main(
+            monkeypatch, clock=_Clock(), passes=passes,
+            drain=[RuntimeError("boom") for _ in range(passes)], note=[],
+        )
+
+    assert caplog.text.count("feed-read handling failed") == 3
+
+
+def test_the_first_fault_is_logged_on_a_host_that_has_just_booted(monkeypatch, caplog):
+    # time.monotonic() counts from boot on Linux: under CYCLE_SECONDS of uptime only the
+    # "never logged" clause speaks.
+    with caplog.at_level("ERROR"):
+        _drive_main(
+            monkeypatch, clock=_Clock(start=12.0), passes=2,
+            drain=[RuntimeError("boom"), RuntimeError("boom")], note=[],
+        )
 
     assert caplog.text.count("feed-read handling failed") == 1
 
 
-def test_each_cycle_says_how_many_reads_it_heard(monkeypatch, caplog):
+def test_the_summary_is_per_cycle_and_counts_every_pass_since_the_last(monkeypatch, caplog):
+    monkeypatch.setattr(rd, "_lane_taken", 3)
+    monkeypatch.setattr(rd, "_lane_slots", 100)
     with caplog.at_level("INFO"):
-        _drive_main(monkeypatch, drain=[{"alice", "bob"}], note=[{"alice"}])
+        _drive_main(
+            monkeypatch, passes=4,
+            drain=[{"a"}, {"b", "c"}, {"d"}, {"e", "f", "g"}],
+            note=[{"a"}, {"b"}, set(), {"e", "f"}],
+        )
 
-    assert "feed reads since the last cycle: 2 account(s) heard, 1 re-ranked at once" in caplog.text
-    assert (rd._reads_heard, rd._reads_reranked) == (0, 0), "the counters restart each cycle"
+    # One cycle, on the first pass: its line covers that pass only, and the three
+    # passes since are still being counted for the next one.
+    assert caplog.text.count("feed reads since the last cycle") == 1
+    assert (
+        "feed reads since the last cycle: 1 account(s) heard, 1 re-ranked at once; "
+        "reader lane 3 of 100 slot(s)" in caplog.text
+    )
+    assert (rd._reads_heard, rd._reads_reranked) == (6, 3)
+
+
+def test_no_summary_on_a_schema_without_the_read_column(monkeypatch, caplog):
+    monkeypatch.setattr(rd, "_reads_supported", False)
+    monkeypatch.setattr(rd, "_reads_heard", 4)
+    with caplog.at_level("INFO"):
+        rd._log_feed_read_summary()
+
+    assert "feed reads since" not in caplog.text
+    assert rd._reads_heard == 0
+
+
+def test_a_ranker_without_the_read_column_looks_again_after_each_cycle(monkeypatch):
+    # On a HAF without application locks an install can run under a running ranker,
+    # and nothing else would ever notice the column had arrived.
+    monkeypatch.setattr(rd, "_reads_supported", False)
+    seen = _drive_main(monkeypatch, passes=2, drain=[set(), set()], note=[])
+
+    assert seen.listened == [seen.first], "once per cycle, not once per pass"
+
+
+def test_a_ranker_with_the_read_column_does_not_keep_checking(monkeypatch):
+    seen = _drive_main(monkeypatch, passes=2, drain=[set(), set()], note=[])
+
+    assert seen.listened == []
+
+
+# --------------------------------------------------------------------------
+# Logging a read-triggered refresh: who had their feed read is not log material
+# --------------------------------------------------------------------------
+
+
+def _targeted(monkeypatch, names):
+    conn, _ = _mock_conn([])
+    monkeypatch.setattr(rd, "register_vector_type", lambda _c: None)
+    monkeypatch.setattr(rd, "_evict_unsubscribed", lambda _c, _u: set())
+    monkeypatch.setattr(rd, "_rotation_members", lambda _c, u: set(u))
+    monkeypatch.setattr(rd, "_fetch_algorithm", lambda _c: ("1.0.0", {}))
+    monkeypatch.setattr(
+        rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
+    )
+    monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
+    monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
+    monkeypatch.setattr(rd, "_rank_user", lambda *a, **k: None)
+    rd._run_targeted_refresh(conn, set(names))
+
+
+def test_a_small_refresh_is_logged_by_name_as_before(monkeypatch, caplog):
+    with caplog.at_level(logging.INFO):
+        _targeted(monkeypatch, ["alice", "bobby"])
+
+    assert "force-refresh for 2 user(s): ['alice', 'bobby']" in caplog.text
+    assert "force-refresh complete for alice" in caplog.text
+
+
+def test_a_large_refresh_is_logged_as_a_count(monkeypatch, caplog):
+    names = [f"user{i:03d}" for i in range(rd._QUIET_REFRESH_ABOVE + 1)]
+    with caplog.at_level(logging.INFO):
+        _targeted(monkeypatch, names)
+
+    assert f"force-refresh for {len(names)} user(s)" in caplog.text
+    assert "user000" not in caplog.text
 
 
 # --------------------------------------------------------------------------
@@ -563,7 +770,7 @@ _NAMES = (
     "READER_CYCLE_SHARE",
     "READ_REFRESH_MIN_AGE_SECONDS",
     "READ_REFRESH_MAX_PER_CYCLE",
-    "_FEED_READ_MAX_PER_DRAIN",
+    "_READ_REFRESH_DEFAULT_CEILING",
     "_FEED_READ_BACKLOG_MAX",
 )
 _PROBE = f"""
@@ -596,6 +803,8 @@ def settings():
             "READ_REFRESH_MAX_PER_CYCLE": "3",
         },
         "bigger_cycle": {"MAX_USERS_PER_CYCLE": "3000"},
+        "share_only": {"READER_CYCLE_SHARE": "0.25"},
+        "by_hand": {"MAX_USERS_PER_CYCLE": "3000", "READ_REFRESH_MAX_PER_CYCLE": "1500"},
         "too_high": {"READER_CYCLE_SHARE": "7"},
         "exactly_one": {"READER_CYCLE_SHARE": "1"},
         "negative": {
@@ -622,7 +831,7 @@ def test_the_reader_defaults_are_the_documented_ones(settings):
         "READER_CYCLE_SHARE": 0.5,
         "READ_REFRESH_MIN_AGE_SECONDS": 600,
         "READ_REFRESH_MAX_PER_CYCLE": 100,
-        "_FEED_READ_MAX_PER_DRAIN": 5000,
+        "_READ_REFRESH_DEFAULT_CEILING": 300,
         "_FEED_READ_BACKLOG_MAX": 20000,
     }
 
@@ -636,9 +845,20 @@ def test_the_reader_settings_are_read_from_the_environment(settings):
     assert got["READ_REFRESH_MAX_PER_CYCLE"] == 3
 
 
-def test_the_default_rerank_budget_follows_the_cycle_size(settings):
-    # Readers may add at most their share of a cycle on top of the cycle itself.
-    assert settings["bigger_cycle"]["READ_REFRESH_MAX_PER_CYCLE"] == 1500
+def test_the_default_rerank_budget_is_the_readers_share_of_the_cycle(settings):
+    assert settings["share_only"]["READ_REFRESH_MAX_PER_CYCLE"] == 50  # 200 x 0.25
+    assert settings["too_high"]["READ_REFRESH_MAX_PER_CYCLE"] == 180  # 200 x the 0.9 cap
+
+
+def test_the_default_rerank_budget_stops_growing_with_the_cycle(settings):
+    # These run in the 300 s the ranker waits between cycles. The plain share of a
+    # 3000-account cycle is 1500, about four minutes of ranking: enough to start
+    # delaying the cycle itself.
+    assert settings["bigger_cycle"]["READ_REFRESH_MAX_PER_CYCLE"] == 300
+
+
+def test_an_operator_can_still_set_a_larger_budget_by_hand(settings):
+    assert settings["by_hand"]["READ_REFRESH_MAX_PER_CYCLE"] == 1500
 
 
 @pytest.mark.parametrize("case", ["too_high", "exactly_one"])
@@ -702,7 +922,8 @@ def test_the_notify_is_inside_the_branch_for_an_account_with_a_feed():
         # NOTIFY is an error on a standby, and would fail the read
         "AND NOT pg_is_in_recovery()",
         # the operator's switch, which needs no reinstall
-        "AND COALESCE(current_setting('haf_fyp.feed_read_notify', true), 'on') <> 'off'",
+        "AND lower(btrim(COALESCE(current_setting('haf_fyp.feed_read_notify', true), 'on'))) "
+        "NOT IN ('off', 'false', 'no', '0')",
         # one signal per ten minutes per account, not one per request
         "AND EXISTS ( SELECT 1 FROM haf_fyp_app.active_users au "
         "WHERE au.username = get_personalized_feed.username "
@@ -759,6 +980,16 @@ def test_the_table_the_db_tests_run_against_has_the_shipped_columns():
 
     assert shipped == _active_users_columns("tests/ci_fastapi_setup.sql")
     assert shipped["last_read_at"] == "timestamp"
+
+
+def test_last_read_at_is_a_plain_nullable_column_where_the_table_is_created():
+    for path in ("db/create_tables.sql", "tests/ci_fastapi_setup.sql"):
+        sql = open(os.path.join(REPO, path), encoding="utf-8").read()
+        body = re.search(
+            r"CREATE TABLE IF NOT EXISTS haf_fyp_app\.active_users \((.*?)\n\);", sql, re.S
+        ).group(1)
+        (line,) = [ln for ln in body.splitlines() if "last_read_at" in ln.split("--", 1)[0]]
+        assert line.split("--", 1)[0].strip().lower() == "last_read_at timestamp,", path
 
 
 def test_an_installed_table_gets_the_column_in_place():
