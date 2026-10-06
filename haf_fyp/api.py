@@ -1826,8 +1826,18 @@ def post_events(request: Request, req: EventsBatch):
         telemetry hiccup never disrupts the client; failures are logged
         server-side. Malformed batches are rejected with 422.
 
-    Rate-limited per IP; batches are capped at 200 events. Send it fire-and-forget
-    (e.g. navigator.sendBeacon on visibilitychange).
+    Rate-limited per IP; batches are capped at 200 events. Send it fire-and-forget,
+    and flush once more when the page is hidden.
+
+    How to send it from a browser on another origin:
+      * `fetch(url, {method: "POST", keepalive: true, credentials: "omit", ...})`
+        works behind any gateway, including on page hide.
+      * `navigator.sendBeacon(url, new Blob([json], {type: "application/json"}))` is
+        a CREDENTIALED request. Its preflight passes only if the gateway answers
+        with the caller's own origin and `Access-Control-Allow-Credentials: true`;
+        behind a gateway that answers `Access-Control-Allow-Origin: *` the browser
+        drops the batch and sendBeacon still returns true (#80). Do not fall back
+        to fetch on a false return value alone -- it is true in the failing case.
     """
     _charge_global_ceiling(request, "600/minute")
     rows = []
