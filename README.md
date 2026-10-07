@@ -678,14 +678,17 @@ passes them through, so add them to that service's `environment:` to change one.
 | `READER_WINDOW_SECONDS` | 86400 | How long one read keeps an account eligible for the reader lane. |
 | `READ_REFRESH_MIN_AGE_SECONDS` | 600 | A feed younger than this is not re-ranked on read, and does not take a lane slot. |
 | `READ_REFRESH_MAX_PER_CYCLE` | `MAX_USERS_PER_CYCLE` x `READER_CYCLE_SHARE`, at most 300 | Immediate re-ranks between two scheduled cycles. 0 turns them off. They run in the 300 s the ranker waits between cycles: keep this times seconds-per-account well under `CYCLE_SECONDS`, or they start delaying the cycle. |
+| `READ_REFRESH_BATCH_SECONDS` | 30 | After one read-triggered re-rank, the next waits this long and takes everyone who became due meanwhile. Each one fetches the candidates before ranking anyone (about 8 s on a full node), so they are grouped. 0 turns the grouping off. |
 
 What to expect, and what this does not do:
 
-* **It is not immediate.** The ranker hears reads between passes of its loop, so a read
-  that arrives during a scheduled cycle, or while a large batch of re-ranks is running,
-  is handled when that ends: under a minute at the default cycle size, several minutes
-  on a node that ranks thousands per cycle. And once the cycle's budget is spent, a
-  stale reader waits for the reader lane instead.
+* **It is not immediate.** With the ranker between cycles, a fresh feed is there about
+  ten seconds after the read (measured on a full node: the refresh itself takes about
+  8 s), or up to `READ_REFRESH_BATCH_SECONDS` later if another reader was served just
+  before. The ranker hears reads between passes of its loop, so a read that arrives
+  during a scheduled cycle is handled when that ends: under a minute at the default
+  cycle size, several minutes on a node that ranks thousands per cycle. And once the
+  cycle's budget is spent, a stale reader waits for the reader lane instead.
 * **Everyone else rotates more slowly while the reader lane is in use**, by up to
   `1 / (1 - READER_CYCLE_SHARE)`: twice as slowly at the default when the lane is full.
   That includes the first load of someone who has not read for longer than the window.
@@ -725,20 +728,26 @@ ALTER ROLE haf_fyp_user RESET haf_fyp.feed_read_notify;
 ```
 
 PostgreSQL applies a role's settings when a session starts, so this reaches the feed
-function as PostgREST's database sessions are replaced:
+function as the database sessions PostgREST uses are replaced. The way that restarts
+nothing is to end that role's idle sessions, from a superuser session connected to
+PostgreSQL itself, and let the pool open new ones:
 
-* **PostgREST connected directly** (this repository's compose file): restart
-  `haf-fyp-postgrest`, or wait for its pool to turn over (half an hour at PostgREST's
-  defaults).
-* **PostgREST behind PgBouncer** (`haf_api_node`): the sessions that matter are
-  PgBouncer's, so restarting PostgREST changes nothing. End that role's idle server
-  connections instead, from a superuser session connected to PostgreSQL itself:
-  `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'haf_fyp_user' AND state = 'idle';`
-  (a request in flight on a connection ended this way can fail once), or wait for
-  PgBouncer's `server_lifetime`.
+```sql
+SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+ WHERE usename = 'haf_fyp_user' AND application_name LIKE 'PostgREST%' AND state = 'idle';
+```
 
-Neither path has been exercised on a node yet. To check it took, request a feed and
-watch `LISTEN haf_fyp_feed_read;` from a psql session.
+Run it twice, a few seconds apart. This was exercised on a node with PostgREST connected
+directly: no request failed, and the next first-page read did not notify. Behind
+PgBouncer (`haf_api_node`) the sessions that matter are PgBouncer's server connections,
+which do not carry PostgREST's `application_name`: drop that condition there (a request
+in flight on a connection ended this way can fail once). That layout has not been
+exercised. Restarting `haf-fyp-postgrest` also works when it connects directly, and
+changes nothing behind PgBouncer.
+
+To check it took, request a feed and watch `LISTEN haf_fyp_feed_read;` from a psql
+session that keeps issuing a statement (a notification is shown after the next one),
+and is not left inside a transaction.
 
 With the signal off, or with `READER_CYCLE_SHARE=0` and `READ_REFRESH_MAX_PER_CYCLE=0`,
 the ranker ranks the same accounts in the same order as before #81. It still listens,

@@ -136,6 +136,13 @@ READ_REFRESH_MAX_PER_CYCLE = max(0, int(os.environ.get(
     "READ_REFRESH_MAX_PER_CYCLE",
     str(min(int(MAX_USERS_PER_CYCLE * READER_CYCLE_SHARE), _READ_REFRESH_DEFAULT_CEILING)),
 )))
+# Read-triggered re-ranks are grouped: after one runs, the next waits this long and
+# takes everyone who became due meanwhile. A targeted refresh fetches the candidates,
+# their vectors and the authors' credibility before it ranks anyone (about 8 s on a
+# full node, against a fraction of a second per account), so one call per read let a
+# trickle of reads for different accounts keep the ranker fetching between cycles. The
+# first read after a quiet spell is not held back. 0 turns the grouping off.
+READ_REFRESH_BATCH_SECONDS = max(0, int(os.environ.get("READ_REFRESH_BATCH_SECONDS", "30")))
 # Notifications held on the connection between drains. psycopg2 appends to
 # conn.notifies whenever it reads the socket, i.e. during every query of a cycle, and
 # nothing else bounds that list; the oldest are discarded past this. It is also the
@@ -1212,6 +1219,8 @@ def main() -> None:
     conn = _connect()
     next_full_cycle = 0.0  # run immediately on startup
     read_budget = READ_REFRESH_MAX_PER_CYCLE  # #81: immediate re-ranks left until the next cycle
+    read_pending: set[str] = set()  # #81: stale readers waiting for the next grouped re-rank
+    next_read_refresh = 0.0
     next_feed_maint = 0.0  # run feed_events rollup/prune immediately on startup
 
     while True:
@@ -1238,13 +1247,20 @@ def main() -> None:
         try:
             stale = _handle_feed_reads(conn, read_budget)
             read_budget -= len(stale)
-            pending |= stale
+            read_pending |= stale
         except (psycopg2.OperationalError, psycopg2.InterfaceError):
             log.warning("database connection lost (feed reads) — reconnecting")
             conn = _reconnect(conn)
         except Exception:
             _log_feed_read_failure()
             _safe_rollback(conn)
+
+        # Stale readers ride along with a refresh that is running anyway (a Redis
+        # request), and otherwise go together, READ_REFRESH_BATCH_SECONDS apart.
+        if read_pending and (pending or time.monotonic() >= next_read_refresh):
+            pending |= read_pending
+            read_pending = set()
+            next_read_refresh = time.monotonic() + READ_REFRESH_BATCH_SECONDS
 
         if pending:
             try:
@@ -1272,6 +1288,10 @@ def main() -> None:
             # good cycle, a standing cycle failure left immediate re-ranks switched off
             # once the budget was spent, and the summary silent exactly then.
             read_budget = READ_REFRESH_MAX_PER_CYCLE
+            # Whoever was still waiting is stamped and stale, which is exactly who the
+            # reader lane of the cycle that just ran takes first: ranking them again
+            # now would be the same work twice.
+            read_pending = set()
             _log_feed_read_summary()
             if not _reads_supported:
                 # The install may have run since this session connected. On a HAF with

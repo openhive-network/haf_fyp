@@ -428,7 +428,7 @@ class _Clock:
 
 def _drive_main(
     monkeypatch, *, passes=1, drain, note, queued=(), first_closed=0,
-    cycle_every_pass=False, cycle=(), clock=None,
+    cycle_every_pass=False, cycle=(), clock=None, queue_after=None,
 ):
     """Run main() for `passes` passes with everything but the feed-read block stubbed.
     `drain` and `note` are lists of per-pass results; an exception instance is raised.
@@ -467,6 +467,8 @@ def _drive_main(
         if clock is not None:
             clock.now += _seconds
         slept.append(1)
+        for name in (queue_after or {}).get(len(slept), ()):
+            rd._refresh_queue.put(name)
         if len(slept) >= passes:
             raise _StopLoop
 
@@ -532,12 +534,82 @@ def test_main_merges_stale_readers_with_the_redis_refresh_requests(monkeypatch):
 
 
 def test_main_reads_the_notifications_on_every_pass(monkeypatch):
+    monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 0)
     seen = _drive_main(
         monkeypatch, passes=3, drain=[{"alice"}, set(), {"bob"}], note=[{"alice"}, set(), {"bob"}]
     )
 
     assert [names for _conn, names in seen.note] == [{"alice"}, set(), {"bob"}]
     assert [names for _conn, names in seen.targeted] == [{"alice"}, {"bob"}]
+
+
+# --------------------------------------------------------------------------
+# Grouping: a targeted refresh fetches the candidates before it ranks anyone
+# --------------------------------------------------------------------------
+
+
+def test_the_first_read_after_a_quiet_spell_is_not_held_back(monkeypatch):
+    monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 30)
+    seen = _drive_main(monkeypatch, clock=_Clock(), drain=[{"alice"}], note=[{"alice"}])
+
+    assert seen.targeted == [(seen.first, {"alice"})]
+
+
+def test_reads_that_follow_closely_are_ranked_together_not_one_call_each(monkeypatch):
+    # One call per read let a trickle of reads for different accounts keep the ranker
+    # fetching candidates (about 8 s a time on a full node) between cycles.
+    monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 30)
+    names = ["a", "b", "c", "d", "e", "f", "g", "h"]
+    seen = _drive_main(
+        monkeypatch, clock=_Clock(), passes=8,
+        drain=[{n} for n in names], note=[{n + "1"} for n in names],
+    )
+
+    # Passes are 5 s apart: the first read goes at once, the next six wait for the
+    # 30 s to pass and go together, and the eighth is waiting for the next group.
+    assert [names for _conn, names in seen.targeted] == [
+        {"a1"}, {"b1", "c1", "d1", "e1", "f1", "g1"},
+    ]
+
+
+def test_a_redis_refresh_takes_the_waiting_readers_along(monkeypatch):
+    monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 30)
+    seen = _drive_main(
+        monkeypatch, clock=_Clock(), passes=3,
+        drain=[{"a"}, {"b"}, set()], note=[{"a1"}, {"b1"}],
+        queue_after={2: ["carol"]},  # an interest save arrives before the third pass
+    )
+
+    # b1 was waiting out the 30 s; carol's refresh fetches the candidates anyway, so
+    # b1 goes with it.
+    assert [names for _conn, names in seen.targeted] == [{"a1"}, {"b1", "carol"}]
+
+
+def test_a_cycle_takes_over_the_readers_still_waiting(monkeypatch):
+    # They are stamped and stale, so the cycle's reader lane takes them first.
+    # Ranking them again straight after would be the same work twice.
+    monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 30)
+    monkeypatch.setattr(rd, "CYCLE_SECONDS", 10)
+    seen = _drive_main(
+        monkeypatch, clock=_Clock(), passes=9,
+        drain=[{"a"}, {"b"}] + [set()] * 7, note=[{"a1"}, {"b1"}],
+    )
+
+    # Pass 1: a1 at once, then the cycle. Pass 2 (5 s): b1 waits. Pass 3 (10 s): the
+    # second cycle runs and takes b1 over. Six more passes take the clock past the
+    # 30 s: nothing is left to rank.
+    assert [names for _conn, names in seen.targeted] == [{"a1"}]
+    assert len(seen.cycle) >= 2
+
+
+def test_grouping_can_be_switched_off(monkeypatch):
+    monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 0)
+    seen = _drive_main(
+        monkeypatch, clock=_Clock(), passes=3,
+        drain=[{"a"}, {"b"}, {"c"}], note=[{"a1"}, {"b1"}, {"c1"}],
+    )
+
+    assert [names for _conn, names in seen.targeted] == [{"a1"}, {"b1"}, {"c1"}]
 
 
 def test_the_rerank_budget_is_spent_across_passes_not_renewed_by_each(monkeypatch):
@@ -770,6 +842,7 @@ _NAMES = (
     "READER_CYCLE_SHARE",
     "READ_REFRESH_MIN_AGE_SECONDS",
     "READ_REFRESH_MAX_PER_CYCLE",
+    "READ_REFRESH_BATCH_SECONDS",
     "_READ_REFRESH_DEFAULT_CEILING",
     "_FEED_READ_BACKLOG_MAX",
 )
@@ -801,6 +874,7 @@ def settings():
             "READER_CYCLE_SHARE": "0.25",
             "READ_REFRESH_MIN_AGE_SECONDS": "42",
             "READ_REFRESH_MAX_PER_CYCLE": "3",
+            "READ_REFRESH_BATCH_SECONDS": "7",
         },
         "bigger_cycle": {"MAX_USERS_PER_CYCLE": "3000"},
         "share_only": {"READER_CYCLE_SHARE": "0.25"},
@@ -812,6 +886,7 @@ def settings():
             "READER_WINDOW_SECONDS": "-1",
             "READ_REFRESH_MIN_AGE_SECONDS": "-1",
             "READ_REFRESH_MAX_PER_CYCLE": "-1",
+            "READ_REFRESH_BATCH_SECONDS": "-1",
         },
     }
     out = subprocess.run(
@@ -831,6 +906,7 @@ def test_the_reader_defaults_are_the_documented_ones(settings):
         "READER_CYCLE_SHARE": 0.5,
         "READ_REFRESH_MIN_AGE_SECONDS": 600,
         "READ_REFRESH_MAX_PER_CYCLE": 100,
+        "READ_REFRESH_BATCH_SECONDS": 30,
         "_READ_REFRESH_DEFAULT_CEILING": 300,
         "_FEED_READ_BACKLOG_MAX": 20000,
     }
@@ -843,6 +919,7 @@ def test_the_reader_settings_are_read_from_the_environment(settings):
     assert got["READER_CYCLE_SHARE"] == 0.25
     assert got["READ_REFRESH_MIN_AGE_SECONDS"] == 42
     assert got["READ_REFRESH_MAX_PER_CYCLE"] == 3
+    assert got["READ_REFRESH_BATCH_SECONDS"] == 7
 
 
 def test_the_default_rerank_budget_is_the_readers_share_of_the_cycle(settings):
@@ -874,6 +951,7 @@ def test_negative_settings_are_treated_as_zero(settings):
     assert got["READER_WINDOW_SECONDS"] == 0
     assert got["READ_REFRESH_MIN_AGE_SECONDS"] == 0
     assert got["READ_REFRESH_MAX_PER_CYCLE"] == 0
+    assert got["READ_REFRESH_BATCH_SECONDS"] == 0
 
 
 # --------------------------------------------------------------------------
