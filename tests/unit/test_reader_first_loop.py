@@ -249,3 +249,59 @@ def test_the_reader_lane_is_announced_once_not_on_every_later_connection(caplog)
         rd._listen_for_feed_reads(new)  # a reconnect, days later
 
     assert caplog.text.count("reader lane enabled") == 1
+
+
+# ---- what a cycle reports back ------------------------------------------------------------
+
+
+def _cycle(monkeypatch, users, *, candidates=None, rank=lambda *a, **k: None):
+    conn, _ = _mock_conn([])
+    if candidates is None:
+        candidates = pd.DataFrame({"post_id": [1], "author": ["a"]})
+    monkeypatch.setattr(rd, "register_vector_type", lambda _c: None)
+    monkeypatch.setattr(rd, "_evict_unsubscribed", lambda _c, _u: set())
+    monkeypatch.setattr(rd, "_fetch_personalised_users", lambda _c, _limit: list(users))
+    monkeypatch.setattr(rd, "_fetch_algorithm", lambda _c: ("1.0.0", {}))
+    monkeypatch.setattr(rd, "_fetch_candidates", lambda _c: candidates)
+    monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
+    monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
+    monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)
+    monkeypatch.setattr(rd, "compute_scores", lambda **k: pd.DataFrame())
+    monkeypatch.setattr(rd, "_log_user_failure", lambda _u, _e: None)
+    monkeypatch.setattr(rd, "_rank_user", rank)
+    return rd.run_cycle(conn)
+
+
+def test_a_cycle_reports_the_accounts_it_ranked_and_not_the_ones_that_failed(monkeypatch):
+    # main() takes these out of the queue of readers waiting for a re-rank. An account
+    # the cycle tried and failed must stay in it.
+    def _rank(_conn, username, *_a, **_k):
+        if username == "bobby":
+            raise RuntimeError("boom")
+
+    assert _cycle(monkeypatch, ["alice", "bobby", "carol"], rank=_rank) == {"alice", "carol"}
+
+
+def test_a_cycle_with_no_candidates_ranked_nobody_and_took_no_lane(monkeypatch):
+    monkeypatch.setattr(rd, "_lane_taken", 7)
+    monkeypatch.setattr(rd, "_lane_slots", 100)
+
+    assert _cycle(monkeypatch, ["alice"], candidates=pd.DataFrame()) == set()
+    # Otherwise the line after this cycle would repeat the last cycle's occupancy.
+    assert (rd._lane_taken, rd._lane_slots) == (0, 0)
+
+
+def test_a_small_refresh_has_no_summary_line_of_its_own(monkeypatch, caplog):
+    with caplog.at_level(logging.INFO):
+        _refresh(monkeypatch, ["alice", "bobby"])
+
+    assert "user(s)" not in caplog.text.split("force-refresh for 2 user(s)", 1)[1]
+
+
+def test_a_schema_check_that_fails_says_so(monkeypatch, caplog):
+    monkeypatch.setattr(rd, "_reads_supported", False)
+    monkeypatch.setattr(rd, "_listen_for_feed_reads", _raiser(RuntimeError("boom")))
+    with caplog.at_level(logging.ERROR):
+        _drive_main(_Keep(monkeypatch, "_listen_for_feed_reads"), drain=[set()], note=[])
+
+    assert "could not check the schema for last_read_at" in caplog.text
