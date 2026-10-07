@@ -40,7 +40,7 @@ def _schema_has_the_read_column(monkeypatch):
     # What _listen_for_feed_reads finds on this database. Set here so the tests that
     # never listen exercise the reader lane too, and restored after each test.
     monkeypatch.setattr(rd, "_reads_supported", True)
-    monkeypatch.setattr(rd, "_missing_column_warned", False)
+    monkeypatch.setattr(rd, "_missing_column_warned_at", None)
 
 
 def _connect():

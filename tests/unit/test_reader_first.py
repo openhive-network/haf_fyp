@@ -33,7 +33,7 @@ def _reader_state(monkeypatch):
     monkeypatch.setattr(rd, "_reads_heard", 0)
     monkeypatch.setattr(rd, "_reads_reranked", 0)
     monkeypatch.setattr(rd, "_feed_read_failure_logged_at", 0.0)
-    monkeypatch.setattr(rd, "_missing_column_warned", False)
+    monkeypatch.setattr(rd, "_missing_column_warned_at", None)
     monkeypatch.setattr(rd, "_lane_taken", 0)
     monkeypatch.setattr(rd, "_lane_slots", 0)
 
@@ -371,6 +371,38 @@ def test_a_schema_without_the_read_column_is_reported_once_and_not_listened_to(c
     assert conn.commit.call_count == 2
 
 
+def test_a_ranker_that_stays_without_the_column_says_so_every_hour(monkeypatch, caplog):
+    # One line at startup is not something anybody finds weeks later.
+    now = [1000.0]
+    monkeypatch.setattr(rd.time, "monotonic", lambda: now[0])
+    conn, _cur = _mock_conn([], fetchone=(False,))
+
+    with caplog.at_level("WARNING"):
+        for elapsed in (0, 300, 3599, 3600, 3900, 7200):
+            now[0] = 1000.0 + elapsed
+            rd._listen_for_feed_reads(conn)
+
+    assert caplog.text.count("no last_read_at column") == 3
+
+
+def test_a_listen_that_fails_does_not_leave_the_ranker_believing_it_listens(monkeypatch):
+    monkeypatch.setattr(rd, "_reads_supported", False)
+    conn, cur = _mock_conn([], fetchone=(True,))
+    calls = []
+
+    def _execute(sql, *_a):
+        calls.append(sql)
+        if sql.startswith("LISTEN"):
+            raise psycopg2.ProgrammingError("boom")
+
+    cur.execute.side_effect = _execute
+
+    with pytest.raises(psycopg2.ProgrammingError):
+        rd._listen_for_feed_reads(conn)
+
+    assert rd._reads_supported is False, "or main() would never look at the schema again"
+
+
 def test_the_reader_lane_is_announced_when_the_column_appears(caplog):
     old, _ = _mock_conn([], fetchone=(False,))
     new, cur = _mock_conn([], fetchone=(True,))
@@ -461,7 +493,7 @@ def _drive_main(
     def _run_cycle(conn):
         seen.cycle.append(conn)
         if cycle:
-            _next(cycle)
+            return _next(cycle)
 
     def _sleep(_seconds):
         if clock is not None:
@@ -593,6 +625,7 @@ def test_a_cycle_takes_over_the_readers_still_waiting(monkeypatch):
     seen = _drive_main(
         monkeypatch, clock=_Clock(), passes=9,
         drain=[{"a"}, {"b"}] + [set()] * 7, note=[{"a1"}, {"b1"}],
+        cycle=[set(), {"b1", "zed"}],
     )
 
     # Pass 1: a1 at once, then the cycle. Pass 2 (5 s): b1 waits. Pass 3 (10 s): the
@@ -600,6 +633,31 @@ def test_a_cycle_takes_over_the_readers_still_waiting(monkeypatch):
     # 30 s: nothing is left to rank.
     assert [names for _conn, names in seen.targeted] == [{"a1"}]
     assert len(seen.cycle) >= 2
+
+
+@pytest.mark.parametrize(
+    "second_cycle",
+    [
+        RuntimeError("no active algorithm version"),
+        psycopg2.OperationalError("gone"),
+        {"zed"},  # a good cycle whose lane was full, or switched off: it ranked others
+        set(),  # no candidates
+    ],
+)
+def test_readers_a_cycle_did_not_rank_keep_waiting_for_the_grouped_rerank(
+    monkeypatch, second_cycle
+):
+    # They are stamped, so the feed function will not signal for them again for ten
+    # minutes, and their budget is spent: dropped here they would simply be forgotten.
+    monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 30)
+    monkeypatch.setattr(rd, "CYCLE_SECONDS", 10)
+    seen = _drive_main(
+        monkeypatch, clock=_Clock(), passes=9,
+        drain=[{"a"}, {"b"}] + [set()] * 7, note=[{"a1"}, {"b1"}],
+        cycle=[set(), second_cycle],
+    )
+
+    assert [names for _conn, names in seen.targeted] == [{"a1"}, {"b1"}]
 
 
 def test_grouping_can_be_switched_off(monkeypatch):
@@ -709,7 +767,7 @@ def test_a_failed_cycle_still_renews_the_budget_and_writes_the_summary(
         )
 
     assert seen.limits == [5, 5]
-    assert "feed reads since the last cycle: 1 account(s) heard, 2 re-ranked at once" in caplog.text
+    assert "feed reads since the last cycle: 1 account(s) heard, 2 queued for an early re-rank" in caplog.text
     assert len(seen.cycle) == 1, "and the next cycle waits its turn, it is not retried at once"
 
 
@@ -765,7 +823,7 @@ def test_the_summary_is_per_cycle_and_counts_every_pass_since_the_last(monkeypat
     # passes since are still being counted for the next one.
     assert caplog.text.count("feed reads since the last cycle") == 1
     assert (
-        "feed reads since the last cycle: 1 account(s) heard, 1 re-ranked at once; "
+        "feed reads since the last cycle: 1 account(s) heard, 1 queued for an early re-rank; "
         "reader lane 3 of 100 slot(s)" in caplog.text
     )
     assert (rd._reads_heard, rd._reads_reranked) == (6, 3)
@@ -929,7 +987,7 @@ def test_the_default_rerank_budget_is_the_readers_share_of_the_cycle(settings):
 
 def test_the_default_rerank_budget_stops_growing_with_the_cycle(settings):
     # These run in the 300 s the ranker waits between cycles. The plain share of a
-    # 3000-account cycle is 1500, about four minutes of ranking: enough to start
+    # 3000-account cycle is 1500, about five minutes of ranking: enough to start
     # delaying the cycle itself.
     assert settings["bigger_cycle"]["READ_REFRESH_MAX_PER_CYCLE"] == 300
 

@@ -28,8 +28,8 @@ Readers first (#81):
   get_personalized_feed notifies the Postgres channel haf_fyp_feed_read when an
   account's first page is requested. The main loop hears it on its own session,
   stamps active_users.last_read_at, re-ranks a reader whose feed is old through the
-  same targeted cycle, and takes recent readers at the front of every scheduled
-  cycle. The rest of the rotation is ranked as before, in what is left of the cycle.
+  same targeted cycle (grouped, a few seconds to half a minute later), and takes
+  recent readers at the front of every scheduled cycle. The rest of the rotation is ranked as before, in what is left of the cycle.
 """
 
 from __future__ import annotations
@@ -99,8 +99,8 @@ MAX_USERS_PER_CYCLE = int(os.environ.get("MAX_USERS_PER_CYCLE", "200"))
 # reader's feed was as old as the whole rotation takes (22 h at 45k accounts and 200
 # per cycle). get_personalized_feed notifies FEED_READ_CHANNEL on a page-1 read; this
 # daemon stamps active_users.last_read_at, re-ranks a reader whose feed is older than
-# READ_REFRESH_MIN_AGE_SECONDS straight away, and gives accounts that read within
-# READER_WINDOW_SECONDS the front of every scheduled cycle.
+# READ_REFRESH_MIN_AGE_SECONDS without waiting for its turn in the rotation, and gives
+# accounts that read within READER_WINDOW_SECONDS the front of every scheduled cycle.
 #
 # Every setting below is a ceiling on work a caller can cause. The feed endpoint is
 # public and takes any username, so "a read" is not evidence of a person: anyone can
@@ -111,8 +111,9 @@ MAX_USERS_PER_CYCLE = int(os.environ.get("MAX_USERS_PER_CYCLE", "200"))
 FEED_READ_CHANNEL = "haf_fyp_feed_read"
 # A day, not a week: someone who comes back after longer still gets the immediate
 # re-rank on their first read, and a short window keeps the lane to people who are
-# actually around. A reader in the window is re-ranked EVERY cycle while the lane has
-# room, so the window is also how long one stray read keeps costing a slot.
+# actually around. A reader in the window is re-ranked whenever its feed is older than
+# READ_REFRESH_MIN_AGE_SECONDS and the lane has room (every second cycle at the
+# defaults), so the window is also how long one stray read keeps costing slots.
 READER_WINDOW_SECONDS = max(0, int(os.environ.get("READER_WINDOW_SECONDS", str(24 * 60 * 60))))
 # Share of MAX_USERS_PER_CYCLE that recent readers may take. The remainder always goes
 # to the stalest of everyone else, so a full lane slows the rotation by 1 / (1 - share)
@@ -170,7 +171,7 @@ _reads_reranked = 0
 _lane_taken = 0
 _lane_slots = 0
 _feed_read_failure_logged_at = 0.0
-_missing_column_warned = False
+_missing_column_warned_at: float | None = None
 
 
 # Rotation eviction + #9-invariant repair (#10), on the hourly maintenance cadence.
@@ -334,14 +335,32 @@ def _connect() -> psycopg2.extensions.connection:
         time.sleep(5)
 
 
+def _warn_missing_read_column() -> None:
+    """Once an hour, not once: a ranker can stay like this for weeks, and one line at
+    startup is not something anybody finds."""
+    global _missing_column_warned_at
+    now = time.monotonic()
+    if _missing_column_warned_at is not None and now - _missing_column_warned_at < 3600:
+        return
+    _missing_column_warned_at = now
+    log.warning(
+        "haf_fyp_app.active_users has no last_read_at column: the installed SQL "
+        "is older than this ranker. Ranking continues without the reader lane. "
+        "Stop the block processor and this ranker (the install is skipped while "
+        "either holds HAF's lock) and re-run the install to enable it."
+    )
+
+
 def _listen_for_feed_reads(conn) -> None:
     """LISTEN on the session main() uses, so no second connection and no thread: the
     notifications wait on this socket and _drain_feed_reads collects them between
     passes. LISTEN belongs to the session, which is why every reconnect repeats it.
 
     Also decides whether the schema has last_read_at: on every connection, and after
-    each cycle for as long as it does not."""
-    global _reads_supported, _missing_column_warned
+    each cycle for as long as it does not. On a HAF with application locks that second
+    look cannot succeed while this ranker runs (the install waits for its lock); it is
+    for a HAF without them."""
+    global _reads_supported, _missing_column_warned_at
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -351,20 +370,19 @@ def _listen_for_feed_reads(conn) -> None:
                    AND attname = 'last_read_at' AND NOT attisdropped)
             """
         )
-        _reads_supported = bool(cur.fetchone()[0])
-        if _reads_supported:
+        supported = bool(cur.fetchone()[0])
+        if supported:
             cur.execute(f"LISTEN {FEED_READ_CHANNEL}")
-            if _missing_column_warned:
-                log.info("active_users.last_read_at is there now: reader lane enabled")
-                _missing_column_warned = False
-        elif not _missing_column_warned:
-            _missing_column_warned = True
-            log.warning(
-                "haf_fyp_app.active_users has no last_read_at column: the installed SQL "
-                "is older than this ranker. Ranking continues without the reader lane; "
-                "stop haf-fyp-sync and haf-fyp-ranker and re-run the install to enable it."
-            )
     conn.commit()
+    # Only now: had the LISTEN failed, a flag already set would say "listening" for a
+    # session that is not, and nothing would ever look again.
+    _reads_supported = supported
+    if supported:
+        if _missing_column_warned_at is not None:
+            log.info("active_users.last_read_at is there now: reader lane enabled")
+            _missing_column_warned_at = None
+    else:
+        _warn_missing_read_column()
     # psycopg2 lets this be any object with append(); a bounded deque is what keeps a
     # flood of reads during a long cycle from growing without limit.
     conn.notifies = collections.deque(maxlen=_FEED_READ_BACKLOG_MAX)
@@ -434,8 +452,8 @@ def _note_feed_reads(conn, usernames: set[str], rerank_limit: int) -> set[str]:
 
 
 def _handle_feed_reads(conn, rerank_budget: int) -> set[str]:
-    """One pass of #81: hear the reads, stamp them, and return the accounts to re-rank
-    now (never more than `rerank_budget`)."""
+    """One pass of #81: hear the reads, stamp them, and return the accounts whose feed
+    is old enough to re-rank ahead of the rotation (never more than `rerank_budget`)."""
     global _reads_heard, _reads_reranked
     heard = _drain_feed_reads(conn)
     stale = _note_feed_reads(conn, heard, rerank_budget)
@@ -452,8 +470,8 @@ def _log_feed_read_summary() -> None:
     global _reads_heard, _reads_reranked
     if _reads_supported:
         log.info(
-            "feed reads since the last cycle: %d account(s) heard, %d re-ranked at once; "
-            "reader lane %d of %d slot(s)",
+            "feed reads since the last cycle: %d account(s) heard, %d queued for an "
+            "early re-rank; reader lane %d of %d slot(s)",
             _reads_heard, _reads_reranked, _lane_taken, _lane_slots,
         )
     _reads_heard = _reads_reranked = 0
@@ -615,9 +633,9 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
             #
             # Not a feed ranked within READ_REFRESH_MIN_AGE_SECONDS: the lane would
             # otherwise re-rank the same accounts every cycle however fresh they are,
-            # and whoever keeps the lane full (a busy day, or one caller requesting as
-            # many feeds as it has slots) would hold everyone else at 1 / (1 - share)
-            # of the rotation speed for nothing. Such an account simply competes in
+            # and whoever keeps the lane full (a busy day, or one caller requesting
+            # enough feeds) would hold everyone else at (1 - share) of the rotation
+            # speed, half at the default, for nothing. Such an account simply competes in
             # the remainder, where a fresh feed sorts last.
             cur.execute(
                 """
@@ -858,7 +876,10 @@ def _rank_user(
     write_feed_cache(conn, username, scored, algo_version)
 
 
-def run_cycle(conn) -> None:
+def run_cycle(conn) -> set[str]:
+    """One scheduled cycle. Returns the accounts whose feed it wrote."""
+    global _lane_taken, _lane_slots
+    _lane_taken = _lane_slots = 0  # a cycle that stops before the lane query took nobody
     register_vector_type(conn)
 
     algo_version, weights = _fetch_algorithm(conn)
@@ -866,7 +887,7 @@ def run_cycle(conn) -> None:
 
     if candidates.empty:
         log.info("no candidates to rank — skipping cycle")
-        return
+        return set()
 
     log.info("scoring %d candidates (algo %s)", len(candidates), algo_version)
 
@@ -931,10 +952,12 @@ def run_cycle(conn) -> None:
             continue
         users.extend(survivors[: MAX_USERS_PER_CYCLE - len(users)])
     processed = failed = 0
+    ranked: set[str] = set()
     for username in users:
         try:
             _rank_user(conn, username, candidates, post_vectors, author_credibility, algo_version, weights)
             processed += 1
+            ranked.add(username)
         except psycopg2.OperationalError:
             raise
         except Exception as exc:
@@ -951,6 +974,7 @@ def run_cycle(conn) -> None:
         # this is not done per successful user.
         if not failed:
             _clear_user_failure_memo()
+    return ranked
 
 
 def _run_targeted_refresh(conn, usernames: set[str]) -> None:
@@ -1029,6 +1053,10 @@ def _run_targeted_refresh(conn, usernames: set[str]) -> None:
         # run_cycle it has no per-cycle summary, so the hourly line was the only
         # signal and between those lines nothing at all was emitted.
         log.warning("force-refresh: %d/%d user(s) failed", failed, len(targets))
+    if quiet:
+        # The per-account lines are at DEBUG, so without this a large refresh has no
+        # end in the log and its duration cannot be read from it.
+        log.info("force-refresh complete for %d/%d user(s)", len(targets) - failed, len(targets))
 
 
 def _run_feed_events_maintenance(conn) -> None:
@@ -1275,7 +1303,10 @@ def main() -> None:
         # Full cycle on schedule
         if time.monotonic() >= next_full_cycle:
             try:
-                run_cycle(conn)
+                # Waiting readers the cycle ranked are done. The rest keep waiting for
+                # the next grouped re-rank: a failed cycle, a full lane or a lane that
+                # is switched off took none of them, and their budget is already spent.
+                read_pending -= run_cycle(conn) or set()
             except (psycopg2.OperationalError, psycopg2.InterfaceError):
                 log.warning("database connection lost — reconnecting")
                 conn = _reconnect(conn)
@@ -1288,10 +1319,6 @@ def main() -> None:
             # good cycle, a standing cycle failure left immediate re-ranks switched off
             # once the budget was spent, and the summary silent exactly then.
             read_budget = READ_REFRESH_MAX_PER_CYCLE
-            # Whoever was still waiting is stamped and stale, which is exactly who the
-            # reader lane of the cycle that just ran takes first: ranking them again
-            # now would be the same work twice.
-            read_pending = set()
             _log_feed_read_summary()
             if not _reads_supported:
                 # The install may have run since this session connected. On a HAF with
@@ -1303,6 +1330,7 @@ def main() -> None:
                     log.warning("database connection lost (schema check) — reconnecting")
                     conn = _reconnect(conn)
                 except Exception:
+                    log.exception("could not check the schema for last_read_at")
                     _safe_rollback(conn)
 
         # The active_users liveness/eviction pass (#10), the feed-events

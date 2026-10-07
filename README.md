@@ -682,10 +682,10 @@ passes them through, so add them to that service's `environment:` to change one.
 
 What to expect, and what this does not do:
 
-* **It is not immediate.** With the ranker between cycles, a fresh feed is there about
-  ten seconds after the read (measured on a full node: the refresh itself takes about
-  8 s), or up to `READ_REFRESH_BATCH_SECONDS` later if another reader was served just
-  before. The ranker hears reads between passes of its loop, so a read that arrives
+* **It is not immediate.** With the ranker between cycles, the refresh takes about 8 s
+  once the ranker looks, which is up to 5 s after the read (one measurement on a full
+  node: 9 s end to end), or up to `READ_REFRESH_BATCH_SECONDS` later if another reader
+  was served just before. The ranker hears reads between passes of its loop, so a read that arrives
   during a scheduled cycle is handled when that ends: under a minute at the default
   cycle size, several minutes on a node that ranks thousands per cycle. And once the
   cycle's budget is spent, a stale reader waits for the reader lane instead.
@@ -696,18 +696,22 @@ What to expect, and what this does not do:
   username, so anyone can make accounts look read. Requesting every account's first
   page puts the whole rotation in the lane, and real readers are back to the old
   round-robin for the length of the window. The cheaper way to hurt is smaller: keeping
-  a few hundred accounts in the window (enough to fill the lane's slots every cycle)
-  holds everyone else at `1 / (1 - READER_CYCLE_SHARE)` of the old rotation speed for
-  as long as it is kept up. That is the worst this can do. Telling a reader from a
-  crawler needs an authenticated read, which this app does not have.
+  about twice the lane's slots in the window (200 accounts at the defaults: an account
+  ranked in one cycle is under the minimum age for the next) holds everyone else at
+  `1 - READER_CYCLE_SHARE` of the old rotation speed, half at the default, for as long
+  as it is kept up. That is the worst this can do. Telling a reader from a crawler
+  needs an authenticated read, which this app does not have.
 * **Paging.** A feed rewritten while someone scrolls can repeat or skip a post between
   page 1 and page 2. Readers' feeds are rewritten more often than others'.
 * **The signal is visible inside the database.** It is a Postgres notification on the
-  channel `haf_fyp_feed_read` carrying the username, and any role with a session on the
-  database can listen to it. `last_read_at` is not exposed by any endpoint.
+  channel `haf_fyp_feed_read` carrying the username. Any role with a session on the
+  database can listen to it, and can also send on it, which is one more way a read can
+  be forged; what the ranker does with one is bounded the same either way.
+  `last_read_at` is not exposed by any endpoint.
 
 After every scheduled cycle the ranker logs one line:
-`feed reads since the last cycle: N account(s) heard, M re-ranked at once; reader lane L of S slot(s)`.
+`feed reads since the last cycle: N account(s) heard, M queued for an early re-rank; reader lane L of S slot(s)`.
+(After a cycle that failed, the lane figures read 0 of 0.)
 A lane that stays full means the rest of the rotation is running slower. A heard count
 in the thousands means someone is requesting other people's feeds. Nothing heard for
 days on a node whose feed is in use means the signal is not arriving; a zero now and
@@ -740,29 +744,36 @@ SELECT pg_terminate_backend(pid) FROM pg_stat_activity
 Run it twice, a few seconds apart. This was exercised on a node with PostgREST connected
 directly: no request failed, and the next first-page read did not notify. Behind
 PgBouncer (`haf_api_node`) the sessions that matter are PgBouncer's server connections,
-which do not carry PostgREST's `application_name`: drop that condition there (a request
-in flight on a connection ended this way can fail once). That layout has not been
-exercised. Restarting `haf-fyp-postgrest` also works when it connects directly, and
-changes nothing behind PgBouncer.
+which do not carry PostgREST's `application_name`. Left alone, they are replaced within
+PgBouncer's `server_lifetime` (an hour by default), so the switch applies itself. To
+apply it sooner, drop the `application_name` condition; that also ends the idle
+sessions of `haf-fyp-api`, which logs in as the same role and reconnects, and a
+request in flight on a connection ended this way can fail once. That layout has not
+been exercised. Restarting `haf-fyp-postgrest` also works when it connects directly,
+and changes nothing behind PgBouncer.
 
 To check it took, request a feed and watch `LISTEN haf_fyp_feed_read;` from a psql
 session that keeps issuing a statement (a notification is shown after the next one),
 and is not left inside a transaction.
 
-With the signal off, or with `READER_CYCLE_SHARE=0` and `READ_REFRESH_MAX_PER_CYCLE=0`,
-the ranker ranks the same accounts in the same order as before #81. It still listens,
-and still writes its line each cycle.
+With `READER_CYCLE_SHARE=0` and `READ_REFRESH_MAX_PER_CYCLE=0` the ranker ranks the
+same accounts in the same order as before #81, at once. With only the signal off it
+gets there once the reads already recorded are older than `READER_WINDOW_SECONDS`.
+Either way it still listens, and still writes its line each cycle.
 
 `pg_notification_queue_usage()` is the thing to watch if a ranker is ever left paused
 (not stopped) for days, or a psql session is left listening inside an open transaction:
 a listener that stops reading pins the cluster's notification queue.
 
 **Upgrading.** The ranker needs the `last_read_at` column, which the install adds in
-place. A ranker started against SQL that predates it logs a warning, ranks without the
-reader lane, and looks again after each cycle and on each connection (see
-[Re-installing while the stack runs](#re-installing-while-the-stack-runs-hafs-application-locks):
-an install run while the ranker is up installs nothing on a HAF with application
-locks). The other way round, new SQL under an old or stopped ranker, nothing breaks,
+place. A ranker started against SQL that predates it ranks without the reader lane and
+says so in a warning, repeated hourly. On a HAF with application locks it stays that
+way until someone stops it: the ranker itself holds the lock the install waits for, so
+an install run while it is up installs nothing (see
+[Re-installing while the stack runs](#re-installing-while-the-stack-runs-hafs-application-locks)).
+Stop the block processor and the ranker, run the install, start them. On a HAF without
+those locks the ranker notices the column after its next cycle.
+The other way round, new SQL under an old or stopped ranker, nothing breaks,
 but nothing records the reads either, so every first-page request notifies: switch the
 signal off for the duration.
 
