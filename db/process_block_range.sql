@@ -1,4 +1,5 @@
--- Phase 2: Block range dispatcher — override the stub in haf_fyp_app.sql.
+-- Phase 2: Block range dispatcher. On a first install it replaces the placeholder
+-- db/haf_fyp_app.sql leaves; on a re-install it replaces itself (#83).
 -- Add PERFORM calls here as each processor phase is completed.
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_block_range(
