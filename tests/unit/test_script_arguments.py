@@ -308,6 +308,25 @@ def test_the_preconditions_run_first(bash, tmp_path):
     assert "SET ROLE" not in first, first
 
 
+def test_nothing_runs_between_the_placeholder_and_the_dispatcher(bash, tmp_path):
+    """db/haf_fyp_app.sql leaves a placeholder where there is no block dispatcher, and
+    db/process_block_range.sql installs the dispatcher (#83). Between the two the install
+    may only load files: a statement that started block processing there, or created the
+    context a processor waits for, would run it against the placeholder."""
+    _, _, argv_log = run_install_full_stub(bash, tmp_path)
+    calls = argv_log.read_text().splitlines()
+    loaded = [c.rsplit("/db/", 1)[1] if "/db/" in c else None for c in calls]
+    first, last = loaded.index("haf_fyp_app.sql"), loaded.index("process_block_range.sql")
+    assert first < last, loaded
+    assert loaded.count("haf_fyp_app.sql") == 1 and loaded.count("process_block_range.sql") == 1, loaded
+    between = calls[first + 1:last]
+    assert between, "the two files are adjacent now: update the comment in db/haf_fyp_app.sql"
+    for call, name in zip(between, loaded[first + 1:last]):
+        assert name is not None and " -f " in f" {call} " and " -c " not in f" {call} ", (
+            f"something other than a file load runs between the placeholder and the "
+            f"dispatcher: {call}")
+
+
 def test_a_precondition_refusal_stops_the_install(bash, tmp_path):
     """A refusal must end the install there -- nothing after it runs, and the script
     fails -- or "Nothing has been modified" is untrue."""

@@ -307,18 +307,57 @@ END;
 $$;
 
 -- ---------------------------------------------------------------------------
--- Block range dispatcher (stub — overridden by process_block_range.sql)
+-- Block range dispatcher: a placeholder, and only where there is no dispatcher
 -- ---------------------------------------------------------------------------
-
-CREATE OR REPLACE FUNCTION haf_fyp_app.process_block_range(
-    _first_block int,
-    _last_block int
-)
-RETURNS void
-LANGUAGE plpgsql
-AS $$
+-- The dispatcher itself is db/process_block_range.sql, which install_app.sh loads later
+-- in the same install (nine files stand between the two today). main() and
+-- process_blocks() below call it by name, so on a database that has never had one this
+-- file leaves a placeholder behind.
+--
+-- NEVER over a working dispatcher (#83). This used to be CREATE OR REPLACE with a body
+-- of `NULL;`, so every re-install swapped the working dispatcher for a no-op until
+-- process_block_range.sql ran again, a few seconds later. Each file is its own psql
+-- call: the no-op was committed and visible in between. A block processor running in
+-- that window kept taking ranges from hive.app_next_iteration and "processing" them
+-- instantly: the context pointer advanced, nothing was ingested, nothing raised. On one
+-- node that was 58 ranges of 10,000 blocks in seven seconds, twenty days of chain
+-- history that haf_fyp never saw.
+--
+-- And the placeholder RAISES. Nothing should ever run it; if something does, a stall on
+-- the first range, with a message that says why, is far better than skipping them all.
+--
+-- Two cases get the placeholder: no process_block_range(int, int) at all, and one whose
+-- whole body is that old `NULL;`. The second is a node whose last install under the old
+-- file died between the two files: what it holds is not a dispatcher, and keeping it
+-- would keep the silent skip. Any other body is a dispatcher and is left alone. The
+-- match is on the exact signature, so a function of the same name elsewhere, or with
+-- other arguments, does not stand in for it.
+DO $$
+DECLARE
+    _dispatcher regprocedure := to_regprocedure('haf_fyp_app.process_block_range(integer, integer)');
+    _is_the_old_no_op boolean;
 BEGIN
-    NULL;
+    SELECT p.prosrc ~ '^\s*BEGIN\s+NULL;\s+END;\s*$'
+    INTO _is_the_old_no_op
+    FROM pg_catalog.pg_proc AS p
+    WHERE p.oid = _dispatcher;
+
+    IF _dispatcher IS NULL OR _is_the_old_no_op THEN
+        CREATE OR REPLACE FUNCTION haf_fyp_app.process_block_range(
+            _first_block int,
+            _last_block int
+        )
+        RETURNS void
+        LANGUAGE plpgsql
+        AS $placeholder$
+        BEGIN
+            RAISE EXCEPTION
+                'haf_fyp_app.process_block_range is still the install placeholder: '
+                'db/process_block_range.sql has not been loaded, so blocks % to % cannot '
+                'be processed. Re-run scripts/install_app.sh.', _first_block, _last_block;
+        END;
+        $placeholder$;
+    END IF;
 END;
 $$;
 
