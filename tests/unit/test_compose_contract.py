@@ -1728,3 +1728,63 @@ def test_ci_setup_waits_for_a_healthy_postgres():
     doc = _require_yaml().safe_load(CI_COMPOSE.read_text(encoding="utf-8"))
     condition = doc["services"]["setup"]["depends_on"]["postgres"]["condition"]
     assert condition == "service_healthy", condition
+
+
+# --- the ranker's tuning reaches the ranker (#87) ---------------------------------
+
+RANKER_SOURCE = ROOT / "haf_fyp" / "ranker_daemon.py"
+ENV_FILE = ROOT / "docker" / ".env"
+
+
+def _tuning_variables() -> set:
+    """The variables the ranker reads through _tuning(), from its source."""
+    names = set(re.findall(r'_tuning\(\s*"([A-Z_]+)"', RANKER_SOURCE.read_text(encoding="utf-8")))
+    assert names, "ranker_daemon.py no longer reads any setting through _tuning()"
+    return names
+
+
+def test_the_tuning_variables_are_the_documented_six():
+    assert _tuning_variables() == {
+        "MAX_USERS_PER_CYCLE",
+        "READER_CYCLE_SHARE",
+        "READER_WINDOW_SECONDS",
+        "READ_REFRESH_MIN_AGE_SECONDS",
+        "READ_REFRESH_MAX_PER_CYCLE",
+        "READ_REFRESH_BATCH_SECONDS",
+    }
+
+
+def test_the_ranker_is_passed_every_tuning_variable(services):
+    """A setting the compose file does not pass can only be changed by editing the file.
+
+    That is how a full node sat at MAX_USERS_PER_CYCLE=200, a 22-hour rotation. Each must
+    be `${NAME:-}` exactly: the same name on both sides, and nothing after `:-`, so the
+    default stays the daemon's (one of them is computed and has no constant to write).
+    """
+    env = (services[RANKER] or {}).get("environment") or {}
+    assert isinstance(env, dict), "the ranker's environment is expected in mapping form"
+    for name in sorted(_tuning_variables()):
+        assert name in env, f"{RANKER} is not passed {name}: it cannot be set from .env"
+        assert env[name] == "${%s:-}" % name, (
+            f"{RANKER}.environment.{name} is {env[name]!r}; expected ${{{name}:-}}")
+
+
+def test_no_other_service_is_passed_the_ranker_tuning(services):
+    for service, spec in services.items():
+        if service == RANKER:
+            continue
+        env = (spec or {}).get("environment") or {}
+        if isinstance(env, list):
+            env = dict(item.split("=", 1) if "=" in item else (item, "") for item in env)
+        stray = _tuning_variables() & set(env)
+        assert not stray, f"{service} is passed {sorted(stray)}, which only the ranker reads"
+
+
+def test_the_env_file_lists_every_tuning_variable_and_sets_none():
+    """Listed, so an operator finds them; empty, so the tracked file changes nothing."""
+    env = _read_env(ENV_FILE)
+    for name in sorted(_tuning_variables()):
+        assert name in env, f"docker/.env does not list {name}"
+        assert env[name] == "", (
+            f"docker/.env sets {name}={env[name]!r}: the tracked file would then override "
+            f"the daemon's default on every checkout")

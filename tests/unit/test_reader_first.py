@@ -934,6 +934,21 @@ def settings():
             "READ_REFRESH_MAX_PER_CYCLE": "3",
             "READ_REFRESH_BATCH_SECONDS": "7",
         },
+        # What the compose file hands the daemon when the operator set none of them
+        # (#87): every key present, every value empty.
+        "passed_through_empty": {
+            "MAX_USERS_PER_CYCLE": "",
+            "READER_WINDOW_SECONDS": "",
+            "READER_CYCLE_SHARE": "",
+            "READ_REFRESH_MIN_AGE_SECONDS": "",
+            "READ_REFRESH_MAX_PER_CYCLE": "",
+            "READ_REFRESH_BATCH_SECONDS": "",
+        },
+        "cycle_only_rest_empty": {
+            "MAX_USERS_PER_CYCLE": "3000",
+            "READER_CYCLE_SHARE": "",
+            "READ_REFRESH_MAX_PER_CYCLE": " ",
+        },
         "bigger_cycle": {"MAX_USERS_PER_CYCLE": "3000"},
         "share_only": {"READER_CYCLE_SHARE": "0.25"},
         "by_hand": {"MAX_USERS_PER_CYCLE": "3000", "READ_REFRESH_MAX_PER_CYCLE": "1500"},
@@ -968,6 +983,44 @@ def test_the_reader_defaults_are_the_documented_ones(settings):
         "_READ_REFRESH_DEFAULT_CEILING": 300,
         "_FEED_READ_BACKLOG_MAX": 20000,
     }
+
+
+def test_settings_passed_through_empty_are_the_defaults(settings):
+    # docker-compose.yml passes each one as ${NAME:-}. int("") raises, so before #87
+    # the pass-through would have stopped every ranker whose operator set nothing.
+    assert settings["passed_through_empty"] == settings["defaults"]
+
+
+def test_an_empty_setting_still_follows_the_ones_that_are_set(settings):
+    got = settings["cycle_only_rest_empty"]
+
+    assert got["READER_CYCLE_SHARE"] == 0.5
+    assert got["READ_REFRESH_MAX_PER_CYCLE"] == 300  # 3000 x 0.5, held at the ceiling
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [(None, 5), ("", 5), ("   ", 5), ("7", 7), (" 7 ", 7), ("0", 0), ("-2", -2)],
+)
+def test_a_tuning_variable_unset_or_empty_takes_the_default(monkeypatch, raw, expected):
+    monkeypatch.delenv("HAF_FYP_TEST_TUNING", raising=False)
+    if raw is not None:
+        monkeypatch.setenv("HAF_FYP_TEST_TUNING", raw)
+
+    assert rd._tuning("HAF_FYP_TEST_TUNING", "5", int) == expected
+
+
+def test_a_tuning_variable_that_is_not_a_number_names_itself(monkeypatch):
+    monkeypatch.setenv("HAF_FYP_TEST_TUNING", "lots")
+
+    with pytest.raises(ValueError, match="HAF_FYP_TEST_TUNING='lots' is not a number"):
+        rd._tuning("HAF_FYP_TEST_TUNING", "5", int)
+
+    monkeypatch.setenv("HAF_FYP_TEST_TUNING", "0.5")
+    with pytest.raises(ValueError, match="HAF_FYP_TEST_TUNING='0.5'"):
+        rd._tuning("HAF_FYP_TEST_TUNING", "5", int)  # a share where a count belongs
+
+    assert rd._tuning("HAF_FYP_TEST_TUNING", "5", float) == 0.5  # the same value is a valid share
 
 
 def test_the_reader_settings_are_read_from_the_environment(settings):

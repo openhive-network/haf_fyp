@@ -668,8 +668,11 @@ once per full rotation: about 22 hours at 45,000 accounts and the default 200.
 The rest of each cycle goes to everyone else in the old order. The first request after
 a long absence is still served the old feed; it is the one that triggers the refresh.
 
-These are environment variables of the `haf-fyp-ranker` service. Neither compose file
-passes them through, so add them to that service's `environment:` to change one.
+These are environment variables of the `haf-fyp-ranker` service. `docker/docker-compose.yml`
+passes them through, so set one in `docker/.env` (or `.env.local`, or the shell) and
+recreate the ranker: `docker compose up -d haf-fyp-ranker`. Left empty, a variable takes
+the default below. haf_api_node's `haf_fyp.yaml` does not pass them through yet (#87):
+there, add them to that service's `environment:`.
 
 | Variable | Default | What it bounds |
 |---|---|---|

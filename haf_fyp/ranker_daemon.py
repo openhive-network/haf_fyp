@@ -70,6 +70,24 @@ log = logging.getLogger(__name__)
 CYCLE_SECONDS = 300
 POLL_SECONDS = 5
 
+
+def _tuning(key: str, default: str, convert):
+    """A tuning variable, with unset and empty meaning the same thing: the default (#87).
+
+    The compose files pass these through as `${NAME:-}`, so a variable the operator never
+    set arrives here as an empty string, not as an absent key. os.environ.get returns its
+    default only for an absent key, and int("") raises: without this, passing the
+    variables through would stop every ranker whose operator set none of them.
+
+    A value that is not a number still stops the daemon, and says which variable.
+    """
+    raw = os.environ.get(key, "").strip()
+    try:
+        return convert(raw or default)
+    except ValueError:
+        raise ValueError(f"{key}={raw!r} is not a number ({convert.__name__} expected)") from None
+
+
 # Feed-events (#12) retention + rollup, run periodically off the same loop.
 # Hourly by default: the raw log is unauthenticated, so a shorter interval bounds
 # the worst-case flood window between prune passes (the rollup is incremental and
@@ -92,7 +110,7 @@ CANDIDATE_LIMIT = 5000
 # _run_targeted_refresh. The scheduled cycle then only keeps already-cached
 # (i.e. active) users fresh, oldest-first, capped at MAX_USERS_PER_CYCLE so each
 # pass stays bounded no matter how large the subscriber base grows.
-MAX_USERS_PER_CYCLE = int(os.environ.get("MAX_USERS_PER_CYCLE", "200"))
+MAX_USERS_PER_CYCLE = _tuning("MAX_USERS_PER_CYCLE", "200", int)
 
 # Readers first (#81). The rotation holds every account there is something to
 # personalize for; almost none of them ever open their feed. Ranked round-robin, a
@@ -114,13 +132,13 @@ FEED_READ_CHANNEL = "haf_fyp_feed_read"
 # actually around. A reader in the window is re-ranked whenever its feed is older than
 # READ_REFRESH_MIN_AGE_SECONDS and the lane has room (every second cycle at the
 # defaults), so the window is also how long one stray read keeps costing slots.
-READER_WINDOW_SECONDS = max(0, int(os.environ.get("READER_WINDOW_SECONDS", str(24 * 60 * 60))))
+READER_WINDOW_SECONDS = max(0, _tuning("READER_WINDOW_SECONDS", str(24 * 60 * 60), int))
 # Share of MAX_USERS_PER_CYCLE that recent readers may take. The remainder always goes
 # to the stalest of everyone else, so a full lane slows the rotation by 1 / (1 - share)
 # and cannot stop it -- which is why the share is capped below 1: at 1.0 a full lane
 # would leave the rotation nothing at all. 0 turns the reader lane off.
-READER_CYCLE_SHARE = min(0.9, max(0.0, float(os.environ.get("READER_CYCLE_SHARE", "0.5"))))
-READ_REFRESH_MIN_AGE_SECONDS = max(0, int(os.environ.get("READ_REFRESH_MIN_AGE_SECONDS", "600")))
+READER_CYCLE_SHARE = min(0.9, max(0.0, _tuning("READER_CYCLE_SHARE", "0.5", float)))
+READ_REFRESH_MIN_AGE_SECONDS = max(0, _tuning("READ_REFRESH_MIN_AGE_SECONDS", "600", int))
 # Immediate re-ranks between two scheduled cycles. A budget per cycle, not per pass of
 # the main loop: a pass is five seconds, so a per-pass limit let one caller keep the
 # ranker busy continuously. Readers past the budget are not lost: they are stamped,
@@ -133,17 +151,18 @@ READ_REFRESH_MIN_AGE_SECONDS = max(0, int(os.environ.get("READ_REFRESH_MIN_AGE_S
 # Set it by hand to go higher; keep it times seconds-per-account well under
 # CYCLE_SECONDS.
 _READ_REFRESH_DEFAULT_CEILING = 300
-READ_REFRESH_MAX_PER_CYCLE = max(0, int(os.environ.get(
+READ_REFRESH_MAX_PER_CYCLE = max(0, _tuning(
     "READ_REFRESH_MAX_PER_CYCLE",
     str(min(int(MAX_USERS_PER_CYCLE * READER_CYCLE_SHARE), _READ_REFRESH_DEFAULT_CEILING)),
-)))
+    int,
+))
 # Read-triggered re-ranks are grouped: after one runs, the next waits this long and
 # takes everyone who became due meanwhile. A targeted refresh fetches the candidates,
 # their vectors and the authors' credibility before it ranks anyone (about 8 s on a
 # full node, against a fraction of a second per account), so one call per read let a
 # trickle of reads for different accounts keep the ranker fetching between cycles. The
 # first read after a quiet spell is not held back. 0 turns the grouping off.
-READ_REFRESH_BATCH_SECONDS = max(0, int(os.environ.get("READ_REFRESH_BATCH_SECONDS", "30")))
+READ_REFRESH_BATCH_SECONDS = max(0, _tuning("READ_REFRESH_BATCH_SECONDS", "30", int))
 # Notifications held on the connection between drains. psycopg2 appends to
 # conn.notifies whenever it reads the socket, i.e. during every query of a cycle, and
 # nothing else bounds that list; the oldest are discarded past this. It is also the
