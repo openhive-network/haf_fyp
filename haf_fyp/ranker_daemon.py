@@ -43,6 +43,8 @@ import re
 import signal
 import threading
 import time
+from collections.abc import Callable
+from typing import TypeVar
 
 import pandas as pd
 import psycopg2
@@ -71,21 +73,26 @@ CYCLE_SECONDS = 300
 POLL_SECONDS = 5
 
 
-def _tuning(key: str, default: str, convert):
+_Number = TypeVar("_Number", int, float)
+
+
+def _tuning(key: str, default: str, convert: Callable[[str], _Number]) -> _Number:
     """A tuning variable, with unset and empty meaning the same thing: the default (#87).
 
-    The compose files pass these through as `${NAME:-}`, so a variable the operator never
-    set arrives here as an empty string, not as an absent key. os.environ.get returns its
-    default only for an absent key, and int("") raises: without this, passing the
-    variables through would stop every ranker whose operator set none of them.
+    docker/docker-compose.yml passes these to the ranker by name, so `NAME=` left blank
+    in an env file arrives here as an empty string, not as an absent key.
+    os.environ.get returns its default only for an absent key, and int("") raises: a
+    blanked-out line would stop the ranker. Blank is defaulted here, where
+    dbenv.env_or_default refuses it, because nothing here is concatenated into a
+    connection string.
 
-    A value that is not a number still stops the daemon, and says which variable.
+    A value `convert` rejects still stops the daemon, and the error says which variable.
     """
     raw = os.environ.get(key, "").strip()
     try:
         return convert(raw or default)
     except ValueError:
-        raise ValueError(f"{key}={raw!r} is not a number ({convert.__name__} expected)") from None
+        raise ValueError(f"{key}={raw!r} is not a valid {convert.__name__}") from None
 
 
 # Feed-events (#12) retention + rollup, run periodically off the same loop.

@@ -1735,38 +1735,115 @@ def test_ci_setup_waits_for_a_healthy_postgres():
 RANKER_SOURCE = ROOT / "haf_fyp" / "ranker_daemon.py"
 ENV_FILE = ROOT / "docker" / ".env"
 
+TUNING = {
+    "MAX_USERS_PER_CYCLE",
+    "READER_CYCLE_SHARE",
+    "READER_WINDOW_SECONDS",
+    "READ_REFRESH_MIN_AGE_SECONDS",
+    "READ_REFRESH_MAX_PER_CYCLE",
+    "READ_REFRESH_BATCH_SECONDS",
+}
 
-def _tuning_variables() -> set:
-    """The variables the ranker reads through _tuning(), from its source."""
-    names = set(re.findall(r'_tuning\(\s*"([A-Z_]+)"', RANKER_SOURCE.read_text(encoding="utf-8")))
-    assert names, "ranker_daemon.py no longer reads any setting through _tuning()"
-    return names
+# Read by the ranker and deliberately NOT passed by docker-compose.yml: retention and
+# maintenance settings nobody has needed to change, and two connection settings whose
+# defaults are the stack's own. Passing one is fine -- take it off this list, and read
+# it through something that survives an empty value.
+RANKER_READS_NOT_PASSED = {
+    "POSTGRES_PASSWORD",
+    "POSTGRES_PORT",
+    "FEED_EVENTS_MAINT_SECONDS",
+    "FEED_EVENTS_RETAIN_DAYS",
+    "FEED_EVENTS_MAX_ROWS",
+    "EMBEDDING_COVERAGE_DAYS",
+    "ACTIVE_USERS_MAX_EVICTIONS",
+    "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS",
+}
+
+_ENV_READERS = ("_tuning", "os.environ.get", "os.getenv", "env_or_default")
+
+
+def _ranker_env_reads() -> dict:
+    """Every environment variable ranker_daemon.py reads, by the call that reads it.
+
+    From the syntax tree, not a regex: a regex over the text missed single quotes, a
+    digit in the name and the keyword form, and counted a call inside a comment.
+    """
+    import ast
+
+    tree = ast.parse(RANKER_SOURCE.read_text(encoding="utf-8"))
+    reads = {name: set() for name in _ENV_READERS}
+    inside_tuning = {
+        id(node)
+        for func in ast.walk(tree)
+        if isinstance(func, ast.FunctionDef) and func.name == "_tuning"
+        for node in ast.walk(func)
+    }                                   # its own os.environ.get(key, "")
+    for node in ast.walk(tree):
+        if id(node) in inside_tuning:
+            continue
+        if isinstance(node, ast.Subscript) and ast.unparse(node.value) == "os.environ":
+            raise AssertionError(
+                f"os.environ[...] at line {node.lineno}: this check cannot see what it reads")
+        if not isinstance(node, ast.Call) or ast.unparse(node.func) not in reads:
+            continue
+        first = node.args[0] if node.args else next(
+            (k.value for k in node.keywords if k.arg == "key"), None)
+        assert isinstance(first, ast.Constant) and isinstance(first.value, str), (
+            f"line {node.lineno}: {ast.unparse(node)} does not name its variable with a literal")
+        reads[ast.unparse(node.func)].add(first.value)
+    return reads
+
+
+def _ranker_environment(services) -> dict:
+    env = (services[RANKER] or {}).get("environment") or {}
+    assert isinstance(env, dict), "the ranker's environment is expected in mapping form"
+    return env
 
 
 def test_the_tuning_variables_are_the_documented_six():
-    assert _tuning_variables() == {
-        "MAX_USERS_PER_CYCLE",
-        "READER_CYCLE_SHARE",
-        "READER_WINDOW_SECONDS",
-        "READ_REFRESH_MIN_AGE_SECONDS",
-        "READ_REFRESH_MAX_PER_CYCLE",
-        "READ_REFRESH_BATCH_SECONDS",
-    }
+    assert _ranker_env_reads()["_tuning"] == TUNING
 
 
-def test_the_ranker_is_passed_every_tuning_variable(services):
+def test_the_ranker_is_passed_every_tuning_variable_by_name_alone(services):
     """A setting the compose file does not pass can only be changed by editing the file.
 
-    That is how a full node sat at MAX_USERS_PER_CYCLE=200, a 22-hour rotation. Each must
-    be `${NAME:-}` exactly: the same name on both sides, and nothing after `:-`, so the
-    default stays the daemon's (one of them is computed and has no constant to write).
+    That is how a full node sat at MAX_USERS_PER_CYCLE=200, a 22-hour rotation. Each is
+    a key with no value: compose fills it from the env file or the shell, and leaves it
+    out of the container when neither sets it. `${NAME:-}` instead would hand an EMPTY
+    variable to the ranker, and an image built before #87 does int("") on it.
     """
-    env = (services[RANKER] or {}).get("environment") or {}
-    assert isinstance(env, dict), "the ranker's environment is expected in mapping form"
-    for name in sorted(_tuning_variables()):
-        assert name in env, f"{RANKER} is not passed {name}: it cannot be set from .env"
-        assert env[name] == "${%s:-}" % name, (
-            f"{RANKER}.environment.{name} is {env[name]!r}; expected ${{{name}:-}}")
+    env = _ranker_environment(services)
+    for name in sorted(TUNING):
+        assert name in env, f"{RANKER} is not passed {name}: it cannot be set from an env file"
+        assert env[name] is None, (
+            f"{RANKER}.environment.{name} is {env[name]!r}; expected the bare key, no value")
+
+
+def test_only_what_survives_an_empty_value_is_passed_without_one(services):
+    """The other direction. A bare key, or `${X:-}`, can reach the daemon empty (a blank
+    line in the env file), so everything passed that way must be read through _tuning().
+    FEED_EVENTS_RETAIN_DAYS passed like this would bring back the crash with every test
+    above still green."""
+    env = _ranker_environment(services)
+    may_be_empty = {
+        key for key, value in env.items()
+        if value is None or re.fullmatch(r"\$\{[A-Za-z0-9_]+:?-\}", str(value))
+    }
+    assert may_be_empty == TUNING, sorted(may_be_empty ^ TUNING)
+
+
+def test_every_variable_the_ranker_reads_is_passed_or_listed_as_not(services):
+    """The bug class of #87: a setting added to the daemon and to nothing else."""
+    env = set(_ranker_environment(services))
+    read = set().union(*_ranker_env_reads().values())
+    missing = read - env - RANKER_READS_NOT_PASSED
+    assert not missing, (
+        f"{RANKER} reads {sorted(missing)} but docker-compose.yml does not pass it: pass "
+        f"it, or add it to RANKER_READS_NOT_PASSED on purpose")
+    stale = RANKER_READS_NOT_PASSED & env
+    assert not stale, f"{sorted(stale)} is passed now: take it off RANKER_READS_NOT_PASSED"
+    unread = RANKER_READS_NOT_PASSED - read
+    assert not unread, f"{sorted(unread)} is no longer read by the ranker: drop it from the list"
 
 
 def test_no_other_service_is_passed_the_ranker_tuning(services):
@@ -1776,15 +1853,36 @@ def test_no_other_service_is_passed_the_ranker_tuning(services):
         env = (spec or {}).get("environment") or {}
         if isinstance(env, list):
             env = dict(item.split("=", 1) if "=" in item else (item, "") for item in env)
-        stray = _tuning_variables() & set(env)
+        stray = TUNING & set(env)
         assert not stray, f"{service} is passed {sorted(stray)}, which only the ranker reads"
 
 
-def test_the_env_file_lists_every_tuning_variable_and_sets_none():
-    """Listed, so an operator finds them; empty, so the tracked file changes nothing."""
+def test_the_env_file_shows_every_tuning_variable_and_sets_none():
+    """Shown, so an operator finds them; commented, so the tracked file changes nothing.
+
+    Not even set empty: with a bare key in the compose file, `NAME=` here would put an
+    empty NAME in the container, which a ranker image from before #87 cannot start with.
+    """
+    text = ENV_FILE.read_text(encoding="utf-8")
     env = _read_env(ENV_FILE)
-    for name in sorted(_tuning_variables()):
-        assert name in env, f"docker/.env does not list {name}"
-        assert env[name] == "", (
-            f"docker/.env sets {name}={env[name]!r}: the tracked file would then override "
-            f"the daemon's default on every checkout")
+    for name in sorted(TUNING):
+        assert name not in env, f"docker/.env sets {name}={env[name]!r}; leave it commented"
+        assert re.search(rf"(?m)^# {name}=", text), (
+            f"docker/.env has no commented `# {name}=` line for an operator to copy")
+
+
+def test_the_defaults_shown_in_the_env_file_are_the_daemons():
+    """A default written in a comment drifts the day the code's changes."""
+    import ast
+
+    shown = dict(re.findall(r"(?m)^# ([A-Z_]+)=(\S*)$", ENV_FILE.read_text(encoding="utf-8")))
+    tree = ast.parse(RANKER_SOURCE.read_text(encoding="utf-8"))
+    coded = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "_tuning" \
+                and isinstance(node.args[0], ast.Constant) and node.args[0].value in TUNING:
+            try:
+                coded[node.args[0].value] = str(eval(ast.unparse(node.args[1]), {"str": str}))  # noqa: S307
+            except NameError:
+                coded[node.args[0].value] = ""          # computed from the other settings
+    assert {name: shown.get(name) for name in TUNING} == coded

@@ -277,17 +277,21 @@ services:
       REDIS_HOST:    ${REDIS_HOST:-haf-fyp-redis}
       REDIS_PORT:    ${REDIS_PORT:-6379}
       REDIS_URL:     ${REDIS_URL:-redis://haf-fyp-redis:6379}
-      # Ranker tuning (#87), passed through from docker/.env or the shell. Empty means
-      # "not set": the daemon then uses its own default (README, "How fresh a feed is"),
-      # so the defaults live in one place, haf_fyp/ranker_daemon.py. Deliberately `:-`
-      # with nothing after it, not a default here: READ_REFRESH_MAX_PER_CYCLE's default
-      # is computed from two of the others and cannot be written as a constant.
-      MAX_USERS_PER_CYCLE:          ${MAX_USERS_PER_CYCLE:-}
-      READER_CYCLE_SHARE:           ${READER_CYCLE_SHARE:-}
-      READER_WINDOW_SECONDS:        ${READER_WINDOW_SECONDS:-}
-      READ_REFRESH_MIN_AGE_SECONDS: ${READ_REFRESH_MIN_AGE_SECONDS:-}
-      READ_REFRESH_MAX_PER_CYCLE:   ${READ_REFRESH_MAX_PER_CYCLE:-}
-      READ_REFRESH_BATCH_SECONDS:   ${READ_REFRESH_BATCH_SECONDS:-}
+      # Ranker tuning (#87), README "How fresh a feed is". A key with NO value: compose
+      # takes it from the env file (or the shell) when it is set there, and otherwise
+      # leaves it out of the container altogether, so the daemon uses its own default.
+      #
+      # Deliberately not `${NAME:-}`. That hands the container an EMPTY variable when
+      # nothing is set, and a ranker image built before #87 does int("") on it and
+      # restarts forever -- which is what a plain `up -d` without --build would run.
+      # Nor `${NAME:-200}`: the defaults live in haf_fyp/ranker_daemon.py, and
+      # READ_REFRESH_MAX_PER_CYCLE's is computed from two of the others.
+      MAX_USERS_PER_CYCLE:
+      READER_CYCLE_SHARE:
+      READER_WINDOW_SECONDS:
+      READ_REFRESH_MIN_AGE_SECONDS:
+      READ_REFRESH_MAX_PER_CYCLE:
+      READ_REFRESH_BATCH_SECONDS:
     depends_on:
       haf-fyp-setup:
         condition: service_completed_successfully
