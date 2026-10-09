@@ -1365,7 +1365,515 @@ class TestEarlyChargingRequiresIdentifiableCallers:
         monkeypatch.setattr(
             __import__("haf_fyp.api", fromlist=["x"]), "_TRUSTED_LITERALS", literals
         )
-        assert mw._early_charge_is_safe() is True
+        monkeypatch.setattr(__import__("haf_fyp.api", fromlist=["x"]), "_TRUSTED_NETS", nets)
+        # With or without the header: nothing is trusted to send it, so its absence
+        # says nothing about whether callers can be told apart.
+        assert mw._early_charge_is_safe(_peer_request("203.0.113.9")) is True
+        assert mw._early_charge_is_safe(
+            _peer_request("203.0.113.9", {"x-real-ip": "198.51.100.1"})
+        ) is True
+
+
+class TestADeclaredEdgeMustAlsoSendTheHeader:
+    """#35. The gate used to ask "did the operator declare an edge?", and the safe
+    question is "is the caller's address arriving?". Behind an edge that was never
+    made to send X-Real-IP they differ: TRUSTED_PROXY_IPS is set correctly, every
+    request keys on the edge -- and charging those before validation is the shared
+    bucket lockout the gate exists to prevent."""
+
+    EDGE = "testclient"  # the peer TestClient presents
+
+    @staticmethod
+    def _toy(monkeypatch, per_ip="3/minute", trusted=("testclient",), peer="testclient",
+             early=None):
+        """The module's real key function and gate, on a limiter of its own."""
+        from haf_fyp import api
+
+        literals, nets = api._parse_trusted(",".join(trusted))
+        monkeypatch.setattr(api, "_TRUSTED_LITERALS", literals)
+        monkeypatch.setattr(api, "_TRUSTED_NETS", nets)
+        monkeypatch.setattr(api, "_warned_edge_sends_no_header", False)
+
+        class Batch(BaseModel):
+            session: str = Field(min_length=1, max_length=64)
+            n: int = Field(ge=0, le=10)
+
+        lim = Limiter(key_func=api.client_ip_key, storage_uri="memory://", key_style="url")
+        app = FastAPI()
+        app.state.limiter = lim
+        app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+        # early=None: the gate decides, which is how the real app installs it.
+        app.add_middleware(RateLimitBeforeValidationMiddleware, limiter=lim, early=early)
+
+        @app.post("/v1/fyp/events")
+        @lim.limit(per_ip)
+        def post_events(request: Request, req: Batch):  # noqa: ARG001
+            return {"accepted": req.n}
+
+        return TestClient(app, client=(peer, 50000))
+
+    def test_junk_with_no_header_cannot_lock_out_the_other_callers(self, monkeypatch):
+        c = self._toy(monkeypatch)
+        # Twelve senders, one bucket: no header means all of them are "the edge".
+        junk = [c.post("/v1/fyp/events", json=INVALID).status_code for _ in range(12)]
+        assert junk == [422] * 12, junk
+        r = c.post("/v1/fyp/events", json=VALID)
+        assert r.status_code == 200, (
+            f"{r.status_code}: malformed traffic was charged before validation into "
+            "the edge's one bucket, so a clean caller behind the same edge is locked "
+            "out"
+        )
+
+    def test_the_same_holds_on_the_real_app(self, monkeypatch):
+        api = TestEarlyChargingRequiresIdentifiableCallers._real(
+            monkeypatch, frozenset({"testclient"})
+        )
+        monkeypatch.setattr(api, "_warned_edge_sends_no_header", False)
+        c = TestClient(api.app)
+        codes = [
+            c.request("DELETE", "/v1/fyp/interests", json={"username": "u"}).status_code
+            for _ in range(13)
+        ]
+        assert 429 not in codes, codes
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {"X-Real-IP": ""},
+            {"X-Real-IP": "   "},
+            {"X-Real-IP": "not-an-address"},
+            {"X-Real-IP": "203.0.113.7, "},
+            {"X-Forwarded-For": "203.0.113.7"},
+        ],
+        ids=["empty", "blank", "not-an-address", "trailing-comma", "the-other-header"],
+    )
+    def test_a_header_that_names_nobody_counts_as_absent(self, monkeypatch, headers):
+        c = self._toy(monkeypatch)
+        junk = [
+            c.post("/v1/fyp/events", json=INVALID, headers=headers).status_code
+            for _ in range(6)
+        ]
+        assert junk == [422] * 6, junk
+
+    @pytest.mark.parametrize(
+        "trusted", [("testclient",), ()], ids=["edge-sends-no-header", "empty-trust-list"]
+    )
+    def test_the_body_cap_holds_where_the_early_charge_does_not(self, monkeypatch, trusted):
+        # The cap sat behind the early charge, so declining to charge early also
+        # let a malformed body of any size through to the parser, unmetered.
+        from haf_fyp import api
+
+        c = self._toy(monkeypatch, trusted=trusted)
+        big = b"x" * (api._MAX_BODY_BYTES + 1)
+        codes = [
+            c.post("/v1/fyp/events", content=big,
+                   headers={"content-type": "application/json"}).status_code
+            for _ in range(6)
+        ]
+        assert codes == [413] * 6, codes
+        # ...and those cost nobody anything: there is no bucket here that it would
+        # be safe to charge them to.
+        assert c.post("/v1/fyp/events", json=VALID).status_code == 200
+
+    def test_a_body_at_the_cap_is_not_refused_there(self, monkeypatch):
+        from haf_fyp import api
+
+        c = self._toy(monkeypatch)
+        at_cap = b"x" * api._MAX_BODY_BYTES
+        r = c.post("/v1/fyp/events", content=at_cap,
+                   headers={"content-type": "application/json"})
+        assert r.status_code == 422, r.status_code
+
+    @pytest.mark.parametrize(
+        "peer", ["10.0.0.5", "::ffff:10.0.0.5"], ids=["v4-peer", "v4-mapped-peer"]
+    )
+    @pytest.mark.parametrize(
+        "named", ["10.0.0.5", "::ffff:10.0.0.5", "198.51.100.9, 10.0.0.5"],
+        ids=["the-peer", "the-peer-v4-mapped", "appended"],
+    )
+    @pytest.mark.parametrize(
+        "trusted", [("10.0.0.0/8",), ("10.0.0.5",)], ids=["trusted-as-a-net", "trusted-as-one-address"]
+    )
+    def test_the_peer_cannot_vouch_for_itself(self, monkeypatch, peer, named, trusted):
+        # An edge that passes a client's own X-Real-IP through lets any sender
+        # write the edge's address in it. Were that "vouched", the sender would be
+        # charged early into the bucket that peer's header-less callers fall back to.
+        from haf_fyp import api
+
+        c = self._toy(monkeypatch, trusted=trusted, peer=peer)
+        junk = [
+            c.post("/v1/fyp/events", json=INVALID, headers={"X-Real-IP": named}).status_code
+            for _ in range(6)
+        ]
+        assert junk == [422] * 6, junk
+        assert c.post("/v1/fyp/events", json=VALID).status_code == 200
+        mw = RateLimitBeforeValidationMiddleware(object(), limiter=api.limiter)
+        req = _peer_request(peer, {"x-real-ip": named})
+        assert mw._early_charge_is_safe(req) is False
+        assert api.client_ip_key(req) == peer
+
+    def test_an_ipv6_peer_cannot_vouch_for_itself_either(self, monkeypatch, caplog):
+        # The vouched key of an IPv6 caller is its /64, so nothing but this rule
+        # stops the peer's own address being accepted. Asked of the gate FIRST,
+        # while the warning is unspent, so the answer is the gate's own.
+        import logging
+
+        from haf_fyp import api
+
+        self._toy(monkeypatch, trusted=("fd00::/64",), peer="fd00::5")
+        mw = RateLimitBeforeValidationMiddleware(object(), limiter=api.limiter)
+        with caplog.at_level(logging.WARNING, logger="haf_fyp.api"):
+            req = _peer_request("fd00::5", {"x-real-ip": "fd00::5"})
+            assert mw._early_charge_is_safe(req) is False
+        assert api.client_ip_key(req) == "fd00::5"
+        # Naming the peer is "no usable header" in the log as well.
+        assert caplog.text.count("no usable X-Real-IP") == 1, caplog.text
+        other = _peer_request("fd00::5", {"x-real-ip": "fd00::9"})
+        assert mw._early_charge_is_safe(other) is True
+        assert api.client_ip_key(other) == "fd00::/64"
+
+    def test_an_unusable_header_is_declined_on_the_very_first_request(self, monkeypatch):
+        from haf_fyp import api
+
+        self._toy(monkeypatch)
+        mw = RateLimitBeforeValidationMiddleware(object(), limiter=api.limiter)
+        assert api._warned_edge_sends_no_header is False
+        assert mw._early_charge_is_safe(
+            _peer_request("testclient", {"x-real-ip": "garbage"})
+        ) is False
+
+    def test_the_warning_names_the_peer_and_never_the_header(self, monkeypatch, caplog):
+        import logging
+
+        from haf_fyp import api
+
+        self._toy(monkeypatch, trusted=("10.0.0.0/8",))
+        mw = RateLimitBeforeValidationMiddleware(object(), limiter=api.limiter)
+        for call in (mw._early_charge_is_safe, api.client_ip_key):
+            monkeypatch.setattr(api, "_warned_edge_sends_no_header", False)
+            caplog.clear()
+            with caplog.at_level(logging.DEBUG, logger="haf_fyp.api"):
+                call(_peer_request("10.0.0.5", {"x-real-ip": "203.0.113.7:4711"}))
+            (record,) = [r for r in caplog.records if "no usable X-Real-IP" in r.getMessage()]
+            assert record.levelno == logging.WARNING
+            text = record.getMessage()
+            assert text.count("10.0.0.5") == 2, text
+            assert "4711" not in text and "203.0.113.7" not in text, text
+            # The peer as the socket reported it: that is the string an operator
+            # will find in the proxy's own configuration and logs.
+            monkeypatch.setattr(api, "_warned_edge_sends_no_header", False)
+            caplog.clear()
+            with caplog.at_level(logging.DEBUG, logger="haf_fyp.api"):
+                call(_peer_request("::ffff:10.0.0.5"))
+            assert caplog.text.count("::ffff:10.0.0.5") == 2, caplog.text
+
+    def test_a_direct_deployment_is_not_told_its_peers_are_trusted(self, monkeypatch, caplog):
+        import logging
+
+        from haf_fyp import api
+
+        self._toy(monkeypatch, trusted=("direct",))
+        mw = RateLimitBeforeValidationMiddleware(object(), limiter=api.limiter)
+        with caplog.at_level(logging.WARNING, logger="haf_fyp.api"):
+            assert mw._early_charge_is_safe(_peer_request("203.0.113.9")) is True
+            api.client_ip_key(_peer_request("203.0.113.9"))
+        assert "no usable X-Real-IP" not in caplog.text
+
+    def test_a_direct_deployment_still_pays_for_an_oversized_body(self, monkeypatch):
+        # Charged early, so the cap comes after the charge -- with no header at all.
+        from haf_fyp import api
+
+        c = self._toy(monkeypatch, trusted=("direct",))
+        big = b"x" * (api._MAX_BODY_BYTES + 1)
+        codes = [
+            c.post("/v1/fyp/events", content=big,
+                   headers={"content-type": "application/json"}).status_code
+            for _ in range(5)
+        ]
+        assert codes == [413, 413, 413, 429, 429], codes
+        other = TestClient(c.app, client=("203.0.113.77", 50000))
+        r = other.post("/v1/fyp/events", content=big,
+                       headers={"content-type": "application/json"})
+        assert r.json() == {
+            "detail": f"request body of {len(big)} bytes exceeds the "
+                      f"{api._MAX_BODY_BYTES}-byte limit"
+        }
+
+    def test_the_uncharged_cap_reports_the_size_and_follows_the_setting(self, monkeypatch):
+        from haf_fyp import api
+
+        c = self._toy(monkeypatch)
+        monkeypatch.setattr(api, "_MAX_BODY_BYTES", 64)
+        r = c.post("/v1/fyp/events", content=b"x" * 65,
+                   headers={"content-type": "application/json"})
+        assert r.status_code == 413, r.status_code
+        assert r.json() == {"detail": "request body of 65 bytes exceeds the 64-byte limit"}
+        ok = c.post("/v1/fyp/events", json=VALID)
+        assert ok.status_code == 200, ok.status_code
+
+    def test_only_the_value_the_nearest_proxy_wrote_is_compared(self, monkeypatch):
+        # The peer's address earlier in an appended list is a client's claim, not
+        # what was vouched; the last value is, and it names somebody else.
+        from haf_fyp import api
+
+        self._toy(monkeypatch, trusted=("10.0.0.0/8",))
+        mw = RateLimitBeforeValidationMiddleware(object(), limiter=api.limiter)
+        req = _peer_request("10.0.0.5", {"x-real-ip": "10.0.0.5, 198.51.100.9"})
+        assert mw._early_charge_is_safe(req) is True
+        assert api.client_ip_key(req) == "198.51.100.9"
+
+    def test_a_loopback_caller_behind_the_edge_is_a_caller(self, monkeypatch):
+        from haf_fyp import api
+
+        self._toy(monkeypatch, trusted=("10.0.0.0/8",))
+        mw = RateLimitBeforeValidationMiddleware(object(), limiter=api.limiter)
+        req = _peer_request("10.0.0.5", {"x-real-ip": "127.0.0.1"})
+        assert mw._early_charge_is_safe(req) is True
+        assert api.client_ip_key(req) == "127.0.0.1"
+
+    def test_a_request_with_no_socket_peer_is_handled_like_loopback(self, monkeypatch):
+        # slowapi reports 127.0.0.1 when the server gives no client address; the
+        # self-vouch rule has to read the peer the same way the key function does.
+        from haf_fyp import api
+
+        self._toy(monkeypatch, trusted=("127.0.0.1",))
+        mw = RateLimitBeforeValidationMiddleware(object(), limiter=api.limiter)
+        req = Request({"type": "http", "method": "POST", "path": "/v1/fyp/events",
+                       "client": None, "headers": [(b"x-real-ip", b"127.0.0.1")]})
+        assert mw._early_charge_is_safe(req) is False
+        assert api.client_ip_key(req) == "127.0.0.1"
+
+    def test_the_body_cap_holds_when_early_charging_is_forced_off(self, monkeypatch):
+        from haf_fyp import api
+
+        c = self._toy(monkeypatch, early=False)
+        r = c.post("/v1/fyp/events", content=b"x" * (api._MAX_BODY_BYTES + 1),
+                   headers={"content-type": "application/json", "X-Real-IP": CLIENT})
+        assert r.status_code == 413, r.status_code
+
+    def test_callers_inside_the_trusted_network_keep_a_bucket_each(self, monkeypatch):
+        # The trust list is usually a CIDR, and on a LAN, a VPN or a compose network
+        # the callers' own addresses fall inside it. Only the peer's own address is
+        # refused as a header value -- refusing the whole list put every one of
+        # these callers in the edge's bucket.
+        from haf_fyp import api
+
+        c = self._toy(monkeypatch, trusted=("10.0.0.0/8",), peer="10.0.0.5")
+        mine = [
+            c.post("/v1/fyp/events", json=VALID, headers={"X-Real-IP": "10.1.2.3"}).status_code
+            for _ in range(4)
+        ]
+        assert mine == [200, 200, 200, 429], mine
+        r = c.post("/v1/fyp/events", json=VALID, headers={"X-Real-IP": "10.1.2.4"})
+        assert r.status_code == 200, "a neighbour in the trusted network was 429'd by another's traffic"
+        mw = RateLimitBeforeValidationMiddleware(object(), limiter=api.limiter)
+        req = _peer_request("10.0.0.5", {"x-real-ip": "10.1.2.9"})
+        assert mw._early_charge_is_safe(req) is True
+        assert api.client_ip_key(req) == "10.1.2.9"
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (None, None), ("", None), ("12", 12), ("0012", 12), (" 12", None),
+            ("+12", None), ("-1", None), ("1.5", None), ("\u00b2", None),
+            ("\u0663", None), ("9" * 18, int("9" * 18)), ("9" * 19, 10**18),
+            ("9" * 5000, 10**18), ("0" * 30 + "5", 5), ("0" * 30, 0),
+            ("0" * 30 + "9" * 19, 10**18),
+        ],
+        ids=["absent", "empty", "plain", "leading-zeros", "leading-space", "plus",
+             "minus", "decimal", "superscript-two", "arabic-indic-digit", "18-digits",
+             "19-digits", "5000-digits", "zero-padded-small", "all-zeros",
+             "zero-padded-huge"],
+    )
+    def test_content_length_is_read_without_raising(self, value, expected):
+        # isdigit() is true of characters int() refuses, and int() refuses more
+        # than 4300 digits; this now runs for every request to a limited route.
+        assert RateLimitBeforeValidationMiddleware._declared_size(value) == expected
+        if expected is not None and len(value.lstrip("0")) > 18:
+            from haf_fyp import api
+
+            assert expected > api._MAX_BODY_BYTES, "a clamped value must still be over the cap"
+
+    def test_valid_requests_with_no_header_are_still_limited(self, monkeypatch):
+        # Not charged EARLY is not the same as not charged: the decorator still
+        # meters whatever passes validation, exactly as with an empty trust list.
+        c = self._toy(monkeypatch)
+        codes = [c.post("/v1/fyp/events", json=VALID).status_code for _ in range(5)]
+        assert codes == [200, 200, 200, 429, 429], codes
+
+    def test_a_caller_the_edge_vouches_for_is_still_charged_early(self, monkeypatch):
+        c = self._toy(monkeypatch)
+        codes = [
+            c.post("/v1/fyp/events", json=INVALID, headers={"X-Real-IP": CLIENT}).status_code
+            for _ in range(5)
+        ]
+        assert codes == [422, 422, 422, 429, 429], codes
+
+    def test_it_is_decided_per_request_not_per_process(self, monkeypatch):
+        # A node part-way through an edge change serves both kinds at once.
+        c = self._toy(monkeypatch)
+        for _ in range(6):
+            assert c.post("/v1/fyp/events", json=INVALID).status_code == 422
+        vouched = [
+            c.post("/v1/fyp/events", json=INVALID, headers={"X-Real-IP": OTHER}).status_code
+            for _ in range(4)
+        ]
+        assert vouched == [422, 422, 422, 429], vouched
+        assert c.post("/v1/fyp/events", json=INVALID).status_code == 422
+
+    def test_a_peer_outside_the_trust_list_is_charged_early_on_its_own_address(
+        self, monkeypatch
+    ):
+        # Someone reaching the published port directly. Their bucket is their own
+        # socket address, so there is nobody else in it to lock out.
+        from haf_fyp import api
+
+        self._toy(monkeypatch)
+        mw = RateLimitBeforeValidationMiddleware(object(), limiter=api.limiter)
+        assert mw._early_charge_is_safe(_peer_request("45.9.148.99")) is True
+        assert api.client_ip_key(_peer_request("45.9.148.99")) == "45.9.148.99"
+        # ...and a header from such a peer changes neither answer.
+        forged = _peer_request("45.9.148.99", {"x-real-ip": CLIENT})
+        assert mw._early_charge_is_safe(forged) is True
+        assert api.client_ip_key(forged) == "45.9.148.99"
+        assert mw._early_charge_is_safe(_peer_request("testclient")) is False
+        assert mw._early_charge_is_safe(
+            _peer_request("testclient", {"x-real-ip": CLIENT})
+        ) is True
+        # An IPv6 caller is vouched for as well; its key is a /64, not an address.
+        assert mw._early_charge_is_safe(
+            _peer_request("testclient", {"x-real-ip": "2001:db8::1"})
+        ) is True
+
+    def test_the_trust_list_can_be_a_network(self, monkeypatch):
+        import ipaddress
+
+        from haf_fyp import api
+
+        self._toy(monkeypatch)
+        monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset({"172.18.0.0/16"}))
+        monkeypatch.setattr(api, "_TRUSTED_NETS", (ipaddress.ip_network("172.18.0.0/16"),))
+        mw = RateLimitBeforeValidationMiddleware(object(), limiter=api.limiter)
+        assert mw._early_charge_is_safe(_peer_request("172.18.0.23")) is False
+        assert mw._early_charge_is_safe(_peer_request("::ffff:172.18.0.23")) is False
+        assert mw._early_charge_is_safe(
+            _peer_request("172.18.0.23", {"x-real-ip": CLIENT})
+        ) is True
+
+    def test_forcing_the_gate_still_overrides_it(self, monkeypatch):
+        from haf_fyp import api
+
+        self._toy(monkeypatch)
+        req = _peer_request("testclient")
+        on = RateLimitBeforeValidationMiddleware(object(), limiter=api.limiter, early=True)
+        off = RateLimitBeforeValidationMiddleware(object(), limiter=api.limiter, early=False)
+        assert on._early_charge_is_safe(req) is True
+        assert off._early_charge_is_safe(
+            _peer_request("testclient", {"x-real-ip": CLIENT})
+        ) is False
+
+    def test_it_says_so_once_even_when_nothing_ever_validates(self, monkeypatch, caplog):
+        # The warning must not depend on the decorator running: under a flood of
+        # malformed requests nothing reaches it, and that is when it matters.
+        import logging
+
+        c = self._toy(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="haf_fyp.api"):
+            for _ in range(5):
+                c.post("/v1/fyp/events", json=INVALID)
+            assert caplog.text.count("no usable X-Real-IP") == 1, caplog.text
+            assert "Trusted peer testclient" in caplog.text
+            # ...and the key function, reached by a request that does validate,
+            # does not say it a second time.
+            assert c.post("/v1/fyp/events", json=VALID).status_code == 200
+        assert caplog.text.count("no usable X-Real-IP") == 1, caplog.text
+
+    def test_a_good_request_first_does_not_use_the_warning_up(self, monkeypatch, caplog):
+        import logging
+
+        c = self._toy(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="haf_fyp.api"):
+            c.post("/v1/fyp/events", json=INVALID, headers={"X-Real-IP": CLIENT})
+            assert "no usable X-Real-IP" not in caplog.text
+            c.post("/v1/fyp/events", json=INVALID)
+        assert caplog.text.count("no usable X-Real-IP") == 1, caplog.text
+
+    def test_a_header_that_names_nobody_is_warned_about_too(self, monkeypatch, caplog):
+        # An edge sending `{remote}` (address:port) is as broken as one sending
+        # nothing, and as silent.
+        import logging
+
+        c = self._toy(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="haf_fyp.api"):
+            c.post("/v1/fyp/events", json=INVALID, headers={"X-Real-IP": "203.0.113.7:4711"})
+        assert caplog.text.count("no usable X-Real-IP") == 1, caplog.text
+
+    def test_it_is_once_per_process_not_once_per_peer(self, monkeypatch, caplog):
+        import logging
+
+        from haf_fyp import api
+
+        self._toy(monkeypatch, trusted=("10.0.0.0/24",))
+        mw = RateLimitBeforeValidationMiddleware(object(), limiter=api.limiter)
+        with caplog.at_level(logging.WARNING, logger="haf_fyp.api"):
+            for peer in ("10.0.0.5", "10.0.0.6", "10.0.0.7"):
+                assert mw._early_charge_is_safe(_peer_request(peer)) is False
+        assert caplog.text.count("no usable X-Real-IP") == 1, caplog.text
+        assert "Trusted peer 10.0.0.5" in caplog.text
+
+    def test_it_does_not_use_up_the_stale_trust_list_warning(self, monkeypatch, caplog):
+        # Two different faults, two flags: seeing one must not silence the other.
+        import logging
+
+        from haf_fyp import api
+
+        self._toy(monkeypatch)
+        monkeypatch.setattr(api, "_warned_untrusted_header", False)
+        mw = RateLimitBeforeValidationMiddleware(object(), limiter=api.limiter)
+        with caplog.at_level(logging.WARNING, logger="haf_fyp.api"):
+            mw._early_charge_is_safe(_peer_request("testclient"))
+            api.client_ip_key(_peer_request("10.9.9.9", {"x-real-ip": CLIENT}))
+        assert caplog.text.count("no usable X-Real-IP") == 1, caplog.text
+        assert caplog.text.count("not in TRUSTED_PROXY_IPS") == 1, caplog.text
+
+    def test_routes_with_no_limit_say_nothing(self, monkeypatch, caplog):
+        # /health is polled from inside the trusted network with no header. Were
+        # that to raise the warning it would be spent before any real traffic.
+        import logging
+
+        from haf_fyp import api
+
+        c = self._toy(monkeypatch)
+
+        @c.app.get("/health")
+        def health():
+            return {"ok": True}
+
+        with caplog.at_level(logging.WARNING, logger="haf_fyp.api"):
+            assert c.get("/health").status_code == 200
+            assert c.get("/no-such-route").status_code == 404
+        assert "no usable X-Real-IP" not in caplog.text
+        assert api._warned_edge_sends_no_header is False
+
+    def test_it_stays_quiet_while_the_header_arrives(self, monkeypatch, caplog):
+        import logging
+
+        c = self._toy(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="haf_fyp.api"):
+            c.post("/v1/fyp/events", json=VALID, headers={"X-Real-IP": CLIENT})
+            c.post("/v1/fyp/events", json=INVALID, headers={"X-Real-IP": CLIENT})
+        assert "no usable X-Real-IP" not in caplog.text
+
+
+def _peer_request(peer, headers=None):
+    """A Request with a socket peer of our choosing; TestClient's is fixed."""
+    return Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/fyp/events",
+        "client": (peer, 40000),
+        "headers": [(k.encode(), v.encode()) for k, v in (headers or {}).items()],
+    })
 
 
 def _dummy_limiter():

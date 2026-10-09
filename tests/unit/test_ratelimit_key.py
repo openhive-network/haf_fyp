@@ -104,7 +104,7 @@ class TestClientIpKey:
         # Only expressible with real Headers. Under an appending edge the FIRST value
         # is the client-supplied one, so keying on it would hand any caller a forged
         # bucket and defeat the peer gate entirely. The last is what the nearest proxy
-        # wrote. Caddy's `header_up X-Real-IP {remote_host}` sets rather than appends,
+        # wrote. Caddy's `header_up X-Real-IP {client_ip}` sets rather than appends,
         # so today there is only ever one -- this pins the safe choice for the day
         # that stops being true.
         r = _req_multi([("x-real-ip", "1.1.1.1"), ("x-real-ip", CLIENT_A)])
@@ -584,6 +584,44 @@ class TestStartupWarnings:
             for _ in range(5):
                 client_ip_key(_req({"x-real-ip": CLIENT_A}, peer="10.9.9.9"))
         assert caplog.text.count("not in TRUSTED_PROXY_IPS") == 1, "should warn once, not per request"
+
+    def test_a_trusted_peer_sending_no_header_warns_once(self, monkeypatch, caplog):
+        """#35, the mirror image: the trust list is right and the edge sends nothing.
+
+        Just as silent -- 200s, and one bucket for everyone behind the edge.
+        """
+        import logging
+
+        monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset({EDGE}))
+        monkeypatch.setattr(api, "_TRUSTED_NETS", ())
+        monkeypatch.setattr(api, "_warned_edge_sends_no_header", False)
+        with caplog.at_level(logging.WARNING, logger="haf_fyp.api"):
+            keys = {client_ip_key(_req({}, peer=EDGE)) for _ in range(5)}
+            keys.add(client_ip_key(_req({"x-real-ip": "garbage"}, peer=EDGE)))
+        assert keys == {EDGE}
+        assert caplog.text.count("no usable X-Real-IP") == 1, "should warn once, not per request"
+        assert EDGE in caplog.text
+
+    def test_a_trusted_peer_sending_an_unusable_header_warns_as_well(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset({EDGE}))
+        monkeypatch.setattr(api, "_TRUSTED_NETS", ())
+        monkeypatch.setattr(api, "_warned_edge_sends_no_header", False)
+        with caplog.at_level(logging.WARNING, logger="haf_fyp.api"):
+            assert client_ip_key(_req({"x-real-ip": "garbage"}, peer=EDGE)) == EDGE
+        assert caplog.text.count("no usable X-Real-IP") == 1
+
+    def test_no_such_warning_while_the_edge_does_send_it(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setattr(api, "_TRUSTED_LITERALS", frozenset({EDGE}))
+        monkeypatch.setattr(api, "_TRUSTED_NETS", ())
+        monkeypatch.setattr(api, "_warned_edge_sends_no_header", False)
+        with caplog.at_level(logging.WARNING, logger="haf_fyp.api"):
+            assert client_ip_key(_req({"x-real-ip": CLIENT_A}, peer=EDGE)) == CLIENT_A
+            client_ip_key(_req({}, peer="10.9.9.9"))
+        assert "no usable X-Real-IP" not in caplog.text
 
     def test_no_warning_when_an_untrusted_peer_sends_no_header(self, monkeypatch, caplog):
         import logging

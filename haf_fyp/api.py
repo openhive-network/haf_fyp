@@ -145,7 +145,8 @@ if not _TRUSTED_LITERALS:
     # converts "one bad client wastes CPU" into "one bad client locks everyone
     # out", which is strictly worse than the bug being fixed -- so the early charge
     # is DISABLED while this is unset (see RateLimitBeforeValidationMiddleware),
-    # and the app runs with pre-#28 behaviour until an operator says which it is.
+    # and the app runs with pre-#28 behaviour (plus the body-size cap, which does
+    # not need a bucket) until an operator says which it is.
     log.error(
         "TRUSTED_PROXY_IPS is not set - rate limits will key on the socket peer, "
         "which behind a reverse proxy is ONE SHARED BUCKET for all callers. "
@@ -178,6 +179,97 @@ def _peer_is_trusted(peer: str) -> bool:
 
 
 _warned_untrusted_header = False
+_warned_edge_sends_no_header = False
+
+
+def _peer_address(request: Request):
+    """The socket peer as an address, IPv4-mapped unwrapped; None for a literal."""
+    try:
+        addr = ipaddress.ip_address(get_remote_address(request))
+    except ValueError:
+        return None
+    if addr.version == 6 and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    return addr
+
+
+def _vouched_client_key(request: Request) -> Optional[str]:
+    """The bucket key a TRUSTED peer vouched for in X-Real-IP, or None.
+
+    None means no usable value arrived: the header is absent, empty, not an
+    address, or names the peer the request came from. The caller
+    decides what that costs -- client_ip_key falls back to the peer, and the
+    early-charge gate refuses to charge before validation (#35).
+    Only meaningful once the PEER is known to be trusted; that it does not check.
+    """
+    # Last value, not first. Under Caddy's `header_up X-Real-IP {client_ip}` (set
+    # semantics) there is only one; if an edge ever used the appending form instead,
+    # the FIRST value is the client-supplied one and keying on it would hand any
+    # caller a forged bucket. The last is the one the nearest proxy wrote.
+    #
+    # Both spellings of "appended" have to be handled: repeated header lines, AND a
+    # single comma-joined value, which is what proxies emit and what an intermediary
+    # may collapse repeats into. Splitting only on the former left the latter
+    # unparseable, so it fell back to the peer -- one shared bucket, silently.
+    values = request.headers.getlist("x-real-ip")
+    raw = (values[-1] if values else "").split(",")[-1].strip()
+    if not raw:
+        return None
+
+    try:
+        ip = ipaddress.ip_address(raw)
+        # ::ffff:203.0.113.7 is an IPv4 client in v6 clothing. Without this it takes
+        # the /64 branch below and masks to '::', collapsing EVERY mapped address
+        # into one bucket -- this MR's own bug, recreated in a corner.
+        if ip.version == 6 and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        # The peer cannot vouch for itself. An edge that forwards a client-supplied
+        # header untouched would otherwise let any sender write the edge's own
+        # address here: "vouched", so charged before validation, into the very
+        # bucket every header-less caller falls back to (#35 again, one header
+        # later). Only the peer's own address, not everything on the trust list:
+        # operators list a CIDR, and callers whose real addresses fall inside it
+        # (a LAN, a VPN, another container) must keep a bucket each.
+        #
+        # That leaves one case open, as it is on develop: with TWO trusted peers, a
+        # sender behind a pass-through one can name the OTHER peer's address and be
+        # charged into that peer's fallback bucket. Telling a caller's address from
+        # a second edge's would take a list of edges, which the trust list is not.
+        if ip == _peer_address(request):
+            return None
+        if ip.version == 6:
+            return f"{ipaddress.ip_network(f'{ip}/64', strict=False).network_address}/64"
+    except ValueError:
+        return None
+    return str(ip)
+
+
+def _warn_edge_sends_no_header(peer: str) -> None:
+    """Once per process: a trusted peer is not telling us who the caller is.
+
+    The mirror image of the stale-trust-list warning in client_ip_key, and silent
+    in the same way: TRUSTED_PROXY_IPS is right, the app serves 200s, and every
+    caller shares the edge's bucket because the edge was never made to send the
+    header -- a hand-written proxy, or a Caddy route without the header_up line (#35).
+
+    `peer` is the socket peer, which is the LAST hop (HAProxy on haf_api_node), not
+    necessarily the proxy that should have set the header. And one request is
+    enough to fire this, so the text speaks of requests like this one, not of all
+    traffic: a container inside a trusted CIDR calling directly also lands here.
+    """
+    global _warned_edge_sends_no_header
+    if _warned_edge_sends_no_header:
+        return
+    _warned_edge_sends_no_header = True
+    log.warning(
+        "Trusted peer %s sent a request with no usable X-Real-IP. Requests like "
+        "that key on the peer - ONE SHARED BUCKET for all of them - and are charged "
+        "only after validation (#28). If your traffic arrives through %s, listing "
+        "it in TRUSTED_PROXY_IPS is not enough: the outermost proxy must SET the "
+        "header (Caddy: `header_up X-Real-IP {client_ip}`) and every proxy after it "
+        "must pass it on.",
+        peer, peer,
+    )
 
 
 def client_ip_key(request: Request) -> str:
@@ -212,32 +304,11 @@ def client_ip_key(request: Request) -> str:
             )
         return peer
 
-    # Last value, not first. Under Caddy's `header_up X-Real-IP {remote_host}` (set
-    # semantics) there is only one; if an edge ever used the appending form instead,
-    # the FIRST value is the client-supplied one and keying on it would hand any
-    # caller a forged bucket. The last is the one the nearest proxy wrote.
-    #
-    # Both spellings of "appended" have to be handled: repeated header lines, AND a
-    # single comma-joined value, which is what proxies emit and what an intermediary
-    # may collapse repeats into. Splitting only on the former left the latter
-    # unparseable, so it fell back to the peer -- one shared bucket, silently.
-    values = request.headers.getlist("x-real-ip")
-    raw = (values[-1] if values else "").split(",")[-1].strip()
-    if not raw:
+    vouched = _vouched_client_key(request)
+    if vouched is None:
+        _warn_edge_sends_no_header(peer)
         return peer
-
-    try:
-        ip = ipaddress.ip_address(raw)
-        # ::ffff:203.0.113.7 is an IPv4 client in v6 clothing. Without this it takes
-        # the /64 branch below and masks to '::', collapsing EVERY mapped address
-        # into one bucket -- this MR's own bug, recreated in a corner.
-        if ip.version == 6 and ip.ipv4_mapped:
-            ip = ip.ipv4_mapped
-        if ip.version == 6:
-            return f"{ipaddress.ip_network(f'{ip}/64', strict=False).network_address}/64"
-    except ValueError:
-        return peer
-    return str(ip)
+    return vouched
 
 
 def global_key() -> str:
@@ -264,7 +335,8 @@ class _FailOpenLimiter(Limiter):
     The app's policy is that the limiter protects against abuse and is not part of
     answering correctly, so a storage outage degrades limiting rather than the service.
     RateLimitBeforeValidationMiddleware implements that, but it only meters while
-    TRUSTED_PROXY_IPS is set (see _early_charge_is_safe). With it empty -- the shipped
+    TRUSTED_PROXY_IPS is set, and not the requests of a trusted peer that carry no
+    usable X-Real-IP (see _early_charge_is_safe). With it empty -- the shipped
     default -- the metering happens here, in slowapi's decorator, which re-raises a
     storage error: a 500 on every rate-limited route for as long as Redis was down.
 
@@ -520,8 +592,9 @@ class RateLimitBeforeValidationMiddleware:
 
     def __init__(self, app, limiter=None, early=None):
         self.app = app
-        # None = decide per request from TRUSTED_PROXY_IPS, so a test (or a reload)
-        # that changes the trust list is honoured. True/False force it.
+        # None = decide per request from TRUSTED_PROXY_IPS and the request's own
+        # peer and X-Real-IP, so a test (or a reload) that changes the trust list is
+        # honoured. True/False force it.
         self._early = early
         # Defaults to this module's limiter, which is the one the real app installs;
         # taking it as an argument is what lets a test drive a fresh, isolated one.
@@ -566,7 +639,7 @@ class RateLimitBeforeValidationMiddleware:
                     "stop metering silently."
                 )
 
-    def _early_charge_is_safe(self) -> bool:
+    def _early_charge_is_safe(self, request: Request) -> bool:
         """Only meter before validation when the bucket can tell callers apart.
 
         With TRUSTED_PROXY_IPS unset every caller keys on the socket peer, which
@@ -581,10 +654,30 @@ class RateLimitBeforeValidationMiddleware:
         value) in TRUSTED_PROXY_IPS re-enables it: it never matches a real peer, so
         the header stays ignored and keying stays on the peer -- which IS per-client
         when nothing fronts the app.
+
+        A declared edge is not enough either (#35). What makes the bucket per-caller
+        is the header ARRIVING. Behind an edge that sends none (a hand-written
+        proxy, or a Caddy route without the header_up line) the trust list is right,
+        every request keys on the edge, and this gate used to open into the very
+        lockout described above. So it is decided per request -- a trusted peer that
+        vouches for nobody gets the same treatment as an empty trust list, and the
+        decorator charges it after validation instead.
+
+        NOT covered: the stale trust list. An edge whose address has changed is an
+        untrusted peer, its header is ignored, and its callers are charged early
+        into its one bucket. Declining there would let a `direct` caller opt out of
+        the early charge by adding a header, so that case keeps its warning (see
+        client_ip_key) and nothing more.
         """
         if self._early is not None:
             return self._early
-        return bool(_TRUSTED_LITERALS)
+        if not _TRUSTED_LITERALS:
+            return False
+        peer = get_remote_address(request)
+        if _peer_is_trusted(peer) and _vouched_client_key(request) is None:
+            _warn_edge_sends_no_header(peer)
+            return False
+        return True
 
     def _is_limited(self, handler) -> bool:
         if handler is None:
@@ -612,7 +705,7 @@ class RateLimitBeforeValidationMiddleware:
         handler = _find_route_handler(scope["app"].routes, scope)
         # No route match (404, or a method this path does not serve), and routes
         # with no decorator of their own: nothing to charge, behave as before.
-        if not self._is_limited(handler) or not self._early_charge_is_safe():
+        if not self._is_limited(handler):
             return await self.app(scope, receive, send)
 
         # Built for the key func and the handler only. Do NOT read the body here --
@@ -620,10 +713,21 @@ class RateLimitBeforeValidationMiddleware:
         # a size) leaves the endpoint waiting on a stream that will never arrive.
         request = Request(scope, receive=receive)
 
-        # Cheapest possible rejection, and it happens after metering so it still
-        # costs the sender its allowance. Content-Length is absent on a chunked
+        # Cheapest possible rejection. Where the request is charged early it happens
+        # after metering, so it still costs the sender its allowance; where it is not,
+        # it costs nothing (see below). Content-Length is absent on a chunked
         # request, which this cannot pre-empt -- the per-IP limit is the bound there.
-        declared = request.headers.get("content-length")
+        declared = self._declared_size(request.headers.get("content-length"))
+        too_large = declared is not None and declared > _MAX_BODY_BYTES
+
+        if not self._early_charge_is_safe(request):
+            # The size cap does not depend on telling callers apart, so it holds
+            # here too -- uncharged, because there is no bucket it is safe to
+            # charge. Without it the path that declines to meter malformed requests
+            # would also parse them at any size.
+            if too_large:
+                return await self._too_large(scope, receive, send, declared)
+            return await self.app(scope, receive, send)
 
         try:
             # OFF THE EVENT LOOP, AND OFF THE SHARED POOL. With REDIS_URL set
@@ -691,10 +795,26 @@ class RateLimitBeforeValidationMiddleware:
         # decorator sees it and skips its own check rather than charging twice.
         request.state._rate_limiting_complete = True
 
-        if declared is not None and declared.isdigit() and int(declared) > _MAX_BODY_BYTES:
-            return await self._too_large(scope, receive, send, int(declared))
+        if too_large:
+            return await self._too_large(scope, receive, send, declared)
 
         return await self.app(scope, receive, send)
+
+    @staticmethod
+    def _declared_size(value: Optional[str]) -> Optional[int]:
+        """Content-Length as a number, or None when it is not one.
+
+        Evaluated for every request to a limited route, charged or not, so it must
+        not raise: str.isdigit() is true of characters int() refuses (a superscript
+        two), and int() itself refuses more than 4300 digits. A real server rejects
+        both before the app sees them; this does not depend on that.
+        """
+        if value is None or not (value.isascii() and value.isdigit()):
+            return None
+        # More than 18 significant digits is over any cap, whatever the exact value.
+        # Significant: a zero-padded length is still the small number it says.
+        digits = value.lstrip("0")
+        return int(digits or "0") if len(digits) <= 18 else 10**18
 
     @staticmethod
     async def _too_large(scope, receive, send, size: int):

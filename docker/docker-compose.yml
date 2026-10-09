@@ -328,7 +328,9 @@ services:
       # assigned dynamically). EMPTY BY DEFAULT: unset means no edge, and limits
       # degrade to keying on the socket peer rather than on a forgeable header.
       # Leaving it unset behind a proxy silently restores the one-global-bucket bug
-      # this exists to fix, so set it wherever an edge is in front.
+      # this exists to fix, so set it wherever an edge is in front. The edge must
+      # also send X-Real-IP; behind a listed peer that sends none, callers share
+      # one bucket too.
       TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-}
       POSTGRES_HOST: haf
       POSTGRES_USER: haf_fyp_user

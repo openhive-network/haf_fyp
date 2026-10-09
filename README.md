@@ -304,6 +304,8 @@ cp docker/.env docker/.env.local
 #   - Set TRUSTED_PROXY_IPS to whatever fronts this app (Caddy/Varnish/HAProxy),
 #     or to `direct` if nothing does. Left empty, every caller shares one bucket
 #     and pre-validation rate limiting stays OFF -- see the deployment checklist.
+#     Listing it is not enough: X-Real-IP must also ARRIVE, set by the outermost
+#     proxy and passed on by any in between.
 #
 # Every command below passes --env-file docker/.env.local. Without it Compose reads
 # docker/.env (the project-directory default) and the edits above are silently ignored,
@@ -570,7 +572,7 @@ inside its own per-IP allowance, so never throttled — drain the shared bucket 
 `429` every other caller, which is a denial of service the per-IP design exists to
 prevent. The admin route goes one step further and charges its ceiling only when
 the key is *wrong*, so guessing stays bounded at 30/min while the holder of the
-correct key can never be locked out by guessers. Per-IP keying depends on `TRUSTED_PROXY_IPS` being set correctly; see the
+correct key can never be locked out by guessers. Per-IP keying depends on `TRUSTED_PROXY_IPS` being set correctly and on the proxy sending `X-Real-IP`; see the
 deployment checklist.
 
 Clean URL rewrites (via nginx `endpoints/rewrite_rules.conf`):
@@ -1209,6 +1211,7 @@ Before going live:
 - [ ] `pgvector` extension installed by superuser on the HAF PostgreSQL server
 - [ ] `FYP_ADMIN_API_KEY` set to a strong random value in `docker/.env.local`
 - [ ] **`TRUSTED_PROXY_IPS` set to the reverse proxy's address or CIDR** (or the literal `direct` if nothing fronts this app). Since #28 this also gates *when* limits are charged: with it unset the app logs an ERROR at startup and falls back to charging only after validation, because charging a request before it is validated is safe only when the bucket identifies the caller — into one shared bucket it lets a single sender 429 everybody else, which is worse than the bug #28 fixes. Rate limits key on `X-Real-IP` only from a trusted peer; unset, every caller keys on the proxy's address instead — one shared bucket for all of them, which is no per-client limit at all. The app logs a warning at startup when it is unset, and once more if a peer outside the list presents the header (which usually means the proxy was recreated with a new address and the list is now stale). Re-check it after anything that can renumber the proxy container.
+- [ ] **The reverse proxy sends `X-Real-IP`.** Setting `TRUSTED_PROXY_IPS` only says whose header to believe; the outermost proxy still has to set one (set, not append) to the client's address, and every proxy after it has to pass it on. In Caddy that is `header_up X-Real-IP {client_ip}` on the haf_fyp routes, which `haf_api_node`'s `caddy/Caddyfile.tmpl` carries wherever it has the haf_fyp route (the 1.28.8 series) — a local Caddy snippet with its own `reverse_proxy` for a haf_fyp path needs the line too. Requests from a trusted peer without a usable header (absent, empty, not an address, or naming the peer itself) all share that peer's bucket, as with an empty list: they are charged only after validation, and the app logs one warning per process naming the peer the request came from (`Trusted peer ... sent a request with no usable X-Real-IP`). To confirm: restart the API, send one `POST` to the events endpoint through the edge (`/haf-fyp-admin/v1/fyp/events` on `haf_api_node`; only the four rate-limited routes can raise it, and any body will do), and check that the log since that start has neither this warning, nor the `not in TRUSTED_PROXY_IPS` one, nor the startup error about an unset list. This proves the header only if the trust list matches the peer: with a list that is set but wrong, a missing header is silent.
 - [ ] `HAF_VERSION` pinned to a specific release tag — not `latest`, which moves, and not a commit tag, which the registry sweeps once it falls out of the five newest — at `1.29.0-rc2` or newer so the app registers itself instead of falling back to the legacy loop. Pinned **before the first sync**: changing it later is a replay, not an upgrade (see Prerequisites)
 - [ ] **If Hivemind was installed AFTER haf_fyp started syncing: `CALL haf_fyp_app.run_hive_post_id_backfill();`** — the per-block resolver only covers a rolling 7-day window, so without this every older post stays unresolved and the feeds stay empty. `/metrics` cannot detect this yet ([#43](https://gitlab.syncad.com/hive/haf_fyp/-/issues/43)) — run the backfill on the strength of the install order alone.
 - [ ] **Hivemind installed and synced** → `grant_cross_schema.sh` re-run. REQUIRED: with hivemind ABSENT every feed returns `[]`. (A lost *grant* on an already-running node is different — resolution stops, but already-rendered posts keep serving from `post_bridge_cache`, so the outage is delayed rather than immediate.) Confirm with `GET /metrics` → `ranking_sources.degraded` is `false`, not by assuming — alert on that rather than on `sources.hivemind == "readable"`, which misses both the `readable_unverified` case and everything the servability probe sees. (Losing `SELECT` on the table does at least `RAISE WARNING` from the resolver; an absent schema — or a revoked `USAGE` on it, which makes `to_regclass` return NULL — is entirely silent.)
@@ -1232,9 +1235,10 @@ code change:
 **Failure policy: the limiter fails open.** If Redis is unreachable or slow, a request is
 served *unmetered* rather than rejected — limits protect against abuse, they are not part
 of answering correctly, so a Redis incident degrades limiting instead of the service. This
-holds whichever path does the metering: the pre-validation middleware while
-`TRUSTED_PROXY_IPS` is set, slowapi's own decorator while it is empty (#78; before that,
-the decorator's path answered 500). Storage failures are logged once per minute with a
+holds whichever path does the metering: the pre-validation middleware for most requests
+while `TRUSTED_PROXY_IPS` is set, slowapi's own decorator while it is empty and for requests
+from a trusted peer with no usable `X-Real-IP` (#78; before that, the decorator's path
+answered 500). Storage failures are logged once per minute with a
 suppressed-occurrence count, and again immediately if a *different* kind of failure
 appears. `/health` reports the limiter's storage in `rate_limit_store` and stays 200.
 
