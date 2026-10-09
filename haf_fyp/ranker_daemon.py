@@ -906,24 +906,42 @@ def _rank_user(
     write_feed_cache(conn, username, scored, algo_version)
 
 
-def _readers_to_rank_now(conn, reads: Callable[..., set[str]], done: set[str]) -> list[str]:
+def _readers_to_rank_now(
+    conn, reads: Callable[..., set[str]], done: set[str], skipped: set[str]
+) -> list[str]:
     """Readers to take ahead of their turn in the cycle that is running (#85).
 
     `reads` hears and stamps the reads that arrived since it was last asked and returns
-    the accounts whose feed is old enough to re-rank. Best-effort, like the same step in
-    main(): whatever goes wrong here must not cost the cycle, except a lost connection,
-    which ends the cycle as it does anywhere else in it.
+    the accounts whose feed is old enough to re-rank. It may name the same account on
+    every call (main() keeps handing over whoever is still waiting), so nobody is
+    looked at twice: not an account the cycle has taken (`done`), and not one this
+    function turned away (`skipped`, which it fills).
+
+    Best-effort, like the same step in main(): a check that fails must not cost the
+    cycle. Only a session that is gone ends it, as it does anywhere else in the cycle.
     """
     try:
-        early = sorted(u for u in reads(conn) if u not in done)
+        early = sorted(u for u in reads(conn) if u not in done and u not in skipped)
         if not early:
             return []
-        # The same reconcile as the two other ways into _rank_user (#10): ranking an
-        # account that has un-opted-in would put its rotation row straight back.
+        # Both halves of what _run_targeted_refresh does before it ranks anyone (#10).
+        # Ranking writes the rotation row, so an account that has un-opted-in must be
+        # evicted, not ranked. And the reconcile only answers for a row that EXISTS: a
+        # reader evicted a moment ago (by this cycle's own reconcile, or by the last
+        # check) is no longer named by it, and without the membership filter would be
+        # ranked and re-enrolled.
         evicted = _evict_unsubscribed(conn, early)
-        return [u for u in early if u not in evicted]
+        members = _rotation_members(conn, [u for u in early if u not in evicted])
+        skipped.update(u for u in early if u not in members)
+        return [u for u in early if u in members]
     except (psycopg2.OperationalError, psycopg2.InterfaceError):
-        raise
+        # OperationalError is also a cancelled statement, a deadlock, a lock timeout:
+        # errors of one statement on a session that is still there.
+        if conn.closed:
+            raise
+        _log_feed_read_failure()
+        _safe_rollback(conn)
+        return []
     except Exception:
         _log_feed_read_failure()
         _safe_rollback(conn)
@@ -934,7 +952,8 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
     """One scheduled cycle. Returns the accounts whose feed it wrote.
 
     With `reads` (#85), the cycle asks it every POLL_SECONDS, between two accounts, and
-    ranks next whoever it returns. A cycle on a node that ranks thousands takes minutes
+    ranks next whoever it returns (an account it has already taken is not taken again,
+    however long ago in the cycle that was). A cycle on a node that ranks thousands takes minutes
     (4 to 21 were measured for 3000), and until this a read that arrived during one was
     neither recorded nor acted on until it ended: the reader waited out the cycle, and
     the feed function, which rations its notification on the recorded read, sent one
@@ -1018,16 +1037,17 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
     processed = failed = 0
     ranked: set[str] = set()
     done: set[str] = set()      # attempted, ranked or not: nobody is taken twice
+    skipped: set[str] = set()   # readers turned away: evicted, or not in the rotation
     ahead: set[str] = set()     # readers taken ahead of their turn
     waiting = collections.deque(users)
     next_read_check = 0.0       # before the first account: the fetches above took a while
     while True:
-        # Between two accounts no transaction is open (every write in _rank_user
-        # commits, and a failure is rolled back below), which is the only time this
-        # session is handed its notifications and the only time _drain_feed_reads'
-        # rollback discards nothing.
+        # Between two accounts nothing is uncommitted (every write in _rank_user
+        # commits, and a failure is rolled back below), so this is where
+        # _drain_feed_reads' rollback discards nothing. At most a transaction that has
+        # only read is open: before the first account, the queries above.
         if reads is not None and time.monotonic() >= next_read_check:
-            early = _readers_to_rank_now(conn, reads, done)
+            early = _readers_to_rank_now(conn, reads, done, skipped)
             ahead.update(early)
             waiting.extendleft(reversed(early))
             next_read_check = time.monotonic() + POLL_SECONDS
@@ -1334,7 +1354,7 @@ def main() -> None:
 
     conn = _connect()
     next_full_cycle = 0.0  # run immediately on startup
-    read_budget = READ_REFRESH_MAX_PER_CYCLE  # #81: immediate re-ranks left until the next cycle
+    read_budget = READ_REFRESH_MAX_PER_CYCLE  # #81: re-ranks on read left until the next cycle ends
     read_pending: set[str] = set()  # #81: stale readers waiting for the next grouped re-rank
     next_read_refresh = 0.0
     next_feed_maint = 0.0  # run feed_events rollup/prune immediately on startup

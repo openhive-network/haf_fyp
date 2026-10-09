@@ -39,11 +39,22 @@ class _Reads:
         return set(value)
 
 
-def _cycle(monkeypatch, users, reads, *, per_account=0.0, clock=None, evict=(), fail=()):
+def _cycle(
+    monkeypatch, users, reads, *, per_account=0.0, clock=None, evict=(), fail=(),
+    absent=(), closed=0,
+):
     """run_cycle with everything around the per-account loop stubbed. Each account
-    takes `per_account` seconds of the clock. Returns (result, order ranked, conn)."""
+    takes `per_account` seconds of the clock. Returns (result, order ranked, conn,
+    reconcile calls).
+
+    The rotation is modelled as the database has it: `evict` names accounts that have
+    opted out, and the reconcile deletes such a row ONCE, answering nothing for it
+    afterwards; `absent` names accounts with no row at all. `evict` may instead be a
+    callable standing in for the reconcile."""
     conn, _ = _mock_conn([])
+    conn.closed = closed
     order = []
+    opted_out, no_row = set(evict) if not callable(evict) else set(), set(absent)
     if isinstance(reads, _Reads):
         reads.order = order
     if clock is None:
@@ -59,12 +70,19 @@ def _cycle(monkeypatch, users, reads, *, per_account=0.0, clock=None, evict=(), 
 
     def _evict(_conn, names):
         evictions.append(list(names))
-        return set(names) & set(evict)
+        if callable(evict):
+            return evict(_conn, names)
+        gone = {n for n in names if n in opted_out and n not in no_row}
+        no_row.update(gone)
+        return gone
 
     monkeypatch.setattr(rd.time, "monotonic", clock)
     monkeypatch.setattr(rd, "register_vector_type", lambda _c: None)
     monkeypatch.setattr(rd, "_evict_unsubscribed", _evict)
-    monkeypatch.setattr(rd, "_fetch_personalised_users", lambda _c, _limit: list(users))
+    monkeypatch.setattr(rd, "_rotation_members", lambda _c, names: set(names) - no_row)
+    monkeypatch.setattr(
+        rd, "_fetch_personalised_users", lambda _c, _limit: [u for u in users if u not in no_row]
+    )
     monkeypatch.setattr(rd, "_fetch_algorithm", lambda _c: ("1.0.0", {}))
     monkeypatch.setattr(
         rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
@@ -114,9 +132,9 @@ def test_a_reader_further_down_the_queue_moves_up_and_is_ranked_once(monkeypatch
 
 
 def test_a_reader_the_cycle_already_ranked_is_not_ranked_again(monkeypatch):
-    # The stamping query does not return a feed ranked a moment ago, but a failed
-    # ranking leaves last_scored_at old, and such an account would come back on every
-    # check for the rest of the cycle.
+    # A failed ranking leaves last_scored_at old, and main() hands over whoever is
+    # still waiting on every check: without `done` such an account would be tried
+    # again every POLL_SECONDS for the rest of the cycle.
     reads = _Reads([set(), {"u1"}, {"u1"}])
     _result, order, _conn, evictions = _cycle(
         monkeypatch, ["u1", "u2", "u3"], reads, per_account=rd.POLL_SECONDS, fail={"u1"}
@@ -124,6 +142,24 @@ def test_a_reader_the_cycle_already_ranked_is_not_ranked_again(monkeypatch):
 
     assert order == ["u2", "u3"]
     assert evictions == [["u1", "u2", "u3"]]  # only the cycle's own reconcile: nobody new
+
+
+def test_a_reader_moved_up_from_the_middle_does_not_cut_the_cycle_short(monkeypatch, caplog):
+    # u3 is met a second time with u4 and u5 still behind it: skipped, not the end of
+    # the cycle, and counted once in both lines.
+    reads = _Reads([set(), {"u3"}])
+    with caplog.at_level(logging.INFO):
+        result, order, _conn, _ = _cycle(
+            monkeypatch, ["u1", "u2", "u3", "u4", "u5"], reads, per_account=rd.POLL_SECONDS
+        )
+
+    assert order == ["u1", "u3", "u2", "u4", "u5"]
+    assert result == {"u1", "u2", "u3", "u4", "u5"}
+    assert "refreshed personalized feeds for 5/5 cached users (0 failed)" in caplog.text
+    assert (
+        "1 of them were readers with a stale feed, taken ahead of their turn: ['u3']"
+        in caplog.text
+    )
 
 
 def test_readers_waiting_when_the_cycle_starts_go_before_its_first_account(monkeypatch):
@@ -160,13 +196,13 @@ def test_the_cycle_asks_every_poll_seconds_not_after_every_account(monkeypatch):
     # 0.2 s an account is what a full node does. Asking after each would be a rollback
     # and a poll 3000 times a cycle.
     clock = _Clock()
+    start = clock.now
     reads = _Reads([], clock=clock)
-    users = [f"u{i:03d}" for i in range(100)]  # 20 s of ranking
-    _cycle(monkeypatch, users, reads, per_account=0.2, clock=clock)
+    users = [f"u{i:03d}" for i in range(80)]  # 20 s of ranking
+    # 0.25 is exact in binary: with 0.2 the count depended on how the sum rounded.
+    _cycle(monkeypatch, users, reads, per_account=0.25, clock=clock)
 
-    assert len(reads.asked_at) == 5  # at 0, 5, 10, 15 and 20 s
-    gaps = [b - a for a, b in zip(reads.asked_at, reads.asked_at[1:])]
-    assert all(rd.POLL_SECONDS <= gap < rd.POLL_SECONDS + 0.3 for gap in gaps), gaps
+    assert reads.asked_at == [start + rd.POLL_SECONDS * i for i in range(5)]
 
 
 def test_the_wait_is_counted_from_the_end_of_a_check_not_its_start(monkeypatch):
@@ -228,6 +264,41 @@ def test_a_reader_who_has_opted_out_is_evicted_not_ranked(monkeypatch):
     assert evictions[1] == ["gone", "zed"]
 
 
+def test_a_waiting_reader_evicted_by_one_check_is_not_ranked_by_the_next(monkeypatch):
+    # main() hands over whoever is still waiting on EVERY check. The reconcile deletes
+    # the row once and answers nothing for it afterwards, so 5 s later the same name
+    # looked like a member in good standing: ranked, and re-enrolled (found in review).
+    reads = _Reads([{"gone"}] * 4)
+    result, order, _conn, evictions = _cycle(
+        monkeypatch, ["u1", "u2", "u3"], reads, per_account=rd.POLL_SECONDS, evict={"gone"}
+    )
+
+    assert order == ["u1", "u2", "u3"] and "gone" not in result
+    # ...and it is looked at once, not reconciled again on every check.
+    assert evictions == [["u1", "u2", "u3"], ["gone"]]
+
+
+def test_a_waiting_reader_the_cycle_itself_evicted_is_not_ranked(monkeypatch):
+    # In the reader lane AND waiting: the cycle's own reconcile evicts it before the
+    # first check, which then finds no row for the reconcile to answer about.
+    reads = _Reads([{"gone"}])
+    result, order, _conn, _ = _cycle(
+        monkeypatch, ["gone", "u1", "u2"], reads, evict={"gone"}
+    )
+
+    assert order == ["u1", "u2"] and "gone" not in result
+
+
+def test_a_reader_with_no_rotation_row_is_not_ranked_into_one(monkeypatch):
+    reads = _Reads([{"stranger", "zed"}] * 3)
+    result, order, _conn, evictions = _cycle(
+        monkeypatch, ["u1", "u2"], reads, per_account=rd.POLL_SECONDS, absent={"stranger"}
+    )
+
+    assert order == ["zed", "u1", "u2"] and "stranger" not in result
+    assert evictions == [["u1", "u2"], ["stranger", "zed"]]
+
+
 def test_a_reader_whose_ranking_fails_is_not_reported_as_ranked(monkeypatch):
     # main() keeps such a reader waiting for the next grouped re-rank.
     reads = _Reads([set(), {"zed"}])
@@ -250,14 +321,46 @@ def test_a_failed_check_costs_the_cycle_nothing(monkeypatch, caplog):
 
     assert order == ["u1", "u2", "zed", "u3"] and "zed" in result
     assert rollbacks == [conn, conn]  # a failed statement leaves the session unusable
-    # ...and a standing fault writes one traceback per cycle, not one per check.
+    # ...and a standing fault writes one traceback per CYCLE_SECONDS, not one per check.
     assert caplog.text.count("feed-read handling failed") == 1
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        psycopg2.ProgrammingError("column last_read_at does not exist"),
+        psycopg2.DataError("invalid input"),
+        psycopg2.InternalError("current transaction is aborted"),
+        psycopg2.errors.QueryCanceled("canceling statement due to statement timeout"),
+        psycopg2.errors.DeadlockDetected("deadlock detected"),
+        psycopg2.InterfaceError("cursor already closed"),
+    ],
+    ids=["programming", "data", "internal", "cancelled", "deadlock", "interface"],
+)
+def test_a_failed_statement_on_a_live_session_is_not_a_lost_connection(monkeypatch, error):
+    # The realistic failure of the step is a database error. QueryCanceled and
+    # DeadlockDetected are OperationalError too: the session is still there, and
+    # ending the cycle for them would stop ranking at the first check of every cycle
+    # for as long as the fault stands.
+    rollbacks = []
+    monkeypatch.setattr(rd, "_safe_rollback", rollbacks.append)
+    reads = _Reads([error, {"zed"}])
+    result, order, conn, _ = _cycle(monkeypatch, ["u1", "u2"], reads, per_account=rd.POLL_SECONDS)
+
+    assert order == ["u1", "zed", "u2"] and result == {"u1", "u2", "zed"}
+    assert rollbacks == [conn]
+
+
+def test_a_stop_raised_inside_a_check_is_not_swallowed(monkeypatch):
+    class _Stop(BaseException):
+        pass
+
+    with pytest.raises(_Stop):
+        _cycle(monkeypatch, ["u1"], _Reads([_Stop()]))
+
+
 def test_a_failed_reconcile_of_the_readers_costs_the_cycle_nothing(monkeypatch):
-    conn, _ = _mock_conn([])
-    order, rollbacks = [], []
-    calls = []
+    calls, rollbacks = [], []
 
     def _evict(_conn, names):
         calls.append(list(names))
@@ -265,22 +368,10 @@ def test_a_failed_reconcile_of_the_readers_costs_the_cycle_nothing(monkeypatch):
             raise RuntimeError("boom")
         return set()
 
-    monkeypatch.setattr(rd.time, "monotonic", _Clock())
     monkeypatch.setattr(rd, "_safe_rollback", rollbacks.append)
-    monkeypatch.setattr(rd, "register_vector_type", lambda _c: None)
-    monkeypatch.setattr(rd, "_evict_unsubscribed", _evict)
-    monkeypatch.setattr(rd, "_fetch_personalised_users", lambda _c, _limit: ["u1", "u2"])
-    monkeypatch.setattr(rd, "_fetch_algorithm", lambda _c: ("1.0.0", {}))
-    monkeypatch.setattr(
-        rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
-    )
-    monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
-    monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
-    monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)
-    monkeypatch.setattr(rd, "compute_scores", lambda **k: pd.DataFrame())
-    monkeypatch.setattr(rd, "_rank_user", lambda _c, username, *_a, **_k: order.append(username))
+    result, order, conn, _ = _cycle(monkeypatch, ["u1", "u2"], _Reads([{"zed"}]), evict=_evict)
 
-    assert rd.run_cycle(conn, _Reads([{"zed"}])) == {"u1", "u2"}
+    assert result == {"u1", "u2"}
     assert order == ["u1", "u2"]  # zed is not ranked on a reconcile that did not answer
     assert rollbacks == [conn]
 
@@ -290,7 +381,10 @@ def test_a_connection_lost_while_asking_ends_the_cycle(monkeypatch, error):
     # The accounts still waiting cannot be ranked on a dead session, and main() is
     # what replaces it.
     with pytest.raises(type(error)):
-        _cycle(monkeypatch, ["u1", "u2"], _Reads([set(), error]), per_account=rd.POLL_SECONDS)
+        _cycle(
+            monkeypatch, ["u1", "u2"], _Reads([set(), error]),
+            per_account=rd.POLL_SECONDS, closed=2,
+        )
 
 
 # ---- what the cycle logs ------------------------------------------------------------------
@@ -305,6 +399,35 @@ def test_the_cycle_line_counts_the_readers_it_took_and_names_them(monkeypatch, c
     assert (
         "2 of them were readers with a stale feed, taken ahead of their turn: ['amy', 'zed']"
         in caplog.text
+    )
+
+
+def test_the_cycle_line_counts_a_reader_whose_ranking_failed(monkeypatch, caplog):
+    reads = _Reads([set(), {"zed"}])
+    with caplog.at_level(logging.INFO):
+        _cycle(monkeypatch, ["u1", "u2"], reads, per_account=rd.POLL_SECONDS, fail={"zed"})
+
+    assert "refreshed personalized feeds for 2/3 cached users (1 failed)" in caplog.text
+
+
+def test_a_cycle_in_which_every_ranking_failed_still_writes_its_line(monkeypatch, caplog):
+    with caplog.at_level(logging.INFO):
+        _cycle(monkeypatch, ["u1"], _Reads([{"zed"}]), fail={"u1", "zed"})
+
+    assert "refreshed personalized feeds for 0/2 cached users (2 failed)" in caplog.text
+
+
+def test_exactly_the_quiet_threshold_of_readers_is_still_listed(monkeypatch, caplog):
+    names = {f"r{i:02d}" for i in range(rd._QUIET_REFRESH_ABOVE)}
+    with caplog.at_level(logging.INFO):
+        _result, order, _conn, _ = _cycle(monkeypatch, ["u1"], _Reads([names]))
+
+    # 20 names: one set order in 20! would pass an unsorted queue or an unsorted line.
+    assert order == sorted(names) + ["u1"]
+    (line,) = [r.getMessage() for r in caplog.records if "ahead of their turn" in r.getMessage()]
+    assert line == (
+        "20 of them were readers with a stale feed, taken ahead of their turn: "
+        f"{sorted(names)}"
     )
 
 
@@ -470,3 +593,110 @@ def test_what_one_cycle_was_given_is_not_carried_into_the_next(monkeypatch):
     )
 
     assert seen.targeted == []
+
+
+def test_a_waiting_reader_handed_to_the_cycle_is_not_charged_to_the_budget_again(monkeypatch):
+    monkeypatch.setattr(rd, "READ_REFRESH_MAX_PER_CYCLE", 5)
+    monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 30)
+    monkeypatch.setattr(rd, "CYCLE_SECONDS", 7)  # first cycle at start, second on pass 3
+    cycle = _asks(times=2)
+    seen = _drive_main(
+        monkeypatch, clock=_Clock(), passes=3,
+        drain=[{"a"}, {"b"}], note=[{"a1"}, {"b1"}], cycle=[set(), cycle],
+    )
+
+    assert cycle.got == [{"b1"}, {"b1"}]
+    # pass 1; pass 2 (renewed after the first cycle); pass 3, then the two checks of
+    # the second cycle: b1 was paid for on pass 2 and costs nothing more.
+    assert seen.limits == [5, 5, 4, 4, 4]
+
+
+def test_a_waiting_reader_handed_to_a_cycle_that_fails_keeps_waiting(monkeypatch):
+    monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 30)
+    monkeypatch.setattr(rd, "CYCLE_SECONDS", 7)
+
+    def _asks_and_fails(conn, reads):
+        _asks_and_fails.got = set(reads(conn))
+        raise RuntimeError("boom")
+
+    seen = _drive_main(
+        monkeypatch, clock=_Clock(), passes=8,
+        drain=[{"a"}, {"b"}], note=[{"a1"}, {"b1"}], cycle=[set(), _asks_and_fails],
+    )
+
+    assert _asks_and_fails.got == {"b1"}
+    assert [names for _conn, names in seen.targeted] == [{"a1"}, {"b1"}]
+
+
+def test_readers_handed_over_by_every_check_of_a_cycle_keep_waiting(monkeypatch):
+    monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 0)
+    cycle = _asks(times=2)
+    seen = _drive_main(
+        monkeypatch, passes=2, cycle=[cycle],
+        drain=[set(), {"alice"}, {"bob"}], note=[set(), {"alice"}, {"bob"}],
+    )
+
+    assert cycle.got == [{"alice"}, {"bob"}]
+    assert [names for _conn, names in seen.targeted] == [{"alice", "bob"}]
+
+
+def test_the_real_cycle_and_the_real_loop_do_not_re_enrol_a_waiting_reader(monkeypatch):
+    """main() and run_cycle together, as they run: only the per-account step and the
+    SQL helpers are stubbed. A reader that is waiting for its group when a cycle starts
+    has cleared its interests meanwhile. The cycle must evict it, and must not rank it
+    on any of the later checks at which main() names it again."""
+    monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 30)
+    monkeypatch.setattr(rd, "CYCLE_SECONDS", 7)   # first cycle at start, second on pass 3
+    clock, order, reconciled, no_row = _Clock(), [], [], set()
+
+    def _evict(_conn, names):
+        reconciled.append(list(names))
+        gone = {n for n in names if n == "optout" and n not in no_row}
+        no_row.update(gone)
+        return gone
+
+    def _rank(_conn, username, *_a, **_k):
+        clock.now += rd.POLL_SECONDS
+        order.append(username)
+
+    monkeypatch.setattr(rd, "register_vector_type", lambda _c: None)
+    monkeypatch.setattr(rd, "_evict_unsubscribed", _evict)
+    monkeypatch.setattr(rd, "_rotation_members", lambda _c, names: set(names) - no_row)
+    monkeypatch.setattr(rd, "_fetch_personalised_users", lambda _c, _limit: ["u1", "u2", "u3"])
+    monkeypatch.setattr(rd, "_fetch_algorithm", lambda _c: ("1.0.0", {}))
+    monkeypatch.setattr(
+        rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
+    )
+    monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
+    monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
+    monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)
+    monkeypatch.setattr(rd, "compute_scores", lambda **k: pd.DataFrame())
+    monkeypatch.setattr(rd, "_rank_user", _rank)
+    monkeypatch.setattr(rd, "MAX_USERS_PER_CYCLE", 3)
+
+    # Pass 1: a1 is heard and refreshed at once, then the first cycle (four checks,
+    # nothing heard). Pass 2: optout is heard, 20 s after a1's group went, so it waits.
+    # Pass 3: the second cycle starts with optout still waiting.
+    quiet = [set()] * 4
+    seen = _drive_main(
+        _KeepCycle(monkeypatch), clock=clock, passes=3,
+        drain=[{"a"}, *quiet, {"o"}], note=[{"a1"}, *quiet, {"optout"}],
+    )
+
+    assert order == ["u1", "u2", "u3"] * 2
+    # Named on each of the second cycle's four checks, looked at on the first only.
+    assert reconciled == [["u1", "u2", "u3"], ["u1", "u2", "u3"], ["optout"]]
+    assert "optout" in no_row
+    assert [names for _conn, names in seen.targeted] == [{"a1"}]
+
+
+class _KeepCycle:
+    """A monkeypatch that leaves run_cycle as it is: _drive_main stubs it otherwise."""
+
+    def __init__(self, monkeypatch):
+        self._mp = monkeypatch
+
+    def setattr(self, target, name, value):
+        if target is rd and name == "run_cycle":
+            return
+        self._mp.setattr(target, name, value)
