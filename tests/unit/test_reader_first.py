@@ -898,6 +898,7 @@ def test_a_large_refresh_is_logged_as_a_count(monkeypatch, caplog):
 _NAMES = (
     "READER_WINDOW_SECONDS",
     "READER_CYCLE_SHARE",
+    "MAX_USERS_PER_CYCLE",
     "READ_REFRESH_MIN_AGE_SECONDS",
     "READ_REFRESH_MAX_PER_CYCLE",
     "READ_REFRESH_BATCH_SECONDS",
@@ -934,6 +935,21 @@ def settings():
             "READ_REFRESH_MAX_PER_CYCLE": "3",
             "READ_REFRESH_BATCH_SECONDS": "7",
         },
+        # Every line present and blank in the operator's env file (#87): each key
+        # reaches the daemon, each value empty.
+        "blank_in_env_file": {
+            "MAX_USERS_PER_CYCLE": "",
+            "READER_WINDOW_SECONDS": "",
+            "READER_CYCLE_SHARE": "",
+            "READ_REFRESH_MIN_AGE_SECONDS": "",
+            "READ_REFRESH_MAX_PER_CYCLE": "",
+            "READ_REFRESH_BATCH_SECONDS": "",
+        },
+        "cycle_only_rest_empty": {
+            "MAX_USERS_PER_CYCLE": "3000",
+            "READER_CYCLE_SHARE": "",
+            "READ_REFRESH_MAX_PER_CYCLE": " ",
+        },
         "bigger_cycle": {"MAX_USERS_PER_CYCLE": "3000"},
         "share_only": {"READER_CYCLE_SHARE": "0.25"},
         "by_hand": {"MAX_USERS_PER_CYCLE": "3000", "READ_REFRESH_MAX_PER_CYCLE": "1500"},
@@ -962,12 +978,62 @@ def test_the_reader_defaults_are_the_documented_ones(settings):
     assert settings["defaults"] == {
         "READER_WINDOW_SECONDS": 24 * 60 * 60,
         "READER_CYCLE_SHARE": 0.5,
+        "MAX_USERS_PER_CYCLE": 200,
         "READ_REFRESH_MIN_AGE_SECONDS": 600,
         "READ_REFRESH_MAX_PER_CYCLE": 100,
         "READ_REFRESH_BATCH_SECONDS": 30,
         "_READ_REFRESH_DEFAULT_CEILING": 300,
         "_FEED_READ_BACKLOG_MAX": 20000,
     }
+
+
+def test_settings_left_blank_in_the_env_file_are_the_defaults(settings):
+    # `NAME=` in the env file reaches the daemon as an empty string. int("") raises, so
+    # before #87 a blanked-out line stopped the ranker.
+    assert settings["blank_in_env_file"] == settings["defaults"]
+
+
+def test_an_empty_setting_still_follows_the_ones_that_are_set(settings):
+    got = settings["cycle_only_rest_empty"]
+
+    assert got["MAX_USERS_PER_CYCLE"] == 3000
+    assert got["READER_CYCLE_SHARE"] == 0.5
+    assert got["READ_REFRESH_MAX_PER_CYCLE"] == 300  # 3000 x 0.5, held at the ceiling
+
+
+def test_the_cycle_size_stays_a_whole_number(settings):
+    # It is a LIMIT and a slice bound: 200.0 equals 200 and still breaks the slice.
+    for case in ("defaults", "blank_in_env_file", "bigger_cycle"):
+        assert type(settings[case]["MAX_USERS_PER_CYCLE"]) is int, case
+    assert settings["bigger_cycle"]["MAX_USERS_PER_CYCLE"] == 3000
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [(None, 5), ("", 5), ("   ", 5), ("7", 7), (" 7 ", 7), ("0", 0), ("-2", -2)],
+)
+def test_a_tuning_variable_unset_or_empty_takes_the_default(monkeypatch, raw, expected):
+    monkeypatch.delenv("HAF_FYP_TEST_TUNING", raising=False)
+    if raw is not None:
+        monkeypatch.setenv("HAF_FYP_TEST_TUNING", raw)
+
+    assert rd._tuning("HAF_FYP_TEST_TUNING", "5", int) == expected
+
+
+def test_a_tuning_variable_that_is_not_a_number_names_itself(monkeypatch):
+    monkeypatch.setenv("HAF_FYP_TEST_TUNING", "lots")
+
+    with pytest.raises(ValueError, match="^HAF_FYP_TEST_TUNING='lots' is not a valid int$"):
+        rd._tuning("HAF_FYP_TEST_TUNING", "5", int)
+    # Not the default instead: a typo must not look like a setting that took.
+    with pytest.raises(ValueError, match="^HAF_FYP_TEST_TUNING='lots' is not a valid float$"):
+        rd._tuning("HAF_FYP_TEST_TUNING", "0.5", float)
+
+    monkeypatch.setenv("HAF_FYP_TEST_TUNING", "0.5")
+    with pytest.raises(ValueError, match="^HAF_FYP_TEST_TUNING='0.5' is not a valid int$"):
+        rd._tuning("HAF_FYP_TEST_TUNING", "5", int)  # a share where a count belongs
+
+    assert rd._tuning("HAF_FYP_TEST_TUNING", "5", float) == 0.5  # the same value is a valid share
 
 
 def test_the_reader_settings_are_read_from_the_environment(settings):

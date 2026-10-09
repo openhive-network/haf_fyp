@@ -668,8 +668,30 @@ once per full rotation: about 22 hours at 45,000 accounts and the default 200.
 The rest of each cycle goes to everyone else in the old order. The first request after
 a long absence is still served the old feed; it is the one that triggers the refresh.
 
-These are environment variables of the `haf-fyp-ranker` service. Neither compose file
-passes them through, so add them to that service's `environment:` to change one.
+These are environment variables of the `haf-fyp-ranker` service.
+`docker/docker-compose.yml` passes each one to the ranker when it is set, so add the
+line to your `docker/.env.local` (`MAX_USERS_PER_CYCLE=3000`; a copy made before this
+existed has no line for it) and recreate the ranker with the same `--env-file` as every
+other command:
+
+```bash
+docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
+  up -d --build --no-deps haf-fyp-ranker
+```
+
+(Plus your stack's `-p`, if it has one.) `--build` matters the first time: a ranker
+image built before these settings were passed stops on a line left blank. `--no-deps`
+keeps the command to the ranker; it also means Redis is not started if it is down.
+
+Not set, or left blank, a variable takes the default below. A variable of the same
+name exported in your shell outranks the file, and lasts only as long as that shell:
+the next `up` of the ranker without it puts the ranker back. haf_api_node's
+`haf_fyp.yaml` does not pass them yet (#87): there, add them to that service's
+`environment:`.
+
+The ranker reads six more settings that are not passed and not listed here (retention
+and maintenance: `FEED_EVENTS_*`, `EMBEDDING_COVERAGE_DAYS`, `ACTIVE_USERS_*`). Changing
+one of those still means adding it to the service's `environment:`.
 
 | Variable | Default | What it bounds |
 |---|---|---|

@@ -277,6 +277,22 @@ services:
       REDIS_HOST:    ${REDIS_HOST:-haf-fyp-redis}
       REDIS_PORT:    ${REDIS_PORT:-6379}
       REDIS_URL:     ${REDIS_URL:-redis://haf-fyp-redis:6379}
+      # Ranker tuning (#87), README "How fresh a feed is". A key with NO value: compose
+      # takes it from the env file (or the shell) when it is set there, and otherwise
+      # leaves it out of the container altogether, so the daemon uses its own default
+      # (the env-file half is measured, on Compose v5.1.4; Docker documents the shell).
+      #
+      # Deliberately not `${NAME:-}`. That hands the container an EMPTY variable when
+      # nothing is set, and a ranker image built before #87 does int("") on it and
+      # restarts forever -- which is what a plain `up -d` without --build would run.
+      # Nor `${NAME:-200}`: the defaults live in haf_fyp/ranker_daemon.py, and
+      # READ_REFRESH_MAX_PER_CYCLE's is computed from two of the others.
+      MAX_USERS_PER_CYCLE:
+      READER_CYCLE_SHARE:
+      READER_WINDOW_SECONDS:
+      READ_REFRESH_MIN_AGE_SECONDS:
+      READ_REFRESH_MAX_PER_CYCLE:
+      READ_REFRESH_BATCH_SECONDS:
     depends_on:
       haf-fyp-setup:
         condition: service_completed_successfully
