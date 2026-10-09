@@ -130,7 +130,14 @@ services:
     # the postgrest lane builds nothing from Dockerfile.sql. Nothing in CI executes the
     # dispatcher inside the image; tests/unit/test_docker_entrypoint.py is what covers
     # it, by running the script directly against stub scripts.
-    command: ["install_app"]
+    #
+    # --swagger-url is the base URL the published OpenAPI document advertises (#58). On
+    # THIS stack the rewriter is the root of its port and its rules match the public
+    # paths (^/v1/fyp/..., /health, ...) with no prefix, so the base is `/`. The app's default, /haf-fyp-api, is the route
+    # haf_api_node gives it; advertised here it sends "Try it out" to paths that 404.
+    # FYP_SWAGGER_URL overrides it, for a standalone stack that sits behind a proxy
+    # under a prefix. It is applied on every `up`, like the rest of the install.
+    command: ["install_app", "--swagger-url=${FYP_SWAGGER_URL:-/}"]
     environment:
       POSTGRES_HOST: haf
       POSTGRES_USER: haf_admin   # install requires DDL privileges
@@ -223,7 +230,7 @@ services:
   # USE `run --rm`, NOT `--profile haf-fyp-uninstall up`. Upstream documents the `up`
   # form and it is safe THERE because upstream puts every app service behind a profile
   # too. In THIS file nothing else has `profiles:`, so `up` would also start
-  # haf-fyp-setup -- whose command is `install_app` -- concurrently with the teardown,
+  # haf-fyp-setup -- whose command runs `install_app` -- concurrently with the teardown,
   # racing DROP SCHEMA against CREATE SCHEMA, and restart the very services the operator
   # was just told to stop. The session guard cannot see it either: haf-fyp-setup
   # connects as haf_admin, and the guard counts only haf_fyp_owner/haf_fyp_user.

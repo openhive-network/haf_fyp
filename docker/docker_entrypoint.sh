@@ -33,7 +33,7 @@ usage() {
 usage: $0 <verb> [args...]
 
 verbs:
-  install_app [--swagger-url=HOST] [--schema=] [--is_forking=] [--host=] [--port=]
+  install_app [--swagger-url=BASE] [--schema=] [--is_forking=] [--host=] [--port=]
               [--user=]              install/upgrade schema, endpoints and roles
   process_blocks [--schema=] [--is_forking=] [--host=] [--port=] [--user=]
                                      run the block-processing loop (blocks forever)

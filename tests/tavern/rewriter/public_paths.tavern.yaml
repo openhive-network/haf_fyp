@@ -330,6 +330,11 @@ stages:
         extra_kwargs:
           comparisons:
             - {jmespath: "type(openapi)", operator: "eq", expected: "string"}
+            # root() sets `servers` at request time (#58). This lane loads no
+            # haf_fyp_app.app_config, so it is the default, through PostgREST and as
+            # the anonymous role.
+            - {jmespath: "servers[0].url", operator: "eq", expected: "/haf-fyp-api"}
+            - {jmespath: "length(servers)", operator: "eq", expected: 1}
 
 ---
 test_name: rewrite rule - the catch-all

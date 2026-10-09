@@ -61,6 +61,34 @@ ON haf_fyp_app.app_status ((TRUE));
 -- /version while /health failed on "permission denied for table app_status".
 GRANT SELECT ON haf_fyp_app.app_status TO haf_fyp_user;
 
+-- ---------------------------------------------------------------------------
+-- Deployment settings the SERVED OpenAPI document has to reflect (#58)
+-- ---------------------------------------------------------------------------
+-- The base URL the document advertises in `servers` differs between a node route
+-- (/haf-fyp-api) and a bare `docker compose up`, so it cannot be baked into the image.
+-- install_app.sh --swagger-url writes it here and haf_fyp_endpoints.root() reads it at
+-- request time.
+--
+-- A session GUC cannot carry it. install_app.sh used to `SET custom.swagger_url` in its
+-- own psql session; PostgREST connects later, on its own pool, and never saw it. That
+-- is why the flag did nothing for as long as it existed. NULL means "not set": root()
+-- then advertises its default.
+CREATE TABLE IF NOT EXISTS haf_fyp_app.app_config (
+    swagger_base_url text
+);
+
+-- Singleton, by the same constant-expression index as app_status above: a re-install
+-- overwrites the setting, it does not add a second row for readers to pick from.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_app_config_singleton
+ON haf_fyp_app.app_config ((TRUE));
+
+INSERT INTO haf_fyp_app.app_config (swagger_base_url)
+SELECT NULL AS swagger_base_url
+WHERE NOT EXISTS (SELECT 1 AS one FROM haf_fyp_app.app_config);
+
+-- root() runs as the anonymous role and reads this on every GET /.
+GRANT SELECT ON haf_fyp_app.app_config TO haf_fyp_user;
+
 -- app_version and its singleton machinery live in db/app_version.sql, loaded next by
 -- scripts/install_app.sh (step 2b). Split out so the postgrest CI lane -- which does not
 -- load this file -- can execute the shipped DDL instead of a copy of it. That lane could

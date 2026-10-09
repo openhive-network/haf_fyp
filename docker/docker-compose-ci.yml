@@ -52,7 +52,7 @@ services:
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /create_tables.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -v git_hash=ci-test -f /set_version.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /seed_data.sql &&
-        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -c "SET custom.swagger_url = 'localhost';" -f /endpoint_schema.sql &&
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /endpoint_schema.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /active_users_maintenance.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /sync_status.sql &&
         PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /cross_schema_grants.sql &&

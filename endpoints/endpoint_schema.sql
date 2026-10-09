@@ -188,6 +188,7 @@ CREATE OR REPLACE FUNCTION haf_fyp_endpoints.root() RETURNS json
 LANGUAGE plpgsql STABLE
 AS $func$
 DECLARE
+    _base text;
     -- The OpenAPI spec below is generated from the /** openapi ... */ annotations
     -- in this file by scripts/openapi_rewrite.sh (it fills the block after the
     -- "-- openapi-spec" marker). Edit the annotations, not the generated JSON.
@@ -1103,7 +1104,60 @@ DECLARE
 $$;
 -- openapi-generated-code-end
 BEGIN
-    RETURN openapi;
+    -- The base URL this deployment set with install_app.sh --swagger-url (#58), if any.
+    -- Wrapped because haf_fyp_app.app_config is not on every database that loads this
+    -- file: the postgrest CI lane hand-applies a list of files that does not include
+    -- db/haf_fyp_app.sql, and a half-installed database should still serve a document
+    -- rather than answer GET / with a 500.
+    --
+    -- NOT insufficient_privilege. A lost grant on the table would make the setting
+    -- silently inert again, which is the defect this replaced; that one should fail.
+    BEGIN
+        SELECT c.swagger_base_url INTO _base FROM haf_fyp_app.app_config AS c LIMIT 1;
+    EXCEPTION
+        WHEN undefined_table THEN _base := NULL;
+    END;
+
+    -- Only something that can BE a base URL: an absolute path, or an http(s) origin with
+    -- a path. Anything else leaves the default, which is right behind haf_api_node.
+    --
+    --   a bare hostname -- what a node operator reaches for first (PUBLIC_HOSTNAME).
+    --                      `servers: [{url: "your.host"}]` is not a URL.
+    --   //evil.example  -- protocol-relative. It passes a naive `^/`, and Swagger UI
+    --                      resolves it against the current scheme, so "Try it out" would
+    --                      send requests to another origin. The path arm therefore
+    --                      refuses a second leading slash.
+    --   https://host    -- an origin with no path. This app is routed under a prefix,
+    --                      so every generated client would call paths that are 404.
+    --                      The host part may not hold `?` or `#` (https://h?/ is an
+    --                      origin with a query and still no path) or `@`: this document
+    --                      is served to anyone, and user:password@host would publish a
+    --                      credential.
+    --
+    -- And nothing with a backslash, whitespace or a control character anywhere in it.
+    -- A browser reads `/\evil.example` as `//evil.example` and drops tabs and newlines
+    -- before it parses, so `/<newline>/evil.example` is the same thing; neither starts
+    -- with two slashes.
+    --
+    -- Keep both patterns identical to the ones in scripts/install_app.sh, which warns
+    -- the operator when their value will be ignored. This function is the enforcer.
+    IF _base IS NULL
+        OR _base !~ '^(/($|[^/])|https?://[^/?#@]+/)'
+        OR _base ~ '[[:space:][:cntrl:]\\]'
+    THEN
+        _base := '/haf-fyp-api';
+    END IF;
+
+    -- jsonb, not text surgery: the blob above is machine-written and its spacing is not
+    -- a contract. jsonb_pretty keeps GET / readable in a browser; it reorders keys, which
+    -- OpenAPI does not care about.
+    RETURN jsonb_pretty(
+        jsonb_set(
+            openapi::jsonb,
+            '{servers}',
+            jsonb_build_array(jsonb_build_object('url', _base))
+        )
+    )::json;
 END;
 $func$;
 
