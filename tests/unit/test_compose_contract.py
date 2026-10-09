@@ -1791,6 +1791,23 @@ def _ranker_env_reads() -> dict:
         assert isinstance(first, ast.Constant) and isinstance(first.value, str), (
             f"line {node.lineno}: {ast.unparse(node)} does not name its variable with a literal")
         reads[ast.unparse(node.func)].add(first.value)
+    # Anything else that touches the environment is a read this cannot name: an alias
+    # (`from os import environ as e`), os.environ.setdefault, `in os.environ`.
+    recognised = {
+        id(sub)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) in reads
+        for sub in ast.walk(node.func)
+    }
+    for node in ast.walk(tree):
+        if id(node) in inside_tuning or id(node) in recognised:
+            continue
+        named = getattr(node, "attr", None) or getattr(node, "id", None)
+        imported = isinstance(node, ast.ImportFrom) and node.module == "os" and any(
+            alias.name in ("environ", "getenv") for alias in node.names)
+        assert named not in ("environ", "getenv") and not imported, (
+            f"line {node.lineno}: the environment is reached in a way this check cannot "
+            f"read ({ast.unparse(node)}); use os.environ.get, _tuning or env_or_default")
     return reads
 
 
@@ -1824,11 +1841,18 @@ def test_only_what_survives_an_empty_value_is_passed_without_one(services):
     line in the env file), so everything passed that way must be read through _tuning().
     FEED_EVENTS_RETAIN_DAYS passed like this would bring back the crash with every test
     above still green."""
+    def can_arrive_empty(value) -> bool:
+        # A bare key, a literal "", ${X} and $X (empty when unset), ${X:-} and ${X-}.
+        if value is None or str(value) == "":
+            return True
+        whole = re.fullmatch(
+            r"\$\{[A-Za-z0-9_]+(?::?[-+](.*))?\}|\$[A-Za-z0-9_]+", str(value))
+        return bool(whole) and not whole.group(1)
+
     env = _ranker_environment(services)
-    may_be_empty = {
-        key for key, value in env.items()
-        if value is None or re.fullmatch(r"\$\{[A-Za-z0-9_]+:?-\}", str(value))
-    }
+    assert "env_file" not in (services[RANKER] or {}), (
+        f"{RANKER} has an env_file: every line in it reaches the daemon, blank ones too")
+    may_be_empty = {key for key, value in env.items() if can_arrive_empty(value)}
     assert may_be_empty == TUNING, sorted(may_be_empty ^ TUNING)
 
 
@@ -1875,7 +1899,10 @@ def test_the_defaults_shown_in_the_env_file_are_the_daemons():
     """A default written in a comment drifts the day the code's changes."""
     import ast
 
-    shown = dict(re.findall(r"(?m)^# ([A-Z_]+)=(\S*)$", ENV_FILE.read_text(encoding="utf-8")))
+    lines = re.findall(r"(?m)^# ([A-Z_]+)=(\S*)$", ENV_FILE.read_text(encoding="utf-8"))
+    for name in sorted(TUNING):
+        assert [n for n, _ in lines].count(name) == 1, f"docker/.env shows {name} more than once"
+    shown = dict(lines)
     tree = ast.parse(RANKER_SOURCE.read_text(encoding="utf-8"))
     coded = {}
     for node in ast.walk(tree):
@@ -1885,4 +1912,33 @@ def test_the_defaults_shown_in_the_env_file_are_the_daemons():
                 coded[node.args[0].value] = str(eval(ast.unparse(node.args[1]), {"str": str}))  # noqa: S307
             except NameError:
                 coded[node.args[0].value] = ""          # computed from the other settings
-    assert {name: shown.get(name) for name in TUNING} == coded
+    assert [name for name, value in coded.items() if value == ""] == ["READ_REFRESH_MAX_PER_CYCLE"], (
+        "only READ_REFRESH_MAX_PER_CYCLE's default is computed; write the others as literals")
+    assert {name: shown.get(name) for name in TUNING} == coded, (
+        "docker/.env's commented defaults differ from ranker_daemon.py's (compared as written)")
+
+
+def test_the_readme_table_shows_the_daemons_defaults():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for name, default in (
+        ("MAX_USERS_PER_CYCLE", "200"),
+        ("READER_CYCLE_SHARE", "0.5"),
+        ("READER_WINDOW_SECONDS", "86400"),
+        ("READ_REFRESH_MIN_AGE_SECONDS", "600"),
+        ("READ_REFRESH_BATCH_SECONDS", "30"),
+    ):
+        assert f"| `{name}` | {default} |" in readme, f"README's table: {name} is not shown as {default}"
+    shown = dict(re.findall(r"(?m)^# ([A-Z_]+)=(\S*)$", ENV_FILE.read_text(encoding="utf-8")))
+    for name in ("MAX_USERS_PER_CYCLE", "READER_CYCLE_SHARE", "READER_WINDOW_SECONDS",
+                 "READ_REFRESH_MIN_AGE_SECONDS", "READ_REFRESH_BATCH_SECONDS"):
+        assert f"| `{name}` | {shown[name]} |" in readme, f"README and docker/.env disagree on {name}"
+
+
+def test_the_documented_recreate_command_reads_the_operators_file_and_builds():
+    """Without --env-file the value just set is ignored; without --build a ranker image
+    from before #87 runs, and stops on a blank line; without --no-deps `up` reaches haf."""
+    want = "up -d --build --no-deps haf-fyp-ranker"
+    for path in (ROOT / "README.md", ENV_FILE):
+        text = re.sub(r"\\\n#?\s*", "", path.read_text(encoding="utf-8"))
+        assert ("docker compose --env-file docker/.env.local -f docker/docker-compose.yml "
+                + want) in text, f"{path.name} does not give the full recreate command"

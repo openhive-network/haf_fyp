@@ -279,7 +279,8 @@ services:
       REDIS_URL:     ${REDIS_URL:-redis://haf-fyp-redis:6379}
       # Ranker tuning (#87), README "How fresh a feed is". A key with NO value: compose
       # takes it from the env file (or the shell) when it is set there, and otherwise
-      # leaves it out of the container altogether, so the daemon uses its own default.
+      # leaves it out of the container altogether, so the daemon uses its own default
+      # (the env-file half is measured, on Compose v5.1.4; Docker documents the shell).
       #
       # Deliberately not `${NAME:-}`. That hands the container an EMPTY variable when
       # nothing is set, and a ranker image built before #87 does int("") on it and

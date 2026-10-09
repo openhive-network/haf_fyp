@@ -676,13 +676,18 @@ other command:
 
 ```bash
 docker compose --env-file docker/.env.local -f docker/docker-compose.yml \
-  up -d --no-deps haf-fyp-ranker
+  up -d --build --no-deps haf-fyp-ranker
 ```
+
+(Plus your stack's `-p`, if it has one.) `--build` matters the first time: a ranker
+image built before these settings were passed stops on a line left blank. `--no-deps`
+keeps the command to the ranker; it also means Redis is not started if it is down.
 
 Not set, or left blank, a variable takes the default below. A variable of the same
 name exported in your shell outranks the file, and lasts only as long as that shell:
-the next compose command without it puts the ranker back. haf_api_node's `haf_fyp.yaml`
-does not pass them yet (#87): there, add them to that service's `environment:`.
+the next `up` of the ranker without it puts the ranker back. haf_api_node's
+`haf_fyp.yaml` does not pass them yet (#87): there, add them to that service's
+`environment:`.
 
 The ranker reads six more settings that are not passed and not listed here (retention
 and maintenance: `FEED_EVENTS_*`, `EMBEDDING_COVERAGE_DAYS`, `ACTIVE_USERS_*`). Changing

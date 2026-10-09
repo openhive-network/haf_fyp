@@ -937,7 +937,7 @@ def settings():
         },
         # Every line present and blank in the operator's env file (#87): each key
         # reaches the daemon, each value empty.
-        "passed_through_empty": {
+        "blank_in_env_file": {
             "MAX_USERS_PER_CYCLE": "",
             "READER_WINDOW_SECONDS": "",
             "READER_CYCLE_SHARE": "",
@@ -987,10 +987,10 @@ def test_the_reader_defaults_are_the_documented_ones(settings):
     }
 
 
-def test_settings_passed_through_empty_are_the_defaults(settings):
+def test_settings_left_blank_in_the_env_file_are_the_defaults(settings):
     # `NAME=` in the env file reaches the daemon as an empty string. int("") raises, so
     # before #87 a blanked-out line stopped the ranker.
-    assert settings["passed_through_empty"] == settings["defaults"]
+    assert settings["blank_in_env_file"] == settings["defaults"]
 
 
 def test_an_empty_setting_still_follows_the_ones_that_are_set(settings):
@@ -1003,7 +1003,7 @@ def test_an_empty_setting_still_follows_the_ones_that_are_set(settings):
 
 def test_the_cycle_size_stays_a_whole_number(settings):
     # It is a LIMIT and a slice bound: 200.0 equals 200 and still breaks the slice.
-    for case in ("defaults", "passed_through_empty", "bigger_cycle"):
+    for case in ("defaults", "blank_in_env_file", "bigger_cycle"):
         assert type(settings[case]["MAX_USERS_PER_CYCLE"]) is int, case
     assert settings["bigger_cycle"]["MAX_USERS_PER_CYCLE"] == 3000
 
