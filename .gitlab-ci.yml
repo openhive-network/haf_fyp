@@ -327,7 +327,20 @@ fastapi-tests:
     POSTGRES_HOST: haf
     POSTGRES_PORT: "5432"
     POSTGRES_PASSWORD: ""
-    ADMIN_API_KEY: ""
+    # NOT empty (#50). With an empty key `activate_algorithm` answers 403 from
+    # `not admin_key` and never reaches hmac.compare_digest, so nothing in THIS lane
+    # ran the comparison and an inverted conditional passed it. The tavern stages for
+    # the admin endpoint send this key, and the wrong ones below, through it.
+    ADMIN_API_KEY: "ci-admin-key-0123456789-A"
+    # Four keys that are almost right, each wrong in the one way a careless
+    # comparison forgives: the last byte in the other case (same length, same
+    # prefix, equal if case is ignored), the first byte in the other case (same
+    # suffix), the key cut short by a byte (a prefix of it), and one letter in the
+    # middle changed (same length, same first and last bytes).
+    WRONG_ADMIN_API_KEY_LAST_BYTE: "ci-admin-key-0123456789-a"
+    WRONG_ADMIN_API_KEY_FIRST_BYTE: "Ci-admin-key-0123456789-A"
+    WRONG_ADMIN_API_KEY_CUT_SHORT: "ci-admin-key-0123456789-"
+    WRONG_ADMIN_API_KEY_MIDDLE_BYTE: "ci-admin-kay-0123456789-A"
     API_URL: "http://localhost:3000"
     FASTAPI_URL: "http://localhost:3002"
     # Makes the tavern lane key rate limits on each stage's X-Real-IP rather than on

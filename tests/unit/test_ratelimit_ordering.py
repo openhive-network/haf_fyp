@@ -832,6 +832,26 @@ class TestTheRealAdminIsNotLockedOutByGuessers:
             "wrong-key guesses from 6 addresses locked the real admin out"
         )
 
+    @pytest.mark.parametrize("configured", [None, ""])
+    def test_with_no_key_configured_nothing_authenticates(self, real_app, monkeypatch, configured):
+        """A deployment that sets no ADMIN_API_KEY has no admin, not an open one (#50).
+
+        An EMPTY header compares equal to an empty key, so without the `not admin_key`
+        guard ahead of the comparison this endpoint is open to anyone who sends
+        `X-Admin-Key:` with nothing after it. The fastapi-tests lane sets a key now, so
+        this is where that guard is exercised."""
+        from fastapi.testclient import TestClient
+
+        if configured is None:
+            monkeypatch.delenv("ADMIN_API_KEY", raising=False)
+        else:
+            monkeypatch.setenv("ADMIN_API_KEY", configured)
+        c = TestClient(real_app.app, raise_server_exceptions=False)
+        for n, sent in enumerate(("", "anything", "None", "changeme-before-production")):
+            r = c.post("/v1/fyp/admin/algorithm", json={"version": "1.0.0"},
+                       headers={"X-Real-IP": f"192.0.2.{120 + n}", "X-Admin-Key": sent})
+            assert r.status_code == 403, f"{sent!r} got {r.status_code} with no key configured"
+
     def test_but_guessing_is_still_bounded(self, real_app, monkeypatch):
         from fastapi.testclient import TestClient
 
