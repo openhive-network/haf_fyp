@@ -469,7 +469,7 @@ def _drive_main(
     first.closed, second.closed = first_closed, 0
     seen = SimpleNamespace(
         first=first, second=second, note=[], limits=[], targeted=[], cycle=[],
-        reconnect=[], rollback=[], listened=[],
+        cycle_reads=[], reconnect=[], rollback=[], listened=[],
     )
     cycle = list(cycle)
 
@@ -490,10 +490,16 @@ def _drive_main(
 
     slept = []
 
-    def _run_cycle(conn):
+    def _run_cycle(conn, reads=None):
         seen.cycle.append(conn)
+        seen.cycle_reads.append(reads)
         if cycle:
-            return _next(cycle)
+            value = cycle.pop(0)
+            if callable(value):
+                return value(conn, reads)
+            if isinstance(value, BaseException):
+                raise value
+            return value
 
     def _sleep(_seconds):
         if clock is not None:

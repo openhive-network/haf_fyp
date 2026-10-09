@@ -747,3 +747,119 @@ def test_the_shipped_upgrade_adds_the_column_and_its_index_to_an_installed_table
         )
         (indexdef,) = cur.fetchone()
         assert "(last_read_at)" in indexdef and "WHERE (last_read_at IS NOT NULL)" in indexdef
+
+
+# --------------------------------------------------------------------------
+# #85: a read that arrives while a scheduled cycle is running
+# --------------------------------------------------------------------------
+
+
+def test_a_read_during_a_cycle_is_recorded_and_ranked_before_the_cycle_ends(
+    conn, other, monkeypatch
+):
+    """The real session, the real LISTEN, the real stamping statement, and a cycle whose
+    per-account step writes and commits as write_feed_cache does. Everything #85 does
+    rests on two things only a server can show: that a notification committed by another
+    session while this one is inside an account's transaction is handed over as soon as
+    that transaction ends, and that the drain's rollback between two accounts loses none
+    of the cycle's own writes."""
+    import pandas as pd
+
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
+    monkeypatch.setattr(rd, "MAX_USERS_PER_CYCLE", 3)
+    monkeypatch.setattr(rd, "POLL_SECONDS", 0)  # ask after every account
+    for name in ("u1", "u2", "u3"):
+        _user(conn, name, scored="3 hours")
+    _user(conn, "zed", scored="1 hour")  # stale, but last in the rotation's order
+    rd._listen_for_feed_reads(conn)
+
+    order, zed_read_when_u2_ranked = [], []
+
+    def _rank(c, username, *_a, **_k):
+        with c.cursor() as cur:
+            cur.execute("SELECT count(*) FROM haf_fyp_app.active_users")  # opens the transaction
+        if username == "u1":
+            _notify(other, "zed")
+            other.commit()  # zed's feed is read while u1 is being ranked
+        if username == "u2":
+            zed_read_when_u2_ranked.append(_read_age_seconds(other, "zed"))
+        with c.cursor() as cur:
+            cur.execute(
+                "UPDATE haf_fyp_app.active_users SET last_scored_at = (NOW() AT TIME ZONE 'utc') "
+                "WHERE username = %s",
+                (username,),
+            )
+        c.commit()
+        order.append(username)
+
+    monkeypatch.setattr(rd, "register_vector_type", lambda _c: None)
+    monkeypatch.setattr(rd, "_evict_unsubscribed", lambda _c, _u: set())
+    monkeypatch.setattr(rd, "_fetch_algorithm", lambda _c: ("1.0.0", {}))
+    monkeypatch.setattr(
+        rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
+    )
+    monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
+    monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
+    monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)
+    monkeypatch.setattr(rd, "compute_scores", lambda **k: pd.DataFrame())
+    monkeypatch.setattr(rd, "_rank_user", _rank)
+
+    ranked = rd.run_cycle(conn, lambda c: rd._handle_feed_reads(c, 10))
+
+    assert order == ["u1", "zed", "u2", "u3"]
+    assert ranked == {"u1", "u2", "u3", "zed"}
+    # Recorded while the cycle was still running: this is what arms the feed
+    # function's ten-minute ration.
+    assert zed_read_when_u2_ranked[0] is not None and zed_read_when_u2_ranked[0] < 30
+    # The cycle's own writes survived the drains between accounts.
+    with other.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM haf_fyp_app.active_users "
+            "WHERE last_scored_at > (NOW() AT TIME ZONE 'utc') - INTERVAL '1 minute'"
+        )
+        assert cur.fetchone()[0] == 4
+    other.commit()
+
+
+def test_a_fresh_feed_read_during_a_cycle_is_recorded_but_not_ranked_again(conn, other, monkeypatch):
+    import pandas as pd
+
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    monkeypatch.setattr(rd, "MAX_USERS_PER_CYCLE", 2)
+    monkeypatch.setattr(rd, "POLL_SECONDS", 0)
+    _user(conn, "u1", scored="3 hours")
+    _user(conn, "u2", scored="2 hours")
+    _user(conn, "fresh", scored="1 minute")
+    rd._listen_for_feed_reads(conn)
+    order = []
+
+    def _rank(c, username, *_a, **_k):
+        if username == "u1":
+            _notify(other, "fresh")
+            other.commit()
+        with c.cursor() as cur:
+            cur.execute(
+                "UPDATE haf_fyp_app.active_users SET last_scored_at = (NOW() AT TIME ZONE 'utc') "
+                "WHERE username = %s",
+                (username,),
+            )
+        c.commit()
+        order.append(username)
+
+    monkeypatch.setattr(rd, "register_vector_type", lambda _c: None)
+    monkeypatch.setattr(rd, "_evict_unsubscribed", lambda _c, _u: set())
+    monkeypatch.setattr(rd, "_fetch_algorithm", lambda _c: ("1.0.0", {}))
+    monkeypatch.setattr(
+        rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
+    )
+    monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
+    monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
+    monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)
+    monkeypatch.setattr(rd, "compute_scores", lambda **k: pd.DataFrame())
+    monkeypatch.setattr(rd, "_rank_user", _rank)
+
+    rd.run_cycle(conn, lambda c: rd._handle_feed_reads(c, 10))
+
+    assert order == ["u1", "u2"]
+    assert _read_age_seconds(other, "fresh") is not None

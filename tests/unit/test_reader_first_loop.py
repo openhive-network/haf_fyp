@@ -169,7 +169,7 @@ def test_the_wait_between_cycles_starts_when_a_cycle_ends(monkeypatch):
     # wait" would have no wait to run in.
     clock, started = _Clock(), []
 
-    def _long_cycle(_conn):
+    def _long_cycle(_conn, _reads=None):
         started.append(clock.now)
         clock.now += rd.CYCLE_SECONDS + 100
 
