@@ -10,8 +10,9 @@
 # to the loopback for the header to be honoured; without it the app correctly
 # ignores X-Real-IP and keys on the peer, and the DELETE cases go red.
 #
-# Addresses are from TEST-NET-2 (198.51.100.0/24, RFC 5737) and are per-stage,
-# not per-endpoint. Adding a stage means adding an unused address, not reusing one.
+# Addresses are from TEST-NET-2 and TEST-NET-3 (198.51.100.0/24 and 203.0.113.0/24,
+# RFC 5737) and are per-stage, not per-endpoint. Adding a stage means adding an unused
+# address, not reusing one.
 
 test_name: FastAPI health returns ok
 
@@ -326,6 +327,143 @@ stages:
         X-Admin-Key: "wrong-key"
       json:
         version: "1.0.0"
+    response:
+      status_code: 403
+      json:
+        detail: "invalid admin key"
+
+---
+# The lane's ADMIN_API_KEY is non-empty (#50), so these reach hmac.compare_digest.
+# Before, every 403 in this lane came from the empty-key branch, and nothing
+# anywhere asserted that the right key gets in.
+test_name: POST /v1/fyp/admin/algorithm compares the key it is given
+
+stages:
+  - name: the right key gets past the gate (an unknown version is then a 404)
+    request:
+      url: "{fastapi_url}/v1/fyp/admin/algorithm"
+      method: POST
+      headers:
+        X-Real-IP: "203.0.113.50"
+        X-Admin-Key: "{tavern.env_vars.ADMIN_API_KEY}"
+      json:
+        version: "0.0.0-absent"
+    response:
+      status_code: 404
+      json:
+        detail: "algorithm version '0.0.0-absent' not found"
+
+  - name: the right key activates a registered version
+    request:
+      url: "{fastapi_url}/v1/fyp/admin/algorithm"
+      method: POST
+      headers:
+        X-Real-IP: "203.0.113.51"
+        X-Admin-Key: "{tavern.env_vars.ADMIN_API_KEY}"
+      json:
+        # The version tests/ci_fastapi_setup.sql seeds as active: activating it
+        # again changes nothing for the stages after this one.
+        version: "1.1.0"
+    response:
+      status_code: 200
+      json:
+        activated: "1.1.0"
+
+  - name: the key with its last byte in the other case is refused
+    request:
+      url: "{fastapi_url}/v1/fyp/admin/algorithm"
+      method: POST
+      headers:
+        X-Real-IP: "203.0.113.52"
+        X-Admin-Key: "{tavern.env_vars.WRONG_ADMIN_API_KEY_LAST_BYTE}"
+      json:
+        version: "1.1.0"
+    response:
+      status_code: 403
+      json:
+        detail: "invalid admin key"
+
+  - name: the key with its first byte in the other case is refused
+    request:
+      url: "{fastapi_url}/v1/fyp/admin/algorithm"
+      method: POST
+      headers:
+        X-Real-IP: "203.0.113.53"
+        X-Admin-Key: "{tavern.env_vars.WRONG_ADMIN_API_KEY_FIRST_BYTE}"
+      json:
+        version: "1.1.0"
+    response:
+      status_code: 403
+      json:
+        detail: "invalid admin key"
+
+  - name: the key cut short by a byte is refused
+    request:
+      url: "{fastapi_url}/v1/fyp/admin/algorithm"
+      method: POST
+      headers:
+        X-Real-IP: "203.0.113.54"
+        X-Admin-Key: "{tavern.env_vars.WRONG_ADMIN_API_KEY_CUT_SHORT}"
+      json:
+        version: "1.1.0"
+    response:
+      status_code: 403
+      json:
+        detail: "invalid admin key"
+
+  - name: the key with a byte added after it is refused
+    request:
+      url: "{fastapi_url}/v1/fyp/admin/algorithm"
+      method: POST
+      headers:
+        X-Real-IP: "203.0.113.55"
+        X-Admin-Key: "{tavern.env_vars.ADMIN_API_KEY}x"
+      json:
+        version: "1.1.0"
+    response:
+      status_code: 403
+      json:
+        detail: "invalid admin key"
+
+  - name: the key with a byte added before it is refused
+    request:
+      url: "{fastapi_url}/v1/fyp/admin/algorithm"
+      method: POST
+      headers:
+        X-Real-IP: "203.0.113.56"
+        X-Admin-Key: "x{tavern.env_vars.ADMIN_API_KEY}"
+      json:
+        version: "1.1.0"
+    response:
+      status_code: 403
+      json:
+        detail: "invalid admin key"
+
+  - name: the key with one byte in the middle changed is refused
+    request:
+      url: "{fastapi_url}/v1/fyp/admin/algorithm"
+      method: POST
+      headers:
+        X-Real-IP: "203.0.113.57"
+        X-Admin-Key: "{tavern.env_vars.WRONG_ADMIN_API_KEY_MIDDLE_BYTE}"
+      json:
+        version: "1.1.0"
+    response:
+      status_code: 403
+      json:
+        detail: "invalid admin key"
+
+  # With a key configured, an empty header must be compared like any other value.
+  # A check that only compares when the header is non-empty lets this one in.
+  - name: an empty key is refused
+    request:
+      url: "{fastapi_url}/v1/fyp/admin/algorithm"
+      method: POST
+      headers:
+        X-Real-IP: "203.0.113.58"
+        X-Admin-Key: ""
+      json:
+        version: "1.1.0"
     response:
       status_code: 403
       json:

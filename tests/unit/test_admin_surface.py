@@ -282,6 +282,15 @@ def test_the_configured_key_comes_from_the_environment():
     assert isinstance(first, ast.Constant) and first.value == "ADMIN_API_KEY", (
         f"admin_key reads {first!r}, not ADMIN_API_KEY"
     )
+    # ...and falls back to nothing. A default here is a key every deployment that
+    # sets none would share (docker/.env ships a placeholder that looks like one).
+    assert not value.keywords, "os.environ.get must not take keyword arguments here"
+    assert len(value.args) <= 2, ast.dump(value)
+    if len(value.args) == 2:
+        default = value.args[1]
+        assert isinstance(default, ast.Constant) and default.value in ("", None), (
+            f"admin_key falls back to {ast.dump(default)}; an unset key must mean no admin"
+        )
 
 
 def test_neither_codec_raises_on_the_input_that_breaks_the_other():
