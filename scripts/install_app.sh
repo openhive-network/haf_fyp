@@ -6,7 +6,11 @@
 #   Run as superuser: CREATE EXTENSION IF NOT EXISTS vector;
 #
 # OPTIONS:                                                      # --- help-start ---
-#   --swagger-url=URL   Public hostname for Swagger UI example URLs (default: localhost)
+#   --swagger-url=BASE  Base URL the OpenAPI document advertises in `servers`: an
+#                       absolute path (/haf-fyp-api, or / on a standalone stack) or an
+#                       http(s) URL with a path. Anything else, a bare hostname
+#                       included, is ignored with a warning. Empty, or not given,
+#                       puts the default back. Default: /haf-fyp-api
 #   --host=VALUE        PostgreSQL host  (default: $POSTGRES_HOST, else haf)
 #   --port=NUMBER       PostgreSQL port  (default: $POSTGRES_PORT, else 5432)
 #   --user=VALUE        PostgreSQL user  (default: $POSTGRES_USER, else haf_fyp_owner)
@@ -27,7 +31,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 source "${SCRIPT_DIR}/common.sh"
 
-SWAGGER_URL="localhost"
+# Empty means "not given": the document then advertises its default base URL.
+SWAGGER_URL=""
 
 print_help() {
     # Delimited by the markers above rather than a hardcoded line range. A range
@@ -157,9 +162,8 @@ for arg in "$@"; do
         --help|-h|-\?) print_help; exit 0 ;;
 
         # Unknown arguments are an ERROR, matching upstream's option loops. This loop
-        # used to have no fallthrough at all, so a mistyped --swagger-url silently
-        # installed with the "localhost" default and baked wrong example URLs into the
-        # published Swagger page, with nothing in the log to say so.
+        # used to have no fallthrough at all, so a mistyped --swagger-url was silently
+        # dropped, with nothing in the log to say so.
         *)
             log "ERROR: '${arg}' is not a valid option"
             print_help
@@ -333,7 +337,46 @@ run_sql_file "${SCRIPT_DIR}/../db/process_block_range.sql"
 run_sql_file "${SCRIPT_DIR}/../db/seed_data.sql"
 
 # 9. API endpoints (includes score explainer + algorithm registry — Phase 9)
-psql_cmd -c "SET custom.swagger_url = '${SWAGGER_URL}';" -f "${SCRIPT_DIR}/../endpoints/endpoint_schema.sql"
+#
+# First the base URL the published document advertises (#58). This used to be
+# `SET custom.swagger_url` on THIS psql session, which nothing read and nothing could
+# have: PostgREST connects later on its own pool. It is persisted in
+# haf_fyp_app.app_config (db/haf_fyp_app.sql, step 2) and read by
+# haf_fyp_endpoints.root() at request time.
+#
+# Tell the operator when their value will be ignored. The flag is documented as the way
+# to set the base URL, so without this the only way to find out is to read the SQL.
+# Keep both patterns identical to the ones in haf_fyp_endpoints.root(): that function
+# is the enforcer, this only reports.
+#
+# [[ =~ ]], not grep: grep matches line by line, and root() matches the whole value. A
+# value with a newline in it could pass here on its second line and be refused there.
+swagger_shape='^(/($|[^/])|https?://[^/?#@]+/)'
+swagger_forbidden='[[:space:][:cntrl:]\\]'
+if [ -n "${SWAGGER_URL}" ] && {
+    [[ ! "${SWAGGER_URL}" =~ ${swagger_shape} ]] || [[ "${SWAGGER_URL}" =~ ${swagger_forbidden} ]]
+}; then
+    log "WARNING: --swagger-url='${SWAGGER_URL}' is not an absolute path or an http(s)"
+    log "         URL with a path, so the published OpenAPI document will advertise the"
+    log "         default base URL '/haf-fyp-api' instead. Pass a path (e.g. '/' for a"
+    log "         standalone stack, '/haf-fyp-api' behind a node) to set it."
+fi
+
+# -v and :'swagger_url', NOT string interpolation. The old line spliced the value into
+# the SQL text, and `psql -c` runs several statements: --swagger-url="x'; DROP ...; --"
+# closed the literal and ran the rest as the installing role, and a value with one
+# apostrophe in it broke the install with a syntax error far from its cause. psql now
+# gets the value out of band and does the quoting.
+#
+# -f, not -c: psql applies :'var' substitution to a file and to stdin, but hands a -c
+# string to the server untouched. The statements are in scripts/set_swagger_base_url.sql
+# so that tests/integration/test_swagger_base_url_db.py runs them, not a copy of them.
+#
+# An empty value is stored as NULL, so a re-install without the flag puts the default
+# back rather than keeping whatever an earlier install set.
+psql_cmd -v swagger_url="${SWAGGER_URL}" -f "${SCRIPT_DIR}/../scripts/set_swagger_base_url.sql"
+
+run_sql_file "${SCRIPT_DIR}/../endpoints/endpoint_schema.sql"
 
 # 9b. Sync-status reader (#16) — SECURITY DEFINER over hafd.contexts, owned by
 #     haf_fyp_owner. Needs the schema (step 2) and the roles (step 1); the context

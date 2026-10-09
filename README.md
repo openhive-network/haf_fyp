@@ -876,7 +876,7 @@ fails. A kept stack survives only until the next run, which starts by removing i
 
 | Verb | Runs | Notes |
 |------|------|-------|
-| `install_app [--swagger-url=HOST] [--host=] [--port=] [--user=] [--is_forking=FALSE]` | `scripts/install_app.sh` | idempotent; safe to re-run — but *skipped* while the block processor runs (below) |
+| `install_app [--swagger-url=BASE] [--host=] [--port=] [--user=] [--is_forking=FALSE]` | `scripts/install_app.sh` | idempotent; safe to re-run — but *skipped* while the block processor runs (below) |
 | `process_blocks` | `scripts/process_blocks.sh` | infinite loop |
 | `uninstall_app [--force] [--host=] [--port=] [--user=]` | `scripts/uninstall_app.sh` | destructive |
 
@@ -888,7 +888,28 @@ Connection settings default from the environment (`POSTGRES_HOST`, `POSTGRES_POR
 the entrypoint forwards them exactly as balance_tracker's does, so a runbook copied
 from an upstream app works here. An argument neither option loop recognises is now an
 error rather than being silently discarded — which also turns a mistyped
-`--swagger-url` from a silent fallback to `localhost` into a failed install.
+`--swagger-url` from a silent fallback into a failed install.
+
+`--swagger-url=BASE` sets the base URL the published OpenAPI document advertises in
+`servers` (`GET /haf-fyp-api/`). It takes an absolute path (`/haf-fyp-api`, or `/` on a
+standalone stack) or an http(s) URL with a path. A bare hostname is not a base URL: it
+is ignored with a warning in the install log, and the default `/haf-fyp-api` stands.
+The value is stored in `haf_fyp_app.app_config`, so the next install without the flag
+(or with an empty value) puts the default back. The standalone stack in
+`docker/docker-compose.yml` passes `/`, because there the API is served at the root of
+its port; set `FYP_SWAGGER_URL` in `docker/.env.local` to pass something else. Like the
+rest of an install, the setting is not applied while the block processor runs: the
+install is skipped (see "Re-installing while the stack runs"), and with it the warning
+about a value that will be ignored.
+
+To change it on a running node without an install, run the one file the installer
+runs. It takes effect on the next request; nothing needs restarting:
+
+```bash
+psql -X -v ON_ERROR_STOP=on -v swagger_url=/haf-fyp-api -f scripts/set_swagger_base_url.sql
+```
+
+The next install sets it again from its own flag, so put the value there as well.
 
 `--is_forking` is accepted, and **only `FALSE` is honoured**. haf_fyp registers a
 **non-forking** HAF context by design (`hive.app_context_set_non_forking`,

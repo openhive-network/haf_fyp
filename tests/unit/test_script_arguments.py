@@ -273,15 +273,25 @@ def test_connection_flags_are_honoured_not_rejected(bash, tmp_path):
 # entrypoint forwards to the destructive script.
 
 
-def run_install_full_stub(bash, tmp_path, *args: str):
-    """Run install_app.sh with a psql that succeeds at everything and records it all."""
+def run_install_full_stub(bash, tmp_path, *args: str, fail_on: str = "@@never@@"):
+    """Run install_app.sh with a psql that succeeds at everything and records it all.
+
+    argv.log has one line per call, its arguments joined by spaces. argv.exact.log has
+    one line per ARGUMENT and a `--` line after each call, which is the only way to see
+    whether a value with a space in it arrived as one argument. A call whose joined
+    arguments contain `fail_on` exits 3, as psql does under ON_ERROR_STOP.
+    """
     bindir = stub_bin(tmp_path)
     sql_log = tmp_path / "sql.log"
     argv_log = tmp_path / "argv.log"
+    exact_log = tmp_path / "argv.exact.log"
     write_exec(
         bindir / "psql",
         "#!/bin/sh\n"
         f'printf "%s\n" "$*" >> "{argv_log.as_posix()}"\n'
+        f'for a in "$@"; do printf "%s\n" "$a" >> "{exact_log.as_posix()}"; done\n'
+        f'printf "%s\n" "--" >> "{exact_log.as_posix()}"\n'
+        f'case "$*" in *"{fail_on}"*) exit 3 ;; esac\n'
         'prev=""\n'
         'for a in "$@"; do\n'
         # Test prev BEFORE reassigning it, or the log records the literal "-c"
@@ -473,17 +483,156 @@ def test_without_the_wrapper_the_install_runs_unlocked_and_says_so(bash, tmp_pat
     assert sql_log.exists()
 
 
-def test_swagger_url_reaches_the_endpoint_load(bash, tmp_path):
-    """The installer's only functional option. Its default silently baked wrong example
-    URLs into the published Swagger page -- the failure the new unknown-option error
-    was added to prevent -- yet nothing asserted the flag has an effect when correct."""
-    _, sql_log, _ = run_install_full_stub(bash, tmp_path, "--swagger-url=example.com")
-    assert "SET custom.swagger_url = 'example.com';" in sql_log.read_text()
+# --- --swagger-url (#58) ----------------------------------------------------------
+#
+# The flag used to `SET custom.swagger_url` on the installer's own session, which nothing
+# read, with the value spliced into the SQL text. It is now handed to psql as a variable
+# and stored in haf_fyp_app.app_config by scripts/set_swagger_base_url.sql. The stub psql
+# here runs nothing: what that file's statements DO, and what root() makes of the stored
+# value, is tested against a real PostgreSQL in tests/integration/test_swagger_base_url_db.py.
+
+SWAGGER_SQL = "/scripts/set_swagger_base_url.sql"
 
 
-def test_swagger_url_defaults_to_localhost(bash, tmp_path):
-    _, sql_log, _ = run_install_full_stub(bash, tmp_path)
-    assert "SET custom.swagger_url = 'localhost';" in sql_log.read_text()
+def _swagger_calls(argv_log) -> list:
+    return [c for c in argv_log.read_text().splitlines() if "swagger_url=" in c]
+
+
+def test_swagger_url_is_handed_to_psql_as_a_variable(bash, tmp_path):
+    _, sql_log, argv_log = run_install_full_stub(bash, tmp_path, "--swagger-url=/haf-fyp-api")
+    calls = _swagger_calls(argv_log)
+    assert len(calls) == 1, calls
+    assert " -v swagger_url=/haf-fyp-api -f " in calls[0] and calls[0].endswith(SWAGGER_SQL), calls[0]
+    assert "custom.swagger_url" not in sql_log.read_text() + argv_log.read_text()
+
+
+def test_without_the_flag_psql_is_handed_an_empty_value(bash, tmp_path):
+    """Empty, which scripts/set_swagger_base_url.sql stores as NULL (tested there)."""
+    _, _, argv_log = run_install_full_stub(bash, tmp_path)
+    calls = _swagger_calls(argv_log)
+    assert len(calls) == 1 and " -v swagger_url= -f " in calls[0] and calls[0].endswith(SWAGGER_SQL), calls
+
+
+def test_the_swagger_value_never_becomes_sql_text(bash, tmp_path):
+    """The old line was `psql -c "SET custom.swagger_url = '<value>';"`: a value with an
+    apostrophe closed the literal, and the rest ran as SQL."""
+    hostile = "x'; DROP SCHEMA haf_fyp_app CASCADE; --"
+    proc, sql_log, argv_log = run_install_full_stub(bash, tmp_path, f"--swagger-url={hostile}")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "DROP SCHEMA" not in sql_log.read_text(), "the value reached a -c statement"
+    carrying = [c for c in argv_log.read_text().splitlines() if "DROP SCHEMA" in c]
+    assert len(carrying) == 1 and f" -v swagger_url={hostile} -f " in carrying[0], carrying
+    assert " -c " not in f" {carrying[0]} " and carrying[0].endswith(SWAGGER_SQL), carrying[0]
+
+
+def _exact_swagger_call(tmp_path) -> list:
+    """The arguments of the one psql call that carries the value, one per element."""
+    calls = (tmp_path / "argv.exact.log").read_text().split("\n--\n")
+    carrying = [c.split("\n") for c in calls if "\nswagger_url=" in "\n" + c]
+    assert len(carrying) == 1, carrying
+    return carrying[0]
+
+
+@pytest.mark.parametrize("value", [
+    "/has a space",                 # unquoted, psql would get two arguments and store `/has`
+    "https://api.example/p?a=b",    # everything after the FIRST `=` is the value
+    "/a=b=c",
+    "/*",                           # unquoted, a glob
+    "",
+])
+def test_the_value_reaches_psql_as_one_argument_exactly_as_given(bash, tmp_path, value):
+    proc, _, _ = run_install_full_stub(bash, tmp_path, f"--swagger-url={value}")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    argv = _exact_swagger_call(tmp_path)
+    at = argv.index(f"swagger_url={value}")
+    assert argv[at - 1] == "-v" and argv[at + 1] == "-f", argv
+    assert argv[at + 2].endswith(SWAGGER_SQL) and len(argv) == at + 3, argv
+    # ...through psql_cmd, so a failed write stops the install rather than being a notice.
+    assert "ON_ERROR_STOP=on" in argv and "-X" in argv, argv
+
+
+def test_a_failed_write_fails_the_install(bash, tmp_path):
+    """The table is there or the install is broken; carrying on would publish a
+    document whose base URL is not the one the operator was just told it would be."""
+    proc, _, argv_log = run_install_full_stub(
+        bash, tmp_path, "--swagger-url=/x", fail_on="set_swagger_base_url.sql"
+    )
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    calls = argv_log.read_text().splitlines()
+    assert calls[-1].endswith(SWAGGER_SQL), "the install went on after the write failed"
+
+
+def test_the_last_swagger_url_wins(bash, tmp_path):
+    """As for every other option here: a wrapper appends its own flag after the caller's."""
+    run_install_full_stub(bash, tmp_path, "--swagger-url=/first", "--swagger-url=/second")
+    assert "swagger_url=/second" in _exact_swagger_call(tmp_path)
+
+
+def test_the_warning_names_the_value_and_the_default_that_stands(bash, tmp_path):
+    proc, _, _ = run_install_full_stub(bash, tmp_path, "--swagger-url=api.example")
+    out = " ".join((proc.stdout + proc.stderr).split())
+    assert "WARNING: --swagger-url='api.example'" in out, out
+    assert "default base URL '/haf-fyp-api' instead" in out, out
+
+
+def test_the_value_is_stored_after_its_table_is_created(bash, tmp_path):
+    """app_config is created by db/haf_fyp_app.sql; writing before that fails the install."""
+    _, _, argv_log = run_install_full_stub(bash, tmp_path, "--swagger-url=/")
+    calls = argv_log.read_text().splitlines()
+    table = next(i for i, c in enumerate(calls) if c.endswith("/db/haf_fyp_app.sql"))
+    write = next(i for i, c in enumerate(calls) if c.endswith(SWAGGER_SQL))
+    assert table < write, (table, write)
+
+
+@pytest.mark.parametrize("value, warns", [
+    ("/haf-fyp-api", False),
+    ("/", False),
+    ("https://api.example/haf-fyp-api", False),
+    ("http://localhost:3000/", False),
+    ("api.example", True),                  # a bare hostname: what PUBLIC_HOSTNAME holds
+    ("localhost", True),
+    ("https://api.example", True),          # an origin with no path
+    ("//evil.example/x", True),             # protocol-relative
+    ("haf-fyp-api", True),                  # a relative path
+    ("/\\evil.example", True),              # a browser reads the backslash as a slash
+    ("/has a space", True),
+    ("api.example\n/haf-fyp-api", True),    # its SECOND line has the right shape
+    ("/haf-fyp-api\n", True),
+    ("HTTPS://api.example/haf-fyp-api", True),   # the scheme is matched as written
+    ("https://api.example/a b", True),      # the forbidden characters, in a URL too
+    ("https://api.example/\\x", True),
+    ("https:////x", True),                  # no host
+    ("/\x01x", True),                       # control characters other than whitespace
+    ("/\x7fx", True),
+    ("https://h?/", True),                  # an origin with a query, and still no path
+    ("https://h#/x", True),
+    ("https://user:secret@api.example/x", True),   # would publish a credential
+    ("https://api.example:8443/x?y=1#z", False),   # all three are fine after the path starts
+])
+def test_a_value_that_will_be_ignored_is_reported(bash, tmp_path, value, warns):
+    proc, _, _ = run_install_full_stub(bash, tmp_path, f"--swagger-url={value}")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    assert ("WARNING: --swagger-url=" in out) is warns, out
+
+
+def test_no_warning_when_the_flag_is_not_given(bash, tmp_path):
+    proc, _, _ = run_install_full_stub(bash, tmp_path)
+    assert "--swagger-url" not in proc.stdout + proc.stderr
+
+
+def test_the_installer_and_the_endpoint_use_one_pattern():
+    """install_app.sh only REPORTS a value that will be ignored; root() is what ignores
+    it. If the two patterns drift, the warning lies in one direction or the other."""
+    shape, forbidden = "'^(/($|[^/])|https?://[^/?#@]+/)'", "'[[:space:][:cntrl:]\\\\]'"
+    installer = INSTALL.read_text(encoding="utf-8")
+    assert installer.count("swagger_shape=" + shape) == 1
+    assert installer.count("swagger_forbidden=" + forbidden) == 1
+    schema = (INSTALL.parent.parent / "endpoints" / "endpoint_schema.sql").read_text(encoding="utf-8")
+    assert schema.count("_base !~ " + shape) == 1
+    assert schema.count("_base ~ " + forbidden) == 1
+    # Whole-value matching on both sides: grep would match line by line.
+    assert "grep" not in installer[installer.index("swagger_shape="):installer.index("set_swagger_base_url.sql")]
 
 
 def test_user_flag_reaches_the_connection(bash, tmp_path):

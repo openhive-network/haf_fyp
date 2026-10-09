@@ -72,7 +72,7 @@ def test_verb_dispatches_to_its_script(bash, app_dir, verb, script):
 
 
 def test_arguments_are_forwarded(bash, app_dir):
-    """--swagger-url is the argument every deployment passes, and the one a dispatcher
+    """--swagger-url is the argument a deployment is most likely to pass, and the one a dispatcher
     can swallow while still looking like it worked."""
     r = run_entrypoint(bash, app_dir, "install_app", "--swagger-url=example.com")
     assert r.returncode == 0, r.stderr
