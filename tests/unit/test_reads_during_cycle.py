@@ -322,6 +322,60 @@ def test_an_account_in_the_queue_that_a_check_evicts_is_not_ranked_later(monkeyp
     assert order == ["u1", "u2"] and "u3" not in result
 
 
+def test_an_account_a_check_evicted_stays_out_of_the_queue_when_the_membership_query_fails(monkeypatch):
+    # u3 is in the queue, stops qualifying for the rotation (no interests left and no
+    # on-chain history), and its feed is read. The reconcile
+    # evicts it and commits; the membership query after it fails on a live session.
+    # The eviction happened, so the queue must not rank u3 back in (#10).
+    def _members(_c, _names):
+        raise psycopg2.errors.QueryCanceled("canceling statement due to statement timeout")
+
+    monkeypatch.setattr(rd, "_safe_rollback", lambda _c: None)
+    reads = _Reads([set(), {"reads": {"u3", "zed"}, "opts_out": {"u3"}}])
+    result, order, _conn, evictions = _cycle(
+        monkeypatch, ["u1", "u2", "u3"], reads, per_account=rd.POLL_SECONDS, members=_members
+    )
+
+    assert evictions == [["u1", "u2", "u3"], ["u3", "zed"]]
+    assert order == ["u1", "u2"] and "u3" not in result
+
+
+def test_a_reader_taken_ahead_then_evicted_is_not_reported_as_taken(monkeypatch, caplog):
+    # zed is a member at the first check and goes to the front behind amy; while amy is
+    # ranked it clears its interests, and the next check (main() names a waiting reader
+    # every time) evicts it. It was never ranked.
+    reads = _Reads([{"amy", "zed"}, {"reads": {"zed"}, "opts_out": {"zed"}}])
+    with caplog.at_level(logging.INFO):
+        _result, order, _conn, _ = _cycle(monkeypatch, ["u1"], reads, per_account=rd.POLL_SECONDS)
+
+    assert order == ["amy", "u1"]
+    assert "1 of them were readers with a stale feed, taken ahead of their turn: ['amy']" in caplog.text
+
+
+def test_an_account_in_the_queue_that_a_check_evicts_is_not_counted_and_does_not_end_the_cycle(
+    monkeypatch, caplog
+):
+    reads = _Reads([set(), {"reads": {"u3"}, "opts_out": {"u3"}}])
+    with caplog.at_level(logging.INFO):
+        result, order, _conn, _ = _cycle(
+            monkeypatch, ["u1", "u2", "u3", "u4"], reads, per_account=rd.POLL_SECONDS
+        )
+
+    assert order == ["u1", "u2", "u4"] and result == {"u1", "u2", "u4"}
+    assert "refreshed personalized feeds for 3/3 cached users (0 failed)" in caplog.text
+
+
+def test_an_evicted_account_that_is_in_the_queue_twice_is_skipped_both_times(monkeypatch):
+    # u3 is moved up at the first check (so it is in the queue twice), then evicted at
+    # the second, before either copy is reached.
+    reads = _Reads([{"amy", "u3"}, {"reads": {"u3"}, "opts_out": {"u3"}}])
+    result, order, _conn, _ = _cycle(
+        monkeypatch, ["u1", "u2", "u3"], reads, per_account=rd.POLL_SECONDS
+    )
+
+    assert order == ["amy", "u1", "u2"] and "u3" not in result
+
+
 def test_readers_turned_away_are_not_counted_in_the_cycle_line(monkeypatch, caplog):
     reads = _Reads([{"gone", "stranger"}])
     with caplog.at_level(logging.INFO):
@@ -332,8 +386,9 @@ def test_readers_turned_away_are_not_counted_in_the_cycle_line(monkeypatch, capl
 
 
 def test_a_reader_named_at_a_check_that_failed_is_looked_at_again(monkeypatch):
-    # The reconcile fails once. zed was not turned away, only not answered for: main()
-    # names it again 5 s later and it is ranked then.
+    # The reconcile fails once. zed was not turned away, only not answered for. When
+    # it is named again (main() does that for a reader that was already waiting; a
+    # newly heard one gets a targeted refresh after the cycle), it is ranked.
     calls = []
 
     def _evict(_conn, names):

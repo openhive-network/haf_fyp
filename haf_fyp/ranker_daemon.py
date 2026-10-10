@@ -932,6 +932,9 @@ def _readers_to_rank_now(
         # check) is no longer named by it, and without the membership filter would be
         # ranked and re-enrolled.
         evicted = _evict_unsubscribed(conn, early)
+        # Remembered before anything below can fail: the reconcile has committed, the
+        # rows are gone, and one of these may still be in run_cycle's queue.
+        skipped.update(evicted)
         members = _rotation_members(conn, [u for u in early if u not in evicted])
         skipped.update(u for u in early if u not in members)
         return [u for u in early if u in members]
@@ -1077,10 +1080,11 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
             "refreshed personalized feeds for %d/%d cached users (%d failed)",
             processed, len(done), failed,
         )
-        if ahead:
+        taken = ahead & done  # not one a later check turned away before its turn came
+        if taken:
             log.info(
                 "%d of them were readers with a stale feed, taken ahead of their turn%s",
-                len(ahead), "" if len(ahead) > _QUIET_REFRESH_ABOVE else f": {sorted(ahead)}",
+                len(taken), "" if len(taken) > _QUIET_REFRESH_ABOVE else f": {sorted(taken)}",
             )
         # A clean cycle is what ends a standing failure -- see the docstring for why
         # this is not done per successful user.
