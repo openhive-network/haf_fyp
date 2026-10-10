@@ -127,9 +127,10 @@ services:
     # way here, rather than only in a future module file, so the reference stack uses
     # the same form a module would. Note what that does NOT buy: compose-validate only
     # runs `docker compose config`, which parses YAML and never starts a container, and
-    # the postgrest lane builds nothing from Dockerfile.sql. Nothing in CI executes the
-    # dispatcher inside the image; tests/unit/test_docker_entrypoint.py is what covers
-    # it, by running the script directly against stub scripts.
+    # the postgrest lane builds nothing from Dockerfile.sql. The install lane
+    # (docker-compose-ci-install.yml, #47) is what runs this verb through the image's
+    # dispatcher, without the flag; tests/unit/test_docker_entrypoint.py covers the
+    # dispatcher's other paths, by running the script directly against stub scripts.
     #
     # --swagger-url is the base URL the published OpenAPI document advertises (#58). On
     # THIS stack the rewriter is the root of its port and its rules match the public

@@ -111,9 +111,10 @@ services:
       - ../db/create_tables.sql:/create_tables.sql:ro
       - ../db/seed_data.sql:/seed_data.sql:ro
       - ../endpoints/endpoint_schema.sql:/endpoint_schema.sql:ro
-      # #10: the only lane with real restricted (non-superuser) roles and a real
-      # superuser installer, so it is the only place the maintenance grants footer
-      # and the privilege assertions can actually be exercised.
+      # #10: a lane with real restricted (non-superuser) roles and a real superuser
+      # installer, where the maintenance grants footer and the privilege assertions
+      # can actually be exercised. (docker-compose-ci-install.yml is the other, since
+      # #47; it runs the installer itself and pins the API role's write grants.)
       #
       # create_tables.sql and active_users_maintenance.sql are applied TWICE on
       # purpose — a REINSTALL check, matching what haf_block_explorer covers in its

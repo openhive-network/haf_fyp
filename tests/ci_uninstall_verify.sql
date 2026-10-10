@@ -11,23 +11,46 @@ BEGIN
     SELECT string_agg(i, ', ' ORDER BY i) INTO _left
     FROM (
         SELECT 'schema ' || n.nspname AS i FROM pg_namespace AS n
-        WHERE n.nspname IN ('haf_fyp_app', 'haf_fyp_endpoints')
+        WHERE n.nspname LIKE 'haf\_fyp%'
         UNION ALL
         SELECT 'role ' || r.rolname FROM pg_roles AS r
-        WHERE r.rolname IN ('haf_fyp_owner', 'haf_fyp_user')
+        WHERE r.rolname LIKE 'haf\_fyp%'
         UNION ALL
         SELECT 'context ' || c.name FROM hafd.contexts AS c
-        WHERE c.name = 'haf_fyp' OR c.owner = 'haf_fyp_owner' OR c.schema LIKE 'haf\_fyp%'
+        WHERE c.name = 'haf_fyp' OR c.owner LIKE 'haf\_fyp%' OR c.schema LIKE 'haf\_fyp%'
         UNION ALL
         SELECT 'registry row ' || a.name FROM hafd.applications AS a
         WHERE a.name = 'haf_fyp' OR 'haf_fyp' = ANY(a.contexts)
         UNION ALL
-        -- A function or table left in ANOTHER schema with haf_fyp in its name.
+        -- Anything left in ANOTHER schema with haf_fyp in its name.
         SELECT 'function ' || p.oid::regprocedure::text FROM pg_proc AS p
         WHERE p.proname LIKE '%haf\_fyp%'
         UNION ALL
         SELECT 'relation ' || c.oid::regclass::text FROM pg_class AS c
         WHERE c.relname LIKE '%haf\_fyp%'
+        UNION ALL
+        SELECT 'type ' || t.oid::regtype::text FROM pg_type AS t
+        WHERE t.typname LIKE '%haf\_fyp%'
+        UNION ALL
+        -- A grant, a default privilege or a setting that still names a role of ours.
+        -- A dropped role cannot be named, so these would mean the DROP did not happen;
+        -- they are here for the day the role names change and the patterns above miss.
+        SELECT 'grant on ' || c.oid::regclass::text FROM pg_class AS c
+        WHERE c.relacl::text ~ 'haf_fyp'
+        UNION ALL
+        SELECT 'grant on schema ' || n.nspname FROM pg_namespace AS n
+        WHERE n.nspacl::text ~ 'haf_fyp'
+        UNION ALL
+        SELECT 'default privilege in ' || coalesce(d.defaclnamespace::regnamespace::text, '(all)')
+        FROM pg_default_acl AS d WHERE d.defaclacl::text ~ 'haf_fyp'
+        UNION ALL
+        SELECT 'database or role setting ' || s.setconfig::text FROM pg_db_role_setting AS s
+        WHERE s.setconfig::text ~ 'haf_fyp'
+        UNION ALL
+        -- The lock the installer and the processor take is session-level; one still
+        -- held means a session of ours is still connected.
+        SELECT 'session ' || a.application_name FROM pg_stat_activity AS a
+        WHERE a.application_name LIKE 'haf\_fyp%' AND a.pid <> pg_backend_pid()
     ) AS s;
     IF _left IS NOT NULL THEN
         RAISE EXCEPTION 'the uninstall left: %', _left;
@@ -52,22 +75,56 @@ BEGIN
        OR to_regnamespace('ci_bystander_app') IS NULL THEN
         RAISE EXCEPTION 'the uninstall dropped a schema that is not haf_fyp''s';
     END IF;
+    -- HAF's application group still holds what every other application needs. A
+    -- DROP OWNED BY aimed at the wrong role would take these with it.
+    IF NOT has_schema_privilege('hive_applications_group', 'hafd', 'USAGE')
+       OR NOT has_table_privilege('hive_applications_group', 'hafd.contexts', 'SELECT, INSERT, UPDATE, DELETE')
+       OR NOT pg_has_role('hive_applications_owner_group', 'hive_applications_group', 'MEMBER') THEN
+        RAISE EXCEPTION 'the uninstall took privileges from HAF''s application group';
+    END IF;
+END
+$$;
+
+-- The other application, asked AS ITSELF: a superuser sees a table whatever was done to
+-- its grants.
+SET ROLE ci_bystander_owner;
+DO $$
+BEGIN
     IF NOT EXISTS (
-        SELECT 1 FROM hafd.contexts
-        WHERE name = 'ci_bystander' AND owner = 'ci_bystander_owner'
-          AND current_block_num = 4242 AND schema = 'ci_bystander_app'
+        SELECT 1 FROM hafd.contexts AS c
+        INNER JOIN hafd.contexts_attachment AS t ON t.context_name = c.name
+        WHERE c.name = 'ci_bystander' AND c.owner = 'ci_bystander_owner'
+          AND c.current_block_num = 4242 AND c.schema = 'ci_bystander_app' AND NOT t.is_attached
     ) THEN
         RAISE EXCEPTION 'the uninstall changed or removed another application''s context';
     END IF;
     IF NOT EXISTS (
         SELECT 1 FROM hafd.applications
         WHERE name = 'ci_bystander' AND contexts = ARRAY['ci_bystander']
+          AND process_procedure = 'ci_bystander_app.process_blocks' AND owner = 'ci_bystander_owner'
     ) THEN
         RAISE EXCEPTION 'the uninstall changed or removed another application''s registration';
     END IF;
+    IF (SELECT string_agg(kept, ',') FROM ci_bystander_app.state) IS DISTINCT FROM 'untouched' THEN
+        RAISE EXCEPTION 'the uninstall changed another application''s table';
+    END IF;
+    PERFORM count(*) FROM ci_bystander_app.ci_bystander;
+    PERFORM count(*) FROM ci_bystander_app.blocks_view;
+    CALL ci_bystander_app.process_blocks(NULL);
+    -- It can still advance its own context, through HAF's API and row-level security.
+    PERFORM hive.app_set_current_block_num('ci_bystander', 4243);
+END
+$$;
+RESET ROLE;
+
+DO $$
+BEGIN
     IF (SELECT count(*) FROM hafd.contexts) <> 1 OR (SELECT count(*) FROM hafd.applications) <> 1 THEN
         RAISE EXCEPTION 'expected one context and one application to remain, found % and %',
             (SELECT count(*) FROM hafd.contexts), (SELECT count(*) FROM hafd.applications);
+    END IF;
+    IF (SELECT current_block_num FROM hafd.contexts WHERE name = 'ci_bystander') <> 4243 THEN
+        RAISE EXCEPTION 'the other application could not advance its own context after the uninstall';
     END IF;
     RAISE NOTICE 'haf_fyp is gone and nothing else was touched';
 END

@@ -383,6 +383,21 @@ run_sql_file "${SCRIPT_DIR}/../endpoints/endpoint_schema.sql"
 #     itself is resolved at call time, so this may load before step 10.
 run_sql_file "${SCRIPT_DIR}/../db/sync_status.sql"
 
+# 9c. Read access to what haf_fyp_owner creates FROM HERE ON, for haf_fyp_user.
+#     BEFORE step 10, not after it (#47). hive.app_create_context creates the context's
+#     own table and views in haf_fyp_app, as haf_fyp_owner -- after db/create_tables.sql
+#     (step 3) has granted SELECT on the tables that existed then. With this after step
+#     10, a first install left those objects unreadable by the API role and only the
+#     SECOND install granted them (through step 3's blanket grant), so two installs of
+#     one commit did not leave the same database. The install lane found it once its HAF
+#     stand-in created the table as HAF does.
+psql_cmd -c "
+    ALTER DEFAULT PRIVILEGES FOR ROLE haf_fyp_owner IN SCHEMA haf_fyp_app
+        GRANT SELECT ON TABLES TO haf_fyp_user;
+    ALTER DEFAULT PRIVILEGES FOR ROLE haf_fyp_owner IN SCHEMA haf_fyp_endpoints
+        GRANT EXECUTE ON FUNCTIONS TO haf_fyp_user;
+"
+
 # 10. Register HAF context (idempotent) — as haf_fyp_owner, NOT as haf_admin.
 #     hive.app_create_context stores owner = current_user, and HAF's RLS UPDATE
 #     policy on hafd.contexts is
@@ -399,14 +414,6 @@ psql_cmd -c "SET ROLE haf_fyp_owner; SELECT haf_fyp_app.create_context_if_not_ex
 #      hive.app_register verifies that entry procedure with to_regprocedure().
 #      Warns and skips on a HAF without the registry; see db/register_app.sql.
 psql_cmd -c "SET ROLE haf_fyp_owner;" -f "${SCRIPT_DIR}/../db/register_app.sql"
-
-# 11. Grant read access on current and future objects to haf_fyp_user
-psql_cmd -c "
-    ALTER DEFAULT PRIVILEGES FOR ROLE haf_fyp_owner IN SCHEMA haf_fyp_app
-        GRANT SELECT ON TABLES TO haf_fyp_user;
-    ALTER DEFAULT PRIVILEGES FOR ROLE haf_fyp_owner IN SCHEMA haf_fyp_endpoints
-        GRANT EXECUTE ON FUNCTIONS TO haf_fyp_user;
-"
 
 # 12. Cross-schema grants (hivesense_app, reptracker_app, btracker_app, hafd).
 #     Schemas that don't exist yet are skipped with a NOTICE — re-run

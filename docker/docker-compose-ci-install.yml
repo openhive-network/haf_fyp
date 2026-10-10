@@ -1,33 +1,44 @@
 # The install lane (#47): scripts/install_app.sh and scripts/uninstall_app.sh, run for
-# real, from the image a node runs them from.
+# real, from the SQL image.
 #
-#   db-setup -> install -> verify -> install-again -> verify-again -> uninstall -> verify-gone
+#   db-setup -> install -> verify -> age -> lock-holder -> install-locked -> verify-locked
+#            -> release-lock -> install-again -> verify-again -> uninstall -> verify-gone
 #
 # WHAT IT IS FOR. Before this, no lane executed either script. docker-compose-ci.yml
 # hand-applies some of the db/*.sql files as one superuser, so everything the installer
 # does BETWEEN the files -- the preconditions, creating pgvector, the role switch before
 # the context is created, the registry registration, the grants, the post-install
-# assertions, the install lock -- first ran on an operator's node. Twice that is where a
-# defect was found (#79, and the installer's own first run on a fresh node).
+# assertions, the install lock -- first ran on an operator's node, and the first fresh
+# node to enable haf_fyp is where it failed (#79).
 #
-# WHAT IT IS NOT. The database is PostgreSQL with pgvector and tests/haf_stub.sql, not
-# HAF. The stub MODELS the HAF application API; it cannot notice HAF changing under it,
-# and no block is ever processed here. A lane against a real HAF image is the other half
-# of #47 and is not this file. The application locks are the exception: the stub carries
-# HAF's own app_locks.sql verbatim, so the installer's lock wrapper runs against HAF's
-# code.
+# WHAT IT IS NOT. The database is PostgreSQL with pgvector, tests/haf_stub.sql and
+# tests/ci_install_setup.sql, not HAF. Together they MODEL the HAF application API; they
+# cannot notice HAF changing under them, and no block is ever processed here. A lane
+# against a real HAF image is the other half of #47 and is not this file. The
+# application locks are the exception: the stub carries HAF's own app_locks.sql
+# verbatim, so the installer's lock wrapper runs against HAF's code.
 #
-# TWO INSTALLS, because one proves nothing about the second: every CREATE succeeds on an
-# empty database. verify-again compares everything the installer creates, function bodies
-# and grants included, with what verify recorded after the first.
+# THREE INSTALLS, because one proves nothing about the next: every CREATE succeeds on
+# an empty database.
+#   install         on a database that has never seen haf_fyp.
+#   install-locked  while a block processor's lock is held, after `age` has changed what
+#                   a running node changes. It must exit 0 and do NOTHING (#67).
+#   install-again   once the lock is released, over that same aged database: what an
+#                   install does on a node whose block processor is stopped.
+# Each verify compares everything the installer creates, function bodies and grants
+# included, with what the first recorded, and checks by value what the node owns.
 #
-# The services connect as haf_admin, a superuser with a password, as on a node. The
-# verify steps connect as postgres so that what they see does not depend on anything the
-# installer granted.
+# The app steps connect as haf_admin, a superuser, as on a node (the password is this
+# lane's own: the server image demands one over the network). The verify steps connect
+# as postgres so that what they see does not depend on anything the installer granted.
+#
+# PostgreSQL 17, the major a HAF 1.28.8 node runs. docker-compose-ci.yml is still on 14;
+# role membership (PostgreSQL 16) and privileges changed in between, and this is the
+# lane that exercises them. The CLIENT is whatever the SQL image ships, as on a node.
 #
 # Run by the `install-test` job in .gitlab-ci.yml, which waits on verify-gone: it is last
-# in the chain and each step waits for the one before to exit 0, so it cannot complete
-# unless every step did. By hand:
+# in the chain and each step waits for the one before, so it cannot complete unless
+# every step did. tests/unit/test_install_lane.py pins this whole file. By hand:
 #   docker compose -f docker/docker-compose-ci-install.yml up --detach --build
 #   docker compose -f docker/docker-compose-ci-install.yml wait verify-gone
 #   docker compose -f docker/docker-compose-ci-install.yml down -v
@@ -36,13 +47,13 @@
 # `down -v` here can touch a stack started from another file in this directory.
 name: haf_fyp_ci_install
 
-# The SQL image, built here from this checkout: the scripts run under the image's own
-# shell and psql, through its entrypoint, exactly as haf_api_node's module file and
-# docker-compose.yml's haf-fyp-setup run them. One build, shared by the three services.
-# GIT_HASH is what the installer records in haf_fyp_app.app_version, and what the verify
-# steps then expect to find there.
+# The SQL image, built from this checkout: the scripts run under the image's own shell
+# and psql, through its entrypoint. Build-only, with no `image:` name: a name would be
+# shared by every stack on the host that runs this file, and scripts/check_pinned_images.sh
+# takes a service with `image:` for a reference to pull. So each app step builds, and
+# all but the first are cache hits. GIT_HASH is what the installer records in
+# haf_fyp_app.app_version, and what the verify steps then expect to find there.
 x-app: &app
-  image: haf-fyp-sql:ci-install
   build:
     context: ..
     dockerfile: Dockerfile.sql
@@ -54,12 +65,19 @@ x-app: &app
     POSTGRES_DB: haf_block_log
     PGPASSWORD: ci-haf-admin
 
+# One SQL file, as the postgres superuser, stopping at the first error.
+x-sql: &sql
+  image: postgres:17-alpine
+  entrypoint: ["/bin/sh", "-c"]
+  environment:
+    PGPASSWORD: postgres
+    EXPECTED_GIT_HASH: ${HAF_FYP_GIT_HASH:-ci-install}
+
 services:
-  # The same server image as docker-compose-ci.yml: it ships the pgvector files, as a
-  # HAF image does, WITHOUT the extension created -- creating it is the installer's job
-  # when it connects as a superuser, and verify checks that it did.
+  # It ships the pgvector files WITHOUT the extension created: creating it is the
+  # installer's job when it connects as a superuser, and verify checks that it did.
   postgres:
-    image: pgvector/pgvector:pg14
+    image: pgvector/pgvector:pg17
     environment:
       POSTGRES_DB: haf_block_log
       POSTGRES_USER: postgres
@@ -73,12 +91,11 @@ services:
 
   # A HAF that has never seen haf_fyp, with one other application on it.
   db-setup:
-    image: postgres:14-alpine
-    entrypoint: ["/bin/sh", "-c"]
+    <<: *sql
     command:
       - >-
-        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /haf_stub.sql &&
-        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_install_setup.sql
+        psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /haf_stub.sql &&
+        psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_install_setup.sql
     volumes:
       - ../tests/haf_stub.sql:/haf_stub.sql:ro
       - ../tests/ci_install_setup.sql:/ci_install_setup.sql:ro
@@ -94,36 +111,93 @@ services:
         condition: service_completed_successfully
 
   verify:
-    image: postgres:14-alpine
-    entrypoint: ["/bin/sh", "-c"]
+    <<: *sql
     command:
       - >-
-        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -v phase=first -v git_hash="$$EXPECTED_GIT_HASH" -f /ci_install_verify.sql
-    environment:
-      EXPECTED_GIT_HASH: ${HAF_FYP_GIT_HASH:-ci-install}
+        psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -v phase=first -v git_hash="$$EXPECTED_GIT_HASH" -f /ci_install_verify.sql
     volumes:
       - ../tests/ci_install_verify.sql:/ci_install_verify.sql:ro
     depends_on:
       install:
         condition: service_completed_successfully
 
-  # Over the database the first install left, with nothing reset in between: this is
-  # what every `up` after the first one does on a node.
-  install-again:
-    <<: *app
-    command: ["install_app"]
+  # Makes it a database a node has been running: see tests/ci_install_age.sql.
+  age:
+    <<: *sql
+    command:
+      - >-
+        psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_install_age.sql
+    volumes:
+      - ../tests/ci_install_age.sql:/ci_install_age.sql:ro
     depends_on:
       verify:
         condition: service_completed_successfully
 
-  verify-again:
-    image: postgres:14-alpine
-    entrypoint: ["/bin/sh", "-c"]
+  # A block processor, as far as an installer can tell: one session holding the shared
+  # lock the processor takes. Healthy once the lock is held, and it exits 0 only after
+  # release-lock: so install-locked cannot start before the lock is there, and
+  # install-again cannot start before it is gone.
+  lock-holder:
+    <<: *sql
     command:
       - >-
-        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -v phase=second -v git_hash="$$EXPECTED_GIT_HASH" -f /ci_install_verify.sql
-    environment:
-      EXPECTED_GIT_HASH: ${HAF_FYP_GIT_HASH:-ci-install}
+        psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_install_lock_holder.sql
+    healthcheck:
+      test: ["CMD-SHELL", "psql -h postgres -U postgres -d haf_block_log -Atc \"SELECT count(*) FROM pg_locks AS l INNER JOIN pg_stat_activity AS a ON a.pid = l.pid WHERE l.locktype = 'advisory' AND l.granted AND a.application_name = 'haf_fyp-ci-lock-holder'\" | grep -qx 1"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - ../tests/ci_install_lock_holder.sql:/ci_install_lock_holder.sql:ro
+    depends_on:
+      age:
+        condition: service_completed_successfully
+
+  # Must exit 0 -- on a node haf-fyp-setup restarts on failure and everything waits for
+  # it -- and must change nothing. verify-locked is what says whether it did.
+  install-locked:
+    <<: *app
+    command: ["install_app"]
+    depends_on:
+      lock-holder:
+        condition: service_healthy
+
+  verify-locked:
+    <<: *sql
+    command:
+      - >-
+        psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -v phase=locked -v git_hash="$$EXPECTED_GIT_HASH" -f /ci_install_verify.sql
+    volumes:
+      - ../tests/ci_install_verify.sql:/ci_install_verify.sql:ro
+    depends_on:
+      install-locked:
+        condition: service_completed_successfully
+
+  release-lock:
+    <<: *sql
+    command:
+      - >-
+        psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -c "INSERT INTO ci_install_lane.lock_released DEFAULT VALUES"
+    depends_on:
+      verify-locked:
+        condition: service_completed_successfully
+
+  # Waits for the holder to have EXITED, not merely to have been told to: the lock goes
+  # with its session.
+  install-again:
+    <<: *app
+    command: ["install_app"]
+    depends_on:
+      release-lock:
+        condition: service_completed_successfully
+      lock-holder:
+        condition: service_completed_successfully
+
+  verify-again:
+    <<: *sql
+    command:
+      - >-
+        psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -v phase=second -v git_hash="$$EXPECTED_GIT_HASH" -f /ci_install_verify.sql
     volumes:
       - ../tests/ci_install_verify.sql:/ci_install_verify.sql:ro
     depends_on:
@@ -140,11 +214,10 @@ services:
         condition: service_completed_successfully
 
   verify-gone:
-    image: postgres:14-alpine
-    entrypoint: ["/bin/sh", "-c"]
+    <<: *sql
     command:
       - >-
-        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_uninstall_verify.sql
+        psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_uninstall_verify.sql
     volumes:
       - ../tests/ci_uninstall_verify.sql:/ci_uninstall_verify.sql:ro
     depends_on:

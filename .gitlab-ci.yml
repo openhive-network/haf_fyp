@@ -415,11 +415,15 @@ postgrest-tests:
     - docker compose -f docker/docker-compose-ci.yml down -v
   rules: *standard_rules
 
-# The installer and the uninstaller, run for real (#47): install, verify, install again,
-# verify nothing changed, uninstall, verify it is gone and nothing else is. Until this
-# job, nothing in CI executed scripts/install_app.sh or scripts/uninstall_app.sh at all.
-# docker/docker-compose-ci-install.yml says what the lane covers and what it does not
-# (the database is the HAF stub, not HAF).
+# The installer and the uninstaller, run for real (#47): install; install again while a
+# block processor's lock is held, which must do nothing; install again once it is
+# released, over a database changed the way a node changes it; uninstall. A verify step
+# after each. Until this job, nothing in CI executed scripts/install_app.sh or
+# scripts/uninstall_app.sh at all. docker/docker-compose-ci-install.yml says what the
+# lane covers and what it does not (the database is a model of HAF, not HAF).
+#
+# tests/unit/test_install_lane.py states this job and that compose file in full and
+# compares: any change here has to be made there too.
 #
 # In the test stage, beside postgrest-tests, and independent of the build stage: it
 # builds the SQL image itself, from this checkout, so it also runs when docker-build-sql
@@ -440,8 +444,9 @@ install-test:
     # and report "job timeout" with no log from the step that hung.
     - timeout 900 docker compose -f docker/docker-compose-ci-install.yml up --detach --build
     # verify-gone is LAST in the chain, and every step waits for the one before it to
-    # exit 0, so this is the whole lane. tests/unit/test_compose_contract.py checks that
-    # it stays last: a step added beside the chain instead of in it would never gate.
+    # exit 0, so this is the whole lane. On a red lane `up` above has usually failed
+    # already (compose stops at the first step that exits non-zero and names it); the
+    # step's own log is in after_script below.
     - timeout 600 docker compose -f docker/docker-compose-ci-install.yml wait verify-gone
   after_script:
     - docker compose -f docker/docker-compose-ci-install.yml ps -a || true
@@ -449,6 +454,11 @@ install-test:
     - docker compose -f docker/docker-compose-ci-install.yml logs db-setup || true
     - docker compose -f docker/docker-compose-ci-install.yml logs install || true
     - docker compose -f docker/docker-compose-ci-install.yml logs verify || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs age || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs lock-holder || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs install-locked || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify-locked || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs release-lock || true
     - docker compose -f docker/docker-compose-ci-install.yml logs install-again || true
     - docker compose -f docker/docker-compose-ci-install.yml logs verify-again || true
     - docker compose -f docker/docker-compose-ci-install.yml logs uninstall || true

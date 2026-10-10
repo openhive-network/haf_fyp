@@ -477,7 +477,7 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA haf_fyp_endpoints TO haf_fyp_user;
 --  two columns the upsert actually sets: a table-wide UPDATE would additionally
 --  let the anon-facing role rewrite username/community_id, i.e. reassign another
 --  account's declared interests.
---  NOTE: no CI job catches a regression here — the fastapi-tests lane runs
+--  NOTE: the fastapi-tests lane cannot catch a regression here — it runs
 --  Postgres with POSTGRES_USER=haf_fyp_user, which the official entrypoint creates
 --  as a SUPERUSER, so every GRANT/REVOKE in this file is bypassed there. The
 --  assertions in tests/ci_privileges.sql run in the postgrest-tests lane, which

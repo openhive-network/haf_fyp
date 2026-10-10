@@ -1,8 +1,15 @@
--- What scripts/install_app.sh must leave behind (#47). Run by the install lane
--- (docker/docker-compose-ci-install.yml) after the first install and again after the
--- second, as a superuser:
+-- What scripts/install_app.sh must leave behind (#47). Run three times by the install
+-- lane (docker/docker-compose-ci-install.yml), as a superuser:
 --
---     psql -v phase=first|second -v git_hash=<the image's GIT_HASH> -f ci_install_verify.sql
+--     psql -v phase=<phase> -v git_hash=<the image's GIT_HASH> -f ci_install_verify.sql
+--
+--   first   after the first install, on a database that had never seen haf_fyp
+--   locked  after tests/ci_install_age.sql has changed what a running node changes, and
+--           an install has run while a block processor's lock was held: that install
+--           must have done NOTHING
+--   second  after the lock was released and the install ran again: everything the
+--           installer owns is as the first install left it, and everything the node
+--           owns is as tests/ci_install_age.sql left it
 --
 -- Every check raises, so the first thing wrong stops the lane with its own message.
 -- psql does not substitute :'variables' inside a dollar-quoted block, so the two the
@@ -13,8 +20,8 @@ SELECT
 
 DO $$
 BEGIN
-    IF current_setting('ci.phase') NOT IN ('first', 'second') THEN
-        RAISE EXCEPTION 'phase must be first or second, got %', current_setting('ci.phase');
+    IF current_setting('ci.phase') NOT IN ('first', 'locked', 'second') THEN
+        RAISE EXCEPTION 'phase must be first, locked or second, got %', current_setting('ci.phase');
     END IF;
 END
 $$;
@@ -25,6 +32,7 @@ $$;
 DO $$
 DECLARE
     _missing TEXT;
+    _held TEXT;
 BEGIN
     SELECT string_agg(r, ', ') INTO _missing
     FROM unnest(ARRAY['haf_fyp_owner', 'haf_fyp_user']) AS r
@@ -35,23 +43,33 @@ BEGIN
 
     IF EXISTS (
         SELECT 1 FROM pg_roles
-        WHERE rolname IN ('haf_fyp_owner', 'haf_fyp_user') AND (rolsuper OR rolcreaterole OR rolbypassrls)
+        WHERE rolname IN ('haf_fyp_owner', 'haf_fyp_user')
+          AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolbypassrls OR rolreplication)
     ) THEN
-        RAISE EXCEPTION 'an application role is a superuser, may create roles or bypasses RLS';
+        RAISE EXCEPTION 'an application role is a superuser, may create roles or databases, replicates or bypasses RLS';
     END IF;
 
-    IF NOT pg_has_role('haf_fyp_owner', 'hive_applications_owner_group', 'USAGE') THEN
-        RAISE EXCEPTION 'haf_fyp_owner does not inherit hive_applications_owner_group: the block processor could not advance its context';
+    -- Read from pg_auth_members, not asked of pg_has_role: for a superuser such as
+    -- haf_admin pg_has_role answers TRUE whatever the catalog says.
+    SELECT string_agg(pg_get_userbyid(m.roleid), ', ' ORDER BY pg_get_userbyid(m.roleid)) INTO _held
+    FROM pg_auth_members AS m WHERE pg_get_userbyid(m.member) = 'haf_fyp_owner';
+    IF _held IS DISTINCT FROM 'haf_fyp_user, hive_applications_owner_group' THEN
+        RAISE EXCEPTION 'haf_fyp_owner is a direct member of: % (expected haf_fyp_user and hive_applications_owner_group: without the second the block processor cannot advance its context)', _held;
     END IF;
-    IF NOT pg_has_role('haf_fyp_owner', 'haf_fyp_user', 'USAGE') THEN
-        RAISE EXCEPTION 'haf_fyp_owner does not inherit haf_fyp_user';
+
+    -- The unauthenticated API role is a member of NOTHING. hive_applications_group
+    -- carries TRUNCATE on hafd.contexts; pg_read_all_data would open every table.
+    SELECT string_agg(pg_get_userbyid(m.roleid), ', ') INTO _held
+    FROM pg_auth_members AS m WHERE pg_get_userbyid(m.member) = 'haf_fyp_user';
+    IF _held IS NOT NULL THEN
+        RAISE EXCEPTION 'haf_fyp_user, the unauthenticated role, is a member of: %', _held;
     END IF;
-    IF NOT pg_has_role('haf_admin', 'haf_fyp_owner', 'MEMBER') THEN
-        RAISE EXCEPTION 'haf_admin is not a member of haf_fyp_owner: it could not SET ROLE to it';
-    END IF;
-    -- The unauthenticated API role. The group carries TRUNCATE on hafd.contexts.
-    IF pg_has_role('haf_fyp_user', 'hive_applications_group', 'MEMBER') THEN
-        RAISE EXCEPTION 'haf_fyp_user is in hive_applications_group';
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_auth_members AS m
+        WHERE pg_get_userbyid(m.member) = 'haf_admin' AND pg_get_userbyid(m.roleid) = 'haf_fyp_owner'
+    ) THEN
+        RAISE EXCEPTION 'haf_admin was not granted haf_fyp_owner (db/builtin_roles.sql)';
     END IF;
 END
 $$;
@@ -60,11 +78,12 @@ $$;
 -- 2. Schemas, and who owns what is in them
 -- ---------------------------------------------------------------------------------
 -- The installer connects as haf_admin, a superuser. Tables are handed to haf_fyp_owner
--- (db/create_tables.sql reassigns them) and the endpoint functions are created under
--- SET ROLE haf_fyp_owner. Functions in haf_fyp_app are NOT: they stay owned by whoever
--- installed. That is how the app is deployed today, and it is harmless as long as none
--- of them is SECURITY DEFINER -- one that was would run as a superuser for whoever may
--- call it, the unauthenticated API role included. So that is what is pinned.
+-- (db/create_tables.sql reassigns them), and the endpoint file, the context creation
+-- and the registration run under SET ROLE haf_fyp_owner. Most functions in haf_fyp_app
+-- do NOT: they stay owned by whoever installed. That is how the app is deployed today,
+-- and it is harmless as long as none of them is SECURITY DEFINER -- one that was would
+-- run as a superuser for whoever may call it, the unauthenticated API role included.
+-- So that is what is pinned.
 DO $$
 DECLARE
     _strays TEXT;
@@ -104,8 +123,9 @@ BEGIN
         RAISE EXCEPTION 'endpoint functions not owned by haf_fyp_owner: %', _strays;
     END IF;
 
-    -- No SECURITY DEFINER function may belong to anyone but haf_fyp_owner, and there
-    -- is exactly one of them: the sync-status reader.
+    -- No SECURITY DEFINER function may belong to anyone but haf_fyp_owner, there is
+    -- exactly one of them (the sync-status reader), and it pins its own search_path:
+    -- without that, whoever calls it chooses which objects its unqualified names find.
     SELECT string_agg(p.oid::regprocedure::text || ' (owner ' || pg_get_userbyid(p.proowner) || ')', '; '
                       ORDER BY p.oid::regprocedure::text) INTO _strays
     FROM pg_proc AS p
@@ -116,8 +136,12 @@ BEGIN
     IF _strays IS NOT NULL THEN
         RAISE EXCEPTION 'unexpected SECURITY DEFINER function, or one not owned by haf_fyp_owner: %', _strays;
     END IF;
-    IF NOT (SELECT p.prosecdef FROM pg_proc AS p WHERE p.oid = 'haf_fyp_app.sync_status()'::regprocedure) THEN
-        RAISE EXCEPTION 'haf_fyp_app.sync_status() is not SECURITY DEFINER: haf_fyp_user could not read hafd.contexts through it';
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_proc AS p
+        WHERE p.oid = 'haf_fyp_app.sync_status()'::regprocedure AND p.prosecdef
+          AND EXISTS (SELECT 1 FROM unnest(p.proconfig) AS c WHERE c LIKE 'search\_path=%')
+    ) THEN
+        RAISE EXCEPTION 'haf_fyp_app.sync_status() must be SECURITY DEFINER with its own search_path: haf_fyp_user reads hafd.contexts through it';
     END IF;
 
     SELECT count(*) INTO _n
@@ -129,26 +153,125 @@ END
 $$;
 
 -- ---------------------------------------------------------------------------------
--- 3. pgvector: tests/ci_install_setup.sql does not create it, so the installer did
+-- 3. Everything that must exist, by name
+-- ---------------------------------------------------------------------------------
+-- The comparison in section 9 only says the second install matches the first. It
+-- cannot say the first was complete: an installer that stops loading a file installs
+-- the same incomplete app twice. PL/pgSQL resolves a call when it runs, so a missing
+-- processor is otherwise found by the first block range on a node. Adding or removing a
+-- table or a function means changing these two lists, which is the point.
+DO $$
+DECLARE
+    _want_tables TEXT [] := ARRAY[
+        'active_users', 'algorithm_versions', 'app_config', 'app_status', 'app_version',
+        'embedding_coverage_daily', 'engagement_metrics', 'feed_cache', 'feed_events',
+        'feed_events_rollup_state', 'feed_metrics_daily', 'global_feed_cache', 'haf_fyp',
+        'post_bridge_cache', 'post_candidates', 'post_commenters', 'post_lookup',
+        'user_communities', 'user_interactions', 'user_interests', 'user_profile_vectors'
+    ];
+    _want_functions TEXT [] := ARRAY[
+        'haf_fyp_app.allow_processing()',
+        'haf_fyp_app.block_processor_lock_names()',
+        'haf_fyp_app.community_id_from_name(text)',
+        'haf_fyp_app.community_membership_changes(integer,integer)',
+        'haf_fyp_app.context_claimed_by_other_app(text)',
+        'haf_fyp_app.continue_processing()',
+        'haf_fyp_app.create_context_if_not_exists()',
+        'haf_fyp_app.evict_unproductive_users(integer)',
+        'haf_fyp_app.evict_unsubscribed_users(character varying[])',
+        'haf_fyp_app.get_bridge_post(integer,integer,integer)',
+        'haf_fyp_app.main(hafd.context_name)',
+        'haf_fyp_app.process_block_range(integer,integer)',
+        'haf_fyp_app.process_blocks(hive.blocks_range)',
+        'haf_fyp_app.process_comments(integer,integer)',
+        'haf_fyp_app.process_communities(integer,integer)',
+        'haf_fyp_app.process_engagement(integer,integer)',
+        'haf_fyp_app.process_interactions(integer,integer)',
+        'haf_fyp_app.process_payout_windows(integer)',
+        'haf_fyp_app.process_posts(integer,integer)',
+        'haf_fyp_app.process_reblogs(integer,integer)',
+        'haf_fyp_app.process_subscribe(integer,integer)',
+        'haf_fyp_app.process_unsubscribe(integer,integer)',
+        'haf_fyp_app.process_votes(integer,integer)',
+        'haf_fyp_app.prune_feed_events(integer,bigint,integer)',
+        'haf_fyp_app.refresh_embedding_coverage(integer)',
+        'haf_fyp_app.repair_stranded_optins()',
+        'haf_fyp_app.resolve_hivemind_post_ids(timestamp without time zone,timestamp without time zone)',
+        'haf_fyp_app.rollup_feed_events(integer)',
+        'haf_fyp_app.run_hive_post_id_backfill(interval,numeric)',
+        'haf_fyp_app.safe_parse_json(text)',
+        'haf_fyp_app.stop_processing()',
+        'haf_fyp_app.sync_status()',
+        'haf_fyp_app.take_block_processor_locks()',
+        'haf_fyp_endpoints.get_algorithm()',
+        'haf_fyp_endpoints.get_feed_metrics(date,date,text,text)',
+        'haf_fyp_endpoints.get_global_feed(integer,integer,integer,integer)',
+        'haf_fyp_endpoints.get_health()',
+        'haf_fyp_endpoints.get_personalized_feed(text,integer,integer,integer)',
+        'haf_fyp_endpoints.get_score_explanation(text,bigint)',
+        'haf_fyp_endpoints.get_sync_status()',
+        'haf_fyp_endpoints.get_user_profile(text)',
+        'haf_fyp_endpoints.get_version()',
+        'haf_fyp_endpoints.list_algorithm_versions()',
+        'haf_fyp_endpoints.root()'
+    ];
+    _diff TEXT;
+BEGIN
+    SELECT string_agg(d, '; ' ORDER BY d) INTO _diff
+    FROM (
+        SELECT 'missing table ' || t AS d FROM unnest(_want_tables) AS t
+        WHERE to_regclass('haf_fyp_app.' || quote_ident(t)) IS NULL
+        UNION ALL
+        SELECT 'unlisted table ' || c.relname FROM pg_class AS c
+        INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        WHERE n.nspname IN ('haf_fyp_app', 'haf_fyp_endpoints') AND c.relkind = 'r'
+          AND c.relname <> ALL(_want_tables)
+        UNION ALL
+        SELECT 'missing function ' || f FROM unnest(_want_functions) AS f
+        WHERE to_regprocedure(f) IS NULL
+        UNION ALL
+        SELECT 'unlisted function ' || p.oid::regprocedure::text FROM pg_proc AS p
+        INNER JOIN pg_namespace AS n ON n.oid = p.pronamespace
+        WHERE n.nspname IN ('haf_fyp_app', 'haf_fyp_endpoints')
+          AND p.oid::regprocedure::text <> ALL(_want_functions)
+    ) AS x;
+    IF _diff IS NOT NULL THEN
+        RAISE EXCEPTION 'the installed app is not the one tests/ci_install_verify.sql lists: %', _diff;
+    END IF;
+    -- NOT done: calling haf_fyp_app.process_block_range. The processors read HAF's
+    -- operation tables, which the stub does not have, so the call fails here for a
+    -- reason a node does not have. The lists above are what stands in for it.
+END
+$$;
+
+-- ---------------------------------------------------------------------------------
+-- 4. pgvector: tests/ci_install_setup.sql does not create it, so the installer did
 -- ---------------------------------------------------------------------------------
 DO $$
 BEGIN
     IF to_regtype('vector') IS NULL THEN
         RAISE EXCEPTION 'type vector does not resolve after the install';
     END IF;
-    IF to_regclass('haf_fyp_app.user_profile_vectors') IS NULL THEN
-        RAISE EXCEPTION 'haf_fyp_app.user_profile_vectors is missing';
+    IF format_type(
+        (SELECT a.atttypid FROM pg_attribute AS a
+         WHERE a.attrelid = 'haf_fyp_app.user_profile_vectors'::regclass AND a.attname = 'interest_vector'),
+        (SELECT a.atttypmod FROM pg_attribute AS a
+         WHERE a.attrelid = 'haf_fyp_app.user_profile_vectors'::regclass AND a.attname = 'interest_vector')
+    ) IS DISTINCT FROM 'vector(1024)' THEN
+        RAISE EXCEPTION 'user_profile_vectors.interest_vector is not vector(1024)';
     END IF;
 END
 $$;
 
 -- ---------------------------------------------------------------------------------
--- 4. The HAF context and the registry
+-- 5. The HAF context and the registry
 -- ---------------------------------------------------------------------------------
 DO $$
 DECLARE
     _c RECORD;
     _a RECORD;
+    _want_block INT := CASE current_setting('ci.phase') WHEN 'first' THEN 0 ELSE 1234 END;
+    _status INT;
 BEGIN
     SELECT c.owner, c.current_block_num, c.schema, c.is_forking, t.is_attached INTO _c
     FROM hafd.contexts AS c
@@ -171,54 +294,91 @@ BEGIN
     IF _c.schema <> 'haf_fyp_app' THEN
         RAISE EXCEPTION 'the context lives in schema %', _c.schema;
     END IF;
-    IF _c.current_block_num <> 0 THEN
-        RAISE EXCEPTION 'a fresh install left the context at block %, not 0', _c.current_block_num;
+    -- 0 on a fresh install. After that the pointer is the node's: an install that
+    -- moved it would replay, or skip, blocks.
+    SELECT s.last_processed_block INTO _status FROM haf_fyp_app.app_status AS s;
+    IF _c.current_block_num <> _want_block OR _status IS DISTINCT FROM _want_block THEN
+        RAISE EXCEPTION 'in phase % the context is at block % and app_status at %, expected % for both',
+            current_setting('ci.phase'), _c.current_block_num, _status, _want_block;
     END IF;
 
-    SELECT a.contexts, a.process_procedure, a.paused INTO _a
+    SELECT a.contexts, a.process_procedure, a.paused, a.owner INTO _a
     FROM hafd.applications AS a WHERE a.name = 'haf_fyp';
     IF NOT FOUND THEN
         RAISE EXCEPTION 'haf_fyp is not in the HAF application registry';
     END IF;
-    IF _a.contexts <> ARRAY['haf_fyp'] OR _a.process_procedure <> 'haf_fyp_app.process_blocks' THEN
-        RAISE EXCEPTION 'registered as contexts % / procedure %', _a.contexts, _a.process_procedure;
+    IF _a.contexts IS DISTINCT FROM ARRAY['haf_fyp']
+       OR _a.process_procedure IS DISTINCT FROM 'haf_fyp_app.process_blocks'
+       OR _a.paused IS DISTINCT FROM FALSE THEN
+        RAISE EXCEPTION 'registered as contexts % / procedure % / paused %',
+            _a.contexts, _a.process_procedure, _a.paused;
     END IF;
-    IF to_regprocedure('haf_fyp_app.process_blocks(hive.blocks_range)') IS NULL THEN
-        RAISE EXCEPTION 'the registered entry procedure does not exist';
+    -- hive.app_register records the caller. Registered by haf_admin, the row is one
+    -- haf_fyp_owner can never change.
+    IF _a.owner IS DISTINCT FROM 'haf_fyp_owner' THEN
+        RAISE EXCEPTION 'the registry row is owned by %, not haf_fyp_owner', _a.owner;
     END IF;
 END
 $$;
 
 -- ---------------------------------------------------------------------------------
--- 5. One-row tables, the version, the seed data, the dispatcher
+-- 6. One-row tables, the version, the base URL, the seed data, the dispatcher
 -- ---------------------------------------------------------------------------------
 DO $$
 DECLARE
     _n BIGINT;
     _hash TEXT;
+    _base TEXT;
+    _active TEXT;
+    -- An install that was skipped (phase locked) rewrote neither; one that ran
+    -- records the image's hash and puts the default base URL back (README: the flag is
+    -- applied on every install, and the lane passes none).
+    _want_hash TEXT := CASE current_setting('ci.phase')
+        WHEN 'locked' THEN 'aged-by-the-lane' ELSE current_setting('ci.git_hash') END;
+    _want_base TEXT := CASE current_setting('ci.phase') WHEN 'locked' THEN '/aged-by-the-lane' END;
 BEGIN
     SELECT count(*) INTO _n FROM haf_fyp_app.app_status;
     IF _n <> 1 THEN
         RAISE EXCEPTION 'app_status holds % rows', _n;
     END IF;
-    SELECT count(*) INTO _n FROM haf_fyp_app.app_config;
-    IF _n <> 1 THEN
-        RAISE EXCEPTION 'app_config holds % rows', _n;
+    SELECT count(*), max(swagger_base_url) INTO _n, _base FROM haf_fyp_app.app_config;
+    IF _n <> 1 OR _base IS DISTINCT FROM _want_base THEN
+        RAISE EXCEPTION 'in phase % app_config holds % rows, base URL % (expected one row, %)',
+            current_setting('ci.phase'), _n, _base, _want_base;
     END IF;
     SELECT count(*), max(git_hash) INTO _n, _hash FROM haf_fyp_app.app_version;
-    IF _n <> 1 OR _hash IS DISTINCT FROM current_setting('ci.git_hash') THEN
-        RAISE EXCEPTION 'app_version holds % rows, hash % (the image was built with %)',
-            _n, _hash, current_setting('ci.git_hash');
+    IF _n <> 1 OR _hash IS DISTINCT FROM _want_hash THEN
+        RAISE EXCEPTION 'in phase % app_version holds % rows, hash % (expected one row, %)',
+            current_setting('ci.phase'), _n, _hash, _want_hash;
+    END IF;
+    SELECT count(*) INTO _n FROM haf_fyp_app.feed_events_rollup_state;
+    IF _n <> 1 THEN
+        RAISE EXCEPTION 'feed_events_rollup_state holds % rows', _n;
     END IF;
 
-    -- Seed data must not multiply on a second install.
+    -- Seed data must not multiply on a second install, and must not take back a choice
+    -- the operator made: tests/ci_install_age.sql activates the OLDEST version.
     SELECT count(*) INTO _n FROM haf_fyp_app.algorithm_versions;
     IF _n <> 3 THEN
         RAISE EXCEPTION 'algorithm_versions holds % rows, the seed has 3', _n;
     END IF;
-    SELECT count(*) INTO _n FROM haf_fyp_app.algorithm_versions WHERE is_active;
-    IF _n <> 1 THEN
-        RAISE EXCEPTION '% algorithm versions are active', _n;
+    SELECT string_agg(v.version, ',' ORDER BY v.version) INTO _active
+    FROM haf_fyp_app.algorithm_versions AS v WHERE v.is_active;
+    IF current_setting('ci.phase') = 'first' THEN
+        -- db/seed_data.sql ships 1.1.0 active and 1.2.0 registered but not yet live.
+        IF _active IS DISTINCT FROM '1.1.0' THEN
+            RAISE EXCEPTION 'a fresh install activated %, not 1.1.0 as db/seed_data.sql ships', _active;
+        END IF;
+    ELSIF _active IS DISTINCT FROM (SELECT min(v.version) FROM haf_fyp_app.algorithm_versions AS v) THEN
+        RAISE EXCEPTION 'in phase % the active version is %, not the one the operator chose', current_setting('ci.phase'), _active;
+    END IF;
+
+    -- What the node wrote survives an install.
+    IF current_setting('ci.phase') <> 'first' THEN
+        IF NOT EXISTS (SELECT 1 FROM haf_fyp_app.user_interests WHERE username = 'ci-aged-user')
+           OR NOT EXISTS (SELECT 1 FROM haf_fyp_app.active_users WHERE username = 'ci-aged-user') THEN
+            RAISE EXCEPTION 'in phase % the rows tests/ci_install_age.sql wrote are gone', current_setting('ci.phase');
+        END IF;
     END IF;
 
     -- db/haf_fyp_app.sql leaves a placeholder that raises; db/process_block_range.sql
@@ -232,17 +392,19 @@ END
 $$;
 
 -- ---------------------------------------------------------------------------------
--- 6. The API role can do what PostgREST will ask of it, and no more
+-- 7. The API role can do what PostgREST will ask of it, and no more
 -- ---------------------------------------------------------------------------------
 SET ROLE haf_fyp_user;
 DO $$
 DECLARE
     _doc JSONB;
     _n BIGINT;
+    _want_base TEXT := CASE current_setting('ci.phase')
+        WHEN 'locked' THEN '/aged-by-the-lane' ELSE '/haf-fyp-api' END;
 BEGIN
     _doc := haf_fyp_endpoints.root()::jsonb;
-    IF _doc -> 'servers' <> '[{"url": "/haf-fyp-api"}]'::jsonb THEN
-        RAISE EXCEPTION 'GET / advertises %', _doc -> 'servers';
+    IF _doc -> 'servers' IS DISTINCT FROM jsonb_build_array(jsonb_build_object('url', _want_base)) THEN
+        RAISE EXCEPTION 'GET / advertises %, expected %', _doc -> 'servers', _want_base;
     END IF;
     IF haf_fyp_endpoints.get_version() IS NULL THEN
         RAISE EXCEPTION 'get_version() returned NULL';
@@ -250,6 +412,7 @@ BEGIN
     PERFORM haf_fyp_endpoints.get_health();
     PERFORM haf_fyp_endpoints.get_sync_status();
     PERFORM haf_fyp_endpoints.get_algorithm();
+    PERFORM haf_fyp_endpoints.list_algorithm_versions();
     -- The SECURITY DEFINER hop over hafd.contexts, through HAF's RLS.
     SELECT count(*) INTO _n FROM haf_fyp_app.sync_status();
     IF _n <> 1 THEN
@@ -263,10 +426,23 @@ DO $$
 DECLARE
     _bad TEXT;
 BEGIN
+    -- Every endpoint function, not only the ones called above: the feeds need
+    -- hivemind, which this database does not have, so they are checked by grant.
+    SELECT string_agg(p.oid::regprocedure::text, ', ' ORDER BY p.oid::regprocedure::text) INTO _bad
+    FROM pg_proc AS p
+    INNER JOIN pg_namespace AS n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'haf_fyp_endpoints'
+      AND NOT has_function_privilege('haf_fyp_user', p.oid, 'EXECUTE');
+    IF _bad IS NOT NULL THEN
+        RAISE EXCEPTION 'haf_fyp_user cannot execute: %', _bad;
+    END IF;
+
+    -- Every table and view, the context's own included: those appear at step 10,
+    -- after db/create_tables.sql has granted on what existed then.
     SELECT string_agg(c.relname, ', ' ORDER BY c.relname) INTO _bad
     FROM pg_class AS c
     INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'haf_fyp_app' AND c.relkind = 'r'
+    WHERE n.nspname = 'haf_fyp_app' AND c.relkind IN ('r', 'v')
       AND NOT has_table_privilege('haf_fyp_user', c.oid, 'SELECT');
     IF _bad IS NOT NULL THEN
         RAISE EXCEPTION 'haf_fyp_user cannot read: %', _bad;
@@ -276,7 +452,7 @@ BEGIN
     -- few writes -- each one named in db/create_tables.sql with its reason. Exactly
     -- those and no others: a blanket grant here is a write surface for anyone who
     -- can reach PostgREST.
-    SELECT string_agg(w, ', ' ORDER BY w) INTO _bad
+    SELECT string_agg(w, ', ' ORDER BY w COLLATE "C") INTO _bad
     FROM (
         SELECT c.relname || ':' || priv AS w
         FROM pg_class AS c
@@ -285,13 +461,14 @@ BEGIN
         WHERE n.nspname = 'haf_fyp_app' AND c.relkind = 'r'
           AND has_table_privilege('haf_fyp_user', c.oid, priv)
         UNION ALL
-        SELECT c.relname || '.' || a.attname || ':UPDATE'
+        SELECT c.relname || '.' || a.attname || ':' || priv
         FROM pg_attribute AS a
         INNER JOIN pg_class AS c ON c.oid = a.attrelid
         INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        CROSS JOIN unnest(ARRAY['INSERT', 'UPDATE', 'REFERENCES']) AS priv
         WHERE n.nspname = 'haf_fyp_app' AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped
-          AND NOT has_table_privilege('haf_fyp_user', c.oid, 'UPDATE')
-          AND has_column_privilege('haf_fyp_user', c.oid, a.attnum, 'UPDATE')
+          AND NOT has_table_privilege('haf_fyp_user', c.oid, priv)
+          AND has_column_privilege('haf_fyp_user', c.oid, a.attnum, priv)
     ) AS g;
     IF _bad IS DISTINCT FROM
        'active_users:INSERT, algorithm_versions:UPDATE, feed_events:INSERT, '
@@ -304,25 +481,44 @@ BEGIN
        OR has_schema_privilege('haf_fyp_user', 'haf_fyp_endpoints', 'CREATE') THEN
         RAISE EXCEPTION 'haf_fyp_user can create objects in an application schema';
     END IF;
+
+    -- Step 9c: what haf_fyp_owner creates LATER is readable too. Without it a table the
+    -- ranker adds, or a migration, is invisible to the API until the next install.
+    IF (SELECT count(*) FROM pg_default_acl AS d
+        INNER JOIN pg_namespace AS n ON n.oid = d.defaclnamespace
+        WHERE pg_get_userbyid(d.defaclrole) = 'haf_fyp_owner'
+          AND ((n.nspname = 'haf_fyp_app' AND d.defaclobjtype = 'r' AND d.defaclacl::text LIKE '%haf\_fyp\_user=r/%')
+               OR (n.nspname = 'haf_fyp_endpoints' AND d.defaclobjtype = 'f' AND d.defaclacl::text LIKE '%haf\_fyp\_user=X/%'))
+       ) <> 2 THEN
+        RAISE EXCEPTION 'the default privileges of step 9c (SELECT on future tables, EXECUTE on future endpoint functions) are not both in place';
+    END IF;
+
+    -- Step 12, db/cross_schema_grants.sql: the one grant in it that needs no other
+    -- application. haf_fyp/credibility.py reads account ids through it.
+    IF NOT has_schema_privilege('haf_fyp_user', 'hafd', 'USAGE')
+       OR NOT has_table_privilege('haf_fyp_user', 'hafd.accounts', 'SELECT') THEN
+        RAISE EXCEPTION 'haf_fyp_user cannot read hafd.accounts: db/cross_schema_grants.sql did not run, or not to the end';
+    END IF;
 END
 $$;
 
 -- ---------------------------------------------------------------------------------
--- 7. The other application on this HAF is exactly as tests/ci_install_setup.sql left it
+-- 8. The other application on this HAF is exactly as tests/ci_install_setup.sql left it
 -- ---------------------------------------------------------------------------------
 DO $$
 BEGIN
     IF NOT EXISTS (
-        SELECT 1 FROM hafd.contexts
-        WHERE name = 'ci_bystander' AND owner = 'ci_bystander_owner'
-          AND current_block_num = 4242 AND schema = 'ci_bystander_app'
+        SELECT 1 FROM hafd.contexts AS c
+        INNER JOIN hafd.contexts_attachment AS t ON t.context_name = c.name
+        WHERE c.name = 'ci_bystander' AND c.owner = 'ci_bystander_owner'
+          AND c.current_block_num = 4242 AND c.schema = 'ci_bystander_app' AND NOT t.is_attached
     ) THEN
         RAISE EXCEPTION 'the install changed another application''s context';
     END IF;
     IF NOT EXISTS (
         SELECT 1 FROM hafd.applications
         WHERE name = 'ci_bystander' AND contexts = ARRAY['ci_bystander']
-          AND process_procedure = 'ci_bystander_app.process_blocks'
+          AND process_procedure = 'ci_bystander_app.process_blocks' AND owner = 'ci_bystander_owner'
     ) THEN
         RAISE EXCEPTION 'the install changed another application''s registration';
     END IF;
@@ -330,22 +526,29 @@ BEGIN
         RAISE EXCEPTION 'expected two contexts and two applications, found % and %',
             (SELECT count(*) FROM hafd.contexts), (SELECT count(*) FROM hafd.applications);
     END IF;
+    IF (SELECT string_agg(kept, ',') FROM ci_bystander_app.state) IS DISTINCT FROM 'untouched'
+       OR has_table_privilege('haf_fyp_user', 'ci_bystander_app.state', 'SELECT')
+       OR has_table_privilege('haf_fyp_owner', 'ci_bystander_app.state', 'SELECT') THEN
+        RAISE EXCEPTION 'the install changed, or granted itself, another application''s table';
+    END IF;
 END
 $$;
 
 -- ---------------------------------------------------------------------------------
--- 8. A second install changes nothing
+-- 9. A later install changes nothing the installer owns
 -- ---------------------------------------------------------------------------------
--- Everything the installer creates, one line per item, taken after each install. The
--- second must equal the first: an install that is not idempotent passes on an empty
--- database and breaks the first upgrade on a node. Function BODIES are in it, so a
--- CREATE OR REPLACE that changes nothing shows as nothing.
+-- Everything the installer creates, one line per item, taken in each phase. `locked`
+-- and `second` must equal `first`: an install that is not idempotent passes on an
+-- empty database and breaks the first upgrade on a node. Function BODIES are in it, so
+-- a CREATE OR REPLACE that changes nothing shows as nothing. Data is not: what the node
+-- writes is checked above, by value.
 INSERT INTO ci_install_lane.fingerprint (taken_after, item)
 SELECT current_setting('ci.phase'), array_agg(i ORDER BY i)
 FROM (
     SELECT 'relation ' || c.relkind::text || ' ' || n.nspname || '.' || c.relname
         || ' owner=' || pg_get_userbyid(c.relowner) || ' acl=' || coalesce(c.relacl::text, '-')
-        || ' rls=' || c.relrowsecurity || ' options=' || coalesce(c.reloptions::text, '-') AS i
+        || ' rls=' || c.relrowsecurity || '/' || c.relforcerowsecurity
+        || ' options=' || coalesce(c.reloptions::text, '-') AS i
     FROM pg_class AS c
     INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
     WHERE n.nspname IN ('haf_fyp_app', 'haf_fyp_endpoints')
@@ -353,6 +556,8 @@ FROM (
     SELECT 'column ' || n.nspname || '.' || c.relname || '.' || a.attname || ' '
         || format_type(a.atttypid, a.atttypmod) || ' notnull=' || a.attnotnull
         || ' default=' || coalesce(pg_get_expr(d.adbin, d.adrelid), '-')
+        || ' identity=' || a.attidentity::text || ' generated=' || a.attgenerated::text
+        || ' acl=' || coalesce(a.attacl::text, '-')
     FROM pg_attribute AS a
     INNER JOIN pg_class AS c ON c.oid = a.attrelid
     INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
@@ -360,7 +565,7 @@ FROM (
     WHERE n.nspname IN ('haf_fyp_app', 'haf_fyp_endpoints')
       AND c.relkind IN ('r', 'v', 'm', 'c') AND a.attnum > 0 AND NOT a.attisdropped
     UNION ALL
-    SELECT 'index ' || pg_get_indexdef(x.indexrelid)
+    SELECT 'index ' || pg_get_indexdef(x.indexrelid) || ' valid=' || x.indisvalid
     FROM pg_index AS x
     INNER JOIN pg_class AS c ON c.oid = x.indrelid
     INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
@@ -374,7 +579,10 @@ FROM (
     -- coalesce: a PROCEDURE has no result, and one NULL operand makes the whole item NULL.
     SELECT 'function ' || p.oid::regprocedure::text || ' -> '
         || coalesce(pg_get_function_result(p.oid), 'procedure')
+        || ' args=' || pg_get_function_arguments(p.oid)
         || ' secdef=' || p.prosecdef || ' volatile=' || p.provolatile::text
+        || ' strict=' || p.proisstrict || ' parallel=' || p.proparallel::text
+        || ' leakproof=' || p.proleakproof || ' cost=' || p.procost || ' rows=' || p.prorows
         || ' config=' || coalesce(p.proconfig::text, '-') || ' acl=' || coalesce(p.proacl::text, '-')
         || ' owner=' || pg_get_userbyid(p.proowner) || ' body=' || md5(p.prosrc)
     FROM pg_proc AS p
@@ -387,16 +595,44 @@ FROM (
     INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
     WHERE n.nspname IN ('haf_fyp_app', 'haf_fyp_endpoints') AND NOT t.tgisinternal
     UNION ALL
+    SELECT 'policy ' || pol.polrelid::regclass::text || ' ' || pol.polname || ' ' || pol.polcmd::text
+        || ' using=' || coalesce(pg_get_expr(pol.polqual, pol.polrelid), '-')
+        || ' check=' || coalesce(pg_get_expr(pol.polwithcheck, pol.polrelid), '-')
+    FROM pg_policy AS pol
+    INNER JOIN pg_class AS c ON c.oid = pol.polrelid
+    INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+    WHERE n.nspname IN ('haf_fyp_app', 'haf_fyp_endpoints')
+    UNION ALL
+    SELECT 'type ' || n.nspname || '.' || t.typname || ' ' || t.typtype::text
+        || ' labels=' || coalesce((SELECT string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder)
+                                   FROM pg_enum AS e WHERE e.enumtypid = t.oid), '-')
+    FROM pg_type AS t
+    INNER JOIN pg_namespace AS n ON n.oid = t.typnamespace
+    WHERE n.nspname IN ('haf_fyp_app', 'haf_fyp_endpoints') AND t.typtype IN ('e', 'd')
+    UNION ALL
     SELECT 'schema ' || n.nspname || ' acl=' || coalesce(n.nspacl::text, '-')
     FROM pg_namespace AS n
     WHERE n.nspname IN ('haf_fyp_app', 'haf_fyp_endpoints')
     UNION ALL
+    -- Every default ACL that names an application role, whoever set it and wherever:
+    -- db/cross_schema_grants.sql sets some FOR other applications' owners.
     SELECT 'default acl ' || pg_get_userbyid(d.defaclrole) || ' in ' || coalesce(n.nspname, '(all)')
         || ' on ' || d.defaclobjtype::text || ' = ' || d.defaclacl::text
     FROM pg_default_acl AS d
     LEFT JOIN pg_namespace AS n ON n.oid = d.defaclnamespace
     WHERE pg_get_userbyid(d.defaclrole) IN ('haf_fyp_owner', 'haf_fyp_user')
        OR n.nspname IN ('haf_fyp_app', 'haf_fyp_endpoints')
+       OR d.defaclacl::text ~ 'haf_fyp_(owner|user)'
+    UNION ALL
+    -- What the application roles were granted OUTSIDE their own schemas.
+    SELECT 'foreign grant on ' || c.oid::regclass::text || ' = ' || c.relacl::text
+    FROM pg_class AS c
+    INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+    WHERE n.nspname NOT IN ('haf_fyp_app', 'haf_fyp_endpoints') AND c.relacl::text ~ 'haf_fyp_(owner|user)'
+    UNION ALL
+    SELECT 'foreign grant on schema ' || n.nspname || ' = ' || n.nspacl::text
+    FROM pg_namespace AS n
+    WHERE n.nspname NOT IN ('haf_fyp_app', 'haf_fyp_endpoints') AND n.nspacl::text ~ 'haf_fyp_(owner|user)'
     UNION ALL
     SELECT 'membership ' || pg_get_userbyid(m.member) || ' in ' || pg_get_userbyid(m.roleid)
         || ' admin=' || m.admin_option
@@ -405,18 +641,26 @@ FROM (
        OR pg_get_userbyid(m.roleid) IN ('haf_fyp_owner', 'haf_fyp_user')
     UNION ALL
     SELECT 'role ' || r.rolname || ' login=' || r.rolcanlogin || ' inherit=' || r.rolinherit
+        || ' connlimit=' || r.rolconnlimit || ' validuntil=' || coalesce(r.rolvaliduntil::text, '-')
         || ' config=' || coalesce(r.rolconfig::text, '-')
     FROM pg_roles AS r
     WHERE r.rolname IN ('haf_fyp_owner', 'haf_fyp_user')
     UNION ALL
-    SELECT 'seed algorithm_versions ' || v.version || ' active=' || v.is_active || ' weights=' || md5(v.weights::text)
+    SELECT 'role setting ' || pg_get_userbyid(s.setrole) || ' in db ' || s.setdatabase || ' = ' || s.setconfig::text
+    FROM pg_db_role_setting AS s
+    WHERE pg_get_userbyid(s.setrole) IN ('haf_fyp_owner', 'haf_fyp_user')
+    UNION ALL
+    SELECT 'extension ' || e.extname || ' in ' || e.extnamespace::regnamespace::text
+    FROM pg_extension AS e WHERE e.extname = 'vector'
+    UNION ALL
+    SELECT 'seed algorithm_versions ' || v.version || ' weights=' || md5(v.weights::text)
     FROM haf_fyp_app.algorithm_versions AS v
 ) AS s;
 
 DO $$
 DECLARE
     _first TEXT [];
-    _second TEXT [];
+    _now TEXT [];
     _diff TEXT;
 BEGIN
     -- A NULL item compares as "unknown" to everything and hides whatever it stood for.
@@ -436,24 +680,25 @@ BEGIN
         RETURN;
     END IF;
 
-    SELECT item INTO _second FROM ci_install_lane.fingerprint WHERE taken_after = 'second';
+    SELECT item INTO _now FROM ci_install_lane.fingerprint WHERE taken_after = current_setting('ci.phase');
     SELECT string_agg(d, E'\n' ORDER BY d) INTO _diff
     FROM (
-        SELECT '  only after the FIRST install:  ' || a.i AS d
-        FROM (SELECT unnest(_first) EXCEPT SELECT unnest(_second)) AS a (i)
+        SELECT '  only after the FIRST install: ' || a.i AS d
+        FROM (SELECT unnest(_first) EXCEPT SELECT unnest(_now)) AS a (i)
         UNION ALL
-        SELECT '  only after the SECOND install: ' || b.i
-        FROM (SELECT unnest(_second) EXCEPT SELECT unnest(_first)) AS b (i)
+        SELECT '  only in phase ' || current_setting('ci.phase') || ': ' || b.i
+        FROM (SELECT unnest(_now) EXCEPT SELECT unnest(_first)) AS b (i)
     ) AS x;
     IF _diff IS NOT NULL THEN
-        RAISE EXCEPTION E'the second install changed what the first left:\n%', _diff;
+        RAISE EXCEPTION E'in phase % the installer''s objects are not as the first install left them:\n%',
+            current_setting('ci.phase'), _diff;
     END IF;
     -- Two lists with no differing item and different contents means the comparison
     -- above is wrong, not that the installs agree.
-    IF _first IS DISTINCT FROM _second THEN
+    IF _first IS DISTINCT FROM _now THEN
         RAISE EXCEPTION 'the two fingerprints differ (% and % items) but no differing item was found',
-            cardinality(_first), cardinality(_second);
+            cardinality(_first), cardinality(_now);
     END IF;
-    RAISE NOTICE 'second install: all % items identical to the first', cardinality(_second);
+    RAISE NOTICE 'phase %: all % items identical to the first install', current_setting('ci.phase'), cardinality(_now);
 END
 $$;

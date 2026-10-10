@@ -1,10 +1,16 @@
 """The install lane's wiring (#47): docker/docker-compose-ci-install.yml and the
 `install-test` job in .gitlab-ci.yml.
 
-The lane itself runs in CI against a database. What it cannot check is its own shape: a
+The lane itself runs in CI against a database. What it cannot check is its own shape. A
 compose chain gates only through `depends_on ... service_completed_successfully` and the
-one service the job waits on, so a step that is in the file but not in the chain runs (or
-does not) without anybody waiting for its exit code. These tests pin the shape.
+one service the job waits on, and a job gates only if nothing in it forgives a failure --
+so a step beside the chain, a `|| true`, an `exit 0`, a `retry:` or a different file
+mounted over the verify script all leave a lane that is green and checks nothing.
+
+So this file does not look for the weakenings one at a time (a first version did, and a
+reviewer's mutations walked past it thirty times). It states the WHOLE lane and the WHOLE
+job, and compares. Changing the lane means changing it here, in the same commit, where
+the reviewer of that commit can see what the lane stopped doing.
 """
 
 from __future__ import annotations
@@ -18,12 +24,108 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 LANE = ROOT / "docker" / "docker-compose-ci-install.yml"
 CI = ROOT / ".gitlab-ci.yml"
-REL = "docker/docker-compose-ci-install.yml"
+F = "docker compose -f docker/docker-compose-ci-install.yml"
 
-# In order. Each waits for the one before it to exit 0.
-CHAIN = ["db-setup", "install", "verify", "install-again", "verify-again", "uninstall", "verify-gone"]
-APP_STEPS = {"install": ["install_app"], "install-again": ["install_app"],
-             "uninstall": ["uninstall_app", "--force"]}
+PSQL = "psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1"
+HASH = "${HAF_FYP_GIT_HASH:-ci-install}"
+DONE = {"condition": "service_completed_successfully"}
+
+
+def app(command: list, after: dict) -> dict:
+    """A step that runs one of the app's scripts: from the image, through its
+    entrypoint (no override, nothing mounted over /app), as haf_admin."""
+    return {
+        "build": {"context": "..", "dockerfile": "Dockerfile.sql", "args": {"GIT_HASH": HASH}},
+        "environment": {"POSTGRES_HOST": "postgres", "POSTGRES_USER": "haf_admin",
+                        "POSTGRES_DB": "haf_block_log", "PGPASSWORD": "ci-haf-admin"},
+        "command": command,
+        "depends_on": after,
+    }
+
+
+def sql(command: str, after: dict, files: tuple = (), **extra) -> dict:
+    """A step that runs SQL as the postgres superuser and stops at the first error."""
+    step = {
+        "image": "postgres:17-alpine",
+        "entrypoint": ["/bin/sh", "-c"],
+        "environment": {"PGPASSWORD": "postgres", "EXPECTED_GIT_HASH": HASH},
+        "command": [command],
+        "depends_on": after,
+        **extra,
+    }
+    if files:
+        step["volumes"] = [f"../tests/{f}:/{f}:ro" for f in files]
+    return step
+
+
+def verify(phase: str, after: str) -> dict:
+    return sql(f'{PSQL} -v phase={phase} -v git_hash="$$EXPECTED_GIT_HASH" -f /ci_install_verify.sql',
+               {after: DONE}, ("ci_install_verify.sql",))
+
+
+# In the order they run. Every step but the first waits for the one before it to EXIT 0;
+# install-again also waits for the lock holder to have exited.
+EXPECTED_SERVICES = {
+    "postgres": {
+        "image": "pgvector/pgvector:pg17",
+        "environment": {"POSTGRES_DB": "haf_block_log", "POSTGRES_USER": "postgres",
+                        "POSTGRES_PASSWORD": "postgres"},
+        "healthcheck": {"test": ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d haf_block_log"],
+                        "interval": "3s", "timeout": "2s", "retries": 20},
+    },
+    "db-setup": sql(f"{PSQL} -f /haf_stub.sql && {PSQL} -f /ci_install_setup.sql",
+                    {"postgres": {"condition": "service_healthy"}},
+                    ("haf_stub.sql", "ci_install_setup.sql")),
+    "install": app(["install_app"], {"db-setup": DONE}),
+    "verify": verify("first", "install"),
+    "age": sql(f"{PSQL} -f /ci_install_age.sql", {"verify": DONE}, ("ci_install_age.sql",)),
+    "lock-holder": sql(
+        f"{PSQL} -f /ci_install_lock_holder.sql", {"age": DONE}, ("ci_install_lock_holder.sql",),
+        healthcheck={
+            "test": ["CMD-SHELL",
+                     'psql -h postgres -U postgres -d haf_block_log -Atc "SELECT count(*) FROM pg_locks AS l '
+                     "INNER JOIN pg_stat_activity AS a ON a.pid = l.pid WHERE l.locktype = 'advisory' "
+                     "AND l.granted AND a.application_name = 'haf_fyp-ci-lock-holder'\" | grep -qx 1"],
+            "interval": "1s", "timeout": "3s", "retries": 30,
+        }),
+    "install-locked": app(["install_app"], {"lock-holder": {"condition": "service_healthy"}}),
+    "verify-locked": verify("locked", "install-locked"),
+    "release-lock": sql(f'{PSQL} -c "INSERT INTO ci_install_lane.lock_released DEFAULT VALUES"',
+                        {"verify-locked": DONE}),
+    "install-again": app(["install_app"], {"release-lock": DONE, "lock-holder": DONE}),
+    "verify-again": verify("second", "install-again"),
+    "uninstall": app(["uninstall_app", "--force"], {"verify-again": DONE}),
+    "verify-gone": sql(f"{PSQL} -f /ci_uninstall_verify.sql", {"uninstall": DONE},
+                       ("ci_uninstall_verify.sql",)),
+}
+LAST = "verify-gone"
+
+# .standard-rules, as every other lane has them: merge requests and the default branch,
+# never a schedule. Stated here because the job only ALIASES them -- weakening the
+# anchor (say, to `when: manual`) would weaken this job without touching it.
+STANDARD_RULES = [
+    {"if": '$CI_PIPELINE_SOURCE == "schedule"', "when": "never"},
+    {"if": '$RUN_REGISTRY_RESOLUTION == "true"', "when": "never"},
+    {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'},
+    {"if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"},
+]
+
+EXPECTED_JOB = {
+    "stage": "test",
+    "image": "docker:24",
+    "services": ["docker:24-dind"],
+    "variables": {"DOCKER_TLS_CERTDIR": "/certs", "HAF_FYP_GIT_HASH": "$CI_COMMIT_SHORT_SHA"},
+    "script": [
+        f"timeout 900 {F} up --detach --build",
+        f"timeout 600 {F} wait {LAST}",
+    ],
+    "after_script": [
+        f"{F} ps -a || true",
+        *[f"{F} logs {name} || true" for name in EXPECTED_SERVICES],
+        f"{F} down -v || true",
+    ],
+    "rules": STANDARD_RULES,
+}
 
 
 @pytest.fixture(scope="module")
@@ -32,131 +134,77 @@ def lane() -> dict:
 
 
 @pytest.fixture(scope="module")
-def job() -> str:
-    """The install-test job's text: from its key to the next top-level key."""
-    text = CI.read_text(encoding="utf-8")
-    m = re.search(r"^install-test:\n(.*?)(?=^\S)", text, re.S | re.M)
-    assert m, "no install-test job in .gitlab-ci.yml"
-    return m.group(1)
+def ci() -> dict:
+    return yaml.safe_load(CI.read_text(encoding="utf-8"))
 
 
-def test_the_services_are_the_chain_and_the_database(lane):
-    assert sorted(lane["services"]) == sorted(["postgres", *CHAIN])
+def test_the_lane_is_exactly_the_one_stated_here(lane):
+    services = lane["services"]
+    assert list(services) == list(EXPECTED_SERVICES), "steps added, removed or reordered"
+    for name, want in EXPECTED_SERVICES.items():
+        assert services[name] == want, f"{name} is not the step this file states"
 
 
-@pytest.mark.parametrize("step, before", list(zip(CHAIN, ["postgres", *CHAIN])))
-def test_each_step_waits_for_the_one_before_it_to_succeed(lane, step, before):
-    """service_completed_successfully, not service_started: `started` releases the next
-    step as soon as the container exists, so a failed install would be followed by a
-    verify of whatever it left."""
-    deps = lane["services"][step].get("depends_on")
-    want = "service_healthy" if before == "postgres" else "service_completed_successfully"
-    assert deps == {before: {"condition": want}}, deps
+def test_the_compose_file_has_nothing_but_its_name_its_templates_and_its_services(lane):
+    """No top-level `volumes`, `networks`, `include` or `secrets`: each is a way for
+    this lane to share something with another stack, or to pull in services this file
+    does not show."""
+    assert set(lane) == {"name", "x-app", "x-sql", "services"}, set(lane)
+    assert lane["name"] == "haf_fyp_ci_install"
+    others = {yaml.safe_load(p.read_text(encoding="utf-8")).get("name")
+              for p in LANE.parent.glob("docker-compose*.yml") if p != LANE}
+    assert lane["name"] not in others, others
 
 
-def test_no_step_may_restart(lane):
-    """A restart policy turns a failing step into one that eventually exits 0 or never
-    exits; either way the step after it stops meaning anything."""
-    for name, svc in lane["services"].items():
-        assert "restart" not in svc, name
-
-
-@pytest.mark.parametrize("step", sorted(APP_STEPS))
-def test_the_scripts_run_from_the_image_as_haf_admin(lane, step):
-    svc = lane["services"][step]
-    assert svc["command"] == APP_STEPS[step]
-    assert svc["build"] == {"context": "..", "dockerfile": "Dockerfile.sql",
-                            "args": {"GIT_HASH": "${HAF_FYP_GIT_HASH:-ci-install}"}}
-    # No entrypoint override: the entrypoint's verb dispatch is part of what a node runs.
-    assert "entrypoint" not in svc and "volumes" not in svc, svc
-    env = svc["environment"]
-    # Not `postgres`: the installer's SET ROLE steps and haf_admin's memberships are
-    # exercised only when it connects as the role a node gives it.
-    assert env["POSTGRES_USER"] == "haf_admin" and env["POSTGRES_HOST"] == "postgres", env
-
-
-def test_the_three_app_steps_share_one_image(lane):
-    images = {lane["services"][s]["image"] for s in APP_STEPS}
-    assert len(images) == 1, images
-
-
-def test_the_verify_steps_look_as_a_superuser_and_know_which_install_they_follow(lane):
-    for step, phase in (("verify", "first"), ("verify-again", "second")):
-        svc = lane["services"][step]
-        (cmd,) = svc["command"]
-        assert "-U postgres " in cmd and "-v ON_ERROR_STOP=1" in cmd, cmd
-        assert f"-v phase={phase} " in cmd and cmd.rstrip().endswith("-f /ci_install_verify.sql"), cmd
-        assert '-v git_hash="$$EXPECTED_GIT_HASH"' in cmd, cmd
-        assert svc["environment"]["EXPECTED_GIT_HASH"] == "${HAF_FYP_GIT_HASH:-ci-install}"
-    (gone,) = lane["services"]["verify-gone"]["command"]
-    assert "-U postgres " in gone and "-v ON_ERROR_STOP=1" in gone
-    assert gone.rstrip().endswith("-f /ci_uninstall_verify.sql")
-
-
-def test_every_psql_in_the_lane_stops_on_error(lane):
-    """Without ON_ERROR_STOP psql exits 0 after a failed statement, and a verify file
-    made of RAISE EXCEPTION would pass whatever it found."""
-    for name, svc in lane["services"].items():
-        for part in svc.get("command") or []:
-            for call in re.findall(r"psql [^&]*", part if isinstance(part, str) else ""):
-                assert "-v ON_ERROR_STOP=1" in call, (name, call)
+def test_the_chain_reaches_every_step_from_the_one_the_job_waits_on(lane):
+    """Implied by the equality above for THIS chain. Kept as its own statement so that
+    whoever edits EXPECTED_SERVICES cannot add a step nothing waits for: a step outside
+    the chain runs, or fails, with nobody reading its exit code."""
+    seen, queue = set(), [LAST]
+    while queue:
+        name = queue.pop()
+        if name not in seen:
+            seen.add(name)
+            queue.extend(EXPECTED_SERVICES[name].get("depends_on", {}))
+    assert seen == set(EXPECTED_SERVICES), set(EXPECTED_SERVICES) - seen
+    for name, step in EXPECTED_SERVICES.items():
+        for dep, how in step.get("depends_on", {}).items():
+            # service_started releases the next step as soon as the container exists.
+            assert how["condition"] in ("service_completed_successfully", "service_healthy"), (name, dep)
+            assert how == {"condition": how["condition"]}, (name, dep, "no `required: false`")
 
 
 def test_every_mounted_file_exists(lane):
     for name, svc in lane["services"].items():
         for vol in svc.get("volumes", []):
-            src = vol.split(":")[0]
-            assert (LANE.parent / src).resolve().is_file(), (name, src)
-            assert vol.endswith(":ro"), (name, vol)
+            assert (LANE.parent / vol.split(":")[0]).resolve().is_file(), (name, vol)
 
 
-def test_the_lane_has_a_project_name_of_its_own(lane):
-    others = {yaml.safe_load(p.read_text(encoding="utf-8")).get("name")
-              for p in LANE.parent.glob("docker-compose*.yml") if p != LANE}
-    assert lane["name"] == "haf_fyp_ci_install" and lane["name"] not in others, others
+def test_the_job_is_exactly_the_one_stated_here(ci):
+    """Key for key. `allow_failure`, `retry`, `when`, `needs`, `before_script`,
+    `interruptible`, `timeout`, `parallel`, `extends`, `environment` -- none of them is
+    in the expected job, so adding any one fails here."""
+    assert ci["install-test"] == EXPECTED_JOB
 
 
-def test_nothing_is_published_on_the_host(lane):
-    for name, svc in lane["services"].items():
-        assert "ports" not in svc, name
-
-
-def test_the_job_waits_on_the_last_step(job):
-    waits = re.findall(r"docker compose -f (\S+) wait (\S+)", job)
-    assert waits == [(REL, CHAIN[-1])], waits
-
-
-def test_the_job_bounds_both_blocking_commands(job):
-    script = job.split("after_script:")[0]
-    calls = [line.strip() for line in script.splitlines() if "docker compose" in line and "#" not in line.split("docker")[0]]
-    assert len(calls) == 2, calls
-    assert all(re.match(r"- timeout \d+ docker compose -f " + re.escape(REL) + " ", c) for c in calls), calls
-    assert " up --detach --build" in calls[0], calls[0]
-
-
-def test_the_job_gives_the_image_the_commit_it_was_built_from(job):
-    assert re.search(r"^\s+HAF_FYP_GIT_HASH: \$CI_COMMIT_SHORT_SHA$", job, re.M), job
-
-
-def test_the_job_prints_every_step_and_cleans_up(job):
-    after = job.split("after_script:")[1]
-    logged = re.findall(r"docker compose -f " + re.escape(REL) + r" logs (\S+) \|\| true", after)
-    assert logged == ["postgres", *CHAIN], logged
-    # Every line tolerates failure: after_script stops at the first non-zero, and the
-    # one that matters most -- `down -v` -- is last.
-    lines = [line.strip() for line in after.splitlines() if line.strip().startswith("- ")]
-    assert all(line.endswith("|| true") for line in lines), lines
-    assert lines[-1] == f"- docker compose -f {REL} down -v || true", lines[-1]
-    assert all(f"-f {REL} " in line for line in lines), lines
-
-
-def test_the_job_runs_where_the_other_lanes_do(job):
-    assert re.search(r"^  stage: test$", job, re.M)
-    assert re.search(r"^  rules: \*standard_rules$", job, re.M)
-    assert "allow_failure" not in job and "when: manual" not in job
-
-
-def test_compose_validate_parses_the_lane():
+def test_the_job_is_defined_once_and_nothing_global_runs_inside_it(ci):
     text = CI.read_text(encoding="utf-8")
-    block = re.search(r"^compose-validate:\n(.*?)(?=^\S)", text, re.S | re.M).group(1)
-    assert f"docker compose -f {REL} config --quiet" in block
+    # YAML keeps the LAST of two equal keys without a word, so a second definition
+    # further down the file would replace the one a reader finds first.
+    assert len(re.findall(r"^install-test:", text, re.M)) == 1
+    # Pipeline-wide settings that would run in, or apply to, this job unseen.
+    assert not {"default", "before_script", "after_script", "image", "services"} & set(ci), set(ci)
+
+
+def test_the_standard_rules_are_what_this_file_says_they_are(ci):
+    assert ci[".standard-rules"] == STANDARD_RULES
+
+
+def test_both_blocking_commands_are_bounded():
+    for line in EXPECTED_JOB["script"]:
+        seconds = int(re.match(r"timeout (\d+) ", line).group(1))
+        assert 60 <= seconds <= 1800, line
+
+
+def test_compose_validate_parses_the_lane(ci):
+    assert f"{F} config --quiet" in ci["compose-validate"]["script"]
