@@ -876,7 +876,11 @@ def test_a_fresh_feed_read_during_a_cycle_is_recorded_but_not_ranked_again(conn,
     def _reads(c):
         rd._handle_feed_reads(c, 10)
         deadline = time.monotonic() + 5
-        while order == ["u1"] and _read_age_seconds(other, "fresh") is None                 and time.monotonic() < deadline:
+        while (
+            order == ["u1"]
+            and _read_age_seconds(other, "fresh") is None
+            and time.monotonic() < deadline
+        ):
             time.sleep(0.05)
             rd._handle_feed_reads(c, 10)
         return set()
@@ -927,10 +931,13 @@ def test_a_name_with_no_rotation_row_handed_to_a_cycle_is_not_ranked_into_one(
     monkeypatch.setattr(rd, "compute_scores", lambda **k: pd.DataFrame())
     monkeypatch.setattr(rd, "_rank_user", _rank)
 
-    rd.run_cycle(conn, lambda c: rd._handle_feed_reads(c, 10) | {"evicted-meanwhile"})
+    # Short enough for the column (varchar(16)): a longer name would fail in the
+    # upsert above and pass this test with no membership filter at all.
+    assert len("evicted-now") <= 16
+    ranked = rd.run_cycle(conn, lambda c: rd._handle_feed_reads(c, 10) | {"evicted-now"})
 
-    assert order == ["u1", "u2"]
+    assert order == ["u1", "u2"] and ranked == {"u1", "u2"}
     with other.cursor() as cur:
-        cur.execute("SELECT count(*) FROM haf_fyp_app.active_users WHERE username = 'evicted-meanwhile'")
+        cur.execute("SELECT count(*) FROM haf_fyp_app.active_users WHERE username = 'evicted-now'")
         assert cur.fetchone()[0] == 0
     other.commit()

@@ -915,7 +915,8 @@ def _readers_to_rank_now(
     the accounts whose feed is old enough to re-rank. It may name the same account on
     every call (main() keeps handing over whoever is still waiting), so nobody is
     looked at twice: not an account the cycle has taken (`done`), and not one this
-    function turned away (`skipped`, which it fills).
+    function turned away (`skipped`, which it fills, and which run_cycle also keeps
+    out of the rest of its queue).
 
     Best-effort, like the same step in main(): a check that fails must not cost the
     cycle. Only a session that is gone ends it, as it does anywhere else in the cycle.
@@ -1054,8 +1055,11 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
         if not waiting:
             break
         username = waiting.popleft()
-        if username in done:
-            continue  # a reader further down the queue was taken ahead of its turn
+        if username in done or username in skipped:
+            # Taken ahead of its turn already; or turned away by a check while it was
+            # still in this queue: it passed the reconcile at the top of the cycle,
+            # then cleared its interests, and ranking it now would undo the eviction.
+            continue
         done.add(username)
         try:
             _rank_user(conn, username, candidates, post_vectors, author_credibility, algo_version, weights)

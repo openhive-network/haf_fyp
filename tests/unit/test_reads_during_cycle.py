@@ -28,6 +28,7 @@ class _Reads:
     def __init__(self, answers, clock=None, order=None):
         self.answers, self.clock, self.order = list(answers), clock, order
         self.asked_at, self.asked_after, self.conns = [], [], []
+        self.opted_out = set()  # _cycle makes this the rotation's own set
 
     def __call__(self, conn):
         self.conns.append(conn)
@@ -36,12 +37,15 @@ class _Reads:
         value = self.answers.pop(0) if self.answers else set()
         if isinstance(value, BaseException):
             raise value
+        if isinstance(value, dict):  # {"reads": names, "opts_out": names}, as of this check
+            self.opted_out.update(value.get("opts_out", ()))
+            value = value.get("reads", ())
         return set(value)
 
 
 def _cycle(
     monkeypatch, users, reads, *, per_account=0.0, clock=None, evict=(), fail=(),
-    absent=(), closed=0,
+    absent=(), closed=0, members=None,
 ):
     """run_cycle with everything around the per-account loop stubbed. Each account
     takes `per_account` seconds of the clock. Returns (result, order ranked, conn,
@@ -49,12 +53,15 @@ def _cycle(
 
     The rotation is modelled as the database has it: `evict` names accounts that have
     opted out, and the reconcile deletes such a row ONCE, answering nothing for it
-    afterwards; `absent` names accounts with no row at all. `evict` may instead be a
-    callable standing in for the reconcile."""
+    afterwards; `absent` names accounts with no row at all. An account can also opt
+    out DURING the cycle: a `_Reads` answer of {"reads": ..., "opts_out": ...}. `evict`
+    and `members` may instead be callables standing in for the two queries."""
     conn, _ = _mock_conn([])
     conn.closed = closed
     order = []
     opted_out, no_row = set(evict) if not callable(evict) else set(), set(absent)
+    if isinstance(reads, _Reads):
+        reads.opted_out = opted_out
     if isinstance(reads, _Reads):
         reads.order = order
     if clock is None:
@@ -79,7 +86,9 @@ def _cycle(
     monkeypatch.setattr(rd.time, "monotonic", clock)
     monkeypatch.setattr(rd, "register_vector_type", lambda _c: None)
     monkeypatch.setattr(rd, "_evict_unsubscribed", _evict)
-    monkeypatch.setattr(rd, "_rotation_members", lambda _c, names: set(names) - no_row)
+    monkeypatch.setattr(
+        rd, "_rotation_members", members or (lambda _c, names: set(names) - no_row)
+    )
     monkeypatch.setattr(
         rd, "_fetch_personalised_users", lambda _c, _limit: [u for u in users if u not in no_row]
     )
@@ -299,6 +308,60 @@ def test_a_reader_with_no_rotation_row_is_not_ranked_into_one(monkeypatch):
     assert evictions == [["u1", "u2"], ["stranger", "zed"]]
 
 
+def test_an_account_in_the_queue_that_a_check_evicts_is_not_ranked_later(monkeypatch):
+    # u3 passed the cycle's own reconcile. While u1 is being ranked it clears its
+    # interests and its feed is read. The check evicts it; it is still in the queue,
+    # and ranking it there would write the rotation row straight back (#10): the same
+    # defect as the waiting reader, by the one path the first fix left open.
+    reads = _Reads([set(), {"reads": {"u3"}, "opts_out": {"u3"}}])
+    result, order, _conn, evictions = _cycle(
+        monkeypatch, ["u1", "u2", "u3"], reads, per_account=rd.POLL_SECONDS
+    )
+
+    assert evictions == [["u1", "u2", "u3"], ["u3"]]
+    assert order == ["u1", "u2"] and "u3" not in result
+
+
+def test_readers_turned_away_are_not_counted_in_the_cycle_line(monkeypatch, caplog):
+    reads = _Reads([{"gone", "stranger"}])
+    with caplog.at_level(logging.INFO):
+        _cycle(monkeypatch, ["u1", "u2"], reads, evict={"gone"}, absent={"stranger"})
+
+    assert "refreshed personalized feeds for 2/2 cached users (0 failed)" in caplog.text
+    assert "ahead of their turn" not in caplog.text
+
+
+def test_a_reader_named_at_a_check_that_failed_is_looked_at_again(monkeypatch):
+    # The reconcile fails once. zed was not turned away, only not answered for: main()
+    # names it again 5 s later and it is ranked then.
+    calls = []
+
+    def _evict(_conn, names):
+        calls.append(list(names))
+        if len(calls) == 2:
+            raise RuntimeError("boom")
+        return set()
+
+    monkeypatch.setattr(rd, "_safe_rollback", lambda _c: None)
+    reads = _Reads([{"zed"}, {"zed"}])
+    _result, order, _conn, _ = _cycle(
+        monkeypatch, ["u1", "u2"], reads, per_account=rd.POLL_SECONDS, evict=_evict
+    )
+
+    assert order == ["u1", "zed", "u2"]
+
+
+def test_a_membership_query_that_fails_ranks_no_reader(monkeypatch):
+    # Not "everyone the reconcile left is a member": that is the hole again.
+    def _boom(_c, _names):
+        raise psycopg2.ProgrammingError("relation does not exist")
+
+    monkeypatch.setattr(rd, "_safe_rollback", lambda _c: None)
+    result, order, _conn, _ = _cycle(monkeypatch, ["u1", "u2"], _Reads([{"zed"}]), members=_boom)
+
+    assert order == ["u1", "u2"] and result == {"u1", "u2"}
+
+
 def test_a_reader_whose_ranking_fails_is_not_reported_as_ranked(monkeypatch):
     # main() keeps such a reader waiting for the next grouped re-rank.
     reads = _Reads([set(), {"zed"}])
@@ -351,6 +414,14 @@ def test_a_failed_statement_on_a_live_session_is_not_a_lost_connection(monkeypat
     assert rollbacks == [conn]
 
 
+def test_a_database_error_on_a_live_session_is_logged(monkeypatch, caplog):
+    reads = _Reads([psycopg2.errors.QueryCanceled("canceling statement")] * 3)
+    with caplog.at_level(logging.ERROR):
+        _cycle(monkeypatch, ["u1", "u2", "u3"], reads, per_account=rd.POLL_SECONDS)
+
+    assert caplog.text.count("feed-read handling failed") == 1
+
+
 def test_a_stop_raised_inside_a_check_is_not_swallowed(monkeypatch):
     class _Stop(BaseException):
         pass
@@ -376,14 +447,17 @@ def test_a_failed_reconcile_of_the_readers_costs_the_cycle_nothing(monkeypatch):
     assert rollbacks == [conn]
 
 
+@pytest.mark.parametrize("closed", [1, 2], ids=["closed", "broken"])
 @pytest.mark.parametrize("error", LOST, ids=["operational", "interface"])
-def test_a_connection_lost_while_asking_ends_the_cycle(monkeypatch, error):
+def test_a_connection_lost_while_asking_ends_the_cycle(monkeypatch, error, closed):
     # The accounts still waiting cannot be ranked on a dead session, and main() is
-    # what replaces it.
+    # what replaces it. psycopg2 reports 1 for a session it closed itself (which is
+    # what a failed wait does under the stop handler's wait callback) and 2 for one
+    # that broke.
     with pytest.raises(type(error)):
         _cycle(
             monkeypatch, ["u1", "u2"], _Reads([set(), error]),
-            per_account=rd.POLL_SECONDS, closed=2,
+            per_account=rd.POLL_SECONDS, closed=closed,
         )
 
 
