@@ -1,0 +1,152 @@
+# The install lane (#47): scripts/install_app.sh and scripts/uninstall_app.sh, run for
+# real, from the image a node runs them from.
+#
+#   db-setup -> install -> verify -> install-again -> verify-again -> uninstall -> verify-gone
+#
+# WHAT IT IS FOR. Before this, no lane executed either script. docker-compose-ci.yml
+# hand-applies some of the db/*.sql files as one superuser, so everything the installer
+# does BETWEEN the files -- the preconditions, creating pgvector, the role switch before
+# the context is created, the registry registration, the grants, the post-install
+# assertions, the install lock -- first ran on an operator's node. Twice that is where a
+# defect was found (#79, and the installer's own first run on a fresh node).
+#
+# WHAT IT IS NOT. The database is PostgreSQL with pgvector and tests/haf_stub.sql, not
+# HAF. The stub MODELS the HAF application API; it cannot notice HAF changing under it,
+# and no block is ever processed here. A lane against a real HAF image is the other half
+# of #47 and is not this file. The application locks are the exception: the stub carries
+# HAF's own app_locks.sql verbatim, so the installer's lock wrapper runs against HAF's
+# code.
+#
+# TWO INSTALLS, because one proves nothing about the second: every CREATE succeeds on an
+# empty database. verify-again compares everything the installer creates, function bodies
+# and grants included, with what verify recorded after the first.
+#
+# The services connect as haf_admin, a superuser with a password, as on a node. The
+# verify steps connect as postgres so that what they see does not depend on anything the
+# installer granted.
+#
+# Run by the `install-test` job in .gitlab-ci.yml, which waits on verify-gone: it is last
+# in the chain and each step waits for the one before to exit 0, so it cannot complete
+# unless every step did. By hand:
+#   docker compose -f docker/docker-compose-ci-install.yml up --detach --build
+#   docker compose -f docker/docker-compose-ci-install.yml wait verify-gone
+#   docker compose -f docker/docker-compose-ci-install.yml down -v
+#
+# Pinned to its own project name, like docker-compose-ci.yml, so that neither `up` nor
+# `down -v` here can touch a stack started from another file in this directory.
+name: haf_fyp_ci_install
+
+# The SQL image, built here from this checkout: the scripts run under the image's own
+# shell and psql, through its entrypoint, exactly as haf_api_node's module file and
+# docker-compose.yml's haf-fyp-setup run them. One build, shared by the three services.
+# GIT_HASH is what the installer records in haf_fyp_app.app_version, and what the verify
+# steps then expect to find there.
+x-app: &app
+  image: haf-fyp-sql:ci-install
+  build:
+    context: ..
+    dockerfile: Dockerfile.sql
+    args:
+      GIT_HASH: ${HAF_FYP_GIT_HASH:-ci-install}
+  environment:
+    POSTGRES_HOST: postgres
+    POSTGRES_USER: haf_admin
+    POSTGRES_DB: haf_block_log
+    PGPASSWORD: ci-haf-admin
+
+services:
+  # The same server image as docker-compose-ci.yml: it ships the pgvector files, as a
+  # HAF image does, WITHOUT the extension created -- creating it is the installer's job
+  # when it connects as a superuser, and verify checks that it did.
+  postgres:
+    image: pgvector/pgvector:pg14
+    environment:
+      POSTGRES_DB: haf_block_log
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      # 127.0.0.1, not the socket: see docker-compose-ci.yml for the first-boot race.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d haf_block_log"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  # A HAF that has never seen haf_fyp, with one other application on it.
+  db-setup:
+    image: postgres:14-alpine
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /haf_stub.sql &&
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_install_setup.sql
+    volumes:
+      - ../tests/haf_stub.sql:/haf_stub.sql:ro
+      - ../tests/ci_install_setup.sql:/ci_install_setup.sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  install:
+    <<: *app
+    command: ["install_app"]
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+
+  verify:
+    image: postgres:14-alpine
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -v phase=first -v git_hash="$$EXPECTED_GIT_HASH" -f /ci_install_verify.sql
+    environment:
+      EXPECTED_GIT_HASH: ${HAF_FYP_GIT_HASH:-ci-install}
+    volumes:
+      - ../tests/ci_install_verify.sql:/ci_install_verify.sql:ro
+    depends_on:
+      install:
+        condition: service_completed_successfully
+
+  # Over the database the first install left, with nothing reset in between: this is
+  # what every `up` after the first one does on a node.
+  install-again:
+    <<: *app
+    command: ["install_app"]
+    depends_on:
+      verify:
+        condition: service_completed_successfully
+
+  verify-again:
+    image: postgres:14-alpine
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -v phase=second -v git_hash="$$EXPECTED_GIT_HASH" -f /ci_install_verify.sql
+    environment:
+      EXPECTED_GIT_HASH: ${HAF_FYP_GIT_HASH:-ci-install}
+    volumes:
+      - ../tests/ci_install_verify.sql:/ci_install_verify.sql:ro
+    depends_on:
+      install-again:
+        condition: service_completed_successfully
+
+  # --force: there is no TTY to type the database name into. The same command
+  # docker-compose.yml's haf-fyp-uninstall ships.
+  uninstall:
+    <<: *app
+    command: ["uninstall_app", "--force"]
+    depends_on:
+      verify-again:
+        condition: service_completed_successfully
+
+  verify-gone:
+    image: postgres:14-alpine
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_uninstall_verify.sql
+    volumes:
+      - ../tests/ci_uninstall_verify.sql:/ci_uninstall_verify.sql:ro
+    depends_on:
+      uninstall:
+        condition: service_completed_successfully

@@ -1429,6 +1429,34 @@ runs rather than another green tick.
 API_URL=http://localhost:3000 tavern-ci tests/tavern/test_endpoints.tavern.yaml
 ```
 
+### The install lane
+
+`install-test` in CI runs the installer and the uninstaller for real
+([#47](https://gitlab.syncad.com/hive/haf_fyp/-/issues/47)), from the SQL image, as
+`haf_admin`:
+
+```bash
+docker compose -f docker/docker-compose-ci-install.yml up --detach --build
+docker compose -f docker/docker-compose-ci-install.yml wait verify-gone   # 0 = the whole lane passed
+docker compose -f docker/docker-compose-ci-install.yml logs verify verify-again verify-gone
+docker compose -f docker/docker-compose-ci-install.yml down -v
+```
+
+| step | what it does |
+|---|---|
+| `install` | `install_app` on a database that has never seen haf_fyp, with one other application on it |
+| `verify` | `tests/ci_install_verify.sql`: roles and memberships, ownership, the HAF context and its registration, the one-row tables, the recorded version, what the API role may read and write, the other application untouched |
+| `install-again` | `install_app` over what the first left |
+| `verify-again` | the same checks, and everything the installer creates (function bodies and grants included) is identical to what `verify` recorded |
+| `uninstall` | `uninstall_app --force` |
+| `verify-gone` | `tests/ci_uninstall_verify.sql`: nothing of haf_fyp is left, and pgvector, HAF's roles and the other application are |
+
+**What it does not cover.** The database is PostgreSQL with pgvector and
+`tests/haf_stub.sql`, which models the HAF application API; it is not HAF, and no block is
+processed. A change in HAF itself does not turn this lane red, and nor does anything that
+only shows with chain data or with a block processor running. It also installs the same
+commit twice, so it cannot see a defect that only an upgrade from an older commit shows.
+
 ## SQL Linting
 
 ```bash

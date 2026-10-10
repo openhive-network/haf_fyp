@@ -115,6 +115,8 @@ compose-validate:
     FYP_ADMIN_API_KEY: "dummy"
   script:
     - docker compose -f docker/docker-compose.yml config --quiet
+    # Needs none of the placeholders above: it builds its one image from this checkout.
+    - docker compose -f docker/docker-compose-ci-install.yml config --quiet
   rules: *standard_rules
 
 # Does what compose-validate CANNOT, and the two are complements, not duplicates.
@@ -411,6 +413,47 @@ postgrest-tests:
     # container, and a non-zero here would skip the `down -v` below.
     - docker compose -f docker/docker-compose-ci.yml logs haf-fyp-postgrest-rewriter || true
     - docker compose -f docker/docker-compose-ci.yml down -v
+  rules: *standard_rules
+
+# The installer and the uninstaller, run for real (#47): install, verify, install again,
+# verify nothing changed, uninstall, verify it is gone and nothing else is. Until this
+# job, nothing in CI executed scripts/install_app.sh or scripts/uninstall_app.sh at all.
+# docker/docker-compose-ci-install.yml says what the lane covers and what it does not
+# (the database is the HAF stub, not HAF).
+#
+# In the test stage, beside postgrest-tests, and independent of the build stage: it
+# builds the SQL image itself, from this checkout, so it also runs when docker-build-sql
+# would fail and says why sooner.
+install-test:
+  stage: test
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    # Recorded by the installer in haf_fyp_app.app_version, and expected there by the
+    # verify steps: the image's baked value, read back from the database.
+    HAF_FYP_GIT_HASH: $CI_COMMIT_SHORT_SHA
+  script:
+    # `timeout` on both: a step that never exits (an installer waiting on a database, a
+    # lock that is never released) would otherwise hold the job to GitLab's own limit
+    # and report "job timeout" with no log from the step that hung.
+    - timeout 900 docker compose -f docker/docker-compose-ci-install.yml up --detach --build
+    # verify-gone is LAST in the chain, and every step waits for the one before it to
+    # exit 0, so this is the whole lane. tests/unit/test_compose_contract.py checks that
+    # it stays last: a step added beside the chain instead of in it would never gate.
+    - timeout 600 docker compose -f docker/docker-compose-ci-install.yml wait verify-gone
+  after_script:
+    - docker compose -f docker/docker-compose-ci-install.yml ps -a || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs postgres || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs db-setup || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs install || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs install-again || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify-again || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs uninstall || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify-gone || true
+    - docker compose -f docker/docker-compose-ci-install.yml down -v || true
   rules: *standard_rules
 
 .docker-build:
