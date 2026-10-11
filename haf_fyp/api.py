@@ -8,6 +8,7 @@ Handles write operations and admin actions that PostgREST cannot serve:
   POST   /v1/fyp/admin/algorithm   — activate an algorithm version (API-key gated)
   GET    /health                   — can this container serve: 503 on the database pool; Redis reported, never gated (#61, #78)
   GET    /metrics                  — embedding coverage (#15) + credibility sources (#8) + ranking sources (#36)
+                                    + reader-first figures (#86)
   GET    /sync-status              — uniform HAF-app sync freshness (#16)
 
 The rewriter (port 3001) serves the read endpoints, proxying to PostgREST (port 3000,
@@ -60,10 +61,12 @@ from .metrics import (
     build_coverage_report,
     build_credibility_sources_report,
     build_ranking_sources_report,
+    build_reader_first_report,
     fetch_coverage_rows,
     fetch_credibility_sources,
     fetch_feed_servability,
     fetch_ranking_sources,
+    fetch_reader_first,
 )
 from .sync_status import (
     ContextNotFound,
@@ -1505,6 +1508,12 @@ def metrics(response: Response):
     not deployed here. This answers for haf_fyp_user, whose privileges are a subset
     of the ranker's haf_fyp_owner, so it can only err on the conservative side.
 
+    reader_first (#86): how many accounts read their feed in the last day, how old the
+    stalest of those feeds is, how long a full rotation takes, and how full the
+    notification queue is. Read from active_users, so it needs nothing from the
+    ranker. Informational: it sets no `degraded`. See build_reader_first_report for
+    what each figure means and what to watch.
+
     A failed credibility probe reports state "unknown" (and degraded true, which fails
     safe for a monitor) rather than taking the coverage metric down with it. The
     reverse does not hold: the coverage read runs first and is not optional, so if the
@@ -1513,7 +1522,7 @@ def metrics(response: Response):
     # _db_conn, not the inline getconn prologue: it borrows INSIDE the guarded region,
     # so a PoolError("connection pool exhausted") -- reachable with maxconn=5 and a
     # monitor polling both this and /sync-status -- is mapped to JSON here instead of
-    # escaping as a bare text/plain 500. This route also now issues four queries while
+    # escaping as a bare text/plain 500. This route also now issues five queries while
     # holding the connection, which raises the exhaustion pressure that makes it worth
     # doing. The remaining handlers still use the inline prologue (#17).
     # Headers first: the 503 below raises, and a raised HTTPException is rendered from
@@ -1551,6 +1560,10 @@ def metrics(response: Response):
             ranking_probe = fetch_ranking_sources(conn)
             servability = fetch_feed_servability(conn)
             probe = fetch_credibility_sources(conn)
+            # Last, and inside a SAVEPOINT of its own (#86): the durable form the
+            # paragraph above asks for. It cannot abort the transaction for anything
+            # added after it; if an earlier probe already has, it reports unknown.
+            reader_first = fetch_reader_first(conn)
     except psycopg2.pool.PoolError as exc:
         # Monitors poll this route, so a persistently exhausted pool must not write a
         # traceback per scrape. Same treatment /sync-status gives the identical error,
@@ -1572,6 +1585,7 @@ def metrics(response: Response):
     report = build_coverage_report(rows, today)
     report["credibility_sources"] = build_credibility_sources_report(probe)
     report["ranking_sources"] = build_ranking_sources_report(ranking_probe, servability)
+    report["reader_first"] = build_reader_first_report(reader_first)
     return report
 
 

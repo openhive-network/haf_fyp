@@ -523,3 +523,146 @@ def fetch_credibility_sources(conn) -> dict | None:
         # credibility's transition-only logging.
         log.warning("credibility: source probe failed (%s) -- reporting state unknown", exc)
         return None
+
+
+# --------------------------------------------------------------------------
+# reader_first (#86): who reads, how fresh their feeds are, how long the
+# rotation takes
+# --------------------------------------------------------------------------
+#
+# Reader-first ranking (#81, #85) reports itself in the ranker's log, one line per
+# cycle, and the ranker serves nothing: without this an operator has to read container
+# logs to learn how old the feeds people actually open are. Everything here is read
+# from haf_fyp_app.active_users, so it needs nothing from the ranker process and says
+# what IS, not what a daemon that may have stopped last reported.
+#
+# Two figures depend on ranker settings this process cannot see, so they are computed
+# with the settings' DEFAULTS and the report says which values it used:
+#   READER_WINDOW_SECONDS        -> READER_FIRST_WINDOW_SECONDS
+#   READ_REFRESH_MIN_AGE_SECONDS -> READER_FIRST_DUE_AFTER_SECONDS
+# A node that changed either reads these two counts against its own setting.
+READER_FIRST_WINDOW_SECONDS = 24 * 60 * 60
+READER_FIRST_DUE_AFTER_SECONDS = 600
+
+READER_FIRST_OK = "ok"
+READER_FIRST_UNSUPPORTED = "unsupported"
+READER_FIRST_UNKNOWN = "unknown"
+
+# One pass over the rotation (one row per ranked account: tens of thousands on a full
+# node, a few milliseconds). last_scored_at and last_read_at are naive UTC, as the
+# ranker writes them, so every comparison is against NOW() AT TIME ZONE 'utc'.
+_READER_FIRST_SQL = """
+WITH t AS (SELECT (NOW() AT TIME ZONE 'utc') AS now_utc)
+SELECT
+    COUNT(*),
+    COUNT(*) FILTER (WHERE au.last_scored_at IS NULL),
+    EXTRACT(EPOCH FROM (SELECT now_utc FROM t) - MIN(au.last_scored_at)),
+    COUNT(*) FILTER (WHERE au.last_read_at >= (SELECT now_utc FROM t) - make_interval(secs => %(window)s)),
+    COUNT(*) FILTER (
+        WHERE au.last_read_at >= (SELECT now_utc FROM t) - make_interval(secs => %(window)s)
+          AND (au.last_scored_at IS NULL
+               OR au.last_scored_at < (SELECT now_utc FROM t) - make_interval(secs => %(due)s))),
+    EXTRACT(EPOCH FROM (SELECT now_utc FROM t) - MIN(au.last_scored_at) FILTER (
+        WHERE au.last_read_at >= (SELECT now_utc FROM t) - make_interval(secs => %(window)s))),
+    pg_notification_queue_usage()
+  FROM haf_fyp_app.active_users au
+"""
+
+_READER_FIRST_SAVEPOINT = "haf_fyp_metrics_reader_first"
+
+
+def fetch_reader_first(conn) -> dict | None:
+    """
+    Read the reader-first figures, or None if they could not be read.
+
+    Runs LAST on GET /metrics and inside a SAVEPOINT, which is the durable answer the
+    sibling probes' docstrings ask for when a fourth read is added: the reads share one
+    connection and one transaction, and without it a failure here would leave that
+    transaction aborted for whatever is added after, exactly as the others do to each
+    other. With it, this read can fail without touching anything else. The reverse
+    does not hold and is not meant to: if an earlier probe has already aborted the
+    transaction, the SAVEPOINT itself is refused and this reports unknown.
+
+    `{"unsupported": True}` means active_users has no last_read_at column: the
+    installed SQL predates #81 while this API image does not. That is a state an
+    operator can act on (re-run the install), so it is told apart from a failure.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SAVEPOINT {_READER_FIRST_SAVEPOINT}")
+            try:
+                cur.execute(
+                    _READER_FIRST_SQL,
+                    {"window": READER_FIRST_WINDOW_SECONDS, "due": READER_FIRST_DUE_AFTER_SECONDS},
+                )
+                row = cur.fetchone()
+            except Exception as exc:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {_READER_FIRST_SAVEPOINT}")
+                if getattr(exc, "pgcode", None) == "42703":  # undefined_column
+                    return {"unsupported": True}
+                raise
+            cur.execute(f"RELEASE SAVEPOINT {_READER_FIRST_SAVEPOINT}")
+        size, never, rotation_age, readers, due, oldest_reader, queue = row
+        return {
+            "rotation_size": int(size),
+            "never_ranked": int(never),
+            "rotation_age_seconds": None if rotation_age is None else int(rotation_age),
+            "readers_in_window": int(readers),
+            "readers_due": int(due),
+            "oldest_reader_feed_seconds": None if oldest_reader is None else int(oldest_reader),
+            "notification_queue_usage": float(queue),
+        }
+    except Exception as exc:
+        # As the sibling probes: no rollback of the connection (the pool does that),
+        # and no exc_info, because monitors poll this route.
+        log.warning("reader_first: figures could not be read (%s) -- reporting unknown", exc)
+        return None
+
+
+def build_reader_first_report(probe: dict | None) -> dict:
+    """
+    The reader_first section of GET /metrics.
+
+    Informational: it never sets a top-level `degraded`. What to watch:
+
+      oldest_reader_feed_seconds -- the number reader-first ranking exists to keep
+          low: the stalest feed among accounts that read theirs within the window.
+          Minutes when the ranker keeps up; it approaches rotation_age_seconds when
+          readers are not being put first (ranker stopped, signal not arriving, lane
+          full).
+      readers_due -- readers whose feed is older than the minimum age, i.e. what the
+          reader lane will take next. Compare it with the lane's size on this node
+          (MAX_USERS_PER_CYCLE x READER_CYCLE_SHARE): at or above it, the lane is
+          full, everyone else is rotating more slowly, and if nothing explains that
+          many readers, someone is requesting other people's feeds (#84).
+      rotation_age_seconds -- how long a full rotation takes right now: the age of
+          the stalest ranked feed. never_ranked accounts are not in it; they go first.
+      notification_queue_usage -- the fraction (0 to 1) of PostgreSQL's notification
+          queue in use, cluster-wide. It grows only while some listening session sits
+          in a long transaction; at 1 every NOTIFY in the cluster fails.
+    """
+    if probe is None:
+        return {
+            "state": READER_FIRST_UNKNOWN,
+            "detail": "the reader-first figures could not be read; see the API log",
+        }
+    if probe.get("unsupported"):
+        return {
+            "state": READER_FIRST_UNSUPPORTED,
+            "detail": (
+                "haf_fyp_app.active_users has no last_read_at column: the installed SQL "
+                "predates reader-first ranking. Re-run the install."
+            ),
+        }
+    return {
+        "state": READER_FIRST_OK,
+        "window_seconds": READER_FIRST_WINDOW_SECONDS,
+        "due_after_seconds": READER_FIRST_DUE_AFTER_SECONDS,
+        "readers_in_window": probe["readers_in_window"],
+        "readers_due": probe["readers_due"],
+        "oldest_reader_feed_seconds": probe["oldest_reader_feed_seconds"],
+        "rotation_size": probe["rotation_size"],
+        "never_ranked": probe["never_ranked"],
+        "rotation_age_seconds": probe["rotation_age_seconds"],
+        "notification_queue_usage": probe["notification_queue_usage"],
+    }
