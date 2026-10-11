@@ -383,6 +383,21 @@ run_sql_file "${SCRIPT_DIR}/../endpoints/endpoint_schema.sql"
 #     itself is resolved at call time, so this may load before step 10.
 run_sql_file "${SCRIPT_DIR}/../db/sync_status.sql"
 
+# 9c. Read access to what haf_fyp_owner creates FROM HERE ON, for haf_fyp_user.
+#     BEFORE step 10, not after it (#47). hive.app_create_context creates the context's
+#     own table and views in haf_fyp_app, as haf_fyp_owner -- after db/create_tables.sql
+#     (step 3) has granted SELECT on the tables that existed then. With this after step
+#     10, a first install left those objects unreadable by the API role and only the
+#     SECOND install granted them (through step 3's blanket grant), so two installs of
+#     one commit did not leave the same database. The install lane found it once its HAF
+#     stand-in created the table as HAF does.
+psql_cmd -c "
+    ALTER DEFAULT PRIVILEGES FOR ROLE haf_fyp_owner IN SCHEMA haf_fyp_app
+        GRANT SELECT ON TABLES TO haf_fyp_user;
+    ALTER DEFAULT PRIVILEGES FOR ROLE haf_fyp_owner IN SCHEMA haf_fyp_endpoints
+        GRANT EXECUTE ON FUNCTIONS TO haf_fyp_user;
+"
+
 # 10. Register HAF context (idempotent) — as haf_fyp_owner, NOT as haf_admin.
 #     hive.app_create_context stores owner = current_user, and HAF's RLS UPDATE
 #     policy on hafd.contexts is
@@ -399,14 +414,6 @@ psql_cmd -c "SET ROLE haf_fyp_owner; SELECT haf_fyp_app.create_context_if_not_ex
 #      hive.app_register verifies that entry procedure with to_regprocedure().
 #      Warns and skips on a HAF without the registry; see db/register_app.sql.
 psql_cmd -c "SET ROLE haf_fyp_owner;" -f "${SCRIPT_DIR}/../db/register_app.sql"
-
-# 11. Grant read access on current and future objects to haf_fyp_user
-psql_cmd -c "
-    ALTER DEFAULT PRIVILEGES FOR ROLE haf_fyp_owner IN SCHEMA haf_fyp_app
-        GRANT SELECT ON TABLES TO haf_fyp_user;
-    ALTER DEFAULT PRIVILEGES FOR ROLE haf_fyp_owner IN SCHEMA haf_fyp_endpoints
-        GRANT EXECUTE ON FUNCTIONS TO haf_fyp_user;
-"
 
 # 12. Cross-schema grants (hivesense_app, reptracker_app, btracker_app, hafd).
 #     Schemas that don't exist yet are skipped with a NOTICE — re-run
@@ -444,8 +451,10 @@ fi
 #     so this runs the endpoint's exact query as the exact role, exercising the
 #     real EXECUTE grant, the SECURITY DEFINER hop, the definer's real group
 #     membership and HAF's real RLS policy. It is the ONLY place any of that is
-#     checked: no CI lane runs this script, and the fastapi-tests lane's
-#     haf_fyp_user is a superuser for whom every ACL and policy is bypassed.
+#     checked against HAF itself: the install-test lane (#47) runs this script, but
+#     over a model of HAF (tests/haf_stub.sql plus tests/ci_install_setup.sql, which
+#     carries the policies); and the fastapi-tests lane's haf_fyp_user is a superuser
+#     for whom every ACL and policy is bypassed.
 #     A zero-row result (not an error) is the signature of a missing or
 #     non-inheriting membership on the definer, so assert on the count.
 psql_cmd -v ON_ERROR_STOP=on -c "
@@ -588,7 +597,7 @@ END
 #
 #     Ordering can still leave a stale hash in one direction nothing can fix: an in-place
 #     re-install that aborts at step 12, 13 or 14 has already applied the new SQL in steps
-#     1-11 while this step never runs, so /version keeps naming the previous commit on a
+#     1-10b while this step never runs, so /version keeps naming the previous commit on a
 #     partially upgraded schema. Running last is the least-bad choice, not a guarantee.
 if [ -n "${GIT_HASH:-}" ]; then
     log "Recording application version: ${GIT_HASH}"
@@ -603,9 +612,10 @@ fi
 
 psql_cmd -v git_hash="${GIT_HASH:-}" -f "${SCRIPT_DIR}/../scripts/set_version.sql"
 
-# 16. Assert the version row is a usable singleton. No CI lane runs this script, so this is
-#     the only place the #20 fix is checked against a real node. It asserts a usable row,
-#     not a real commit, so the GIT_HASH-unset path above still passes.
+# 16. Assert the version row is a usable singleton. This is the only place the #20 fix
+#     is checked against a real node (the install-test lane, #47, runs it over the HAF
+#     stub). It asserts a usable row, not a real commit, so the GIT_HASH-unset path
+#     above still passes.
 psql_cmd -c "
 DO \$\$
 DECLARE

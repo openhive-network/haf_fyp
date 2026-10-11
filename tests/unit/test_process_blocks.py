@@ -2,7 +2,8 @@
 
 This script is half of the healthcheck contract — it writes the startup timestamp the
 check compares against — and nothing executed it before this file existed:
-test_docker_entrypoint.py stubs it out, and no CI lane runs the image. Mutation testing
+test_docker_entrypoint.py stubs it out, and no CI lane ran the image (the install lane
+now does, #47, but not this script). Mutation testing
 confirmed the gap: deleting the timestamp write, pointing it at a different path from
 the one the reader defaults to, emitting a non-ISO or local-time value, and calling
 main() with the wrong context name ALL survived the full suite.

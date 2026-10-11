@@ -90,7 +90,7 @@ BEGIN
 
     -- Not just present: usable. git_hash is NOT NULL, but '' satisfies that, and an empty
     -- /version body is as unreadable as the null #20 reported. This mirrors the same check
-    -- in scripts/install_app.sh step 16, which no CI lane runs.
+    -- in scripts/install_app.sh step 16, which only the install-test lane runs.
     SELECT v.git_hash INTO __hash FROM haf_fyp_app.app_version AS v;
     IF __hash IS NULL OR btrim(__hash) = '' THEN
         RAISE EXCEPTION
