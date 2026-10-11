@@ -1332,13 +1332,13 @@ the work up regardless.
 ## Checking that the pinned images still exist
 
 `scripts/check_pinned_images.sh` resolves every image this repository pins — everything the
-compose files **pull** (`docker/docker-compose.yml` and `docker/docker-compose-ci.yml`,
-through `docker/.env`), plus every `FROM` in `Dockerfile.*` — and fails when one of them no
-longer exists in its registry. Ten references today.
+compose files **pull** (`docker/docker-compose.yml`, `docker/docker-compose-ci.yml` and
+`docker/docker-compose-ci-install.yml`, through `docker/.env`), plus every `FROM` in `Dockerfile.*` — and fails when one of them no
+longer exists in its registry. Twelve references today.
 
 It passes **only when every reference was positively resolved**
 ([#71](https://gitlab.syncad.com/hive/haf_fyp/-/issues/71)), and says how many that was:
-`positively resolved 10 of 10`. Each is one manifest `HEAD` to the registry's HTTP API:
+`positively resolved 12 of 12`. Each is one manifest `HEAD` to the registry's HTTP API:
 
 - `200` with a `Docker-Content-Digest` — resolved; the digest is printed.
 - `404` from the registry itself (it carries `Docker-Distribution-Api-Version`) — `MISSING`:
@@ -1369,7 +1369,7 @@ sh scripts/check_pinned_images.sh
 # ...
 # sha256:1b1d9202... registry.gitlab.syncad.com/hive/haf:1.29.0-rc2
 # ...
-# [check-pinned-images] positively resolved 10 of 10: 0 missing or unreadable, 0 unanswered
+# [check-pinned-images] positively resolved 12 of 12: 0 missing or unreadable, 0 unanswered
 ```
 
 Needs `docker` (the CLI with the compose plugin, for `docker compose config`), `curl` and
@@ -1436,6 +1436,51 @@ runs rather than another green tick.
 # rewriter (3001). tests/tavern/rewriter/ is the suite that exercises the clean paths.
 API_URL=http://localhost:3000 tavern-ci tests/tavern/test_endpoints.tavern.yaml
 ```
+
+### The install lane
+
+`install-test` in CI runs the installer and the uninstaller for real
+([#47](https://gitlab.syncad.com/hive/haf_fyp/-/issues/47)), from the SQL image, as
+`haf_admin`, on PostgreSQL 17:
+
+```bash
+docker compose -f docker/docker-compose-ci-install.yml up --detach --build
+docker compose -f docker/docker-compose-ci-install.yml wait verify-gone   # 0 = the whole lane passed
+docker compose -f docker/docker-compose-ci-install.yml logs verify verify-locked verify-again verify-gone
+docker compose -f docker/docker-compose-ci-install.yml down -v
+```
+
+| step | what it does |
+|---|---|
+| `install` | `install_app` on a database that has never seen haf_fyp, with one other application on it |
+| `verify` | `tests/ci_install_verify.sql`: the roles and what they are members of; ownership; every table and function that must exist, by name; the HAF context and its registration; the one-row tables; the recorded version; what the API role may read, execute and write; the default privileges; the other application untouched |
+| `age` | `tests/ci_install_age.sql` changes what a running node changes: the sync pointer, the active algorithm version, a user's declared interests |
+| `lock-holder`, `install-locked`, `verify-locked` | with a block processor's lock held, `install_app` exits 0 and changes nothing |
+| `release-lock`, `install-again`, `verify-again` | with the lock released, `install_app` runs over that database: everything the installer creates is identical to what `verify` recorded (function bodies and grants included), and everything `age` changed is still as `age` left it |
+| `uninstall` | `uninstall_app --force` |
+| `verify-gone` | `tests/ci_uninstall_verify.sql`: nothing of haf_fyp is left, and pgvector, HAF's roles and grants and the other application are |
+
+`tests/unit/test_install_lane.py` states the compose file and the CI job in full and
+compares, so a change to either has to be made there too.
+
+**What it does not cover.**
+
+- The database is PostgreSQL with pgvector, `tests/haf_stub.sql` and
+  `tests/ci_install_setup.sql`, which together model the HAF application API. It is not
+  HAF: a change in HAF itself does not turn this lane red.
+- No block is processed. The processors read HAF's operation tables, which the model
+  does not have; that they all exist is checked, that they work is not.
+- All three installs are the same commit, so a defect that only an upgrade from an older
+  commit shows is not seen.
+- No other application's schema is present, so the parts of `db/cross_schema_grants.sql`
+  that grant on hivemind, HiveSense, reputation_tracker and balance_tracker only print
+  that they found nothing. `scripts/grant_cross_schema.sh` is not run.
+- The installer's refusals (a context owned by someone else, pgvector out of reach) and
+  the uninstaller's confirmation prompt are not exercised; the lane only takes the path
+  where everything is in order, and `--force`.
+- `--swagger-url` is not passed.
+- hivemind is absent, so the installer does not register its dependency on it; the
+  installer always connects as a superuser; the uninstall runs once, to the end.
 
 ## SQL Linting
 

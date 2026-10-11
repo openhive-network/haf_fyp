@@ -115,6 +115,8 @@ compose-validate:
     FYP_ADMIN_API_KEY: "dummy"
   script:
     - docker compose -f docker/docker-compose.yml config --quiet
+    # Needs none of the placeholders above: it builds its one image from this checkout.
+    - docker compose -f docker/docker-compose-ci-install.yml config --quiet
   rules: *standard_rules
 
 # Does what compose-validate CANNOT, and the two are complements, not duplicates.
@@ -411,6 +413,71 @@ postgrest-tests:
     # container, and a non-zero here would skip the `down -v` below.
     - docker compose -f docker/docker-compose-ci.yml logs haf-fyp-postgrest-rewriter || true
     - docker compose -f docker/docker-compose-ci.yml down -v
+  rules: *standard_rules
+
+# The installer and the uninstaller, run for real (#47): install; install again while a
+# block processor's lock is held, which must do nothing; install again once it is
+# released, over a database changed the way a node changes it; uninstall. A verify step
+# after each. Until this job, nothing in CI ran scripts/install_app.sh or
+# scripts/uninstall_app.sh against a database: the unit tests run them against a psql
+# that records what it is handed, and docker-build-sql only asks them for --help.
+# docker/docker-compose-ci-install.yml says what the lane covers and what it does not
+# (the database is a model of HAF, not HAF).
+#
+# tests/unit/test_install_lane.py states this job and that compose file in full and
+# compares: any change here has to be made there too.
+#
+# In the test stage, beside postgrest-tests, and independent of the build stage: it
+# builds the SQL image itself, from this checkout, so it also runs when docker-build-sql
+# would fail and says why sooner.
+install-test:
+  stage: test
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    # Recorded by the installer in haf_fyp_app.app_version, and expected there by the
+    # verify steps: the image's baked value, read back from the database.
+    HAF_FYP_GIT_HASH: $CI_COMMIT_SHORT_SHA
+  script:
+    # `timeout` on both: a step that never exits (an installer waiting on a database, a
+    # lock that is never released) would otherwise hold the job to GitLab's own limit
+    # and report "job timeout" with no log from the step that hung.
+    - timeout 900 docker compose -f docker/docker-compose-ci-install.yml up --detach --build
+    # verify-gone is LAST in the chain, and every step waits for the one before it to
+    # exit 0, so this is the whole lane. On a red lane `up` above has usually failed
+    # already (compose stops at the first step that exits non-zero and names it); the
+    # step's own log is in after_script below.
+    - timeout 600 docker compose -f docker/docker-compose-ci-install.yml wait verify-gone
+    # Exit 0 is not enough: a verify file that was emptied, or that quits at its first
+    # line, exits 0 too. Each one prints a sentence only when it has reached its end.
+    # `grep -c`, not `grep -q`: -q stops reading at the first match, `docker compose
+    # logs` then dies of SIGPIPE, and under the runner's `pipefail` the line FAILS for
+    # having found what it looked for. -c reads to the end and exits 1 on a count of 0.
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify | grep -Ec "first install. [0-9]{3,} items recorded"
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify-locked | grep -Ec "phase locked. all [0-9]{3,} items identical to the first install"
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify-again | grep -Ec "phase second. all [0-9]{3,} items identical to the first install"
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify-gone | grep -c "haf_fyp is gone and nothing else was touched"
+    - docker compose -f docker/docker-compose-ci-install.yml logs install-locked | grep -c "Skipping haf_fyp install"
+    - docker compose -f docker/docker-compose-ci-install.yml logs install-again | grep -c "Acquired install lock for haf_fyp"
+  after_script:
+    - docker compose -f docker/docker-compose-ci-install.yml ps -a || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs postgres || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs db-setup || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs install || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs age || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs lock-holder || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs install-locked || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify-locked || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs release-lock || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs install-again || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify-again || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs bystander-session || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs uninstall || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify-gone || true
+    - docker compose -f docker/docker-compose-ci-install.yml down -v || true
   rules: *standard_rules
 
 .docker-build:

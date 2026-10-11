@@ -52,7 +52,8 @@ REPO_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 # docker/.env, not .env.local: this resolves what the repository SHIPS.
 ENV_FILE="${HAF_FYP_ENV_FILE:-${REPO_ROOT}/docker/.env}"
-# Both files: docker-compose-ci.yml is what the test lanes themselves run on.
+# All three: docker-compose-ci.yml and docker-compose-ci-install.yml are what the test
+# lanes themselves run on.
 COMPOSE_FILES="${HAF_FYP_COMPOSE_FILES:-}"
 # An empty override must not mean "no Dockerfiles" (!77 skipped all three with exit 0 that
 # way): unset or blank, the repository's Dockerfile.* are found, and finding none is an error
@@ -63,7 +64,7 @@ TRIES="${HAF_FYP_RESOLVE_TRIES:-3}"
 REQUEST_TIMEOUT="${HAF_FYP_REQUEST_TIMEOUT:-20}"
 # The whole sweep's budget, and the job's `timeout:` is set ABOVE it (the lane test holds the
 # two together). Per reference the worst case is TRIES x (HEAD + token + HEAD) x
-# REQUEST_TIMEOUT plus backoff -- over three minutes -- so without a deadline ten references
+# REQUEST_TIMEOUT plus backoff -- over three minutes -- so without a deadline a dozen references
 # against a hung registry outlast any sane job timeout, and the failure arrives as a bare
 # "job timed out" instead of this script's account of what it proved. Past the deadline the
 # remaining references are reported unanswered, which fails the job.
@@ -101,7 +102,7 @@ blank() {
     esac
 }
 if blank "${COMPOSE_FILES}"; then
-    COMPOSE_FILES="${REPO_ROOT}/docker/docker-compose.yml ${REPO_ROOT}/docker/docker-compose-ci.yml"
+    COMPOSE_FILES="${REPO_ROOT}/docker/docker-compose.yml ${REPO_ROOT}/docker/docker-compose-ci.yml ${REPO_ROOT}/docker/docker-compose-ci-install.yml"
 fi
 if blank "${DOCKERFILES}"; then
     DOCKERFILES=""
