@@ -71,6 +71,21 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'haf_admin was not granted haf_fyp_owner (db/builtin_roles.sql)';
     END IF;
+
+    -- What only a real login would meet, and no step of this lane logs in as an
+    -- application role: a connection limit (the API's pool would hit it on a fresh
+    -- node), an expiry, a password (a known one is a way in wherever pg_hba accepts
+    -- passwords), a per-role setting.
+    SELECT string_agg(a.rolname || ': connection limit ' || a.rolconnlimit
+                      || ', valid until ' || coalesce(a.rolvaliduntil::text, 'forever')
+                      || ', password ' || CASE WHEN a.rolpassword IS NULL THEN 'none' ELSE 'SET' END
+                      || ', settings ' || coalesce(r.rolconfig::text, 'none'), '; ') INTO _held
+    FROM pg_authid AS a INNER JOIN pg_roles AS r ON r.oid = a.oid
+    WHERE a.rolname IN ('haf_fyp_owner', 'haf_fyp_user')
+      AND (a.rolconnlimit <> -1 OR a.rolvaliduntil IS NOT NULL OR a.rolpassword IS NOT NULL OR r.rolconfig IS NOT NULL);
+    IF _held IS NOT NULL THEN
+        RAISE EXCEPTION 'an application role has a login attribute the installer should not set: %', _held;
+    END IF;
 END
 $$;
 
@@ -149,6 +164,58 @@ BEGIN
     INNER JOIN pg_namespace AS n ON n.oid = p.pronamespace
     WHERE n.nspname = 'haf_fyp_app' AND pg_get_userbyid(p.proowner) <> 'haf_fyp_owner';
     RAISE NOTICE '% functions in haf_fyp_app are owned by the installing role, none of them SECURITY DEFINER', _n;
+END
+$$;
+
+-- Nothing OUTSIDE the two schemas was created or changed: no function, relation,
+-- schema, role or membership. A helper left in `public` is in no schema the uninstall
+-- drops, and one that is SECURITY DEFINER and owned by the installing superuser is a
+-- way to run anything as that superuser.
+DO $$
+DECLARE
+    _diff TEXT;
+BEGIN
+    SELECT string_agg(d, E'\n' ORDER BY d) INTO _diff
+    FROM (
+        SELECT '  new or changed: ' || a.i AS d
+        FROM (SELECT unnest(ci_install_lane.outside_now(FALSE))
+              EXCEPT SELECT unnest(n.item) FROM ci_install_lane.note AS n WHERE n.name = 'outside at setup') AS a (i)
+        UNION ALL
+        SELECT '  gone or changed: ' || b.i
+        FROM (SELECT unnest(n.item) FROM ci_install_lane.note AS n WHERE n.name = 'outside at setup'
+              EXCEPT SELECT unnest(ci_install_lane.outside_now(FALSE))) AS b (i)
+    ) AS x;
+    IF _diff IS NOT NULL THEN
+        RAISE EXCEPTION E'the install touched what is not in haf_fyp''s schemas:\n%', _diff;
+    END IF;
+    IF (SELECT cardinality(n.item) FROM ci_install_lane.note AS n WHERE n.name = 'outside at setup') < 50 THEN
+        RAISE EXCEPTION 'the list of what exists outside the app schemas is implausibly short';
+    END IF;
+END
+$$;
+
+-- PUBLIC is granted nothing on the two schemas or on any table, view or sequence in
+-- them: PUBLIC is every role in the database, the other applications' included.
+-- (Functions are left out: PostgreSQL grants PUBLIC EXECUTE on every new function, and
+-- without USAGE on the schema that reaches nobody.)
+DO $$
+DECLARE
+    _open TEXT;
+BEGIN
+    SELECT string_agg(o, ', ' ORDER BY o) INTO _open
+    FROM (
+        SELECT 'schema ' || n.nspname || ' (' || a.privilege_type || ')' AS o
+        FROM pg_namespace AS n, aclexplode(n.nspacl) AS a
+        WHERE n.nspname IN ('haf_fyp_app', 'haf_fyp_endpoints') AND a.grantee = 0
+        UNION ALL
+        SELECT c.oid::regclass::text || ' (' || a.privilege_type || ')'
+        FROM pg_class AS c
+        INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace, aclexplode(c.relacl) AS a
+        WHERE n.nspname IN ('haf_fyp_app', 'haf_fyp_endpoints') AND a.grantee = 0
+    ) AS x;
+    IF _open IS NOT NULL THEN
+        RAISE EXCEPTION 'granted to PUBLIC: %', _open;
+    END IF;
 END
 $$;
 
@@ -318,6 +385,16 @@ BEGIN
     IF _a.owner IS DISTINCT FROM 'haf_fyp_owner' THEN
         RAISE EXCEPTION 'the registry row is owned by %, not haf_fyp_owner', _a.owner;
     END IF;
+
+    -- The stages the context was created with: 10000 blocks a batch until 101 blocks
+    -- from the head, then live. A batch of 1 there is a first sync that takes months.
+    IF (SELECT string_agg(l.arg, ' | ' ORDER BY l.seq) FROM hive.ci_register_calls AS l
+        WHERE l.called = 'stages of haf_fyp')
+       IS DISTINCT FROM '{"(MASSIVE_PROCESSING,101,10000,00:00:20)","(live,0,1,00:00:03)"}' THEN
+        RAISE EXCEPTION 'the context was created with stages %',
+            (SELECT string_agg(l.arg, ' | ' ORDER BY l.seq) FROM hive.ci_register_calls AS l
+             WHERE l.called = 'stages of haf_fyp');
+    END IF;
 END
 $$;
 
@@ -343,13 +420,17 @@ BEGIN
     END IF;
     SELECT count(*), max(swagger_base_url) INTO _n, _base FROM haf_fyp_app.app_config;
     IF _n <> 1 OR _base IS DISTINCT FROM _want_base THEN
-        RAISE EXCEPTION 'in phase % app_config holds % rows, base URL % (expected one row, %)',
-            current_setting('ci.phase'), _n, _base, _want_base;
+        RAISE EXCEPTION 'in phase % app_config holds % rows, base URL % (expected one row, %)%',
+            current_setting('ci.phase'), _n, _base, _want_base,
+            CASE current_setting('ci.phase') WHEN 'locked'
+                THEN ': an install RAN while the block processor''s lock was held' ELSE '' END;
     END IF;
     SELECT count(*), max(git_hash) INTO _n, _hash FROM haf_fyp_app.app_version;
     IF _n <> 1 OR _hash IS DISTINCT FROM _want_hash THEN
-        RAISE EXCEPTION 'in phase % app_version holds % rows, hash % (expected one row, %)',
-            current_setting('ci.phase'), _n, _hash, _want_hash;
+        RAISE EXCEPTION 'in phase % app_version holds % rows, hash % (expected one row, %)%',
+            current_setting('ci.phase'), _n, _hash, _want_hash,
+            CASE current_setting('ci.phase') WHEN 'locked'
+                THEN ': an install RAN while the block processor''s lock was held' ELSE '' END;
     END IF;
     SELECT count(*) INTO _n FROM haf_fyp_app.feed_events_rollup_state;
     IF _n <> 1 THEN
@@ -493,6 +574,41 @@ BEGIN
         RAISE EXCEPTION 'the default privileges of step 9c (SELECT on future tables, EXECUTE on future endpoint functions) are not both in place';
     END IF;
 
+    -- EVERYTHING the application roles were granted outside their own schemas, as a
+    -- list. With no other application installed, db/cross_schema_grants.sql has two
+    -- things to grant, on hafd. One line more -- ALL on hafd's tables, say -- and the
+    -- unauthenticated role can TRUNCATE hafd.contexts, which row-level security does
+    -- not stop.
+    SELECT string_agg(g, ', ' ORDER BY g COLLATE "C") INTO _bad
+    FROM (
+        SELECT pg_get_userbyid(a.grantee) || ':' || a.privilege_type || ':' || c.oid::regclass::text AS g
+        FROM pg_class AS c
+        INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace, aclexplode(c.relacl) AS a
+        WHERE n.nspname NOT IN ('haf_fyp_app', 'haf_fyp_endpoints')
+          AND pg_get_userbyid(a.grantee) IN ('haf_fyp_owner', 'haf_fyp_user')
+        UNION ALL
+        SELECT pg_get_userbyid(a.grantee) || ':' || a.privilege_type || ':schema ' || n.nspname
+        FROM pg_namespace AS n, aclexplode(n.nspacl) AS a
+        WHERE n.nspname NOT IN ('haf_fyp_app', 'haf_fyp_endpoints')
+          AND pg_get_userbyid(a.grantee) IN ('haf_fyp_owner', 'haf_fyp_user')
+        UNION ALL
+        SELECT pg_get_userbyid(a.grantee) || ':' || a.privilege_type || ':' || p.oid::regprocedure::text
+        FROM pg_proc AS p
+        INNER JOIN pg_namespace AS n ON n.oid = p.pronamespace, aclexplode(p.proacl) AS a
+        WHERE n.nspname NOT IN ('haf_fyp_app', 'haf_fyp_endpoints')
+          AND pg_get_userbyid(a.grantee) IN ('haf_fyp_owner', 'haf_fyp_user')
+        UNION ALL
+        SELECT pg_get_userbyid(a.grantee) || ':' || a.privilege_type || ':column ' || c.oid::regclass::text || '.' || t.attname
+        FROM pg_attribute AS t
+        INNER JOIN pg_class AS c ON c.oid = t.attrelid
+        INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace, aclexplode(t.attacl) AS a
+        WHERE n.nspname NOT IN ('haf_fyp_app', 'haf_fyp_endpoints')
+          AND pg_get_userbyid(a.grantee) IN ('haf_fyp_owner', 'haf_fyp_user')
+    ) AS x;
+    IF _bad IS DISTINCT FROM 'haf_fyp_user:SELECT:hafd.accounts, haf_fyp_user:USAGE:schema hafd' THEN
+        RAISE EXCEPTION 'outside their own schemas the application roles hold: %', _bad;
+    END IF;
+
     -- Step 12, db/cross_schema_grants.sql: the one grant in it that needs no other
     -- application. haf_fyp/credibility.py reads account ids through it.
     IF NOT has_schema_privilege('haf_fyp_user', 'hafd', 'USAGE')
@@ -541,13 +657,14 @@ $$;
 -- and `second` must equal `first`: an install that is not idempotent passes on an
 -- empty database and breaks the first upgrade on a node. Function BODIES are in it, so
 -- a CREATE OR REPLACE that changes nothing shows as nothing. Data is not: what the node
--- writes is checked above, by value.
+-- writes is checked in sections 5, 6 and 10, by value.
 INSERT INTO ci_install_lane.fingerprint (taken_after, item)
 SELECT current_setting('ci.phase'), array_agg(i ORDER BY i)
 FROM (
     SELECT 'relation ' || c.relkind::text || ' ' || n.nspname || '.' || c.relname
         || ' owner=' || pg_get_userbyid(c.relowner) || ' acl=' || coalesce(c.relacl::text, '-')
         || ' rls=' || c.relrowsecurity || '/' || c.relforcerowsecurity
+        || ' persistence=' || c.relpersistence::text
         || ' options=' || coalesce(c.reloptions::text, '-') AS i
     FROM pg_class AS c
     INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
@@ -652,9 +769,6 @@ FROM (
     UNION ALL
     SELECT 'extension ' || e.extname || ' in ' || e.extnamespace::regnamespace::text
     FROM pg_extension AS e WHERE e.extname = 'vector'
-    UNION ALL
-    SELECT 'seed algorithm_versions ' || v.version || ' weights=' || md5(v.weights::text)
-    FROM haf_fyp_app.algorithm_versions AS v
 ) AS s;
 
 DO $$
@@ -700,5 +814,55 @@ BEGIN
             cardinality(_first), cardinality(_now);
     END IF;
     RAISE NOTICE 'phase %: all % items identical to the first install', current_setting('ci.phase'), cardinality(_now);
+END
+$$;
+
+-- ---------------------------------------------------------------------------------
+-- 10. What the node wrote, row for row; and, under the lock, that nothing was written
+-- ---------------------------------------------------------------------------------
+DO $$
+DECLARE
+    _diff TEXT;
+    -- The two tables every install that runs rewrites (section 6 checks their values).
+    _installers TEXT := '^table haf_fyp_app\.(app_version|app_config) ';
+BEGIN
+    IF current_setting('ci.phase') = 'first' THEN
+        RETURN;
+    END IF;
+
+    SELECT string_agg(d, E'\n' ORDER BY d) INTO _diff
+    FROM (
+        SELECT '  after age:  ' || a.i AS d
+        FROM (SELECT unnest(n.item) FROM ci_install_lane.note AS n WHERE n.name = 'data after age'
+              EXCEPT SELECT unnest(ci_install_lane.data_now())) AS a (i)
+        WHERE current_setting('ci.phase') = 'locked' OR a.i !~ _installers
+        UNION ALL
+        SELECT '  now:        ' || b.i
+        FROM (SELECT unnest(ci_install_lane.data_now())
+              EXCEPT SELECT unnest(n.item) FROM ci_install_lane.note AS n WHERE n.name = 'data after age') AS b (i)
+        WHERE current_setting('ci.phase') = 'locked' OR b.i !~ _installers
+    ) AS x;
+    IF _diff IS NOT NULL THEN
+        RAISE EXCEPTION E'in phase % the install changed rows, or moved a sequence, that are the node''s:\n%',
+            current_setting('ci.phase'), _diff;
+    END IF;
+    IF (SELECT cardinality(n.item) FROM ci_install_lane.note AS n WHERE n.name = 'data after age') < 20 THEN
+        RAISE EXCEPTION 'the record of the app''s data after age is implausibly short';
+    END IF;
+
+    -- Under the lock the installer must not have written ANYTHING: not a function
+    -- re-created with the same body, which is what a step that runs before the lock is
+    -- taken does, and which a running block processor would have had replaced under it.
+    IF current_setting('ci.phase') = 'locked' THEN
+        SELECT string_agg(d, E'\n' ORDER BY d) INTO _diff
+        FROM (
+            SELECT '  ' || a.i AS d
+            FROM (SELECT unnest(ci_install_lane.catalog_now())
+                  EXCEPT SELECT unnest(n.item) FROM ci_install_lane.note AS n WHERE n.name = 'catalog after age') AS a (i)
+        ) AS x;
+        IF _diff IS NOT NULL THEN
+            RAISE EXCEPTION E'an install ran while the block processor''s lock was held: these were written during it:\n%', _diff;
+        END IF;
+    END IF;
 END
 $$;

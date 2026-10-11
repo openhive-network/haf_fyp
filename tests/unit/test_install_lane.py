@@ -46,7 +46,7 @@ def app(command: list, after: dict) -> dict:
 def sql(command: str, after: dict, files: tuple = (), **extra) -> dict:
     """A step that runs SQL as the postgres superuser and stops at the first error."""
     step = {
-        "image": "postgres:17-alpine",
+        "image": "postgres:18-alpine",
         "entrypoint": ["/bin/sh", "-c"],
         "environment": {"PGPASSWORD": "postgres", "EXPECTED_GIT_HASH": HASH},
         "command": [command],
@@ -67,7 +67,7 @@ def verify(phase: str, after: str) -> dict:
 # install-again also waits for the lock holder to have exited.
 EXPECTED_SERVICES = {
     "postgres": {
-        "image": "pgvector/pgvector:pg17",
+        "image": "pgvector/pgvector:pg18",
         "environment": {"POSTGRES_DB": "haf_block_log", "POSTGRES_USER": "postgres",
                         "POSTGRES_PASSWORD": "postgres"},
         "healthcheck": {"test": ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d haf_block_log"],
@@ -94,8 +94,18 @@ EXPECTED_SERVICES = {
                         {"verify-locked": DONE}),
     "install-again": app(["install_app"], {"release-lock": DONE, "lock-holder": DONE}),
     "verify-again": verify("second", "install-again"),
-    "uninstall": app(["uninstall_app", "--force"], {"verify-again": DONE}),
-    "verify-gone": sql(f"{PSQL} -f /ci_uninstall_verify.sql", {"uninstall": DONE},
+    "bystander-session": sql(
+        f'PGAPPNAME=ci-bystander-session {PSQL} -c "SET ROLE ci_bystander_owner" -c "SELECT pg_sleep(1800)"',
+        {"verify-again": DONE},
+        healthcheck={
+            "test": ["CMD-SHELL",
+                     'psql -h postgres -U postgres -d haf_block_log -Atc "SELECT count(*) FROM pg_stat_activity '
+                     "WHERE application_name = 'ci-bystander-session'\" | grep -qx 1"],
+            "interval": "1s", "timeout": "3s", "retries": 30,
+        }),
+    "uninstall": app(["uninstall_app", "--force"], {"bystander-session": {"condition": "service_healthy"}}),
+    "verify-gone": sql(f"{PSQL} -f /ci_uninstall_verify.sql",
+                       {"uninstall": DONE, "bystander-session": {"condition": "service_healthy"}},
                        ("ci_uninstall_verify.sql",)),
 }
 LAST = "verify-gone"
@@ -118,6 +128,12 @@ EXPECTED_JOB = {
     "script": [
         f"timeout 900 {F} up --detach --build",
         f"timeout 600 {F} wait {LAST}",
+        f'{F} logs verify | grep -Eq "first install. [0-9]{{3,}} items recorded"',
+        f'{F} logs verify-locked | grep -Eq "phase locked. all [0-9]{{3,}} items identical to the first install"',
+        f'{F} logs verify-again | grep -Eq "phase second. all [0-9]{{3,}} items identical to the first install"',
+        f'{F} logs verify-gone | grep -q "haf_fyp is gone and nothing else was touched"',
+        f'{F} logs install-locked | grep -q "Skipping haf_fyp install"',
+        f'{F} logs install-again | grep -q "Acquired install lock for haf_fyp"',
     ],
     "after_script": [
         f"{F} ps -a || true",
@@ -201,9 +217,56 @@ def test_the_standard_rules_are_what_this_file_says_they_are(ci):
 
 
 def test_both_blocking_commands_are_bounded():
-    for line in EXPECTED_JOB["script"]:
+    for line in EXPECTED_JOB["script"][:2]:
         seconds = int(re.match(r"timeout (\d+) ", line).group(1))
         assert 60 <= seconds <= 1800, line
+
+
+# How many times each of the lane's SQL files can stop the lane. A floor, not an exact
+# count: adding a check needs no change here, removing one does.
+RAISES = {'ci_install_verify.sql': 59, 'ci_uninstall_verify.sql': 12, 'ci_install_lock_holder.sql': 1, 'ci_install_setup.sql': 7}
+
+
+@pytest.mark.parametrize("name", sorted(
+    ["ci_install_setup.sql", "ci_install_verify.sql", "ci_install_age.sql",
+     "ci_install_lock_holder.sql", "ci_uninstall_verify.sql"]))
+def test_the_sql_the_lane_runs_cannot_be_switched_off_from_inside(name):
+    """The compose file passes ON_ERROR_STOP and mounts these files; what is IN them is
+    not its business. A psql meta-command can undo the first (a `set` of ON_ERROR_STOP,
+    a quit on line one), and turning every RAISE EXCEPTION into a NOTICE undoes the
+    second while every step still exits 0."""
+    text = (ROOT / "tests" / name).read_text(encoding="utf-8")
+    meta = [line for line in text.splitlines() if line.lstrip().startswith("\\")]
+    assert not meta, f"{name} uses psql meta-commands: {meta}"
+    assert "ON_ERROR_STOP" not in text, name
+    assert len(re.findall(r"RAISE EXCEPTION", text)) >= RAISES.get(name, 0), name
+
+
+def test_the_sentences_the_job_greps_for_are_the_ones_the_files_print():
+    verify = (ROOT / "tests" / "ci_install_verify.sql").read_text(encoding="utf-8")
+    assert "RAISE NOTICE 'first install: % items recorded'" in verify
+    assert "RAISE NOTICE 'phase %: all % items identical to the first install'" in verify
+    gone = (ROOT / "tests" / "ci_uninstall_verify.sql").read_text(encoding="utf-8")
+    # The last statement of the file, after every check that can raise.
+    assert gone.rstrip().endswith("RAISE NOTICE 'haf_fyp is gone and nothing else was touched';\nEND\n$$;")
+
+
+def test_the_database_does_not_arrive_with_pgvector_created():
+    """The installer creates it when it is missing; a setup file that did so first
+    would leave that step, and the check that it ran, with nothing to do."""
+    for name in ("haf_stub.sql", "ci_install_setup.sql"):
+        assert "CREATE EXTENSION" not in (ROOT / "tests" / name).read_text(encoding="utf-8").upper(), name
+
+
+def test_the_unit_tests_that_guard_this_lane_are_themselves_run(ci):
+    """This file is only as good as the job that runs it. No `--ignore`, `-k` or
+    `--deselect` on that job's pytest line, and no forgiveness on the job."""
+    job = ci["python-tests"]
+    assert "allow_failure" not in job and job.get("when", "on_success") == "on_success"
+    assert job["rules"] == STANDARD_RULES
+    (line,) = [s for s in job["script"] if "pytest" in s and "pip install" not in s]
+    assert line.startswith("PYTHONPATH=. pytest tests/unit/ "), line
+    assert not re.search(r"--ignore|--deselect|(^|\s)-k\b|(^|\s)-m\b|--co\b|--collect-only", line), line
 
 
 def test_compose_validate_parses_the_lane(ci):

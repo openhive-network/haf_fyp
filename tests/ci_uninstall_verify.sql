@@ -58,6 +58,44 @@ BEGIN
 END
 $$;
 
+-- Outside haf_fyp's schemas the database is, object for object and privilege for
+-- privilege, what tests/ci_install_setup.sql made: nothing left behind there, nothing
+-- taken away, and every grant the installer gave its roles gone with them.
+DO $$
+DECLARE
+    _diff TEXT;
+BEGIN
+    SELECT string_agg(d, E'\n' ORDER BY d) INTO _diff
+    FROM (
+        SELECT '  left behind, or changed: ' || a.i AS d
+        FROM (SELECT unnest(ci_install_lane.outside_now(TRUE))
+              EXCEPT SELECT unnest(n.item) FROM ci_install_lane.note AS n
+              WHERE n.name = 'outside at setup, with privileges') AS a (i)
+        UNION ALL
+        SELECT '  removed, or changed:     ' || b.i
+        FROM (SELECT unnest(n.item) FROM ci_install_lane.note AS n
+              WHERE n.name = 'outside at setup, with privileges'
+              EXCEPT SELECT unnest(ci_install_lane.outside_now(TRUE))) AS b (i)
+    ) AS x;
+    IF _diff IS NOT NULL THEN
+        RAISE EXCEPTION E'after the uninstall the rest of the database is not as it was before the install:\n%', _diff;
+    END IF;
+END
+$$;
+
+-- Another application's session, opened before the uninstall, is still connected. The
+-- uninstaller refuses to run over sessions of its OWN roles; one that cleared the way
+-- by terminating everybody would take every other application on the node down.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_stat_activity AS a WHERE a.application_name = 'ci-bystander-session'
+    ) THEN
+        RAISE EXCEPTION 'the uninstall terminated another application''s session';
+    END IF;
+END
+$$;
+
 -- What it must NOT have removed.
 DO $$
 BEGIN

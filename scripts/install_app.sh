@@ -452,8 +452,9 @@ fi
 #     real EXECUTE grant, the SECURITY DEFINER hop, the definer's real group
 #     membership and HAF's real RLS policy. It is the ONLY place any of that is
 #     checked against HAF itself: the install-test lane (#47) runs this script, but
-#     over tests/haf_stub.sql, whose policy is a model of HAF's; and the fastapi-tests
-#     lane's haf_fyp_user is a superuser for whom every ACL and policy is bypassed.
+#     over a model of HAF (tests/haf_stub.sql plus tests/ci_install_setup.sql, which
+#     carries the policies); and the fastapi-tests lane's haf_fyp_user is a superuser
+#     for whom every ACL and policy is bypassed.
 #     A zero-row result (not an error) is the signature of a missing or
 #     non-inheriting membership on the definer, so assert on the count.
 psql_cmd -v ON_ERROR_STOP=on -c "
@@ -596,7 +597,7 @@ END
 #
 #     Ordering can still leave a stale hash in one direction nothing can fix: an in-place
 #     re-install that aborts at step 12, 13 or 14 has already applied the new SQL in steps
-#     1-11 while this step never runs, so /version keeps naming the previous commit on a
+#     1-10b while this step never runs, so /version keeps naming the previous commit on a
 #     partially upgraded schema. Running last is the least-bad choice, not a guarantee.
 if [ -n "${GIT_HASH:-}" ]; then
     log "Recording application version: ${GIT_HASH}"

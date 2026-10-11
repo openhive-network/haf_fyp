@@ -1471,6 +1471,8 @@ compares, so a change to either has to be made there too.
   the uninstaller's confirmation prompt are not exercised; the lane only takes the path
   where everything is in order, and `--force`.
 - `--swagger-url` is not passed.
+- hivemind is absent, so the installer does not register its dependency on it; the
+  installer always connects as a superuser; the uninstall runs once, to the end.
 
 ## SQL Linting
 

@@ -418,9 +418,11 @@ postgrest-tests:
 # The installer and the uninstaller, run for real (#47): install; install again while a
 # block processor's lock is held, which must do nothing; install again once it is
 # released, over a database changed the way a node changes it; uninstall. A verify step
-# after each. Until this job, nothing in CI executed scripts/install_app.sh or
-# scripts/uninstall_app.sh at all. docker/docker-compose-ci-install.yml says what the
-# lane covers and what it does not (the database is a model of HAF, not HAF).
+# after each. Until this job, nothing in CI ran scripts/install_app.sh or
+# scripts/uninstall_app.sh against a database: the unit tests run them against a psql
+# that records what it is handed, and docker-build-sql only asks them for --help.
+# docker/docker-compose-ci-install.yml says what the lane covers and what it does not
+# (the database is a model of HAF, not HAF).
 #
 # tests/unit/test_install_lane.py states this job and that compose file in full and
 # compares: any change here has to be made there too.
@@ -448,6 +450,14 @@ install-test:
     # already (compose stops at the first step that exits non-zero and names it); the
     # step's own log is in after_script below.
     - timeout 600 docker compose -f docker/docker-compose-ci-install.yml wait verify-gone
+    # Exit 0 is not enough: a verify file that was emptied, or that quits at its first
+    # line, exits 0 too. Each one prints a sentence only when it has reached its end.
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify | grep -Eq "first install. [0-9]{3,} items recorded"
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify-locked | grep -Eq "phase locked. all [0-9]{3,} items identical to the first install"
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify-again | grep -Eq "phase second. all [0-9]{3,} items identical to the first install"
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify-gone | grep -q "haf_fyp is gone and nothing else was touched"
+    - docker compose -f docker/docker-compose-ci-install.yml logs install-locked | grep -q "Skipping haf_fyp install"
+    - docker compose -f docker/docker-compose-ci-install.yml logs install-again | grep -q "Acquired install lock for haf_fyp"
   after_script:
     - docker compose -f docker/docker-compose-ci-install.yml ps -a || true
     - docker compose -f docker/docker-compose-ci-install.yml logs postgres || true
@@ -461,6 +471,7 @@ install-test:
     - docker compose -f docker/docker-compose-ci-install.yml logs release-lock || true
     - docker compose -f docker/docker-compose-ci-install.yml logs install-again || true
     - docker compose -f docker/docker-compose-ci-install.yml logs verify-again || true
+    - docker compose -f docker/docker-compose-ci-install.yml logs bystander-session || true
     - docker compose -f docker/docker-compose-ci-install.yml logs uninstall || true
     - docker compose -f docker/docker-compose-ci-install.yml logs verify-gone || true
     - docker compose -f docker/docker-compose-ci-install.yml down -v || true
