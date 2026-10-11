@@ -151,9 +151,12 @@ READ_REFRESH_MIN_AGE_SECONDS = max(0, _tuning("READ_REFRESH_MIN_AGE_SECONDS", "6
 # ranker busy continuously. Readers past the budget are not lost: they are stamped,
 # so the reader lane takes them. 0 turns immediate re-ranks off.
 #
+# The budget also covers readers taken ahead of their turn DURING a cycle (#85): a
+# cycle can grow by at most this many accounts over MAX_USERS_PER_CYCLE.
+#
 # The default is the readers' share of a cycle, but no more than
-# _READ_REFRESH_DEFAULT_CEILING. These run in the CYCLE_SECONDS the ranker waits
-# between cycles, and at ~0.2 s an account, 1500 of them (the plain share on a node
+# _READ_REFRESH_DEFAULT_CEILING. Between cycles these run in the CYCLE_SECONDS the
+# ranker waits, and at ~0.2 s an account, 1500 of them (the plain share on a node
 # that ranks 3000 per cycle) would fill that wait and start delaying the cycle itself.
 # Set it by hand to go higher; keep it times seconds-per-account well under
 # CYCLE_SECONDS.
@@ -380,7 +383,8 @@ def _warn_missing_read_column() -> None:
 def _listen_for_feed_reads(conn) -> None:
     """LISTEN on the session main() uses, so no second connection and no thread: the
     notifications wait on this socket and _drain_feed_reads collects them between
-    passes. LISTEN belongs to the session, which is why every reconnect repeats it.
+    passes, and between two accounts of a scheduled cycle (#85). LISTEN belongs to
+    the session, which is why every reconnect repeats it.
 
     Also decides whether the schema has last_read_at: on every connection, and after
     each cycle for as long as it does not. On a HAF with application locks that second
@@ -902,8 +906,65 @@ def _rank_user(
     write_feed_cache(conn, username, scored, algo_version)
 
 
-def run_cycle(conn) -> set[str]:
-    """One scheduled cycle. Returns the accounts whose feed it wrote."""
+def _readers_to_rank_now(
+    conn, reads: Callable[..., set[str]], done: set[str], skipped: set[str]
+) -> list[str]:
+    """Readers to take ahead of their turn in the cycle that is running (#85).
+
+    `reads` hears and stamps the reads that arrived since it was last asked and returns
+    the accounts whose feed is old enough to re-rank. It may name the same account on
+    every call (main() keeps handing over whoever is still waiting), so nobody is
+    looked at twice: not an account the cycle has taken (`done`), and not one this
+    function turned away (`skipped`, which it fills, and which run_cycle also keeps
+    out of the rest of its queue).
+
+    Best-effort, like the same step in main(): a check that fails must not cost the
+    cycle. Only a session that is gone ends it, as it does anywhere else in the cycle.
+    """
+    try:
+        early = sorted(u for u in reads(conn) if u not in done and u not in skipped)
+        if not early:
+            return []
+        # Both halves of what _run_targeted_refresh does before it ranks anyone (#10).
+        # Ranking writes the rotation row, so an account that has un-opted-in must be
+        # evicted, not ranked. And the reconcile only answers for a row that EXISTS: a
+        # reader evicted a moment ago (by this cycle's own reconcile, or by the last
+        # check) is no longer named by it, and without the membership filter would be
+        # ranked and re-enrolled.
+        evicted = _evict_unsubscribed(conn, early)
+        # Remembered before anything below can fail: the reconcile has committed, the
+        # rows are gone, and one of these may still be in run_cycle's queue.
+        skipped.update(evicted)
+        members = _rotation_members(conn, [u for u in early if u not in evicted])
+        skipped.update(u for u in early if u not in members)
+        return [u for u in early if u in members]
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        # OperationalError is also a cancelled statement, a deadlock, a lock timeout:
+        # errors of one statement on a session that is still there.
+        if conn.closed:
+            raise
+        _log_feed_read_failure()
+        _safe_rollback(conn)
+        return []
+    except Exception:
+        _log_feed_read_failure()
+        _safe_rollback(conn)
+        return []
+
+
+def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
+    """One scheduled cycle. Returns the accounts whose feed it wrote.
+
+    With `reads` (#85), the cycle asks it every POLL_SECONDS, between two accounts, and
+    ranks next whoever it returns (an account it has already taken is not taken again,
+    however long ago in the cycle that was). A cycle on a node that ranks thousands takes minutes
+    (4 to 21 were measured for 3000), and until this a read that arrived during one was
+    neither recorded nor acted on until it ended: the reader waited out the cycle, and
+    the feed function, which rations its notification on the recorded read, sent one
+    for every request of that account meanwhile. Ranking such a reader here costs one
+    account's time: the candidates are already loaded, where a targeted refresh after
+    the cycle fetches them again (about 8 s on a full node).
+    """
     global _lane_taken, _lane_slots
     _lane_taken = _lane_slots = 0  # a cycle that stops before the lane query took nobody
     register_vector_type(conn)
@@ -979,7 +1040,30 @@ def run_cycle(conn) -> set[str]:
         users.extend(survivors[: MAX_USERS_PER_CYCLE - len(users)])
     processed = failed = 0
     ranked: set[str] = set()
-    for username in users:
+    done: set[str] = set()      # attempted, ranked or not: nobody is taken twice
+    skipped: set[str] = set()   # readers turned away: evicted, or not in the rotation
+    ahead: set[str] = set()     # readers taken ahead of their turn
+    waiting = collections.deque(users)
+    next_read_check = 0.0       # before the first account: the fetches above took a while
+    while True:
+        # Between two accounts nothing is uncommitted (every write in _rank_user
+        # commits, and a failure is rolled back below), so this is where
+        # _drain_feed_reads' rollback discards nothing. At most a transaction that has
+        # only read is open: before the first account, the queries above.
+        if reads is not None and time.monotonic() >= next_read_check:
+            early = _readers_to_rank_now(conn, reads, done, skipped)
+            ahead.update(early)
+            waiting.extendleft(reversed(early))
+            next_read_check = time.monotonic() + POLL_SECONDS
+        if not waiting:
+            break
+        username = waiting.popleft()
+        if username in done or username in skipped:
+            # Taken ahead of its turn already; or turned away by a check while it was
+            # still in this queue: it passed the reconcile at the top of the cycle,
+            # then cleared its interests, and ranking it now would undo the eviction.
+            continue
+        done.add(username)
         try:
             _rank_user(conn, username, candidates, post_vectors, author_credibility, algo_version, weights)
             processed += 1
@@ -991,11 +1075,17 @@ def run_cycle(conn) -> set[str]:
             failed += 1
             _log_user_failure(username, exc)
 
-    if users:
+    if done:
         log.info(
             "refreshed personalized feeds for %d/%d cached users (%d failed)",
-            processed, len(users), failed,
+            processed, len(done), failed,
         )
+        taken = ahead & done  # not one a later check turned away before its turn came
+        if taken:
+            log.info(
+                "%d of them were readers with a stale feed, taken ahead of their turn%s",
+                len(taken), "" if len(taken) > _QUIET_REFRESH_ABOVE else f": {sorted(taken)}",
+            )
         # A clean cycle is what ends a standing failure -- see the docstring for why
         # this is not done per successful user.
         if not failed:
@@ -1272,10 +1362,21 @@ def main() -> None:
 
     conn = _connect()
     next_full_cycle = 0.0  # run immediately on startup
-    read_budget = READ_REFRESH_MAX_PER_CYCLE  # #81: immediate re-ranks left until the next cycle
+    read_budget = READ_REFRESH_MAX_PER_CYCLE  # #81: re-ranks on read left until the next cycle ends
     read_pending: set[str] = set()  # #81: stale readers waiting for the next grouped re-rank
     next_read_refresh = 0.0
     next_feed_maint = 0.0  # run feed_events rollup/prune immediately on startup
+    handed: set[str] = set()  # #85: readers given to the cycle that is running
+
+    def _reads_during_cycle(cycle_conn) -> set[str]:
+        """What run_cycle asks between two accounts: the readers to rank next. The same
+        step as the block below, under the same per-cycle budget, plus whoever was
+        already waiting for a grouped re-rank: the cycle has the candidates loaded."""
+        nonlocal read_budget
+        stale = _handle_feed_reads(cycle_conn, read_budget)
+        read_budget -= len(stale)
+        handed.update(stale)
+        return stale | read_pending
 
     while True:
         # A session can end up closed without an OperationalError ever reaching the
@@ -1328,17 +1429,22 @@ def main() -> None:
 
         # Full cycle on schedule
         if time.monotonic() >= next_full_cycle:
+            ranked: set[str] = set()
+            handed.clear()
             try:
-                # Waiting readers the cycle ranked are done. The rest keep waiting for
-                # the next grouped re-rank: a failed cycle, a full lane or a lane that
-                # is switched off took none of them, and their budget is already spent.
-                read_pending -= run_cycle(conn) or set()
+                ranked = run_cycle(conn, _reads_during_cycle) or set()
             except (psycopg2.OperationalError, psycopg2.InterfaceError):
                 log.warning("database connection lost — reconnecting")
                 conn = _reconnect(conn)
             except Exception:
                 log.exception("ranking cycle failed")
                 _safe_rollback(conn)
+            # Waiting readers the cycle ranked are done. The rest keep waiting for the
+            # next grouped re-rank, and so does everyone handed to the cycle that it did
+            # not get to: a cycle that failed, an account whose ranking failed, a lane
+            # that is full or switched off. Their budget is already spent, and they are
+            # stamped, so the feed function will not notify for them again for a while.
+            read_pending = (read_pending | handed) - ranked
             next_full_cycle = time.monotonic() + CYCLE_SECONDS
             # #81: the budget is a ceiling per cycle PERIOD, so it is renewed, and the
             # summary written, whether or not the cycle succeeded. Renewed only after a

@@ -701,7 +701,7 @@ one of those still means adding it to the service's `environment:`.
 | `READER_CYCLE_SHARE` | 0.5 | Share of a cycle recent readers may take (capped at 0.9). 0 turns the reader lane off. |
 | `READER_WINDOW_SECONDS` | 86400 | How long one read keeps an account eligible for the reader lane. |
 | `READ_REFRESH_MIN_AGE_SECONDS` | 600 | A feed younger than this is not re-ranked on read, and does not take a lane slot. |
-| `READ_REFRESH_MAX_PER_CYCLE` | `MAX_USERS_PER_CYCLE` x `READER_CYCLE_SHARE`, at most 300 | Immediate re-ranks between two scheduled cycles. 0 turns them off. They run in the 300 s the ranker waits between cycles: keep this times seconds-per-account well under `CYCLE_SECONDS`, or they start delaying the cycle. |
+| `READ_REFRESH_MAX_PER_CYCLE` | `MAX_USERS_PER_CYCLE` x `READER_CYCLE_SHARE`, at most 300 | Re-ranks on read per cycle period: between two scheduled cycles, and ahead of their turn during one (a cycle grows by at most this many accounts). 0 turns them off. Between cycles they run in the 300 s the ranker waits: keep this times seconds-per-account well under `CYCLE_SECONDS`, or they start delaying the cycle. |
 | `READ_REFRESH_BATCH_SECONDS` | 30 | After one read-triggered re-rank, the next waits this long and takes everyone who became due meanwhile. Each one fetches the candidates before ranking anyone (about 8 s on a full node), so they are grouped. 0 turns the grouping off. |
 
 What to expect, and what this does not do:
@@ -709,10 +709,12 @@ What to expect, and what this does not do:
 * **It is not immediate.** With the ranker between cycles, the refresh takes about 8 s
   once the ranker looks, which is up to 5 s after the read (one measurement on a full
   node: 9 s end to end), or up to `READ_REFRESH_BATCH_SECONDS` later if another reader
-  was served just before. The ranker hears reads between passes of its loop, so a read that arrives
-  during a scheduled cycle is handled when that ends: under a minute at the default
-  cycle size, several minutes on a node that ranks thousands per cycle. And once the
-  cycle's budget is spent, a stale reader waits for the reader lane instead.
+  was served just before. During a scheduled cycle the ranker looks every 5 s, between
+  two accounts, and ranks a stale reader next: no candidates to fetch, so it is quicker
+  than between cycles, except until the cycle starts ranking accounts (it loads its
+  candidates first). An account the cycle has already ranked is not ranked again by the
+  same cycle. And once the period's budget is spent, a read is recorded and the reader
+  waits for the reader lane instead.
 * **Everyone else rotates more slowly while the reader lane is in use**, by up to
   `1 / (1 - READER_CYCLE_SHARE)`: twice as slowly at the default when the lane is full.
   That includes the first load of someone who has not read for longer than the window.
@@ -735,7 +737,11 @@ What to expect, and what this does not do:
 
 After every scheduled cycle the ranker logs one line:
 `feed reads since the last cycle: N account(s) heard, M queued for an early re-rank; reader lane L of S slot(s)`.
-(After a cycle that failed, the lane figures read 0 of 0.)
+(After a cycle that failed, the lane figures read 0 of 0.) "Queued" includes readers the
+cycle itself ranked ahead of their turn. The cycle's own line,
+`refreshed personalized feeds for N/M cached users`, counts those too, so M can exceed
+`MAX_USERS_PER_CYCLE` by up to `READ_REFRESH_MAX_PER_CYCLE`; a line after it says how
+many there were, and names them up to 20.
 A lane that stays full means the rest of the rotation is running slower. A heard count
 in the thousands means someone is requesting other people's feeds. Nothing heard for
 days on a node whose feed is in use means the signal is not arriving; a zero now and
@@ -744,9 +750,11 @@ then is normal, because a returning reader is only heard once in ten minutes.
 **What a notifying request costs.** It takes a transaction id and a brief cluster-wide
 lock at commit, so the feed function rations it: first page only, and at most once per
 account per ten minutes *once the ranker has recorded the read*. The ranker records
-reads between passes, so during a scheduled cycle, and for as long as the ranker is
-stopped or older than this change, every first-page request notifies. If the ranker is
-going to be down for longer than a deploy, switch the signal off:
+reads about every 5 s while it waits and while a cycle ranks accounts. It does not look
+while a cycle loads its candidates, during a targeted refresh, or during hourly
+maintenance; for those stretches, and for as long as the ranker is stopped or older
+than #81, every first-page request notifies. If the ranker is going to be down for
+longer than a deploy, switch the signal off:
 
 ```sql
 -- as a superuser (haf_admin)
