@@ -1509,10 +1509,11 @@ def metrics(response: Response):
     of the ranker's haf_fyp_owner, so it can only err on the conservative side.
 
     reader_first (#86): how many accounts read their feed in the last day, how old the
-    stalest of those feeds is, how long a full rotation takes, and how full the
-    notification queue is. Read from active_users, so it needs nothing from the
-    ranker. Informational: it sets no `degraded`. See build_reader_first_report for
-    what each figure means and what to watch.
+    stalest of those feeds is, how long a full rotation takes, how long ago the ranker
+    last wrote any feed, and how full the notification queue is. Read from
+    active_users, so it needs nothing from the ranker. Informational: it sets no
+    `degraded`. See build_reader_first_report for what each figure means and what to
+    watch.
 
     A failed credibility probe reports state "unknown" (and degraded true, which fails
     safe for a monitor) rather than taking the coverage metric down with it. The
@@ -1522,7 +1523,7 @@ def metrics(response: Response):
     # _db_conn, not the inline getconn prologue: it borrows INSIDE the guarded region,
     # so a PoolError("connection pool exhausted") -- reachable with maxconn=5 and a
     # monitor polling both this and /sync-status -- is mapped to JSON here instead of
-    # escaping as a bare text/plain 500. This route also now issues five queries while
+    # escaping as a bare text/plain 500. This route also now makes five reads while
     # holding the connection, which raises the exhaustion pressure that makes it worth
     # doing. The remaining handlers still use the inline prologue (#17).
     # Headers first: the 503 below raises, and a raised HTTPException is rendered from
@@ -1560,9 +1561,11 @@ def metrics(response: Response):
             ranking_probe = fetch_ranking_sources(conn)
             servability = fetch_feed_servability(conn)
             probe = fetch_credibility_sources(conn)
-            # Last, and inside a SAVEPOINT of its own (#86): the durable form the
-            # paragraph above asks for. It cannot abort the transaction for anything
-            # added after it; if an earlier probe already has, it reports unknown.
+            # Last, and inside a SAVEPOINT of its own (#86). The paragraph above asks
+            # for one around EACH probe; this covers only the new read, so the cascade
+            # among the four before it is as it was. What it buys: this read cannot
+            # abort the transaction for anything added after it. If an earlier probe
+            # already has, it reports unknown.
             reader_first = fetch_reader_first(conn)
     except psycopg2.pool.PoolError as exc:
         # Monitors poll this route, so a persistently exhausted pool must not write a

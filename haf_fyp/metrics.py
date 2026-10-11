@@ -1,5 +1,6 @@
 """
-Health metrics for the signals that fail soft (#15 embeddings, #8 credibility).
+Health metrics for the signals that fail soft (#15 embeddings, #8 credibility, #36
+ranking sources) and for reader-first ranking (#86).
 
 Turns the precomputed haf_fyp_app.embedding_coverage_daily rollup (refreshed
 hourly by the ranker daemon via haf_fyp_app.refresh_embedding_coverage) into the
@@ -24,8 +25,9 @@ that simply has no balance tracker (fine, "absent").
 Unlike embedding coverage, this is NOT precomputed. That rollup is a table because
 the candidate scan behind it is multi-second; the credibility probe is a single
 indexed catalog read, and an inline answer cannot go stale -- which matters here
-because nothing in this app reports ranker liveness, so a persisted row written by a
-dead daemon would keep reporting the last known-good state indefinitely.
+because a persisted row written by a dead daemon would keep reporting the last
+known-good state indefinitely. (The reader_first section at the end of this module is
+the one place the app reports whether the ranker is ranking: newest_feed_seconds.)
 """
 
 from __future__ import annotations
@@ -527,7 +529,7 @@ def fetch_credibility_sources(conn) -> dict | None:
 
 # --------------------------------------------------------------------------
 # reader_first (#86): who reads, how fresh their feeds are, how long the
-# rotation takes
+# rotation takes, and whether the ranker is ranking at all
 # --------------------------------------------------------------------------
 #
 # Reader-first ranking (#81, #85) reports itself in the ranker's log, one line per
@@ -536,27 +538,52 @@ def fetch_credibility_sources(conn) -> dict | None:
 # from haf_fyp_app.active_users, so it needs nothing from the ranker process and says
 # what IS, not what a daemon that may have stopped last reported.
 #
-# Two figures depend on ranker settings this process cannot see, so they are computed
-# with the settings' DEFAULTS and the report says which values it used:
+# Three figures depend on ranker settings this process is not given, so they are
+# computed with the settings' DEFAULTS and the report says which values it used:
 #   READER_WINDOW_SECONDS        -> READER_FIRST_WINDOW_SECONDS
+#       readers_in_window, readers_due, oldest_reader_feed_seconds
 #   READ_REFRESH_MIN_AGE_SECONDS -> READER_FIRST_DUE_AFTER_SECONDS
-# A node that changed either reads these two counts against its own setting.
+#       readers_due
+# On a node that changed either, those three describe a lane the ranker does not run:
+# with a shorter window, accounts the ranker no longer treats as readers are counted
+# here, and their feeds are as old as the rotation.
 READER_FIRST_WINDOW_SECONDS = 24 * 60 * 60
 READER_FIRST_DUE_AFTER_SECONDS = 600
 
 READER_FIRST_OK = "ok"
 READER_FIRST_UNSUPPORTED = "unsupported"
-READER_FIRST_UNKNOWN = "unknown"
+# The same word, with the same meaning, as the credibility section's: this section
+# could not be read. Shared on purpose, unlike the ranking states, which are prefixed
+# because they are a different enum under the same key.
+READER_FIRST_UNKNOWN = STATE_UNKNOWN
 
-# One pass over the rotation (one row per ranked account: tens of thousands on a full
-# node, a few milliseconds). last_scored_at and last_read_at are naive UTC, as the
-# ranker writes them, so every comparison is against NOW() AT TIME ZONE 'utc'.
+# How long the read may wait for its lock on active_users. An install ALTERs that table
+# on every run; queued behind a long ranker transaction, it would make every poll of
+# this route wait behind it, each holding one of the pool's five connections.
+_READER_FIRST_LOCK_TIMEOUT = "2s"
+
+# One pass over the rotation (one row per ranked account: 51 ms for 45,000 on a full
+# node). No index helps: the counts and the two MINs need every row.
+#
+# last_scored_at and last_read_at are naive UTC, as the ranker writes them, so the
+# clock they are compared with is taken AT TIME ZONE 'utc'. It is the STATEMENT's
+# clock, not NOW(): the route's reads share one transaction, NOW() is frozen when the
+# first of them starts, and under READ COMMITTED this statement still sees a feed the
+# ranker stamped after that. Even so an age can come out negative (the ranker stamps
+# last_scored_at from its own container's clock); _seconds() holds it at zero. Not
+# GREATEST(0, ...) here: GREATEST ignores NULL, so an empty rotation would report an
+# age of 0, "perfectly fresh", for feeds that do not exist.
+#
+# pg_notification_queue_usage() is not a pure read: it first advances the queue's tail
+# under two exclusive lightweight locks, the same work a NOTIFY commit does now and
+# then. Microseconds, and fine at a monitor's rate; not something to call per request.
 _READER_FIRST_SQL = """
-WITH t AS (SELECT (NOW() AT TIME ZONE 'utc') AS now_utc)
+WITH t AS (SELECT (statement_timestamp() AT TIME ZONE 'utc') AS now_utc)
 SELECT
     COUNT(*),
     COUNT(*) FILTER (WHERE au.last_scored_at IS NULL),
     EXTRACT(EPOCH FROM (SELECT now_utc FROM t) - MIN(au.last_scored_at)),
+    EXTRACT(EPOCH FROM (SELECT now_utc FROM t) - MAX(au.last_scored_at)),
     COUNT(*) FILTER (WHERE au.last_read_at >= (SELECT now_utc FROM t) - make_interval(secs => %(window)s)),
     COUNT(*) FILTER (
         WHERE au.last_read_at >= (SELECT now_utc FROM t) - make_interval(secs => %(window)s)
@@ -571,26 +598,36 @@ SELECT
 _READER_FIRST_SAVEPOINT = "haf_fyp_metrics_reader_first"
 
 
+def _seconds(value) -> int | None:
+    """Whole seconds, truncated and never negative; None stays None (0 is an age, not
+    an absence)."""
+    return None if value is None else max(0, int(value))
+
+
 def fetch_reader_first(conn) -> dict | None:
     """
     Read the reader-first figures, or None if they could not be read.
 
-    Runs LAST on GET /metrics and inside a SAVEPOINT, which is the durable answer the
-    sibling probes' docstrings ask for when a fourth read is added: the reads share one
-    connection and one transaction, and without it a failure here would leave that
-    transaction aborted for whatever is added after, exactly as the others do to each
-    other. With it, this read can fail without touching anything else. The reverse
-    does not hold and is not meant to: if an earlier probe has already aborted the
-    transaction, the SAVEPOINT itself is refused and this reports unknown.
+    Runs LAST on GET /metrics and inside a SAVEPOINT of its own. The route's reads
+    share one connection and one transaction; the four before this one still abort it
+    for each other when one fails (their docstrings say a SAVEPOINT around each would
+    stop that). This one at least does not add to the cascade: it can fail without
+    leaving the transaction aborted for anything read after it. The reverse does not
+    hold and is not meant to: if an earlier probe has already aborted the transaction,
+    the SAVEPOINT itself is refused and this reports unknown.
 
     `{"unsupported": True}` means active_users has no last_read_at column: the
     installed SQL predates #81 while this API image does not. That is a state an
-    operator can act on (re-run the install), so it is told apart from a failure.
+    operator can act on, so it is told apart from a failure.
     """
     try:
         with conn.cursor() as cur:
             cur.execute(f"SAVEPOINT {_READER_FIRST_SAVEPOINT}")
             try:
+                # Undone with the savepoint on failure; on success it lasts to the end
+                # of the transaction, which is fine: this is the last read, and the
+                # pool rolls the transaction back.
+                cur.execute(f"SET LOCAL lock_timeout = '{_READER_FIRST_LOCK_TIMEOUT}'")
                 cur.execute(
                     _READER_FIRST_SQL,
                     {"window": READER_FIRST_WINDOW_SECONDS, "due": READER_FIRST_DUE_AFTER_SECONDS},
@@ -598,18 +635,22 @@ def fetch_reader_first(conn) -> dict | None:
                 row = cur.fetchone()
             except Exception as exc:
                 cur.execute(f"ROLLBACK TO SAVEPOINT {_READER_FIRST_SAVEPOINT}")
-                if getattr(exc, "pgcode", None) == "42703":  # undefined_column
+                # undefined_column, and it is THIS column: last_scored_at has been in
+                # the table since it was created, but naming the wrong one would send
+                # an operator to fix what is not broken.
+                if getattr(exc, "pgcode", None) == "42703" and "last_read_at" in str(exc):
                     return {"unsupported": True}
                 raise
             cur.execute(f"RELEASE SAVEPOINT {_READER_FIRST_SAVEPOINT}")
-        size, never, rotation_age, readers, due, oldest_reader, queue = row
+        size, never, rotation_age, newest, readers, due, oldest_reader, queue = row
         return {
             "rotation_size": int(size),
             "never_ranked": int(never),
-            "rotation_age_seconds": None if rotation_age is None else int(rotation_age),
+            "rotation_age_seconds": _seconds(rotation_age),
+            "newest_feed_seconds": _seconds(newest),
             "readers_in_window": int(readers),
             "readers_due": int(due),
-            "oldest_reader_feed_seconds": None if oldest_reader is None else int(oldest_reader),
+            "oldest_reader_feed_seconds": _seconds(oldest_reader),
             "notification_queue_usage": float(queue),
         }
     except Exception as exc:
@@ -623,23 +664,39 @@ def build_reader_first_report(probe: dict | None) -> dict:
     """
     The reader_first section of GET /metrics.
 
-    Informational: it never sets a top-level `degraded`. What to watch:
+    Informational: it never sets a `degraded`. Every threshold on these figures is
+    either specific to the node (how long its cycles take, how big its rotation is) or
+    depends on settings this process is not given, so a flag here would page on a small
+    node, or on one account that cannot be ranked. What to watch:
 
+      newest_feed_seconds -- how long ago the ranker last wrote ANY feed. The liveness
+          figure: a ranking ranker writes feeds for most of every cycle and then waits
+          CYCLE_SECONDS, so this stays under about ten minutes on any node, whatever
+          its size. Well above that, the ranker is not ranking anyone.
       oldest_reader_feed_seconds -- the number reader-first ranking exists to keep
-          low: the stalest feed among accounts that read theirs within the window.
-          Minutes when the ranker keeps up; it approaches rotation_age_seconds when
-          readers are not being put first (ranker stopped, signal not arriving, lane
-          full).
+          low: the stalest feed among accounts that read theirs within the window
+          (readers with no feed yet are not in it; never_ranked counts those). A
+          reader's feed is re-ranked once it is READ_REFRESH_MIN_AGE_SECONDS old, by
+          the next cycle that starts: so up to about 15 minutes plus the length of one
+          cycle is healthy (12 minutes on a small node, half an hour on one whose
+          cycles take 20). Well above that, readers are not being put first: signal
+          not arriving, lane full, or ranker stopped.
       readers_due -- readers whose feed is older than the minimum age, i.e. what the
-          reader lane will take next. Compare it with the lane's size on this node
-          (MAX_USERS_PER_CYCLE x READER_CYCLE_SHARE): at or above it, the lane is
-          full, everyone else is rotating more slowly, and if nothing explains that
-          many readers, someone is requesting other people's feeds (#84).
-      rotation_age_seconds -- how long a full rotation takes right now: the age of
-          the stalest ranked feed. never_ranked accounts are not in it; they go first.
+          reader lane takes next. It falls after every cycle. STAYING at or above the
+          lane's size (MAX_USERS_PER_CYCLE x READER_CYCLE_SHARE: 100 at the defaults)
+          across scrapes means the lane is full, everyone else is rotating more
+          slowly, and if nothing explains that many readers, someone is requesting
+          other people's feeds (#84).
+      rotation_age_seconds -- the age of the stalest ranked feed: how long a full
+          rotation takes now. Hours on a large node. It also grows without limit when
+          ONE account fails to rank every cycle ("failed to rank user" in the ranker's
+          log), so it is not the liveness figure; newest_feed_seconds is.
+      never_ranked -- accounts with no feed yet. They go first, so above 0 for more
+          than a few cycles means they are failing to rank, or nothing is ranking.
       notification_queue_usage -- the fraction (0 to 1) of PostgreSQL's notification
-          queue in use, cluster-wide. It grows only while some listening session sits
-          in a long transaction; at 1 every NOTIFY in the cluster fails.
+          queue in use, cluster-wide. It grows only while some session that LISTENs,
+          this app's or any other's, sits in a long transaction; at 1 every NOTIFY in
+          the cluster fails.
     """
     if probe is None:
         return {
@@ -651,7 +708,9 @@ def build_reader_first_report(probe: dict | None) -> dict:
             "state": READER_FIRST_UNSUPPORTED,
             "detail": (
                 "haf_fyp_app.active_users has no last_read_at column: the installed SQL "
-                "predates reader-first ranking. Re-run the install."
+                "predates reader-first ranking. Re-run the install, with the block "
+                "processor and the ranker stopped (it is skipped while either holds "
+                "HAF's lock)."
             ),
         }
     return {
@@ -664,5 +723,6 @@ def build_reader_first_report(probe: dict | None) -> dict:
         "rotation_size": probe["rotation_size"],
         "never_ranked": probe["never_ranked"],
         "rotation_age_seconds": probe["rotation_age_seconds"],
+        "newest_feed_seconds": probe["newest_feed_seconds"],
         "notification_queue_usage": probe["notification_queue_usage"],
     }

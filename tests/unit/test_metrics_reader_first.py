@@ -10,7 +10,9 @@ import pytest
 from haf_fyp import metrics
 from haf_fyp.metrics import build_reader_first_report, fetch_reader_first
 
-ROW = (45000, 12, 14012.7, 9, 2, 431.2, 0.0)
+# rotation size, never ranked, rotation age, newest feed, readers, due, oldest reader
+# feed, queue usage. The ages are x.9 so that rounding and truncating differ.
+ROW = (45000, 12, 14012.9, 61.9, 9, 2, 431.9, 0.0)
 
 
 class _Cursor:
@@ -43,6 +45,16 @@ def _conn(cursor):
     return conn
 
 
+class _StrictCursor(_Cursor):
+    """As psycopg2: fetchone() answers for the LAST statement executed, and a statement
+    that returns no rows (SAVEPOINT, SET, RELEASE, ROLLBACK TO) leaves nothing to fetch."""
+
+    def fetchone(self):
+        if not self.statements[-1].lstrip().upper().startswith(("SELECT", "WITH")):
+            raise RuntimeError("no results to fetch")  # psycopg2.ProgrammingError
+        return self.row
+
+
 class _PgError(Exception):
     def __init__(self, message, pgcode):
         super().__init__(message)
@@ -55,8 +67,8 @@ class _PgError(Exception):
 def test_the_report_carries_every_figure_and_the_settings_it_assumed():
     probe = {
         "rotation_size": 45000, "never_ranked": 12, "rotation_age_seconds": 14012,
-        "readers_in_window": 9, "readers_due": 2, "oldest_reader_feed_seconds": 431,
-        "notification_queue_usage": 0.0,
+        "newest_feed_seconds": 61, "readers_in_window": 9, "readers_due": 2,
+        "oldest_reader_feed_seconds": 431, "notification_queue_usage": 0.0,
     }
 
     assert build_reader_first_report(probe) == {
@@ -70,8 +82,16 @@ def test_the_report_carries_every_figure_and_the_settings_it_assumed():
         "rotation_size": 45000,
         "never_ranked": 12,
         "rotation_age_seconds": 14012,
+        "newest_feed_seconds": 61,
         "notification_queue_usage": 0.0,
     }
+
+
+def test_the_unknown_state_is_the_word_the_credibility_section_uses():
+    # One vocabulary for "this section could not be read" across the payload.
+    from haf_fyp.credibility import STATE_UNKNOWN
+
+    assert build_reader_first_report(None)["state"] == STATE_UNKNOWN == "unknown"
 
 
 def test_the_assumed_settings_are_the_rankers_defaults():
@@ -100,14 +120,15 @@ def test_the_assumed_settings_are_the_rankers_defaults():
 def test_no_readers_and_an_empty_rotation_are_reported_as_such_not_as_zero_seconds():
     probe = {
         "rotation_size": 0, "never_ranked": 0, "rotation_age_seconds": None,
-        "readers_in_window": 0, "readers_due": 0, "oldest_reader_feed_seconds": None,
-        "notification_queue_usage": 0.0,
+        "newest_feed_seconds": None, "readers_in_window": 0, "readers_due": 0,
+        "oldest_reader_feed_seconds": None, "notification_queue_usage": 0.0,
     }
     report = build_reader_first_report(probe)
 
     # 0 would read as "perfectly fresh"; there is nothing to be fresh.
     assert report["oldest_reader_feed_seconds"] is None
     assert report["rotation_age_seconds"] is None
+    assert report["newest_feed_seconds"] is None
     assert report["state"] == "ok"
 
 
@@ -123,12 +144,16 @@ def test_a_schema_without_the_column_is_told_apart_from_a_failure():
 
     assert report["state"] == "unsupported"
     assert "last_read_at" in report["detail"] and "install" in report["detail"]
+    # The install is skipped while the processor or the ranker runs: "re-run the
+    # install" alone does nothing.
+    assert "stopped" in report["detail"]
     assert set(report) == {"state", "detail"}
 
 
 @pytest.mark.parametrize("probe", [None, {"unsupported": True}, {
-    "rotation_size": 1, "never_ranked": 0, "rotation_age_seconds": 5, "readers_in_window": 1,
-    "readers_due": 0, "oldest_reader_feed_seconds": 5, "notification_queue_usage": 0.5}])
+    "rotation_size": 1, "never_ranked": 0, "rotation_age_seconds": 5, "newest_feed_seconds": 5,
+    "readers_in_window": 1, "readers_due": 0, "oldest_reader_feed_seconds": 5,
+    "notification_queue_usage": 0.5}])
 def test_the_section_never_carries_a_degraded_flag(probe):
     # Informational. A monitor alerting on `degraded` anywhere in /metrics must not be
     # paged by a quiet day or a full lane.
@@ -138,26 +163,58 @@ def test_the_section_never_carries_a_degraded_flag(probe):
 # ---- the probe ----------------------------------------------------------------------------
 
 
-def test_the_probe_reads_inside_a_savepoint_and_releases_it():
+def test_the_probe_reads_inside_a_savepoint_with_a_lock_deadline_and_releases_it():
     cur = _Cursor()
     probe = fetch_reader_first(_conn(cur))
 
     assert cur.statements[0] == "SAVEPOINT haf_fyp_metrics_reader_first"
-    assert "FROM haf_fyp_app.active_users" in cur.statements[1]
-    assert cur.statements[2] == "RELEASE SAVEPOINT haf_fyp_metrics_reader_first"
-    assert len(cur.statements) == 3
+    # Inside the savepoint, so a failed read takes the setting back with it, and before
+    # the read, which is the statement that waits for the table.
+    assert cur.statements[1] == "SET LOCAL lock_timeout = '2s'"
+    assert "FROM haf_fyp_app.active_users" in cur.statements[2]
+    assert cur.statements[3] == "RELEASE SAVEPOINT haf_fyp_metrics_reader_first"
+    assert len(cur.statements) == 4
     assert probe == {
         "rotation_size": 45000, "never_ranked": 12, "rotation_age_seconds": 14012,
-        "readers_in_window": 9, "readers_due": 2, "oldest_reader_feed_seconds": 431,
-        "notification_queue_usage": 0.0,
+        "newest_feed_seconds": 61, "readers_in_window": 9, "readers_due": 2,
+        "oldest_reader_feed_seconds": 431, "notification_queue_usage": 0.0,
     }
+
+
+def test_the_row_is_fetched_before_the_savepoint_is_released():
+    probe = fetch_reader_first(_conn(_StrictCursor()))
+
+    assert probe is not None and probe["rotation_size"] == 45000
+
+
+def test_the_ages_are_truncated_not_rounded():
+    probe = fetch_reader_first(_conn(_Cursor(row=(1, 0, 59.9, 59.9, 1, 0, 59.9, 0.0))))
+
+    assert (probe["rotation_age_seconds"], probe["newest_feed_seconds"],
+            probe["oldest_reader_feed_seconds"]) == (59, 59, 59)
+
+
+def test_an_age_below_zero_is_reported_as_zero():
+    # The ranker stamps feeds from its own container's clock, which may be ahead.
+    probe = fetch_reader_first(_conn(_Cursor(row=(1, 0, -3.2, -30.0, 1, 0, -0.4, 0.0))))
+
+    assert (probe["rotation_age_seconds"], probe["newest_feed_seconds"],
+            probe["oldest_reader_feed_seconds"]) == (0, 0, 0)
+
+
+def test_an_age_of_zero_seconds_is_zero_not_null():
+    probe = fetch_reader_first(_conn(_Cursor(row=(1, 0, 0, 0, 1, 0, 0.0, 0.0))))
+
+    assert probe["rotation_age_seconds"] == 0
+    assert probe["newest_feed_seconds"] == 0
+    assert probe["oldest_reader_feed_seconds"] == 0
 
 
 def test_the_probe_passes_the_assumed_settings_to_the_query():
     cur = _Cursor()
     fetch_reader_first(_conn(cur))
 
-    assert cur.params[1] == {"window": 86400, "due": 600}
+    assert cur.params[2] == {"window": 86400, "due": 600}
 
 
 def test_the_query_names_its_schema_and_uses_utc():
@@ -166,15 +223,21 @@ def test_the_query_names_its_schema_and_uses_utc():
     sql = " ".join(metrics._READER_FIRST_SQL.split())
 
     assert "FROM haf_fyp_app.active_users" in sql
-    assert "NOW() AT TIME ZONE 'utc'" in sql
-    assert sql.count("NOW()") == 1  # one clock reading for every comparison
+    # The statement's clock, read once: NOW() is frozen when the route's first read
+    # opens the transaction, and this statement sees feeds stamped after that.
+    assert sql.count("statement_timestamp() AT TIME ZONE 'utc'") == 1
+    assert "NOW()" not in sql.upper() and "CURRENT_TIMESTAMP" not in sql.upper()
+    # No GREATEST(0, ...) around an age: it ignores NULL, and would turn "no feeds" into
+    # "zero seconds old". The clamp is in Python.
+    assert "GREATEST" not in sql.upper()
 
 
 def test_nulls_from_the_server_stay_null():
-    cur = _Cursor(row=(0, 0, None, 0, 0, None, 0.0))
+    cur = _Cursor(row=(0, 0, None, None, 0, 0, None, 0.0))
     probe = fetch_reader_first(_conn(cur))
 
     assert probe["rotation_age_seconds"] is None
+    assert probe["newest_feed_seconds"] is None
     assert probe["oldest_reader_feed_seconds"] is None
 
 
@@ -199,6 +262,37 @@ def test_a_missing_column_is_unsupported_and_also_rolled_back():
     )
 
     assert fetch_reader_first(_conn(cur)) == {"unsupported": True}
+    assert cur.statements[-1] == "ROLLBACK TO SAVEPOINT haf_fyp_metrics_reader_first"
+
+
+def test_a_missing_column_that_is_not_last_read_at_is_a_failure_not_unsupported():
+    # Same error code. Telling an operator the install predates reader-first ranking
+    # because some OTHER column is missing would send them to fix what is not broken.
+    cur = _Cursor(
+        fail_on="FROM haf_fyp_app.active_users",
+        error=_PgError('column au.last_scored_at does not exist', "42703"),
+    )
+
+    assert fetch_reader_first(_conn(cur)) is None
+
+
+def test_an_error_that_is_not_the_servers_is_unknown_rolled_back_and_named(caplog):
+    cur = _Cursor(fail_on="FROM haf_fyp_app.active_users", error=RuntimeError("boom"))
+    with caplog.at_level("WARNING"):
+        probe = fetch_reader_first(_conn(cur))
+
+    assert probe is None  # no pgcode at all: not "unsupported"
+    assert cur.statements[-1] == "ROLLBACK TO SAVEPOINT haf_fyp_metrics_reader_first"
+    assert "boom" in caplog.text  # the log names the real error, not an AttributeError
+
+
+def test_a_lock_that_is_not_granted_in_time_is_unknown_and_rolled_back():
+    cur = _Cursor(
+        fail_on="FROM haf_fyp_app.active_users",
+        error=_PgError("canceling statement due to lock timeout", "55P03"),
+    )
+
+    assert fetch_reader_first(_conn(cur)) is None
     assert cur.statements[-1] == "ROLLBACK TO SAVEPOINT haf_fyp_metrics_reader_first"
 
 
@@ -261,8 +355,8 @@ def _route(monkeypatch, reader_first):
 def test_the_route_reports_the_section_built_from_its_own_probe(monkeypatch):
     probe = {
         "rotation_size": 3, "never_ranked": 1, "rotation_age_seconds": 60,
-        "readers_in_window": 2, "readers_due": 1, "oldest_reader_feed_seconds": 30,
-        "notification_queue_usage": 0.25,
+        "newest_feed_seconds": 4, "readers_in_window": 2, "readers_due": 1,
+        "oldest_reader_feed_seconds": 30, "notification_queue_usage": 0.25,
     }
     report, _order, _conns = _route(monkeypatch, probe)
 
@@ -288,3 +382,32 @@ def test_a_reader_first_read_that_fails_does_not_take_the_route_down(monkeypatch
 
     assert report["reader_first"]["state"] == "unknown"
     assert "embedding_coverage" in report
+
+
+def test_the_route_reads_reader_first_while_it_still_holds_the_connection(monkeypatch):
+    from haf_fyp import api
+
+    held, seen = [], []
+
+    @contextmanager
+    def _conn_cm():
+        conn = MagicMock()
+        held.append(conn)
+        try:
+            yield conn
+        finally:
+            held.remove(conn)
+
+    monkeypatch.setattr(api, "_db_conn", _conn_cm)
+    monkeypatch.setattr(api, "fetch_coverage_rows", lambda conn: [])
+    monkeypatch.setattr(api, "fetch_ranking_sources", lambda conn: None)
+    monkeypatch.setattr(api, "fetch_feed_servability", lambda conn: None)
+    monkeypatch.setattr(api, "fetch_credibility_sources", lambda conn: None)
+    monkeypatch.setattr(api, "fetch_reader_first", lambda conn: seen.append(conn in held))
+    monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
+    monkeypatch.setattr(api, "build_credibility_sources_report", lambda probe: {})
+    monkeypatch.setattr(api, "build_ranking_sources_report", lambda probe, serv: {})
+
+    api.metrics(MagicMock())
+
+    assert seen == [True]  # after the `with`, the connection is back in the pool
