@@ -128,12 +128,12 @@ EXPECTED_JOB = {
     "script": [
         f"timeout 900 {F} up --detach --build",
         f"timeout 600 {F} wait {LAST}",
-        f'{F} logs verify | grep -Eq "first install. [0-9]{{3,}} items recorded"',
-        f'{F} logs verify-locked | grep -Eq "phase locked. all [0-9]{{3,}} items identical to the first install"',
-        f'{F} logs verify-again | grep -Eq "phase second. all [0-9]{{3,}} items identical to the first install"',
-        f'{F} logs verify-gone | grep -q "haf_fyp is gone and nothing else was touched"',
-        f'{F} logs install-locked | grep -q "Skipping haf_fyp install"',
-        f'{F} logs install-again | grep -q "Acquired install lock for haf_fyp"',
+        f'{F} logs verify | grep -Ec "first install. [0-9]{{3,}} items recorded"',
+        f'{F} logs verify-locked | grep -Ec "phase locked. all [0-9]{{3,}} items identical to the first install"',
+        f'{F} logs verify-again | grep -Ec "phase second. all [0-9]{{3,}} items identical to the first install"',
+        f'{F} logs verify-gone | grep -c "haf_fyp is gone and nothing else was touched"',
+        f'{F} logs install-locked | grep -c "Skipping haf_fyp install"',
+        f'{F} logs install-again | grep -c "Acquired install lock for haf_fyp"',
     ],
     "after_script": [
         f"{F} ps -a || true",

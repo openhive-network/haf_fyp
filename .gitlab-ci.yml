@@ -452,12 +452,15 @@ install-test:
     - timeout 600 docker compose -f docker/docker-compose-ci-install.yml wait verify-gone
     # Exit 0 is not enough: a verify file that was emptied, or that quits at its first
     # line, exits 0 too. Each one prints a sentence only when it has reached its end.
-    - docker compose -f docker/docker-compose-ci-install.yml logs verify | grep -Eq "first install. [0-9]{3,} items recorded"
-    - docker compose -f docker/docker-compose-ci-install.yml logs verify-locked | grep -Eq "phase locked. all [0-9]{3,} items identical to the first install"
-    - docker compose -f docker/docker-compose-ci-install.yml logs verify-again | grep -Eq "phase second. all [0-9]{3,} items identical to the first install"
-    - docker compose -f docker/docker-compose-ci-install.yml logs verify-gone | grep -q "haf_fyp is gone and nothing else was touched"
-    - docker compose -f docker/docker-compose-ci-install.yml logs install-locked | grep -q "Skipping haf_fyp install"
-    - docker compose -f docker/docker-compose-ci-install.yml logs install-again | grep -q "Acquired install lock for haf_fyp"
+    # `grep -c`, not `grep -q`: -q stops reading at the first match, `docker compose
+    # logs` then dies of SIGPIPE, and under the runner's `pipefail` the line FAILS for
+    # having found what it looked for. -c reads to the end and exits 1 on a count of 0.
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify | grep -Ec "first install. [0-9]{3,} items recorded"
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify-locked | grep -Ec "phase locked. all [0-9]{3,} items identical to the first install"
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify-again | grep -Ec "phase second. all [0-9]{3,} items identical to the first install"
+    - docker compose -f docker/docker-compose-ci-install.yml logs verify-gone | grep -c "haf_fyp is gone and nothing else was touched"
+    - docker compose -f docker/docker-compose-ci-install.yml logs install-locked | grep -c "Skipping haf_fyp install"
+    - docker compose -f docker/docker-compose-ci-install.yml logs install-again | grep -c "Acquired install lock for haf_fyp"
   after_script:
     - docker compose -f docker/docker-compose-ci-install.yml ps -a || true
     - docker compose -f docker/docker-compose-ci-install.yml logs postgres || true
