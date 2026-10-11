@@ -130,9 +130,9 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM hafd.contexts AS c
-        INNER JOIN hafd.contexts_attachment AS t ON t.context_name = c.name
         WHERE c.name = 'ci_bystander' AND c.owner = 'ci_bystander_owner'
-          AND c.current_block_num = 4242 AND c.schema = 'ci_bystander_app' AND NOT t.is_attached
+          AND c.current_block_num = 4242 AND c.schema = 'ci_bystander_app'
+          AND NOT hive.app_context_is_attached('ci_bystander')
     ) THEN
         RAISE EXCEPTION 'the uninstall changed or removed another application''s context';
     END IF;

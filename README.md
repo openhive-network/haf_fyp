@@ -1359,8 +1359,8 @@ the work up regardless.
 ## Checking that the pinned images still exist
 
 `scripts/check_pinned_images.sh` resolves every image this repository pins — everything the
-compose files **pull** (`docker/docker-compose.yml`, `docker/docker-compose-ci.yml` and
-`docker/docker-compose-ci-install.yml`, through `docker/.env`), plus every `FROM` in `Dockerfile.*` — and fails when one of them no
+compose files **pull** (`docker/docker-compose.yml`, `docker/docker-compose-ci.yml` and the two
+`docker/docker-compose-ci-install*.yml`, through `docker/.env`), plus every `FROM` in `Dockerfile.*` — and fails when one of them no
 longer exists in its registry. Twelve references today.
 
 It passes **only when every reference was positively resolved**
@@ -1464,11 +1464,19 @@ runs rather than another green tick.
 API_URL=http://localhost:3000 tavern-ci tests/tavern/test_endpoints.tavern.yaml
 ```
 
-### The install lane
+### The install lanes
 
-`install-test` in CI runs the installer and the uninstaller for real
+Two CI jobs run the installer and the uninstaller for real
 ([#47](https://gitlab.syncad.com/hive/haf_fyp/-/issues/47)), from the SQL image, as
-`haf_admin`, on PostgreSQL 17:
+`haf_admin`, through the same steps and the same check files:
+
+| job | compose file | the database |
+|---|---|---|
+| `install-test` | `docker/docker-compose-ci-install.yml` | PostgreSQL 18 with a **model** of HAF (`tests/haf_stub.sql`, `tests/ci_install_haf_model.sql`). Fast, pulls nothing large |
+| `install-test-haf` | `docker/docker-compose-ci-install-haf.yml` | **HAF itself**: the image `docker/.env` pins, initialised once by hived (`--exit-before-sync`) and then served without it (`--skip-hived`). No replay, no blocks |
+
+The second is the one that says the installer works on HAF, and the one that goes red
+if HAF moves away from the model. To run either by hand (the model lane shown):
 
 ```bash
 docker compose -f docker/docker-compose-ci-install.yml up --detach --build
@@ -1490,13 +1498,10 @@ docker compose -f docker/docker-compose-ci-install.yml down -v
 `tests/unit/test_install_lane.py` states the compose file and the CI job in full and
 compares, so a change to either has to be made there too.
 
-**What it does not cover.**
+**What neither covers.**
 
-- The database is PostgreSQL with pgvector, `tests/haf_stub.sql` and
-  `tests/ci_install_setup.sql`, which together model the HAF application API. It is not
-  HAF: a change in HAF itself does not turn this lane red.
-- No block is processed. The processors read HAF's operation tables, which the model
-  does not have; that they all exist is checked, that they work is not.
+- No block is processed: in the HAF lane hived stops before it syncs, and the model has
+  no operation tables. That every processor exists is checked, that they work is not.
 - All three installs are the same commit, so a defect that only an upgrade from an older
   commit shows is not seen.
 - No other application's schema is present, so the parts of `db/cross_schema_grants.sql`

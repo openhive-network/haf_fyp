@@ -870,29 +870,33 @@ def test_a_compose_file_that_will_not_parse_fails(repo, registry):
     assert registry.heads == []
 
 
-def test_all_three_compose_files_are_read_by_default(repo, registry):
+def test_all_four_compose_files_are_read_by_default(repo, registry):
     """All of them, not the last: keeping only the last file's images dropped
     docker-compose.yml -- and with it the HAF pin, #56's own case -- with the job green
-    (found by review). The install lane's file (#47) is the third: it pulls a server and a
-    client image no other file names."""
+    (found by review). The install lanes' files (#47) are the third and fourth: the first
+    pulls a server and a client image no other file names."""
     repo.compose("docker-compose-ci.yml", {"db": {"image": f"{registry.host}/db:1"}})
     repo.compose("docker-compose-ci-install.yml", {"db17": {"image": f"{registry.host}/db:17"},
                                                     "built": {"build": "."}})
+    repo.compose("docker-compose-ci-install-haf.yml", {"db18": {"image": f"{registry.host}/db:18"}})
     registry.answers[("db", "1")] = [("ok", DIGEST)]
     registry.answers[("db", "17")] = [("ok", DIGEST)]
+    registry.answers[("db", "18")] = [("ok", DIGEST)]
     r = repo.run({"HAF_FYP_COMPOSE_FILES": ""})
     assert r.returncode == 0, r.stderr
-    assert {APP, f"{registry.host}/db:1", f"{registry.host}/db:17"} <= set(resolved(r)), r.stdout
+    assert {APP, f"{registry.host}/db:1", f"{registry.host}/db:17", f"{registry.host}/db:18"} <= set(resolved(r)), r.stdout
 
 
 def test_a_default_compose_file_that_is_missing_is_an_error(repo, registry):
     """Not skipped: a lane's file that was renamed or deleted would otherwise take its
     images out of the check without a word."""
     repo.compose("docker-compose-ci.yml", {"db": {"image": f"{registry.host}/db:1"}})
+    repo.compose("docker-compose-ci-install.yml", {"db17": {"image": f"{registry.host}/db:17"}})
     registry.answers[("db", "1")] = [("ok", DIGEST)]
+    registry.answers[("db", "17")] = [("ok", DIGEST)]
     r = repo.run({"HAF_FYP_COMPOSE_FILES": ""})
     assert r.returncode == 1
-    assert "no such compose file" in r.stdout + r.stderr and "docker-compose-ci-install.yml" in r.stdout + r.stderr
+    assert "no such compose file" in r.stdout + r.stderr and "docker-compose-ci-install-haf.yml" in r.stdout + r.stderr
 
 
 @pytest.mark.parametrize("var", ["HAF_FYP_COMPOSE_FILES", "HAF_FYP_DOCKERFILES"])
@@ -901,7 +905,9 @@ def test_a_blank_override_is_unset_not_an_empty_list(repo, registry, var):
     nothing, exit 0."""
     repo.compose("docker-compose-ci.yml", {"db": {"image": f"{registry.host}/db:1"}})
     repo.compose("docker-compose-ci-install.yml", {"db17": {"image": f"{registry.host}/db:17"}})
+    repo.compose("docker-compose-ci-install-haf.yml", {"db18": {"image": f"{registry.host}/db:18"}})
     registry.answers[("db", "17")] = [("ok", DIGEST)]
+    registry.answers[("db", "18")] = [("ok", DIGEST)]
     registry.answers[("db", "1")] = [("missing",)]
     registry.answers[("base", "1")] = [("missing",)]
     r = repo.run({var: "   "})

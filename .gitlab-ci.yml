@@ -117,6 +117,8 @@ compose-validate:
     - docker compose -f docker/docker-compose.yml config --quiet
     # Needs none of the placeholders above: it builds its one image from this checkout.
     - docker compose -f docker/docker-compose-ci-install.yml config --quiet
+    # Takes HAF_REGISTRY and HAF_VERSION, as the stack file does.
+    - docker compose -f docker/docker-compose-ci-install-haf.yml config --quiet
   rules: *standard_rules
 
 # Does what compose-validate CANNOT, and the two are complements, not duplicates.
@@ -478,6 +480,66 @@ install-test:
     - docker compose -f docker/docker-compose-ci-install.yml logs uninstall || true
     - docker compose -f docker/docker-compose-ci-install.yml logs verify-gone || true
     - docker compose -f docker/docker-compose-ci-install.yml down -v || true
+  rules: *standard_rules
+
+
+# The same lane against HAF itself (#47): docker/docker-compose-ci-install-haf.yml runs
+# the steps above, with the same files, over the HAF image docker/.env pins instead of
+# over a model of it. No replay: hived runs once to initialise the database and stops
+# before it syncs. This is the job that says the installer works on HAF, and the one
+# that goes red when HAF moves away from what install-test's model says it is.
+#
+# It pulls the HAF image (about 1.3 GB), which install-test does not; that is the cost
+# of asking HAF instead of a model, and the reason there are two jobs and not one.
+install-test-haf:
+  stage: test
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    # Recorded by the installer in haf_fyp_app.app_version, and expected there by the
+    # verify steps: the image's baked value, read back from the database.
+    HAF_FYP_GIT_HASH: $CI_COMMIT_SHORT_SHA
+  script:
+    # `timeout` on both: a step that never exits (an installer waiting on a database, a
+    # lock that is never released) would otherwise hold the job to GitLab's own limit
+    # and report "job timeout" with no log from the step that hung.
+    - timeout 900 docker compose -f docker/docker-compose-ci-install-haf.yml up --detach --build
+    # verify-gone is LAST in the chain, and every step waits for the one before it to
+    # exit 0, so this is the whole lane. On a red lane `up` above has usually failed
+    # already (compose stops at the first step that exits non-zero and names it); the
+    # step's own log is in after_script below.
+    - timeout 600 docker compose -f docker/docker-compose-ci-install-haf.yml wait verify-gone
+    # Exit 0 is not enough: a verify file that was emptied, or that quits at its first
+    # line, exits 0 too. Each one prints a sentence only when it has reached its end.
+    # `grep -c`, not `grep -q`: -q stops reading at the first match, `docker compose
+    # logs` then dies of SIGPIPE, and under the runner's `pipefail` the line FAILS for
+    # having found what it looked for. -c reads to the end and exits 1 on a count of 0.
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs verify | grep -Ec "first install. [0-9]{3,} items recorded"
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs verify-locked | grep -Ec "phase locked. all [0-9]{3,} items identical to the first install"
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs verify-again | grep -Ec "phase second. all [0-9]{3,} items identical to the first install"
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs verify-gone | grep -c "haf_fyp is gone and nothing else was touched"
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs install-locked | grep -c "Skipping haf_fyp install"
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs install-again | grep -c "Acquired install lock for haf_fyp"
+  after_script:
+    - docker compose -f docker/docker-compose-ci-install-haf.yml ps -a || true
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs haf-init || true
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs haf || true
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs db-setup || true
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs install || true
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs verify || true
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs age || true
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs lock-holder || true
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs install-locked || true
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs verify-locked || true
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs release-lock || true
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs install-again || true
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs verify-again || true
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs bystander-session || true
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs uninstall || true
+    - docker compose -f docker/docker-compose-ci-install-haf.yml logs verify-gone || true
+    - docker compose -f docker/docker-compose-ci-install-haf.yml down -v || true
   rules: *standard_rules
 
 .docker-build:

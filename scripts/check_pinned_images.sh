@@ -52,8 +52,8 @@ REPO_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 # docker/.env, not .env.local: this resolves what the repository SHIPS.
 ENV_FILE="${HAF_FYP_ENV_FILE:-${REPO_ROOT}/docker/.env}"
-# All three: docker-compose-ci.yml and docker-compose-ci-install.yml are what the test
-# lanes themselves run on.
+# All four: docker-compose-ci.yml and the two docker-compose-ci-install*.yml are what the
+# test lanes themselves run on.
 COMPOSE_FILES="${HAF_FYP_COMPOSE_FILES:-}"
 # An empty override must not mean "no Dockerfiles" (!77 skipped all three with exit 0 that
 # way): unset or blank, the repository's Dockerfile.* are found, and finding none is an error
@@ -102,7 +102,7 @@ blank() {
     esac
 }
 if blank "${COMPOSE_FILES}"; then
-    COMPOSE_FILES="${REPO_ROOT}/docker/docker-compose.yml ${REPO_ROOT}/docker/docker-compose-ci.yml ${REPO_ROOT}/docker/docker-compose-ci-install.yml"
+    COMPOSE_FILES="${REPO_ROOT}/docker/docker-compose.yml ${REPO_ROOT}/docker/docker-compose-ci.yml ${REPO_ROOT}/docker/docker-compose-ci-install.yml ${REPO_ROOT}/docker/docker-compose-ci-install-haf.yml"
 fi
 if blank "${DOCKERFILES}"; then
     DOCKERFILES=""

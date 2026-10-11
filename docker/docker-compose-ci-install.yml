@@ -98,9 +98,11 @@ services:
     command:
       - >-
         psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /haf_stub.sql &&
+        psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_install_haf_model.sql &&
         psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_install_setup.sql
     volumes:
       - ../tests/haf_stub.sql:/haf_stub.sql:ro
+      - ../tests/ci_install_haf_model.sql:/ci_install_haf_model.sql:ro
       - ../tests/ci_install_setup.sql:/ci_install_setup.sql:ro
     depends_on:
       postgres:

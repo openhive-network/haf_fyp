@@ -1,0 +1,255 @@
+# The install lane against HAF itself (#47): scripts/install_app.sh and
+# scripts/uninstall_app.sh, run from the SQL image against a real HAF database.
+#
+#   haf-init -> haf -> db-setup -> install -> verify -> age -> lock-holder
+#            -> install-locked -> verify-locked -> release-lock -> install-again
+#            -> verify-again -> bystander-session -> uninstall -> verify-gone
+#
+# From db-setup on these are the steps of docker-compose-ci-install.yml, running the
+# SAME files: tests/unit/test_install_lane.py states both lanes with one function and
+# refuses a difference. That file's header says what each step is for. What is
+# different here is the database.
+#
+# THE DATABASE IS HAF. hive_fork_manager, HAF's roles, its row-level security, its
+# application API, registry and locks are the image's own, at the version docker/.env
+# pins. Nothing from tests/haf_stub.sql or tests/ci_install_haf_model.sql is loaded,
+# so this lane is also what says whether that model is still a model of HAF: both
+# lanes are held to one set of checks, and HAF moving away from the model turns this
+# one red while the other stays green.
+#
+# NO BLOCKS. hived runs once, to initialise the database, and stops before it looks
+# for a peer; after that the image only serves PostgreSQL. So no replay, no block log
+# and no special runner -- and nothing here says the block processors work. That every
+# one of them is installed is checked; that they process a block is not.
+#
+# WHAT IT STILL DOES NOT COVER: hivemind, HiveSense, reputation_tracker and
+# balance_tracker are absent, so the foreign-application half of
+# db/cross_schema_grants.sql finds nothing to grant; all three installs are one
+# commit, so an upgrade from an older one is not exercised; and the installer's
+# refusals and the uninstaller's prompt are not reached.
+#
+# The steps connect as haf_admin, HAF's superuser, without a password: PG_ACCESS below
+# admits the compose network, as haf_api_node does for its own services.
+#
+# Run by the `install-test-haf` job in .gitlab-ci.yml. By hand:
+#   docker compose -f docker/docker-compose-ci-install-haf.yml up --detach --build
+#   docker compose -f docker/docker-compose-ci-install-haf.yml wait verify-gone
+#   docker compose -f docker/docker-compose-ci-install-haf.yml down -v
+#
+# Its own project name, so that `down -v` here removes this lane's datadir volume and
+# no other.
+name: haf_fyp_ci_install_haf
+
+# The SQL image, built from this checkout: the scripts run under the image's own shell
+# and psql, through its entrypoint. Build-only, with no `image:` name: a name would be
+# shared by every stack on the host that runs this file, and scripts/check_pinned_images.sh
+# takes a service with `image:` for a reference to pull. So each app step builds, and
+# all but the first are cache hits. GIT_HASH is what the installer records in
+# haf_fyp_app.app_version, and what the verify steps then expect to find there.
+x-app: &app
+  build:
+    context: ..
+    dockerfile: Dockerfile.sql
+    args:
+      GIT_HASH: ${HAF_FYP_GIT_HASH:-ci-install}
+  environment:
+    POSTGRES_HOST: haf
+    POSTGRES_USER: haf_admin
+    POSTGRES_DB: haf_block_log
+
+# One SQL file, as haf_admin, stopping at the first error.
+x-sql: &sql
+  image: postgres:18-alpine
+  entrypoint: ["/bin/sh", "-c"]
+  environment:
+    EXPECTED_GIT_HASH: ${HAF_FYP_GIT_HASH:-ci-install}
+
+volumes:
+  haf_datadir:
+
+services:
+  # The same image again, over the datadir haf-init left, with --skip-hived: HAF's
+  # entrypoint starts PostgreSQL and idles instead of starting hived.
+  # The image is the one docker/.env pins for the standalone stack (compose loads that
+  # file for this one too, because it sits in the same directory), so there is ONE HAF
+  # pin in the repository, and scripts/check_pinned_images.sh already watches it.
+  # Once, with hived: a HAF database that hived has never attached to lacks what hived
+  # writes when it first starts (the sentinel event hive.context_detach points a
+  # context at, for one), and HAF's own API fails on it in ways no node ever sees.
+  # --exit-before-sync makes hived open the database, initialise it and stop before it
+  # looks for a peer; the container then exits, leaving the datadir in the volume.
+  haf-init:
+    image: ${HAF_REGISTRY}/haf:${HAF_VERSION}
+    command: ["--exit-before-sync", "--shared-file-size=1G"]
+    volumes:
+      - haf_datadir:/home/hived/datadir
+
+  haf:
+    image: ${HAF_REGISTRY}/haf:${HAF_VERSION}
+    command: ["--skip-hived"]
+    environment:
+      # Appended to HAF's pg_hba.conf: the lane's containers reach the server over the
+      # compose network, where HAF's default rules admit nobody.
+      PG_ACCESS: "host all all all trust"
+    volumes:
+      - haf_datadir:/home/hived/datadir
+    depends_on:
+      haf-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "psql -U haf_admin -d haf_block_log -Atc 'SELECT 1' | grep -qx 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+
+  # One other application on this HAF, created through HAF's API, and the lane's notes.
+  db-setup:
+    <<: *sql
+    command:
+      - >-
+        psql -h haf -U haf_admin -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_install_setup.sql
+    volumes:
+      - ../tests/ci_install_setup.sql:/ci_install_setup.sql:ro
+    depends_on:
+      haf:
+        condition: service_healthy
+
+  install:
+    <<: *app
+    command: ["install_app"]
+    depends_on:
+      db-setup:
+        condition: service_completed_successfully
+
+  verify:
+    <<: *sql
+    command:
+      - >-
+        psql -h haf -U haf_admin -d haf_block_log -v ON_ERROR_STOP=1 -v phase=first -v git_hash="$$EXPECTED_GIT_HASH" -f /ci_install_verify.sql
+    volumes:
+      - ../tests/ci_install_verify.sql:/ci_install_verify.sql:ro
+    depends_on:
+      install:
+        condition: service_completed_successfully
+
+  # Makes it a database a node has been running: see tests/ci_install_age.sql.
+  age:
+    <<: *sql
+    command:
+      - >-
+        psql -h haf -U haf_admin -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_install_age.sql
+    volumes:
+      - ../tests/ci_install_age.sql:/ci_install_age.sql:ro
+    depends_on:
+      verify:
+        condition: service_completed_successfully
+
+  # A block processor, as far as an installer can tell: one session holding the shared
+  # lock the processor takes. Healthy once the lock is held, and it exits 0 only after
+  # release-lock: so install-locked cannot start before the lock is there, and
+  # install-again cannot start before it is gone.
+  lock-holder:
+    <<: *sql
+    command:
+      - >-
+        psql -h haf -U haf_admin -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_install_lock_holder.sql
+    healthcheck:
+      test: ["CMD-SHELL", "psql -h haf -U haf_admin -d haf_block_log -Atc \"SELECT count(*) FROM pg_locks AS l INNER JOIN pg_stat_activity AS a ON a.pid = l.pid WHERE l.locktype = 'advisory' AND l.granted AND a.application_name = 'haf_fyp-ci-lock-holder'\" | grep -qx 1"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - ../tests/ci_install_lock_holder.sql:/ci_install_lock_holder.sql:ro
+    depends_on:
+      age:
+        condition: service_completed_successfully
+
+  # Must exit 0 -- on a node haf-fyp-setup restarts on failure and everything waits for
+  # it -- and must change nothing. verify-locked is what says whether it did.
+  install-locked:
+    <<: *app
+    command: ["install_app"]
+    depends_on:
+      lock-holder:
+        condition: service_healthy
+
+  verify-locked:
+    <<: *sql
+    command:
+      - >-
+        psql -h haf -U haf_admin -d haf_block_log -v ON_ERROR_STOP=1 -v phase=locked -v git_hash="$$EXPECTED_GIT_HASH" -f /ci_install_verify.sql
+    volumes:
+      - ../tests/ci_install_verify.sql:/ci_install_verify.sql:ro
+    depends_on:
+      install-locked:
+        condition: service_completed_successfully
+
+  release-lock:
+    <<: *sql
+    command:
+      - >-
+        psql -h haf -U haf_admin -d haf_block_log -v ON_ERROR_STOP=1 -c "INSERT INTO ci_install_lane.lock_released DEFAULT VALUES"
+    depends_on:
+      verify-locked:
+        condition: service_completed_successfully
+
+  # Waits for the holder to have EXITED, not merely to have been told to: the lock goes
+  # with its session.
+  install-again:
+    <<: *app
+    command: ["install_app"]
+    depends_on:
+      release-lock:
+        condition: service_completed_successfully
+      lock-holder:
+        condition: service_completed_successfully
+
+  verify-again:
+    <<: *sql
+    command:
+      - >-
+        psql -h haf -U haf_admin -d haf_block_log -v ON_ERROR_STOP=1 -v phase=second -v git_hash="$$EXPECTED_GIT_HASH" -f /ci_install_verify.sql
+    volumes:
+      - ../tests/ci_install_verify.sql:/ci_install_verify.sql:ro
+    depends_on:
+      install-again:
+        condition: service_completed_successfully
+
+  # Another application, connected while haf_fyp is uninstalled. It never exits on its
+  # own: verify-gone looks for it, and `down` ends it. If the uninstall terminates it,
+  # psql fails, the container exits non-zero, and verify-gone cannot start.
+  bystander-session:
+    <<: *sql
+    command:
+      - >-
+        PGAPPNAME=ci-bystander-session psql -h haf -U haf_admin -d haf_block_log -v ON_ERROR_STOP=1 -c "SET ROLE ci_bystander_owner" -c "SELECT pg_sleep(1800)"
+    healthcheck:
+      test: ["CMD-SHELL", "psql -h haf -U haf_admin -d haf_block_log -Atc \"SELECT count(*) FROM pg_stat_activity WHERE application_name = 'ci-bystander-session'\" | grep -qx 1"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      verify-again:
+        condition: service_completed_successfully
+
+  # --force: there is no TTY to type the database name into. The same command
+  # docker-compose.yml's haf-fyp-uninstall ships.
+  uninstall:
+    <<: *app
+    command: ["uninstall_app", "--force"]
+    depends_on:
+      bystander-session:
+        condition: service_healthy
+
+  verify-gone:
+    <<: *sql
+    command:
+      - >-
+        psql -h haf -U haf_admin -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_uninstall_verify.sql
+    volumes:
+      - ../tests/ci_uninstall_verify.sql:/ci_uninstall_verify.sql:ro
+    depends_on:
+      uninstall:
+        condition: service_completed_successfully
+      bystander-session:
+        condition: service_healthy

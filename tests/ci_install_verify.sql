@@ -340,9 +340,11 @@ DECLARE
     _want_block INT := CASE current_setting('ci.phase') WHEN 'first' THEN 0 ELSE 1234 END;
     _status INT;
 BEGIN
-    SELECT c.owner, c.current_block_num, c.schema, c.is_forking, t.is_attached INTO _c
+    -- Through HAF's own function for the attachment: where HAF keeps that is its
+    -- business, and this file runs against HAF as well as against the model.
+    SELECT c.owner, c.current_block_num, c.schema, c.is_forking, c.stages::TEXT AS stages,
+           hive.app_context_is_attached('haf_fyp') AS is_attached INTO _c
     FROM hafd.contexts AS c
-    LEFT JOIN hafd.contexts_attachment AS t ON t.context_name = c.name
     WHERE c.name = 'haf_fyp';
     IF NOT FOUND THEN
         RAISE EXCEPTION 'no HAF context named haf_fyp';
@@ -388,12 +390,8 @@ BEGIN
 
     -- The stages the context was created with: 10000 blocks a batch until 101 blocks
     -- from the head, then live. A batch of 1 there is a first sync that takes months.
-    IF (SELECT string_agg(l.arg, ' | ' ORDER BY l.seq) FROM hive.ci_register_calls AS l
-        WHERE l.called = 'stages of haf_fyp')
-       IS DISTINCT FROM '{"(MASSIVE_PROCESSING,101,10000,00:00:20)","(live,0,1,00:00:03)"}' THEN
-        RAISE EXCEPTION 'the context was created with stages %',
-            (SELECT string_agg(l.arg, ' | ' ORDER BY l.seq) FROM hive.ci_register_calls AS l
-             WHERE l.called = 'stages of haf_fyp');
+    IF _c.stages IS DISTINCT FROM '{"(MASSIVE_PROCESSING,101,10000,00:00:20)","(live,0,1,00:00:03)"}' THEN
+        RAISE EXCEPTION 'the context was created with stages %', _c.stages;
     END IF;
 END
 $$;
@@ -625,9 +623,9 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM hafd.contexts AS c
-        INNER JOIN hafd.contexts_attachment AS t ON t.context_name = c.name
         WHERE c.name = 'ci_bystander' AND c.owner = 'ci_bystander_owner'
-          AND c.current_block_num = 4242 AND c.schema = 'ci_bystander_app' AND NOT t.is_attached
+          AND c.current_block_num = 4242 AND c.schema = 'ci_bystander_app'
+          AND NOT hive.app_context_is_attached('ci_bystander')
     ) THEN
         RAISE EXCEPTION 'the install changed another application''s context';
     END IF;
