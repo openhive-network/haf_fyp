@@ -874,7 +874,7 @@ def test_all_four_compose_files_are_read_by_default(repo, registry):
     """All of them, not the last: keeping only the last file's images dropped
     docker-compose.yml -- and with it the HAF pin, #56's own case -- with the job green
     (found by review). The install lanes' files (#47) are the third and fourth: the first
-    pulls a server and a client image no other file names."""
+    pulls a server image no other file names."""
     repo.compose("docker-compose-ci.yml", {"db": {"image": f"{registry.host}/db:1"}})
     repo.compose("docker-compose-ci-install.yml", {"db17": {"image": f"{registry.host}/db:17"},
                                                     "built": {"build": "."}})

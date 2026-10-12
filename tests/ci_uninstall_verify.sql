@@ -123,6 +123,20 @@ BEGIN
 END
 $$;
 
+-- HAF holds the other application exactly as it did before haf_fyp was installed:
+-- its registry row (`paused` included), its context row (stages included) and its
+-- dependencies.
+DO $$
+BEGIN
+    IF ci_install_lane.bystander_now() IS DISTINCT FROM
+       (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'the other application at setup') THEN
+        RAISE EXCEPTION E'the uninstall changed how HAF holds another application:\n  was: %\n  is:  %',
+            (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'the other application at setup'),
+            ci_install_lane.bystander_now();
+    END IF;
+END
+$$;
+
 -- The other application, asked AS ITSELF: a superuser sees a table whatever was done to
 -- its grants.
 SET ROLE ci_bystander_owner;

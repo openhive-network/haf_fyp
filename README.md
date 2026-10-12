@@ -1495,7 +1495,7 @@ docker compose -f docker/docker-compose-ci-install.yml down -v
 | `uninstall` | `uninstall_app --force` |
 | `verify-gone` | `tests/ci_uninstall_verify.sql`: nothing of haf_fyp is left, and pgvector, HAF's roles and grants and the other application are |
 
-`tests/unit/test_install_lane.py` states the compose file and the CI job in full and
+`tests/unit/test_install_lane.py` states both compose files and both CI jobs in full and
 compares, so a change to either has to be made there too.
 
 **What neither covers.**

@@ -14,8 +14,8 @@
 -- assertion in scripts/install_app.sh against a live HAF node.
 --
 -- The RLS policy and the group grants are applied by tests/ci_setup.sql (the
--- postgrest lane) and tests/ci_install_setup.sql (the install lane), the two lanes
--- with real restricted roles; the fastapi lane's haf_fyp_user is a superuser created
+-- postgrest lane) and tests/ci_install_haf_model.sql (the install lane over the model),
+-- the lanes with real restricted roles; the fastapi lane's haf_fyp_user is a superuser created
 -- by the postgres entrypoint, for whom every ACL and policy is bypassed.
 
 CREATE SCHEMA IF NOT EXISTS hafd;

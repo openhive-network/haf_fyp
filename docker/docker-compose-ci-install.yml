@@ -14,11 +14,12 @@
 # fresh node: that was another application's installer and haf_fyp's processor.)
 #
 # WHAT IT IS NOT. The database is PostgreSQL with pgvector, tests/haf_stub.sql and
-# tests/ci_install_setup.sql, not HAF. Together they MODEL the HAF application API; they
-# cannot notice HAF changing under them, and no block is ever processed here. A lane
-# against a real HAF image is the other half of #47 and is not this file. The
-# application locks are the exception: the stub carries HAF's own app_locks.sql
-# verbatim, so the installer's lock wrapper runs against HAF's code.
+# tests/ci_install_haf_model.sql, not HAF. Together they MODEL the HAF application API;
+# they cannot notice HAF changing under them, and no block is ever processed here.
+# docker-compose-ci-install-haf.yml runs these same steps and files against a real HAF
+# image, and is what notices. The application locks are the exception: the stub
+# carries HAF's own app_locks.sql verbatim, so the installer's lock wrapper runs
+# against HAF's code in both.
 #
 # THREE INSTALLS, because one proves nothing about the next: every CREATE succeeds on
 # an empty database.

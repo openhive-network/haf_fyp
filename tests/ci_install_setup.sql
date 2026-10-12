@@ -161,7 +161,22 @@ RETURNS TEXT [] LANGUAGE sql STABLE AS $$
     ) AS x;
 $$;
 
+-- The other application as HAF holds it: its registry row, its context row and its
+-- dependencies, whole. The checks that it still has its owner and its block say
+-- nothing about `paused`, or about the stages its batch sizes come from.
+CREATE OR REPLACE FUNCTION ci_install_lane.bystander_now()
+RETURNS TEXT [] LANGUAGE sql STABLE AS $$
+    SELECT ARRAY[
+        'registry ' || coalesce((SELECT to_jsonb(a)::text FROM hafd.applications AS a WHERE a.name = 'ci_bystander'), 'GONE'),
+        'context ' || coalesce((SELECT to_jsonb(c)::text FROM hafd.contexts AS c WHERE c.name = 'ci_bystander'), 'GONE'),
+        'dependencies ' || coalesce((SELECT string_agg(d.application || '->' || d.depends_on, ',' ORDER BY 1)
+                                     FROM hafd.application_dependencies AS d
+                                     WHERE 'ci_bystander' IN (d.application, d.depends_on)), 'none')
+    ];
+$$;
+
 -- Taken last, so that it includes everything above.
 INSERT INTO ci_install_lane.note (name, item) VALUES
+('the other application at setup', ci_install_lane.bystander_now()),
 ('outside at setup', ci_install_lane.outside_now(FALSE)),
 ('outside at setup, with privileges', ci_install_lane.outside_now(TRUE));

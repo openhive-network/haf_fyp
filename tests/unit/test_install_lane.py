@@ -203,15 +203,17 @@ REAL = Flavour(
         "haf-init": {
             "image": HAF_IMAGE,
             "command": ["--exit-before-sync", "--shared-file-size=1G"],
+            "environment": {"HAF_CI_MODE": "1"},
             "volumes": ["haf_datadir:/home/hived/datadir"],
         },
         "haf": {
             "image": HAF_IMAGE,
             "command": ["--skip-hived"],
-            "environment": {"PG_ACCESS": "host all all all trust"},
+            "environment": {"HAF_CI_MODE": "1", "PG_ACCESS": "host all all all trust"},
             "volumes": ["haf_datadir:/home/hived/datadir"],
             "depends_on": {"haf-init": DONE},
-            "healthcheck": {"test": ["CMD-SHELL", "psql -U haf_admin -d haf_block_log -Atc 'SELECT 1' | grep -qx 1"],
+            "healthcheck": {"test": ["CMD-SHELL", "pgrep -f sleep_infinity.sh >/dev/null && "
+                                                  "psql -U haf_admin -d haf_block_log -Atc 'SELECT 1' | grep -qx 1"],
                             "interval": "3s", "timeout": "3s", "retries": 60},
         },
     },
@@ -290,14 +292,46 @@ def test_the_real_lane_loads_no_model_of_haf():
     assert "pgvector/pgvector" not in text
 
 
-def test_the_two_lanes_run_the_same_checks():
-    """Same verify, age, lock-holder and uninstall-verify files, mounted the same way:
-    the real lane is what tells us the model is still a model of HAF, and it can only
-    do that while both are held to one set of checks."""
-    def checks(flavour):
-        return {name: svc.get("volumes") for name, svc in flavour.services().items()
+def test_the_two_lanes_differ_only_in_where_the_database_is_and_who_connects():
+    """From `install` on, a step of one lane IS the step of the other once the host,
+    the user and the two connection environments are taken out: same files, mounted
+    the same way, same psql flags, same commands, same healthchecks, same order. The
+    real lane is what tells us the model is still a model of HAF, and it can only do
+    that while both are held to one set of checks -- so a difference smuggled in
+    through the Flavour (ON_ERROR_STOP off in one lane, say) fails here even when the
+    compose file and this file were edited together."""
+    def neutral(flavour):
+        def scrub(value):
+            if isinstance(value, str):
+                return (value.replace(f"-h {flavour.host} -U {flavour.user} ", "-h HOST -U USER ")
+                        .replace(f"-h {flavour.host} ", "-h HOST "))
+            if isinstance(value, list):
+                return [scrub(v) for v in value]
+            if isinstance(value, dict):
+                return {k: scrub(v) for k, v in value.items() if k != "environment"}
+            return value
+        return {name: scrub(step) for name, step in flavour.services().items()
                 if name not in flavour.database and name != "db-setup"}
-    assert checks(MODEL) == checks(REAL)
+    assert neutral(MODEL) == neutral(REAL)
+    assert list(neutral(MODEL)) == list(neutral(REAL))
+    # ...and the environments differ only in what a connection needs.
+    assert set(MODEL.app_env) - set(REAL.app_env) == {"PGPASSWORD"} and set(REAL.app_env) <= set(MODEL.app_env)
+    assert set(MODEL.sql_env) - set(REAL.sql_env) == {"PGPASSWORD"} and set(REAL.sql_env) <= set(MODEL.sql_env)
+    assert MODEL.psql.replace("-h postgres -U postgres", "") == REAL.psql.replace("-h haf -U haf_admin", "")
+
+
+def test_the_haf_the_real_lane_runs_is_the_one_the_repository_pins(ci):
+    """`${HAF_REGISTRY}/haf:${HAF_VERSION}` is a pin only while nothing else can set
+    those two. A CI-level `variables:` would: the shell's environment beats docker/.env
+    in compose, silently, and the lane would be testing some other HAF. So would a
+    `workflow:` or an `include:` that brings variables with it."""
+    assert not {"variables", "workflow", "include"} & set(ci), set(ci)
+    for flavour in (MODEL, REAL):
+        assert not [k for k in ci[flavour.job]["variables"] if k.startswith(("HAF_REGISTRY", "HAF_VERSION", "COMPOSE_"))]
+    env = dict(line.split("=", 1) for line in (ROOT / "docker" / ".env").read_text(encoding="utf-8").splitlines()
+               if "=" in line and not line.lstrip().startswith("#"))
+    assert env["HAF_REGISTRY"] == "registry.gitlab.syncad.com/hive", env["HAF_REGISTRY"]
+    assert re.fullmatch(r"\d+\.\d+\.\d+(-rc\d+)?", env["HAF_VERSION"]), env["HAF_VERSION"]
 
 
 @LANES

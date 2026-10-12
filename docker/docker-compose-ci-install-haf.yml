@@ -17,8 +17,8 @@
 # lanes are held to one set of checks, and HAF moving away from the model turns this
 # one red while the other stays green.
 #
-# NO BLOCKS. hived runs once, to initialise the database, and stops before it looks
-# for a peer; after that the image only serves PostgreSQL. So no replay, no block log
+# NO BLOCKS. hived runs once, to initialise the database, and stops before it connects
+# to a peer; after that the image only serves PostgreSQL. So no replay, no block log
 # and no special runner -- and nothing here says the block processors work. That every
 # one of them is installed is checked; that they process a block is not.
 #
@@ -29,7 +29,12 @@
 # refusals and the uninstaller's prompt are not reached.
 #
 # The steps connect as haf_admin, HAF's superuser, without a password: PG_ACCESS below
-# admits the compose network, as haf_api_node does for its own services.
+# admits the compose network. (haf_api_node writes one such rule per service and role;
+# this project holds nothing but the lane, so it writes one for everybody.)
+#
+# PostgreSQL is whatever the pinned HAF image is built with: 17 for 1.29.0-rc2. The
+# model lane's server is 18, which is what HAF 1.28.8 is built with, so between them
+# the two lanes cover both majors -- but HAF itself only on the pinned one.
 #
 # Run by the `install-test-haf` job in .gitlab-ci.yml. By hand:
 #   docker compose -f docker/docker-compose-ci-install-haf.yml up --detach --build
@@ -69,7 +74,9 @@ volumes:
 
 services:
   # The same image again, over the datadir haf-init left, with --skip-hived: HAF's
-  # entrypoint starts PostgreSQL and idles instead of starting hived.
+  # entrypoint sets PostgreSQL up again, runs its update-script generator, and then
+  # idles instead of starting hived (see the healthcheck below for why that order
+  # matters).
   # The image is the one docker/.env pins for the standalone stack (compose loads that
   # file for this one too, because it sits in the same directory), so there is ONE HAF
   # pin in the repository, and scripts/check_pinned_images.sh already watches it.
@@ -77,10 +84,17 @@ services:
   # writes when it first starts (the sentinel event hive.context_detach points a
   # context at, for one), and HAF's own API fails on it in ways no node ever sees.
   # --exit-before-sync makes hived open the database, initialise it and stop before it
-  # looks for a peer; the container then exits, leaving the datadir in the volume.
+  # connects to a peer; the container then exits, leaving the datadir in the volume.
   haf-init:
     image: ${HAF_REGISTRY}/haf:${HAF_VERSION}
     command: ["--exit-before-sync", "--shared-file-size=1G"]
+    environment:
+      # HAF's own switch for CI: its entrypoint installs docker/ci_postgresql.conf,
+      # which asks for 4 GB of shared buffers where the node configuration asks for 16.
+      # Without it PostgreSQL may refuse to start on a runner with less memory than a
+      # node has. The file lands in the datadir, so `haf` below starts with it too; it
+      # is set there as well so that neither depends on the other for it.
+      HAF_CI_MODE: "1"
     volumes:
       - haf_datadir:/home/hived/datadir
 
@@ -88,16 +102,24 @@ services:
     image: ${HAF_REGISTRY}/haf:${HAF_VERSION}
     command: ["--skip-hived"]
     environment:
-      # Appended to HAF's pg_hba.conf: the lane's containers reach the server over the
-      # compose network, where HAF's default rules admit nobody.
+      HAF_CI_MODE: "1"
+      # Written at the head of HAF's pg_hba.conf, ahead of its default rules: the
+      # lane's containers reach the server over the compose network, where those
+      # defaults admit two of HAF's service roles and not haf_admin.
       PG_ACCESS: "host all all all trust"
     volumes:
       - haf_datadir:/home/hived/datadir
     depends_on:
       haf-init:
         condition: service_completed_successfully
+    # Healthy when HAF's entrypoint has FINISHED, not when PostgreSQL first answers.
+    # Between the two the entrypoint still runs HAF's update-script generator, which
+    # drops and re-creates schema hive_update in this database. db-setup records what
+    # exists outside haf_fyp's schemas; taken in that window, the record would be of a
+    # database still changing, and verify would blame the installer for the rest.
+    # With --skip-hived the last thing the entrypoint does is run sleep_infinity.sh.
     healthcheck:
-      test: ["CMD-SHELL", "psql -U haf_admin -d haf_block_log -Atc 'SELECT 1' | grep -qx 1"]
+      test: ["CMD-SHELL", "pgrep -f sleep_infinity.sh >/dev/null && psql -U haf_admin -d haf_block_log -Atc 'SELECT 1' | grep -qx 1"]
       interval: 3s
       timeout: 3s
       retries: 60

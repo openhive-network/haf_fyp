@@ -1,5 +1,7 @@
--- What scripts/install_app.sh must leave behind (#47). Run three times by the install
--- lane (docker/docker-compose-ci-install.yml), as a superuser:
+-- What scripts/install_app.sh must leave behind (#47). Run three times by each install
+-- lane -- docker/docker-compose-ci-install.yml over a model of HAF, and
+-- docker/docker-compose-ci-install-haf.yml over HAF itself -- as a superuser. It must
+-- therefore ask HAF's API, and nothing only the model has:
 --
 --     psql -v phase=<phase> -v git_hash=<the image's GIT_HASH> -f ci_install_verify.sql
 --
@@ -70,6 +72,16 @@ BEGIN
         WHERE pg_get_userbyid(m.member) = 'haf_admin' AND pg_get_userbyid(m.roleid) = 'haf_fyp_owner'
     ) THEN
         RAISE EXCEPTION 'haf_admin was not granted haf_fyp_owner (db/builtin_roles.sql)';
+    END IF;
+
+    -- ...and who is a member OF them: haf_admin of the owner (above), the owner of the
+    -- API role, and nobody else. Another application's role in haf_fyp_owner can do
+    -- to haf_fyp's tables and context whatever the block processor can.
+    SELECT string_agg(pg_get_userbyid(m.member) || ' in ' || pg_get_userbyid(m.roleid), ', '
+                      ORDER BY pg_get_userbyid(m.member) || pg_get_userbyid(m.roleid)) INTO _held
+    FROM pg_auth_members AS m WHERE pg_get_userbyid(m.roleid) IN ('haf_fyp_owner', 'haf_fyp_user');
+    IF _held IS DISTINCT FROM 'haf_admin in haf_fyp_owner, haf_fyp_owner in haf_fyp_user' THEN
+        RAISE EXCEPTION 'the members of the application roles are: %', _held;
     END IF;
 
     -- What only a real login would meet, and no step of this lane logs in as an
@@ -306,7 +318,7 @@ BEGIN
         RAISE EXCEPTION 'the installed app is not the one tests/ci_install_verify.sql lists: %', _diff;
     END IF;
     -- NOT done: calling haf_fyp_app.process_block_range. The processors read HAF's
-    -- operation tables, which the stub does not have, so the call fails here for a
+    -- operation tables, which the model does not have and HAF has empty, so the call fails here for a
     -- reason a node does not have. The lists above are what stands in for it.
 END
 $$;
@@ -390,6 +402,15 @@ BEGIN
 
     -- The stages the context was created with: 10000 blocks a batch until 101 blocks
     -- from the head, then live. A batch of 1 there is a first sync that takes months.
+    -- haf_fyp depends on hivemind and on nothing else (db/register_app.sql), and
+    -- hivemind is not on this database: so on nothing. HAF holds an application back
+    -- to what it depends on.
+    IF EXISTS (SELECT 1 FROM hafd.application_dependencies AS d WHERE 'haf_fyp' IN (d.application, d.depends_on)) THEN
+        RAISE EXCEPTION 'haf_fyp has dependencies registered: %',
+            (SELECT string_agg(d.application || ' -> ' || d.depends_on, ', ')
+             FROM hafd.application_dependencies AS d WHERE 'haf_fyp' IN (d.application, d.depends_on));
+    END IF;
+
     IF _c.stages IS DISTINCT FROM '{"(MASSIVE_PROCESSING,101,10000,00:00:20)","(live,0,1,00:00:03)"}' THEN
         RAISE EXCEPTION 'the context was created with stages %', _c.stages;
     END IF;
@@ -571,6 +592,16 @@ BEGIN
        ) <> 2 THEN
         RAISE EXCEPTION 'the default privileges of step 9c (SELECT on future tables, EXECUTE on future endpoint functions) are not both in place';
     END IF;
+    -- ...and they are all there is in the app's own schemas: SELECT, not the writes.
+    SELECT string_agg(pg_get_userbyid(a.grantee) || ':' || a.privilege_type || ':' || d.defaclobjtype::text
+                      || ' in ' || d.defaclnamespace::regnamespace::text, ', '
+                      ORDER BY d.defaclnamespace::regnamespace::text, a.privilege_type) INTO _bad
+    FROM pg_default_acl AS d, aclexplode(d.defaclacl) AS a
+    WHERE d.defaclnamespace::regnamespace::text IN ('haf_fyp_app', 'haf_fyp_endpoints')
+      AND pg_get_userbyid(a.grantee) <> pg_get_userbyid(d.defaclrole);
+    IF _bad IS DISTINCT FROM 'haf_fyp_user:SELECT:r in haf_fyp_app, haf_fyp_user:EXECUTE:f in haf_fyp_endpoints' THEN
+        RAISE EXCEPTION 'default privileges in the application schemas: %', _bad;
+    END IF;
 
     -- EVERYTHING the application roles were granted outside their own schemas, as a
     -- list. With no other application installed, db/cross_schema_grants.sql has two
@@ -579,22 +610,42 @@ BEGIN
     -- not stop.
     SELECT string_agg(g, ', ' ORDER BY g COLLATE "C") INTO _bad
     FROM (
-        SELECT pg_get_userbyid(a.grantee) || ':' || a.privilege_type || ':' || c.oid::regclass::text AS g
+        SELECT pg_get_userbyid(a.grantee) || ':' || a.privilege_type || ':' || c.oid::regclass::text
+            || CASE WHEN a.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END AS g
         FROM pg_class AS c
         INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace, aclexplode(c.relacl) AS a
         WHERE n.nspname NOT IN ('haf_fyp_app', 'haf_fyp_endpoints')
           AND pg_get_userbyid(a.grantee) IN ('haf_fyp_owner', 'haf_fyp_user')
         UNION ALL
         SELECT pg_get_userbyid(a.grantee) || ':' || a.privilege_type || ':schema ' || n.nspname
+            || CASE WHEN a.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END
         FROM pg_namespace AS n, aclexplode(n.nspacl) AS a
         WHERE n.nspname NOT IN ('haf_fyp_app', 'haf_fyp_endpoints')
           AND pg_get_userbyid(a.grantee) IN ('haf_fyp_owner', 'haf_fyp_user')
         UNION ALL
         SELECT pg_get_userbyid(a.grantee) || ':' || a.privilege_type || ':' || p.oid::regprocedure::text
+            || CASE WHEN a.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END
         FROM pg_proc AS p
         INNER JOIN pg_namespace AS n ON n.oid = p.pronamespace, aclexplode(p.proacl) AS a
         WHERE n.nspname NOT IN ('haf_fyp_app', 'haf_fyp_endpoints')
           AND pg_get_userbyid(a.grantee) IN ('haf_fyp_owner', 'haf_fyp_user')
+        UNION ALL
+        -- The database itself: CREATE on it lets a role make schemas of its own.
+        SELECT pg_get_userbyid(a.grantee) || ':' || a.privilege_type || ':database'
+            || CASE WHEN a.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END
+        FROM pg_database AS d, aclexplode(d.datacl) AS a
+        WHERE d.datname = current_database()
+          AND pg_get_userbyid(a.grantee) IN ('haf_fyp_owner', 'haf_fyp_user')
+        UNION ALL
+        -- Default privileges anywhere but the two step 9c sets in the app's own
+        -- schemas (checked just above): one in hafd would hand the API role every
+        -- table HAF adds from then on.
+        SELECT pg_get_userbyid(a.grantee) || ':' || a.privilege_type || ':future ' || d.defaclobjtype::text
+            || ' of ' || pg_get_userbyid(d.defaclrole) || ' in ' || coalesce(d.defaclnamespace::regnamespace::text, 'every schema')
+            || CASE WHEN a.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END
+        FROM pg_default_acl AS d, aclexplode(d.defaclacl) AS a
+        WHERE pg_get_userbyid(a.grantee) IN ('haf_fyp_owner', 'haf_fyp_user')
+          AND coalesce(d.defaclnamespace::regnamespace::text, '') NOT IN ('haf_fyp_app', 'haf_fyp_endpoints')
         UNION ALL
         SELECT pg_get_userbyid(a.grantee) || ':' || a.privilege_type || ':column ' || c.oid::regclass::text || '.' || t.attname
         FROM pg_attribute AS t
@@ -639,6 +690,12 @@ BEGIN
     IF (SELECT count(*) FROM hafd.contexts) <> 2 OR (SELECT count(*) FROM hafd.applications) <> 2 THEN
         RAISE EXCEPTION 'expected two contexts and two applications, found % and %',
             (SELECT count(*) FROM hafd.contexts), (SELECT count(*) FROM hafd.applications);
+    END IF;
+    IF ci_install_lane.bystander_now() IS DISTINCT FROM
+       (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'the other application at setup') THEN
+        RAISE EXCEPTION E'the install changed how HAF holds another application:\n  was: %\n  is:  %',
+            (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'the other application at setup'),
+            ci_install_lane.bystander_now();
     END IF;
     IF (SELECT string_agg(kept, ',') FROM ci_bystander_app.state) IS DISTINCT FROM 'untouched'
        OR has_table_privilege('haf_fyp_user', 'ci_bystander_app.state', 'SELECT')

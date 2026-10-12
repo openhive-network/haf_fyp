@@ -177,6 +177,31 @@ CREATE TRIGGER ci_application_row_as_haf_writes_it
 BEFORE INSERT OR UPDATE ON hafd.applications
 FOR EACH ROW EXECUTE FUNCTION hive.ci_application_row_as_haf_writes_it();
 
+-- hive.app_add_dependency records the dependency in hafd.application_dependencies;
+-- the stub's only logged the call. The loop clamps an application to what it depends
+-- on, so a dependency on the wrong application is a processor that stops with it.
+CREATE TABLE IF NOT EXISTS hafd.application_dependencies (
+    application TEXT NOT NULL REFERENCES hafd.applications (name) ON DELETE CASCADE,
+    depends_on TEXT NOT NULL REFERENCES hafd.applications (name) ON DELETE CASCADE,
+    PRIMARY KEY (application, depends_on),
+    CHECK (application <> depends_on)
+);
+
+CREATE OR REPLACE FUNCTION hive.app_add_dependency(_name TEXT, _depends_on TEXT)
+RETURNS VOID LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM hafd.applications WHERE name = _name) THEN
+        RAISE EXCEPTION 'Application % is not registered', _name;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM hafd.applications WHERE name = _depends_on) THEN
+        RAISE EXCEPTION 'Application % is not registered', _depends_on;
+    END IF;
+    INSERT INTO hive.ci_register_calls (called, arg) VALUES ('app_add_dependency', _depends_on);
+    INSERT INTO hafd.application_dependencies (application, depends_on) VALUES (_name, _depends_on)
+    ON CONFLICT DO NOTHING;
+END;
+$$;
+
 -- ---------------------------------------------------------------------------------
 -- What HAF grants its application group
 -- ---------------------------------------------------------------------------------
@@ -185,7 +210,8 @@ FOR EACH ROW EXECUTE FUNCTION hive.ci_application_row_as_haf_writes_it();
 -- another's rows.
 GRANT USAGE ON SCHEMA hafd, hive TO hive_applications_group;
 GRANT SELECT ON ALL TABLES IN SCHEMA hafd TO hive_applications_group;
-GRANT INSERT, UPDATE, DELETE ON hafd.contexts, hafd.contexts_attachment, hafd.applications
+GRANT INSERT, UPDATE, DELETE ON hafd.contexts, hafd.contexts_attachment, hafd.applications,
+hafd.application_dependencies
 TO hive_applications_group;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA hive TO hive_applications_group;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA hive, hafd TO hive_applications_group;
