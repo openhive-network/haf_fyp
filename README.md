@@ -1361,11 +1361,11 @@ the work up regardless.
 `scripts/check_pinned_images.sh` resolves every image this repository pins — everything the
 compose files **pull** (`docker/docker-compose.yml`, `docker/docker-compose-ci.yml` and the two
 `docker/docker-compose-ci-install*.yml`, through `docker/.env`), plus every `FROM` in `Dockerfile.*` — and fails when one of them no
-longer exists in its registry. Twelve references today.
+longer exists in its registry. Thirteen references today.
 
 It passes **only when every reference was positively resolved**
 ([#71](https://gitlab.syncad.com/hive/haf_fyp/-/issues/71)), and says how many that was:
-`positively resolved 12 of 12`. Each is one manifest `HEAD` to the registry's HTTP API:
+`positively resolved 13 of 13`. Each is one manifest `HEAD` to the registry's HTTP API:
 
 - `200` with a `Docker-Content-Digest` — resolved; the digest is printed.
 - `404` from the registry itself (it carries `Docker-Distribution-Api-Version`) — `MISSING`:
@@ -1396,7 +1396,7 @@ sh scripts/check_pinned_images.sh
 # ...
 # sha256:1b1d9202... registry.gitlab.syncad.com/hive/haf:1.29.0-rc2
 # ...
-# [check-pinned-images] positively resolved 12 of 12: 0 missing or unreadable, 0 unanswered
+# [check-pinned-images] positively resolved 13 of 13: 0 missing or unreadable, 0 unanswered
 ```
 
 Needs `docker` (the CLI with the compose plugin, for `docker compose config`), `curl` and
