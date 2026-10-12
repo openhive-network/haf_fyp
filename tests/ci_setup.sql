@@ -82,7 +82,7 @@ RESET ROLE;
 -- docker/docker-compose-ci.yml immediately before this file and shared with the
 -- fastapi-tests lane so the two cannot drift.
 --
--- What is added HERE (the install lane has its own, in tests/ci_install_setup.sql):
+-- What is added HERE (the install lane over the model has its own, in tests/ci_install_haf_model.sql):
 -- HAF's row-level security model. This lane has real restricted roles, so SET ROLE haf_fyp_user drops to a
 -- non-superuser and RLS is actually enforced. The fastapi lane's haf_fyp_user is
 -- a superuser and bypasses all of it.

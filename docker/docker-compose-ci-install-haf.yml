@@ -5,7 +5,7 @@
 #            -> install-locked -> verify-locked -> release-lock -> install-again
 #            -> verify-again -> bystander-session -> uninstall -> verify-gone
 #
-# From db-setup on these are the steps of docker-compose-ci-install.yml, running the
+# From install on these are the steps of docker-compose-ci-install.yml, running the
 # SAME files: tests/unit/test_install_lane.py states both lanes with one function and
 # refuses a difference. That file's header says what each step is for. What is
 # different here is the database.
@@ -119,8 +119,13 @@ services:
     # exists outside haf_fyp's schemas; taken in that window, the record would be of a
     # database still changing, and verify would blame the installer for the rest.
     # With --skip-hived the last thing the entrypoint does is run sleep_infinity.sh.
+    #
+    # [s]leep, not sleep: `pgrep -f` matches whole command lines, and this check runs as
+    # `sh -c "<this text>"` -- a command line that contains whatever is searched for.
+    # Written plainly the check found ITSELF every time and waited for nothing. The
+    # bracket still matches the script and no longer matches the text of the pattern.
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f sleep_infinity.sh >/dev/null && psql -U haf_admin -d haf_block_log -Atc 'SELECT 1' | grep -qx 1"]
+      test: ["CMD-SHELL", "pgrep -f '[s]leep_infinity[.]sh' >/dev/null && psql -U haf_admin -d haf_block_log -Atc 'SELECT 1' | grep -qx 1"]
       interval: 3s
       timeout: 3s
       retries: 60

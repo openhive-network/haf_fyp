@@ -24,6 +24,8 @@ BEGIN
     IF _modes IS NULL THEN
         RAISE EXCEPTION 'haf_fyp_app.take_block_processor_locks() took no lock: an install would run over a live block processor';
     END IF;
+    -- ONE lock, because this database has no hivemind: with hivemind installed the
+    -- processor rightly holds two, and this line is the one to change.
     IF _modes <> 'ShareLock' THEN
         RAISE EXCEPTION 'haf_fyp_app.take_block_processor_locks() holds % where a block processor holds one ShareLock', _modes;
     END IF;

@@ -213,7 +213,7 @@ REAL = Flavour(
             "environment": {"HAF_CI_MODE": "1", "PG_ACCESS": "host all all all trust"},
             "volumes": ["haf_datadir:/home/hived/datadir"],
             "depends_on": {"haf-init": DONE},
-            "healthcheck": {"test": ["CMD-SHELL", "pgrep -f sleep_infinity.sh >/dev/null && "
+            "healthcheck": {"test": ["CMD-SHELL", "pgrep -f '[s]leep_infinity[.]sh' >/dev/null && "
                                                   "psql -U haf_admin -d haf_block_log -Atc 'SELECT 1' | grep -qx 1"],
                             "interval": "3s", "timeout": "3s", "retries": 60},
         },
@@ -284,6 +284,18 @@ def test_every_mounted_file_exists(flavour):
                 assert (flavour.path.parent / vol.split(":")[0]).resolve().is_file(), (name, vol)
 
 
+def test_no_healthcheck_can_find_itself():
+    """`pgrep -f X` inside `sh -c "... pgrep -f X ..."` always succeeds: the shell's own
+    command line contains X. The first version of the HAF service's check did exactly
+    that. A pattern is safe when it does not match its own text."""
+    for flavour in (MODEL, REAL):
+        for name, svc in _load(flavour)["services"].items():
+            check = " ".join(svc.get("healthcheck", {}).get("test", []))
+            for pattern in re.findall(r"pgrep -f (?:'([^']+)'|(\S+))", check):
+                pattern = pattern[0] or pattern[1]
+                assert not re.search(pattern, check), f"{name}: `pgrep -f {pattern}` matches its own command line"
+
+
 def test_the_real_lane_loads_no_model_of_haf():
     """If it did, it would be testing the installer against the model again, with a
     HAF image idling beside it."""
@@ -321,6 +333,48 @@ def test_the_two_lanes_differ_only_in_where_the_database_is_and_who_connects():
     assert MODEL.psql.replace("-h postgres -U postgres", "") == REAL.psql.replace("-h haf -U haf_admin", "")
 
 
+def _neutral(flavour: Flavour, value):
+    """A lane's own file or job with what legitimately differs taken out: the compose
+    file's name, the database host and user, the password a plain PostgreSQL image
+    needs. What is left must be the same in both lanes."""
+    if isinstance(value, str):
+        return (value.replace(flavour.file, "LANE.yml")
+                .replace(f"-h {flavour.host} -U {flavour.user} ", "-h HOST -U USER ")
+                .replace(f"-h {flavour.host} ", "-h HOST "))
+    if isinstance(value, list):
+        return [_neutral(flavour, v) for v in value]
+    if isinstance(value, dict):
+        return {k: ("HOST" if k == "POSTGRES_HOST" else _neutral(flavour, v))
+                for k, v in value.items() if k != "PGPASSWORD"}
+    return value
+
+
+def test_the_two_compose_files_agree_from_install_on():
+    """The FILES, not this module's expectation of them: an edit that changes one lane
+    here and in its compose file together passes every equality above. Environments
+    are compared by VALUE (the installer connecting as `postgres` in one lane, or a
+    PGOPTIONS on one lane's verify steps, is a difference), and so is everything else
+    in a step."""
+    def steps(flavour):
+        services = _load(flavour)["services"]
+        return {name: _neutral(flavour, svc) for name, svc in services.items()
+                if name not in flavour.database and name != "db-setup"}
+    assert steps(MODEL) == steps(REAL)
+    assert list(steps(MODEL)) == list(steps(REAL))
+
+
+def test_the_two_jobs_agree(ci):
+    """One lane with its six log checks removed, or allowed to fail, is half the pair
+    gone. Everything but the compose file's name and the database services' own log
+    lines is the same in both jobs."""
+    def job(flavour):
+        j = _neutral(flavour, ci[flavour.job])
+        own = {f"docker compose -f docker/LANE.yml logs {name} || true" for name in flavour.database}
+        j["after_script"] = [line for line in j["after_script"] if line not in own]
+        return j
+    assert job(MODEL) == job(REAL)
+
+
 def test_the_haf_the_real_lane_runs_is_the_one_the_repository_pins(ci):
     """`${HAF_REGISTRY}/haf:${HAF_INSTALL_LANE_VERSION}` is a pin only while nothing
     else can set those two. A CI-level `variables:` would: the shell's environment beats
@@ -330,7 +384,17 @@ def test_the_haf_the_real_lane_runs_is_the_one_the_repository_pins(ci):
     for flavour in (MODEL, REAL):
         assert not [k for k in ci[flavour.job]["variables"]
                     if k.startswith(("HAF_REGISTRY", "HAF_VERSION", "HAF_INSTALL_LANE", "COMPOSE_"))]
-    env = dict(line.split("=", 1) for line in (ROOT / "docker" / ".env").read_text(encoding="utf-8").splitlines()
+    assert HAF_IMAGE == "${HAF_REGISTRY}/haf:${HAF_INSTALL_LANE_VERSION}"
+    for name in ("haf-init", "haf"):
+        assert _load(REAL)["services"][name]["image"] == HAF_IMAGE, name
+    text = (ROOT / "docker" / ".env").read_text(encoding="utf-8")
+    for key in ("HAF_REGISTRY", "HAF_INSTALL_LANE_VERSION"):
+        # Exactly one assignment, in the one spelling every reader of this file agrees
+        # on. Compose takes the LAST of two and accepts `export KEY=` and `KEY = `; a
+        # parser that does not would report the first, or none.
+        loose = re.findall(rf"^[ \t]*(?:export[ \t]+)?{key}[ \t]*=.*$", text, re.M)
+        assert len(loose) == 1 and loose[0].startswith(f"{key}=") and not loose[0].endswith((" ", "\t")), loose
+    env = dict(line.split("=", 1) for line in text.splitlines()
                if "=" in line and not line.lstrip().startswith("#"))
     assert env["HAF_REGISTRY"] == "registry.gitlab.syncad.com/hive", env["HAF_REGISTRY"]
     # A RELEASE, exactly: not `latest`, which moves; not a release candidate, which is

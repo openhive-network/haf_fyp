@@ -1415,7 +1415,8 @@ redirect the check away from the pin the repository actually ships.
 Nothing else notices a dead pin. `compose-validate` runs `docker compose config`, which
 parses YAML and never contacts a registry — and deliberately uses placeholder values, since
 a lane that cannot pull cannot tell a good reference from a dead one. `docker-compose-ci.yml`
-runs plain PostgreSQL with pgvector, so no test lane pulls HAF at all. The guards in
+runs plain PostgreSQL with pgvector, and the one lane that does pull a HAF
+(`install-test-haf`) pulls its own pin, not the stack's `HAF_VERSION`. The guards in
 `tests/unit/test_compose_contract.py` are offline by design: they keep the reference in the
 shape that resolved when it was last run. That combination is how
 [#56](https://gitlab.syncad.com/hive/haf_fyp/-/issues/56) lived — the stack asked for an
@@ -1488,12 +1489,12 @@ docker compose -f docker/docker-compose-ci-install.yml down -v
 | step | what it does |
 |---|---|
 | `install` | `install_app` on a database that has never seen haf_fyp, with one other application on it |
-| `verify` | `tests/ci_install_verify.sql`: the roles and what they are members of; ownership; every table and function that must exist, by name; the HAF context and its registration; the one-row tables; the recorded version; what the API role may read, execute and write; the default privileges; the other application untouched |
+| `verify` | `tests/ci_install_verify.sql`: the roles and what they are members of; ownership; every table, function, index and constraint that must exist, by name; the HAF context and its registration; the one-row tables; the recorded version; what the API role may read, execute and write; the default privileges; the other application untouched, and able to use what is its own; and **everything else in the database** -- HAF's own functions, tables, policies and event triggers, every other role, membership and setting, and everybody else's privileges -- line for line what it was before the install |
 | `age` | `tests/ci_install_age.sql` changes what a running node changes: the sync pointer, the active algorithm version, a user's declared interests |
 | `lock-holder`, `install-locked`, `verify-locked` | with a block processor's lock held, `install_app` exits 0 and changes nothing |
 | `release-lock`, `install-again`, `verify-again` | with the lock released, `install_app` runs over that database: everything the installer creates is identical to what `verify` recorded (function bodies and grants included), and everything `age` changed is still as `age` left it |
 | `uninstall` | `uninstall_app --force` |
-| `verify-gone` | `tests/ci_uninstall_verify.sql`: nothing of haf_fyp is left, and pgvector, HAF's roles and grants and the other application are |
+| `verify-gone` | `tests/ci_uninstall_verify.sql`: nothing of haf_fyp is left, and the rest of the database is line for line what it was before the first install, privileges included |
 
 `tests/unit/test_install_lane.py` states both compose files and both CI jobs in full and
 compares, so a change to either has to be made there too.

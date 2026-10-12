@@ -4,7 +4,8 @@
 #
 # Nothing else notices a dead pin. compose-validate runs `docker compose config`, which parses
 # YAML and never contacts a registry; docker-compose-ci.yml runs plain PostgreSQL with
-# pgvector, so no CI lane pulls HAF; the guards in tests/unit/test_compose_contract.py are
+# pgvector, and the one lane that pulls a HAF pulls its own pin, not the stack's HAF_VERSION;
+# the guards in tests/unit/test_compose_contract.py are
 # offline by design. That is how #56 lived: the stack asked for an image nobody had published,
 # and every pipeline stayed green until an operator hit it on a cold cache.
 #

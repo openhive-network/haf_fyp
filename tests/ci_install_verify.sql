@@ -77,7 +77,8 @@ BEGIN
     -- ...and who is a member OF them: haf_admin of the owner (above), the owner of the
     -- API role, and nobody else. Another application's role in haf_fyp_owner can do
     -- to haf_fyp's tables and context whatever the block processor can.
-    SELECT string_agg(pg_get_userbyid(m.member) || ' in ' || pg_get_userbyid(m.roleid), ', '
+    SELECT string_agg(pg_get_userbyid(m.member) || ' in ' || pg_get_userbyid(m.roleid)
+                      || CASE WHEN m.admin_option THEN ' WITH ADMIN OPTION' ELSE '' END, ', '
                       ORDER BY pg_get_userbyid(m.member) || pg_get_userbyid(m.roleid)) INTO _held
     FROM pg_auth_members AS m WHERE pg_get_userbyid(m.roleid) IN ('haf_fyp_owner', 'haf_fyp_user');
     IF _held IS DISTINCT FROM 'haf_admin in haf_fyp_owner, haf_fyp_owner in haf_fyp_user' THEN
@@ -97,6 +98,17 @@ BEGIN
       AND (a.rolconnlimit <> -1 OR a.rolvaliduntil IS NOT NULL OR a.rolpassword IS NOT NULL OR r.rolconfig IS NOT NULL);
     IF _held IS NOT NULL THEN
         RAISE EXCEPTION 'an application role has a login attribute the installer should not set: %', _held;
+    END IF;
+
+    -- rolconfig above is only the settings that apply in EVERY database. One set for
+    -- this database alone (ALTER ROLE ... IN DATABASE ... SET) is a row here and
+    -- nowhere else, and it applies to every connection the API makes.
+    SELECT string_agg(pg_get_userbyid(s.setrole) || ' in database ' || s.setdatabase || ': ' || s.setconfig::text, '; ')
+    INTO _held
+    FROM pg_db_role_setting AS s
+    WHERE pg_get_userbyid(s.setrole) IN ('haf_fyp_owner', 'haf_fyp_user');
+    IF _held IS NOT NULL THEN
+        RAISE EXCEPTION 'an application role has settings the installer should not set: %', _held;
     END IF;
 END
 $$;
@@ -179,10 +191,12 @@ BEGIN
 END
 $$;
 
--- Nothing OUTSIDE the two schemas was created or changed: no function, relation,
--- schema, role or membership. A helper left in `public` is in no schema the uninstall
--- drops, and one that is SECURITY DEFINER and owned by the installing superuser is a
--- way to run anything as that superuser.
+-- Nothing OUTSIDE the two schemas was created or changed -- HAF's own functions,
+-- tables, policies and event triggers, the other application's objects, every other
+-- role, and everybody's privileges but haf_fyp's own roles' (section 7 lists those):
+-- tests/ci_install_setup.sql says what the list holds. A helper left in `public` is in
+-- no schema the uninstall drops, and one that is SECURITY DEFINER and owned by the
+-- installing superuser is a way to run anything as that superuser.
 DO $$
 DECLARE
     _diff TEXT;
@@ -200,9 +214,12 @@ BEGIN
     IF _diff IS NOT NULL THEN
         RAISE EXCEPTION E'the install touched what is not in haf_fyp''s schemas:\n%', _diff;
     END IF;
-    IF (SELECT cardinality(n.item) FROM ci_install_lane.note AS n WHERE n.name = 'outside at setup') < 50 THEN
+    -- 153 over the model; several thousand over HAF, whose own objects are in it.
+    IF (SELECT cardinality(n.item) FROM ci_install_lane.note AS n WHERE n.name = 'outside at setup') < 100 THEN
         RAISE EXCEPTION 'the list of what exists outside the app schemas is implausibly short';
     END IF;
+    RAISE NOTICE '% items outside the app schemas are as they were before the first install',
+        (SELECT cardinality(n.item) FROM ci_install_lane.note AS n WHERE n.name = 'outside at setup');
 END
 $$;
 
@@ -294,8 +311,86 @@ DECLARE
         'haf_fyp_endpoints.list_algorithm_versions()',
         'haf_fyp_endpoints.root()'
     ];
+    -- name, table, and whether it enforces anything.
+    _want_indexes TEXT [] := ARRAY[
+        'index active_users_pkey on active_users (primary key)',
+        'index algorithm_versions_pkey on algorithm_versions (primary key)',
+        'index embedding_coverage_daily_pkey on embedding_coverage_daily (primary key)',
+        'index engagement_metrics_pkey on engagement_metrics (primary key)',
+        'index feed_cache_pkey on feed_cache (primary key)',
+        'index feed_events_pkey on feed_events (primary key)',
+        'index feed_events_rollup_state_pkey on feed_events_rollup_state (primary key)',
+        'index feed_metrics_daily_pkey on feed_metrics_daily (primary key)',
+        'index global_feed_cache_pkey on global_feed_cache (primary key)',
+        'index idx_active_users_last_read_at on active_users',
+        'index idx_feed_cache_user_rank on feed_cache',
+        'index idx_feed_events_algo_created on feed_events',
+        'index idx_feed_events_created_at on feed_events',
+        'index idx_global_feed_rank on global_feed_cache',
+        'index idx_post_candidates_payout_window on post_candidates',
+        'index idx_post_candidates_unresolved on post_candidates',
+        'index idx_post_lookup_ap on post_lookup',
+        'index idx_user_communities_user on user_communities',
+        'index idx_user_interactions_user_time on user_interactions',
+        'index post_bridge_cache_pkey on post_bridge_cache (primary key)',
+        'index post_candidates_author_permlink_key on post_candidates (unique)',
+        'index post_candidates_pkey on post_candidates (primary key)',
+        'index post_commenters_pkey on post_commenters (primary key)',
+        'index post_lookup_pkey on post_lookup (primary key)',
+        'index uq_app_config_singleton on app_config (unique)',
+        'index uq_app_status_singleton on app_status (unique)',
+        'index uq_app_version_singleton on app_version (unique)',
+        'index user_communities_pkey on user_communities (primary key)',
+        'index user_interactions_pkey on user_interactions (primary key)',
+        'index user_interests_pkey on user_interests (primary key)',
+        'index user_profile_vectors_pkey on user_profile_vectors (primary key)'
+    ];
+    -- Primary keys, unique, foreign-key and check constraints. NOT NULL is left to the
+    -- columns: PostgreSQL 18 lists each one as a constraint and 17 does not.
+    _want_constraints TEXT [] := ARRAY[
+        'constraint active_users_pkey on active_users: PRIMARY KEY (username)',
+        'constraint algorithm_versions_pkey on algorithm_versions: PRIMARY KEY (version)',
+        'constraint embedding_coverage_daily_pkey on embedding_coverage_daily: PRIMARY KEY (day)',
+        'constraint engagement_metrics_pkey on engagement_metrics: PRIMARY KEY (post_id)',
+        'constraint engagement_metrics_post_id_fkey on engagement_metrics: FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates(post_id)',
+        'constraint feed_cache_pkey on feed_cache: PRIMARY KEY (username, post_id)',
+        'constraint feed_events_event_type_check on feed_events: CHECK (((event_type)::text = ANY ((ARRAY[''impression''::character varying, ''open''::character varying, ''video''::character varying, ''action''::character varying])::text[])))',
+        'constraint feed_events_pkey on feed_events: PRIMARY KEY (id)',
+        'constraint feed_events_rollup_state_pkey on feed_events_rollup_state: PRIMARY KEY (only_row)',
+        'constraint feed_events_rollup_state_singleton on feed_events_rollup_state: CHECK (only_row)',
+        'constraint feed_metrics_daily_pkey on feed_metrics_daily: PRIMARY KEY (day, algorithm_version, source, rank)',
+        'constraint global_feed_cache_pkey on global_feed_cache: PRIMARY KEY (post_id)',
+        'constraint post_bridge_cache_pkey on post_bridge_cache: PRIMARY KEY (post_id)',
+        'constraint post_bridge_cache_post_id_fkey on post_bridge_cache: FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates(post_id)',
+        'constraint post_candidates_author_permlink_key on post_candidates: UNIQUE (author, permlink)',
+        'constraint post_candidates_pkey on post_candidates: PRIMARY KEY (post_id)',
+        'constraint post_commenters_pkey on post_commenters: PRIMARY KEY (post_id, commenter)',
+        'constraint post_commenters_post_id_fkey on post_commenters: FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates(post_id)',
+        'constraint post_lookup_pkey on post_lookup: PRIMARY KEY (post_id)',
+        'constraint post_lookup_post_id_fkey on post_lookup: FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates(post_id)',
+        'constraint user_communities_pkey on user_communities: PRIMARY KEY (username, community_id)',
+        'constraint user_interactions_pkey on user_interactions: PRIMARY KEY (username, post_id)',
+        'constraint user_interests_pkey on user_interests: PRIMARY KEY (username, community_id)',
+        'constraint user_profile_vectors_pkey on user_profile_vectors: PRIMARY KEY (username)'
+    ];
+    _has TEXT [];
     _diff TEXT;
 BEGIN
+    SELECT array_agg(h.i) INTO _has
+    FROM (
+    SELECT 'index ' || i.relname || ' on ' || t.relname
+        || CASE WHEN x.indisprimary THEN ' (primary key)' WHEN x.indisunique THEN ' (unique)' ELSE '' END AS i
+    FROM pg_index AS x
+    INNER JOIN pg_class AS i ON i.oid = x.indexrelid
+    INNER JOIN pg_class AS t ON t.oid = x.indrelid
+    WHERE t.relnamespace = 'haf_fyp_app'::regnamespace AND t.relname <> 'haf_fyp'
+    UNION ALL
+    SELECT 'constraint ' || k.conname || ' on ' || t.relname || ': ' || pg_get_constraintdef(k.oid)
+    FROM pg_constraint AS k
+    INNER JOIN pg_class AS t ON t.oid = k.conrelid
+    WHERE t.relnamespace = 'haf_fyp_app'::regnamespace AND t.relname <> 'haf_fyp' AND k.contype IN ('p', 'u', 'f', 'c', 'x')
+    ) AS h;
+
     SELECT string_agg(d, '; ' ORDER BY d) INTO _diff
     FROM (
         SELECT 'missing table ' || t AS d FROM unnest(_want_tables) AS t
@@ -316,6 +411,22 @@ BEGIN
     ) AS x;
     IF _diff IS NOT NULL THEN
         RAISE EXCEPTION 'the installed app is not the one tests/ci_install_verify.sql lists: %', _diff;
+    END IF;
+
+    -- The same for what makes those tables correct rather than merely present: a
+    -- table created without its primary key installs, and installs identically the
+    -- second time. The context's own table is left out -- HAF makes it, and how is
+    -- HAF's business.
+    SELECT string_agg(d, E'\n' ORDER BY d) INTO _diff
+    FROM (
+        SELECT '  missing: ' || a.i AS d
+        FROM (SELECT unnest(_want_indexes || _want_constraints) EXCEPT SELECT unnest(_has)) AS a (i)
+        UNION ALL
+        SELECT '  unlisted: ' || b.i
+        FROM (SELECT unnest(_has) EXCEPT SELECT unnest(_want_indexes || _want_constraints)) AS b (i)
+    ) AS x;
+    IF _diff IS NOT NULL THEN
+        RAISE EXCEPTION E'the installed indexes and constraints are not the ones tests/ci_install_verify.sql lists:\n%', _diff;
     END IF;
     -- NOT done: calling haf_fyp_app.process_block_range. The processors read HAF's
     -- operation tables, which the model does not have and HAF has empty, so the call fails here for a
@@ -594,7 +705,8 @@ BEGIN
     END IF;
     -- ...and they are all there is in the app's own schemas: SELECT, not the writes.
     SELECT string_agg(pg_get_userbyid(a.grantee) || ':' || a.privilege_type || ':' || d.defaclobjtype::text
-                      || ' in ' || d.defaclnamespace::regnamespace::text, ', '
+                      || ' in ' || d.defaclnamespace::regnamespace::text
+                      || CASE WHEN a.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END, ', '
                       ORDER BY d.defaclnamespace::regnamespace::text, a.privilege_type) INTO _bad
     FROM pg_default_acl AS d, aclexplode(d.defaclacl) AS a
     WHERE d.defaclnamespace::regnamespace::text IN ('haf_fyp_app', 'haf_fyp_endpoints')
@@ -641,11 +753,13 @@ BEGIN
         -- schemas (checked just above): one in hafd would hand the API role every
         -- table HAF adds from then on.
         SELECT pg_get_userbyid(a.grantee) || ':' || a.privilege_type || ':future ' || d.defaclobjtype::text
-            || ' of ' || pg_get_userbyid(d.defaclrole) || ' in ' || coalesce(d.defaclnamespace::regnamespace::text, 'every schema')
+            || ' of ' || pg_get_userbyid(d.defaclrole) || ' in '
+            || CASE WHEN d.defaclnamespace = 0 THEN 'every schema' ELSE d.defaclnamespace::regnamespace::text END
             || CASE WHEN a.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END
         FROM pg_default_acl AS d, aclexplode(d.defaclacl) AS a
         WHERE pg_get_userbyid(a.grantee) IN ('haf_fyp_owner', 'haf_fyp_user')
-          AND coalesce(d.defaclnamespace::regnamespace::text, '') NOT IN ('haf_fyp_app', 'haf_fyp_endpoints')
+          AND (d.defaclnamespace = 0
+               OR d.defaclnamespace::regnamespace::text NOT IN ('haf_fyp_app', 'haf_fyp_endpoints'))
         UNION ALL
         SELECT pg_get_userbyid(a.grantee) || ':' || a.privilege_type || ':column ' || c.oid::regclass::text || '.' || t.attname
         FROM pg_attribute AS t
@@ -704,6 +818,36 @@ BEGIN
     END IF;
 END
 $$;
+
+-- ...and asked AS ITSELF, here and not only after the uninstall: a superuser sees a
+-- table whatever was done to its grants, and a defect of the INSTALL found first at
+-- the last step reads as a defect of the uninstall. Reads only; it advances its
+-- context once, in tests/ci_uninstall_verify.sql.
+SET ROLE ci_bystander_owner;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM hafd.contexts AS c
+        WHERE c.name = 'ci_bystander' AND c.owner = 'ci_bystander_owner' AND c.current_block_num = 4242
+    ) OR NOT EXISTS (
+        SELECT 1 FROM hafd.applications AS a WHERE a.name = 'ci_bystander' AND a.owner = 'ci_bystander_owner'
+    ) THEN
+        RAISE EXCEPTION 'after the install the other application cannot see its own context or registration';
+    END IF;
+    IF (SELECT string_agg(kept, ',') FROM ci_bystander_app.state) IS DISTINCT FROM 'untouched' THEN
+        RAISE EXCEPTION 'after the install the other application reads its own table differently';
+    END IF;
+    PERFORM count(*) FROM ci_bystander_app.ci_bystander;
+    PERFORM count(*) FROM ci_bystander_app.blocks_view;
+    CALL ci_bystander_app.process_blocks(NULL);
+    -- And it was given nothing of haf_fyp's.
+    IF has_schema_privilege('ci_bystander_owner', 'haf_fyp_app', 'USAGE')
+       OR has_schema_privilege('ci_bystander_owner', 'haf_fyp_endpoints', 'USAGE') THEN
+        RAISE EXCEPTION 'the install let another application into haf_fyp''s schemas';
+    END IF;
+END
+$$;
+RESET ROLE;
 
 -- ---------------------------------------------------------------------------------
 -- 9. A later install changes nothing the installer owns
@@ -840,7 +984,11 @@ BEGIN
     END IF;
 
     SELECT item INTO _first FROM ci_install_lane.fingerprint WHERE taken_after = 'first';
-    IF coalesce(cardinality(_first), 0) < 100 THEN
+    -- 350 on PostgreSQL 18 over the model, 416 over HAF 1.28.8. Not pinned exactly: it
+    -- moves with the PostgreSQL major (18 catalogues NOT NULL constraints) and with
+    -- every table the app gains. A floor: a fingerprint that has lost a third of
+    -- itself is a query that stopped seeing something, not an app that shrank.
+    IF coalesce(cardinality(_first), 0) < 300 THEN
         RAISE EXCEPTION 'the fingerprint of the first install has % items; it cannot have described an install',
             coalesce(cardinality(_first), 0);
     END IF;
