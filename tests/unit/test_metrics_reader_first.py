@@ -202,6 +202,14 @@ def test_an_age_below_zero_is_reported_as_zero():
             probe["oldest_reader_feed_seconds"]) == (0, 0, 0)
 
 
+def test_every_age_is_held_at_zero_not_only_the_ones_truncation_hides():
+    # -0.4 truncates to 0 by itself; -1.5 does not.
+    probe = fetch_reader_first(_conn(_Cursor(row=(1, 0, -1.5, -1.5, 1, 0, -1.5, 0.0))))
+
+    assert (probe["rotation_age_seconds"], probe["newest_feed_seconds"],
+            probe["oldest_reader_feed_seconds"]) == (0, 0, 0)
+
+
 def test_an_age_of_zero_seconds_is_zero_not_null():
     probe = fetch_reader_first(_conn(_Cursor(row=(1, 0, 0, 0, 1, 0, 0.0, 0.0))))
 
@@ -274,6 +282,37 @@ def test_a_missing_column_that_is_not_last_read_at_is_a_failure_not_unsupported(
     )
 
     assert fetch_reader_first(_conn(cur)) is None
+
+
+def test_another_error_that_quotes_the_column_is_a_failure_not_unsupported():
+    # psycopg2's str(exc) carries the LINE of the query the error points at, and
+    # several lines of this query name last_read_at.
+    cur = _Cursor(fail_on="FROM haf_fyp_app.active_users", error=_PgError(
+        "operator does not exist: text >= timestamp without time zone\n"
+        "LINE 6:     COUNT(*) FILTER (WHERE au.last_read_at >= (SELECT now_utc...", "42883"))
+
+    assert fetch_reader_first(_conn(cur)) is None
+
+
+def test_the_missing_column_is_read_from_the_servers_primary_message():
+    # A real psycopg2 error: the primary message names the column; the full text also
+    # quotes a line of the query. An undefined last_scored_at whose LINE happened to
+    # name last_read_at must not be reported as "the install predates reader-first".
+    class _Diag:
+        message_primary = "column au.last_scored_at does not exist"
+
+    error = _PgError(
+        "column au.last_scored_at does not exist\n"
+        "LINE 9: AND (au.last_scored_at IS NULL OR au.last_read_at ...", "42703")
+    error.diag = _Diag()
+    cur = _Cursor(fail_on="FROM haf_fyp_app.active_users", error=error)
+
+    assert fetch_reader_first(_conn(cur)) is None
+
+    error.diag.message_primary = "column au.last_read_at does not exist"
+    cur = _Cursor(fail_on="FROM haf_fyp_app.active_users", error=error)
+
+    assert fetch_reader_first(_conn(cur)) == {"unsupported": True}
 
 
 def test_an_error_that_is_not_the_servers_is_unknown_rolled_back_and_named(caplog):

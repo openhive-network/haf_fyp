@@ -172,19 +172,23 @@ def test_a_feed_ranked_after_the_routes_transaction_began_is_not_negative(conn, 
     starts. Under READ COMMITTED this read still sees what the ranker committed since."""
     with conn.cursor() as cur:
         cur.execute("SELECT 1")  # the route's first read: the transaction starts here
-    time.sleep(2)  # the reads before this one take their time
+    time.sleep(3)  # the reads before this one take their time
     with other.cursor() as cur:  # the ranker re-ranks a reader meanwhile
+        # Stamped one second in the past on purpose. Measured from the transaction's
+        # start, three seconds ago, this feed is two seconds in the future, which the
+        # zero clamp would report as 0: an assertion of ">= 0" could not tell the two
+        # clocks apart. Measured from this statement it is at least one second old.
         cur.execute(
             "INSERT INTO haf_fyp_app.active_users (username, last_scored_at, last_read_at) "
-            "VALUES ('reader', clock_timestamp() AT TIME ZONE 'utc', "
+            "VALUES ('reader', (clock_timestamp() AT TIME ZONE 'utc') - INTERVAL '1 second', "
             "        clock_timestamp() AT TIME ZONE 'utc')"
         )
     other.commit()
     probe = fetch_reader_first(conn)
 
     assert probe["readers_in_window"] == 1
-    assert 0 <= probe["oldest_reader_feed_seconds"] < 5
-    assert 0 <= probe["newest_feed_seconds"] < 5
+    assert 1 <= probe["oldest_reader_feed_seconds"] < 6
+    assert 1 <= probe["newest_feed_seconds"] < 6
 
 
 def test_the_read_does_not_wait_for_ever_behind_an_install(conn, other):

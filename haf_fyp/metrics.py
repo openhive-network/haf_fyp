@@ -237,7 +237,7 @@ def fetch_feed_servability(conn) -> dict | None:
     Separate from the other probes because they answer different questions, and it
     reports None rather than raising so one failure does not take GET /metrics down.
 
-    NOT independent, though: all four reads on that route share one connection and
+    NOT independent, though: all five reads on that route share one connection and
     one transaction and none of them rolls back, so the first to fail aborts the
     transaction and every later one dies with 25P02 regardless. A docstring here
     used to claim any of them could fail without the others; that was never true.
@@ -563,7 +563,7 @@ READER_FIRST_UNKNOWN = STATE_UNKNOWN
 _READER_FIRST_LOCK_TIMEOUT = "2s"
 
 # One pass over the rotation (one row per ranked account: 51 ms for 45,000 on a full
-# node). No index helps: the counts and the two MINs need every row.
+# node). No index helps: the counts, the two MINs and the MAX need every row.
 #
 # last_scored_at and last_read_at are naive UTC, as the ranker writes them, so the
 # clock they are compared with is taken AT TIME ZONE 'utc'. It is the STATEMENT's
@@ -638,7 +638,11 @@ def fetch_reader_first(conn) -> dict | None:
                 # undefined_column, and it is THIS column: last_scored_at has been in
                 # the table since it was created, but naming the wrong one would send
                 # an operator to fix what is not broken.
-                if getattr(exc, "pgcode", None) == "42703" and "last_read_at" in str(exc):
+                # The server's primary message, not str(exc): that also carries the
+                # LINE of the query the error points at, and several of those lines
+                # name last_read_at whatever the error is about.
+                message = getattr(getattr(exc, "diag", None), "message_primary", None) or str(exc)
+                if getattr(exc, "pgcode", None) == "42703" and "last_read_at" in message:
                     return {"unsupported": True}
                 raise
             cur.execute(f"RELEASE SAVEPOINT {_READER_FIRST_SAVEPOINT}")
@@ -672,14 +676,20 @@ def build_reader_first_report(probe: dict | None) -> dict:
       newest_feed_seconds -- how long ago the ranker last wrote ANY feed. The liveness
           figure: a ranking ranker writes feeds for most of every cycle and then waits
           CYCLE_SECONDS, so this stays under about ten minutes on any node, whatever
-          its size. Well above that, the ranker is not ranking anyone.
+          its size. Well above that, the ranker is not ranking anyone. Two things it
+          does not say. It is null when no account has a feed yet, which with
+          rotation_size above 0 for more than a few cycles is also "not ranking": a
+          rule that only compares a number must treat null as an alarm too. And a
+          re-rank on read or a forced refresh writes a feed as well, so a fresh value
+          does not prove the scheduled cycle is healthy; rotation_age_seconds and
+          never_ranked show that.
       oldest_reader_feed_seconds -- the number reader-first ranking exists to keep
           low: the stalest feed among accounts that read theirs within the window
           (readers with no feed yet are not in it; never_ranked counts those). A
           reader's feed is re-ranked once it is READ_REFRESH_MIN_AGE_SECONDS old, by
           the next cycle that starts: so up to about 15 minutes plus the length of one
-          cycle is healthy (12 minutes on a small node, half an hour on one whose
-          cycles take 20). Well above that, readers are not being put first: signal
+          cycle is healthy (12 minutes on a small node, 35 on one whose cycles take
+          20). Well above that, readers are not being put first: signal
           not arriving, lane full, or ranker stopped.
       readers_due -- readers whose feed is older than the minimum age, i.e. what the
           reader lane takes next. It falls after every cycle. STAYING at or above the
