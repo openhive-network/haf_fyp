@@ -117,7 +117,7 @@ compose-validate:
     - docker compose -f docker/docker-compose.yml config --quiet
     # Needs none of the placeholders above: it builds its one image from this checkout.
     - docker compose -f docker/docker-compose-ci-install.yml config --quiet
-    # Takes HAF_REGISTRY and HAF_VERSION, as the stack file does.
+    # Takes HAF_REGISTRY from above and HAF_INSTALL_LANE_VERSION from docker/.env.
     - docker compose -f docker/docker-compose-ci-install-haf.yml config --quiet
   rules: *standard_rules
 
@@ -484,8 +484,8 @@ install-test:
 
 
 # The same lane against HAF itself (#47): docker/docker-compose-ci-install-haf.yml runs
-# the steps above, with the same files, over the HAF image docker/.env pins instead of
-# over a model of it. No replay: hived runs once to initialise the database and stops
+# the steps above, with the same files, over the HAF release docker/.env pins for it
+# (HAF_INSTALL_LANE_VERSION, what nodes run) instead of over a model of it. No replay: hived runs once to initialise the database and stops
 # before it syncs. This is the job that says the installer works on HAF, and the one
 # that goes red when HAF moves away from what install-test's model says it is.
 #

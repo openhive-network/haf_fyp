@@ -191,9 +191,10 @@ MODEL = Flavour(
     top_level=frozenset({"name", "x-app", "x-sql", "services"}),
 )
 
-# Over HAF itself: the image docker/.env pins, run once with hived to initialise the
-# database and then without it. No model file is loaded -- that is the point.
-HAF_IMAGE = "${HAF_REGISTRY}/haf:${HAF_VERSION}"
+# Over HAF itself: the release docker/.env pins for this lane, run once with hived to
+# initialise the database and then without it. No model file is loaded -- that is the
+# point.
+HAF_IMAGE = "${HAF_REGISTRY}/haf:${HAF_INSTALL_LANE_VERSION}"
 REAL = Flavour(
     name="haf", file="docker-compose-ci-install-haf.yml", project="haf_fyp_ci_install_haf", job="install-test-haf",
     host="haf", user="haf_admin",
@@ -321,17 +322,20 @@ def test_the_two_lanes_differ_only_in_where_the_database_is_and_who_connects():
 
 
 def test_the_haf_the_real_lane_runs_is_the_one_the_repository_pins(ci):
-    """`${HAF_REGISTRY}/haf:${HAF_VERSION}` is a pin only while nothing else can set
-    those two. A CI-level `variables:` would: the shell's environment beats docker/.env
-    in compose, silently, and the lane would be testing some other HAF. So would a
-    `workflow:` or an `include:` that brings variables with it."""
+    """`${HAF_REGISTRY}/haf:${HAF_INSTALL_LANE_VERSION}` is a pin only while nothing
+    else can set those two. A CI-level `variables:` would: the shell's environment beats
+    docker/.env in compose, silently, and the lane would be testing some other HAF. So
+    would a `workflow:` or an `include:` that brings variables with it."""
     assert not {"variables", "workflow", "include"} & set(ci), set(ci)
     for flavour in (MODEL, REAL):
-        assert not [k for k in ci[flavour.job]["variables"] if k.startswith(("HAF_REGISTRY", "HAF_VERSION", "COMPOSE_"))]
+        assert not [k for k in ci[flavour.job]["variables"]
+                    if k.startswith(("HAF_REGISTRY", "HAF_VERSION", "HAF_INSTALL_LANE", "COMPOSE_"))]
     env = dict(line.split("=", 1) for line in (ROOT / "docker" / ".env").read_text(encoding="utf-8").splitlines()
                if "=" in line and not line.lstrip().startswith("#"))
     assert env["HAF_REGISTRY"] == "registry.gitlab.syncad.com/hive", env["HAF_REGISTRY"]
-    assert re.fullmatch(r"\d+\.\d+\.\d+(-rc\d+)?", env["HAF_VERSION"]), env["HAF_VERSION"]
+    # A RELEASE, exactly: not `latest`, which moves; not a release candidate, which is
+    # not what nodes run; not a commit tag, which the registry sweeps.
+    assert re.fullmatch(r"\d+\.\d+\.\d+", env["HAF_INSTALL_LANE_VERSION"]), env["HAF_INSTALL_LANE_VERSION"]
 
 
 @LANES

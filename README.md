@@ -1473,7 +1473,7 @@ Two CI jobs run the installer and the uninstaller for real
 | job | compose file | the database |
 |---|---|---|
 | `install-test` | `docker/docker-compose-ci-install.yml` | PostgreSQL 18 with a **model** of HAF (`tests/haf_stub.sql`, `tests/ci_install_haf_model.sql`). Fast, pulls nothing large |
-| `install-test-haf` | `docker/docker-compose-ci-install-haf.yml` | **HAF itself**: the image `docker/.env` pins, initialised once by hived (`--exit-before-sync`) and then served without it (`--skip-hived`). No replay, no blocks |
+| `install-test-haf` | `docker/docker-compose-ci-install-haf.yml` | **HAF itself**: the latest HAF release, pinned in `docker/.env` as `HAF_INSTALL_LANE_VERSION` (separately from the standalone stack's `HAF_VERSION`, which cannot move without a replay). Initialised once by hived (`--exit-before-sync`) and then served without it (`--skip-hived`). No replay, no blocks |
 
 The second is the one that says the installer works on HAF, and the one that goes red
 if HAF moves away from the model. To run either by hand (the model lane shown):
