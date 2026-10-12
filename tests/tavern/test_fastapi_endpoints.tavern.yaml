@@ -87,6 +87,22 @@ stages:
               hivemind_app.hive_accounts: "absent"
               hivemind_app.hive_permlink_data: "absent"
           detail: !anystr
+        # #86. This is the only lane where the real probe runs through the real route
+        # and the real pool, and `state: ok` is what it gates: a probe that raised is
+        # swallowed into "unknown". Typed rather than exact, because the rotation is
+        # whatever the integration tests left (empty, so the ages are null).
+        reader_first:
+          state: "ok"
+          window_seconds: 86400
+          due_after_seconds: 600
+          readers_in_window: !anyint
+          readers_due: !anyint
+          oldest_reader_feed_seconds: !anything
+          rotation_size: !anyint
+          never_ranked: !anyint
+          rotation_age_seconds: !anything
+          newest_feed_seconds: !anything
+          notification_queue_usage: !anyfloat
       # credibility_sources is a LIVE privilege probe, so a cached answer would keep
       # reporting degraded=false after a grant is lost (or true after it is repaired),
       # defeating the point of re-probing every request. Pinned here for the same

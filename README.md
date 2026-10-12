@@ -487,7 +487,7 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Can this container serve: `503` when the database pool does not answer a query within 1.5 s. Redis is reported in the body (`redis`, `rate_limit_store`) and never fails it: the app serves without Redis. A probe slower than its deadline (1.5 s database, 1.0 s Redis) counts as no answer. Not sync-aware (#61) |
-| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why) — not feed analytics |
+| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), reader-first figures (#86, under `reader_first`: whether the ranker is ranking, readers in the last day, their stalest feed, rotation age; see "How fresh a feed is"), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why) — not feed analytics |
 | GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
 | POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10/min per IP, 60/min total) |
 | DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5/min per IP, 30/min total) |
@@ -503,8 +503,8 @@ once at import, so it takes a restart.
 
 The two metrics endpoints are unrelated and answer different questions. This one, on the
 FastAPI overlay, is the *operational* read — embedding coverage, credibility source
-health, and ranking source health — and is what an embedding-gap, lost-grant or
-empty-feed alert should watch. It carries no block
+health, ranking source health and the reader-first figures — and is what an
+embedding-gap, lost-grant, empty-feed or stopped-ranker alert should watch. It carries no block
 height, so it is not a freshness check: for that, watch `GET /sync-status` below. Feed
 *performance* analytics are a separate, product-facing read, served by PostgREST itself as
 `/rpc/get_feed_metrics` and as the clean URL `/v1/fyp/feed-metrics` through the nginx
@@ -733,7 +733,7 @@ What to expect, and what this does not do:
   channel `haf_fyp_feed_read` carrying the username. Any role with a session on the
   database can listen to it, and can also send on it, which is one more way a read can
   be forged; what the ranker does with one is bounded the same either way.
-  `last_read_at` is not exposed by any endpoint.
+  No endpoint exposes an account's `last_read_at`; `GET /metrics` reports only counts.
 
 After every scheduled cycle the ranker logs one line:
 `feed reads since the last cycle: N account(s) heard, M queued for an early re-rank; reader lane L of S slot(s)`.
@@ -746,6 +746,33 @@ A lane that stays full means the rest of the rotation is running slower. A heard
 in the thousands means someone is requesting other people's feeds. Nothing heard for
 days on a node whose feed is in use means the signal is not arriving; a zero now and
 then is normal, because a returning reader is only heard once in ten minutes.
+
+The same picture without reading logs is on `GET /metrics` of the write API, under
+`reader_first`. It is read from the rotation table, so it is there whether or not the
+ranker is running:
+
+| Field | What it is | What to watch |
+|---|---|---|
+| `newest_feed_seconds` | How long ago the ranker last wrote any feed (`null` when no account has a feed yet) | **Is the ranker ranking.** Under about ten minutes on any node, whatever its size. Well above that, it is not ranking anyone. So is `null` with `rotation_size` above 0 for more than a few cycles: an alert must treat `null` as an alarm, not as "no value". A re-rank on read also writes a feed, so a fresh value does not prove the scheduled cycle is healthy: `rotation_age_seconds` and `never_ranked` show that |
+| `readers_in_window` | Accounts whose feed was read in the last 24 h | Thousands with no audience to explain them: someone is requesting other people's feeds |
+| `oldest_reader_feed_seconds` | Age of the stalest feed among those readers (`null` with no readers, or when none of them has a feed yet) | The number this feature exists to keep low. Up to about 15 min plus the length of one cycle is healthy: 12 min on a small node, 35 min on one whose cycles take 20. Well above that, readers are not being put first: signal not arriving, lane full, or ranker stopped |
+| `readers_due` | Readers whose feed is over 10 min old: what the reader lane takes next | It falls after every cycle. *Staying* at or above the lane's size (`MAX_USERS_PER_CYCLE` x `READER_CYCLE_SHARE`, 100 at the defaults) across scrapes: the lane is full and everyone else rotates more slowly |
+| `rotation_size`, `never_ranked` | Accounts in the rotation, and how many have no feed yet | `never_ranked` above 0 for more than a few cycles: accounts are failing to rank, or nothing is ranking |
+| `rotation_age_seconds` | Age of the stalest ranked feed: how long a full rotation takes now (`null` when no account has a feed yet) | Hours on a large node. Rising past what a rotation normally takes here: the ranker is not ranking, or one account fails every cycle (`failed to rank user` in the ranker's log). It lags by hours; for "is it alive" use `newest_feed_seconds` |
+| `notification_queue_usage` | Fraction (0 to 1) of PostgreSQL's notification queue in use, cluster-wide | Above 0 across scrapes: a session that listens, this app's or another's, is stuck in a transaction. At 1 every `NOTIFY` in the cluster fails |
+
+The 24 h and the 10 min are the defaults of `READER_WINDOW_SECONDS` and
+`READ_REFRESH_MIN_AGE_SECONDS`. The API is not given the ranker's settings, so
+`readers_in_window`, `readers_due` and `oldest_reader_feed_seconds` are computed with
+the defaults, and the section says which (`window_seconds`, `due_after_seconds`). On a
+node that changed either setting, do not apply the rules above to those three: with a
+shorter window they count accounts the ranker no longer treats as readers, and read as
+trouble when there is none.
+
+`state` is `ok`, `unsupported` (the installed SQL has no `last_read_at`: re-run the
+install with the block processor and the ranker stopped) or `unknown` (the figures
+could not be read; the API log says why). The section never sets a `degraded` flag:
+every threshold above depends on the node.
 
 **What a notifying request costs.** It takes a transaction id and a brief cluster-wide
 lock at commit, so the feed function rations it: first page only, and at most once per
