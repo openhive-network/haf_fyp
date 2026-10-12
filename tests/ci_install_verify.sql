@@ -214,7 +214,7 @@ BEGIN
     IF _diff IS NOT NULL THEN
         RAISE EXCEPTION E'the install touched what is not in haf_fyp''s schemas:\n%', _diff;
     END IF;
-    -- 153 over the model; several thousand over HAF, whose own objects are in it.
+    -- 155 over the model; 1944 over HAF 1.28.8, whose own objects are in it.
     IF (SELECT cardinality(n.item) FROM ci_install_lane.note AS n WHERE n.name = 'outside at setup') < 100 THEN
         RAISE EXCEPTION 'the list of what exists outside the app schemas is implausibly short';
     END IF;
