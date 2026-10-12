@@ -453,7 +453,9 @@ install-test:
     # step's own log is in after_script below.
     - timeout 600 docker compose -f docker/docker-compose-ci-install.yml wait verify-gone
     # Exit 0 is not enough: a verify file that was emptied, or that quits at its first
-    # line, exits 0 too. Each one prints a sentence only when it has reached its end.
+    # line, exits 0 too. Each prints its sentence only once the comparison it reports
+    # has been made (the uninstall check at its very end; the install check with one
+    # section still to run, which its exit code answers for).
     # `grep -c`, not `grep -q`: -q stops reading at the first match, `docker compose
     # logs` then dies of SIGPIPE, and under the runner's `pipefail` the line FAILS for
     # having found what it looked for. -c reads to the end and exits 1 on a count of 0.
@@ -512,7 +514,9 @@ install-test-haf:
     # step's own log is in after_script below.
     - timeout 600 docker compose -f docker/docker-compose-ci-install-haf.yml wait verify-gone
     # Exit 0 is not enough: a verify file that was emptied, or that quits at its first
-    # line, exits 0 too. Each one prints a sentence only when it has reached its end.
+    # line, exits 0 too. Each prints its sentence only once the comparison it reports
+    # has been made (the uninstall check at its very end; the install check with one
+    # section still to run, which its exit code answers for).
     # `grep -c`, not `grep -q`: -q stops reading at the first match, `docker compose
     # logs` then dies of SIGPIPE, and under the runner's `pipefail` the line FAILS for
     # having found what it looked for. -c reads to the end and exits 1 on a count of 0.

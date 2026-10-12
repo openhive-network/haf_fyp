@@ -69,9 +69,10 @@ $$;
 -- (NULL) until the first GRANT writes the owner's defaults into it, so NULL is read as
 -- those defaults: otherwise the installer's first grant on hafd.accounts would show
 -- as HAF's own privileges changing.
--- _with_app FALSE leaves out what is granted TO haf_fyp's two roles (those grants are
--- pinned, as an exact list, in tests/ci_install_verify.sql) and keeps everybody
--- else's: a GRANT ... TO PUBLIC on a HAF table is the installer changing HAF.
+-- _with_app FALSE leaves out what is granted TO haf_fyp's two roles (on relations,
+-- columns, schemas, functions and the database those grants are pinned, as an exact
+-- list, in tests/ci_install_verify.sql) and keeps everybody else's: a GRANT ... TO
+-- PUBLIC on a HAF table is the installer changing HAF.
 CREATE OR REPLACE FUNCTION ci_install_lane.acl_text(_acl ACLITEM [], _default ACLITEM [], _with_app BOOLEAN)
 RETURNS TEXT LANGUAGE sql STABLE AS $$
     SELECT coalesce(string_agg(a::text, ',' ORDER BY a::text), '(nothing)')
@@ -79,13 +80,65 @@ RETURNS TEXT LANGUAGE sql STABLE AS $$
     WHERE _with_app OR a::text !~ '^"?haf_fyp_(owner|user)"?=';
 $$;
 
+-- The ROWS of every table outside haf_fyp's schemas, and where every sequence there
+-- stands: one line each. The catalog says what a table is; an installer that deleted
+-- hafd.hive_state's one row, or an uninstaller that reset HAF's sequences, changes no
+-- catalog row at all.
+--
+-- Left out are the tables and sequences HAF itself writes when an application's
+-- context is created, registered, moved or removed -- which is what an install and an
+-- uninstall legitimately do. What the contexts and applications tables hold FOR THE
+-- OTHER APPLICATION is compared whole by bystander_now() below, and for haf_fyp by
+-- data_now(). HAF's log of context events may only grow: context_log_now() below.
+CREATE OR REPLACE FUNCTION ci_install_lane.rows_outside_now()
+RETURNS TEXT [] LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    _out TEXT [] := ARRAY[]::TEXT [];
+    _rel RECORD;
+    _line TEXT;
+BEGIN
+    FOR _rel IN
+        SELECT c.oid::regclass::text AS name, c.relkind
+        FROM pg_class AS c INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        WHERE n.nspname NOT IN ('haf_fyp_app', 'haf_fyp_endpoints', 'ci_install_lane', 'pg_catalog', 'information_schema')
+          AND n.nspname NOT LIKE 'pg\_toast%' AND n.nspname NOT LIKE 'pg\_temp%'
+          AND c.relkind IN ('r', 'S') AND c.relpersistence = 'p'
+          AND NOT ci_install_lane.of_pgvector('pg_class', c.oid)
+          -- HAF's record of contexts (the table, who is attached, its log, their
+          -- sequences) and of registered applications...
+          AND NOT (n.nspname = 'hafd' AND (c.relname LIKE 'contexts%' OR c.relname = 'applications'))
+          -- ...and, over the model, the model's own record of what was asked of it.
+          AND NOT (n.nspname = 'hive' AND c.relname LIKE 'ci\_%')
+        ORDER BY 1
+    LOOP
+        IF _rel.relkind = 'S' THEN
+            EXECUTE format('SELECT ''sequence value %s last_value='' || last_value || '' is_called='' || is_called FROM %s',
+                           _rel.name, _rel.name) INTO _line;
+        ELSE
+            EXECUTE format('SELECT ''rows of %s count='' || count(*) || '' md5='' || md5(coalesce(string_agg(t::text, E''\n'' ORDER BY t::text), '''')) FROM %s AS t',
+                           _rel.name, _rel.name) INTO _line;
+        END IF;
+        _out := _out || _line;
+    END LOOP;
+    RETURN _out;
+END;
+$$;
+
 -- Everything in this database that is NOT in haf_fyp's two schemas, one line per item:
 -- functions (body and settings), relations (and what a view or an index is defined as),
--- columns, constraints, triggers, policies (and the roles they apply to), types (enum
--- labels included), schemas, extensions, event triggers, roles and their login
--- attributes, who is a member of what and on which terms, per-role and per-database
--- settings, what ALTER SYSTEM wrote, the database's own privileges -- and everybody's
--- privileges on all of it. The installer has no business creating or changing any of
+-- columns (a composite type's attributes too), constraints, triggers, rules, policies
+-- (and the roles they apply to), types (enum labels, a domain's base type), casts,
+-- schemas, extensions, languages, event triggers, publications, replication slots,
+-- roles and their login attributes, who is a member of what and on which terms,
+-- per-role and per-database settings, what ALTER SYSTEM wrote, privileges on
+-- configuration parameters, the database's own privileges -- everybody's privileges on
+-- all of it -- and the rows and sequence values of rows_outside_now() above.
+--
+-- NOT in it: operators, operator classes and access methods, collations, text search
+-- objects, foreign servers, statistics objects, comments, security labels, large
+-- objects. An installer that made one of those would not show here.
+--
+-- The installer has no business creating or changing any of
 -- it (beyond the grants to its own roles, which tests/ci_install_verify.sql lists),
 -- and the uninstaller none at all -- a helper function left in `public`, say, belongs
 -- to no schema the uninstall drops.
@@ -111,7 +164,10 @@ RETURNS TEXT [] LANGUAGE sql STABLE AS $$
         SELECT 'function ' || p.oid::regprocedure::text || ' -> ' || coalesce(pg_get_function_result(p.oid), 'procedure')
             || ' owner=' || pg_get_userbyid(p.proowner) || ' secdef=' || p.prosecdef
             || ' volatile=' || p.provolatile::text || ' strict=' || p.proisstrict
-            || ' config=' || coalesce(p.proconfig::text, '-') || ' body=' || md5(p.prosrc)
+            || ' language=' || (SELECT l.lanname FROM pg_language AS l WHERE l.oid = p.prolang)
+            || ' args=' || md5(pg_get_function_arguments(p.oid))
+            || ' config=' || coalesce(p.proconfig::text, '-')
+            || ' body=' || md5(p.prosrc || coalesce(p.probin, '') || coalesce(pg_get_function_sqlbody(p.oid), ''))
             || ' acl=' || ci_install_lane.acl_text(p.proacl, acldefault('f', p.proowner), _with_app) AS i
         FROM pg_proc AS p INNER JOIN ns ON ns.oid = p.pronamespace
         WHERE NOT ci_install_lane.of_pgvector('pg_proc', p.oid)
@@ -119,6 +175,8 @@ RETURNS TEXT [] LANGUAGE sql STABLE AS $$
         SELECT 'relation ' || c.relkind::text || ' ' || c.oid::regclass::text || ' owner=' || pg_get_userbyid(c.relowner)
             || ' rls=' || c.relrowsecurity || '/' || c.relforcerowsecurity
             || ' persistence=' || c.relpersistence::text || ' options=' || coalesce(c.reloptions::text, '-')
+            || ' replica identity=' || c.relreplident::text
+            || ' valid=' || coalesce((SELECT x.indisvalid::text FROM pg_index AS x WHERE x.indexrelid = c.oid), '-')
             || ' definition=' || CASE WHEN c.relkind IN ('v', 'm') THEN md5(pg_get_viewdef(c.oid))
                                       WHEN c.relkind IN ('i', 'I') THEN md5(pg_get_indexdef(c.oid))
                                       ELSE '-' END
@@ -128,11 +186,13 @@ RETURNS TEXT [] LANGUAGE sql STABLE AS $$
         UNION ALL
         SELECT 'column ' || c.oid::regclass::text || '.' || a.attname || ' ' || format_type(a.atttypid, a.atttypmod)
             || ' notnull=' || a.attnotnull || ' default=' || coalesce(pg_get_expr(d.adbin, d.adrelid), '-')
+            || ' identity=' || a.attidentity::text || ' generated=' || a.attgenerated::text
             || ' acl=' || ci_install_lane.acl_text(a.attacl, ARRAY[]::ACLITEM [], _with_app)
         FROM pg_attribute AS a
         INNER JOIN rel AS c ON c.oid = a.attrelid
         LEFT JOIN pg_attrdef AS d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-        WHERE c.relkind IN ('r', 'v', 'm', 'f', 'p') AND a.attnum > 0 AND NOT a.attisdropped
+        -- 'c': the attributes of a composite type. HAF's API passes them (hive.blocks_range).
+        WHERE c.relkind IN ('r', 'v', 'm', 'f', 'p', 'c') AND a.attnum > 0 AND NOT a.attisdropped
         UNION ALL
         SELECT 'constraint ' || CASE WHEN k.conrelid = 0 THEN 'on type ' || k.contypid::regtype::text
                                      ELSE k.conrelid::regclass::text END
@@ -142,6 +202,11 @@ RETURNS TEXT [] LANGUAGE sql STABLE AS $$
         SELECT 'trigger ' || c.oid::regclass::text || ' ' || pg_get_triggerdef(t.oid) || ' enabled=' || t.tgenabled::text
         FROM pg_trigger AS t INNER JOIN rel AS c ON c.oid = t.tgrelid
         WHERE NOT t.tgisinternal
+        UNION ALL
+        -- Every view has a _RETURN rule, which the view's definition above already is.
+        SELECT 'rule ' || c.oid::regclass::text || ' ' || pg_get_ruledef(w.oid) || ' enabled=' || w.ev_enabled::text
+        FROM pg_rewrite AS w INNER JOIN rel AS c ON c.oid = w.ev_class
+        WHERE w.rulename <> '_RETURN'
         UNION ALL
         SELECT 'policy ' || c.oid::regclass::text || ' ' || pol.polname || ' ' || pol.polcmd::text
             || ' permissive=' || pol.polpermissive
@@ -156,7 +221,11 @@ RETURNS TEXT [] LANGUAGE sql STABLE AS $$
         SELECT 'type ' || t.oid::regtype::text || ' kind=' || t.typtype::text || ' owner=' || pg_get_userbyid(t.typowner)
             || ' labels=' || coalesce((SELECT string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder)
                                        FROM pg_enum AS e WHERE e.enumtypid = t.oid), '-')
-            || ' acl=' || ci_install_lane.acl_text(t.typacl, acldefault('T', t.typowner), _with_app)
+            || ' domain of=' || CASE WHEN t.typtype = 'd' THEN format_type(t.typbasetype, t.typtypmod) ELSE '-' END
+            || ' notnull=' || t.typnotnull || ' default=' || coalesce(t.typdefault, '-')
+            -- TRUE: haf_fyp's roles are granted nothing on a type outside their schemas,
+            -- and no list elsewhere would show it if they were.
+            || ' acl=' || ci_install_lane.acl_text(t.typacl, acldefault('T', t.typowner), TRUE)
         FROM pg_type AS t INNER JOIN ns ON ns.oid = t.typnamespace
         WHERE NOT EXISTS (SELECT 1 FROM pg_type AS e WHERE e.typarray = t.oid)
           AND NOT ci_install_lane.of_pgvector('pg_type', t.oid)
@@ -173,6 +242,36 @@ RETURNS TEXT [] LANGUAGE sql STABLE AS $$
             || ' calls ' || t.evtfoid::regproc::text || ' enabled=' || t.evtenabled::text
             || ' tags=' || coalesce(t.evttags::text, '-')
         FROM pg_event_trigger AS t
+        UNION ALL
+        -- 16384 is the first object id PostgreSQL gives to anything it did not ship.
+        SELECT 'cast ' || format_type(k.castsource, NULL) || ' -> ' || format_type(k.casttarget, NULL)
+            || ' context=' || k.castcontext::text || ' method=' || k.castmethod::text
+            || ' function=' || CASE WHEN k.castfunc = 0 THEN '-' ELSE k.castfunc::regprocedure::text END
+        FROM pg_cast AS k
+        WHERE k.oid >= 16384 AND NOT ci_install_lane.of_pgvector('pg_cast', k.oid)
+        UNION ALL
+        SELECT 'language ' || l.lanname || ' owner=' || pg_get_userbyid(l.lanowner) || ' trusted=' || l.lanpltrusted
+            || ' acl=' || ci_install_lane.acl_text(l.lanacl, acldefault('l', l.lanowner), TRUE)
+        FROM pg_language AS l
+        UNION ALL
+        SELECT 'publication ' || b.pubname || ' owner=' || pg_get_userbyid(b.pubowner) || ' all tables=' || b.puballtables
+            || ' publishes=' || b.pubinsert || '/' || b.pubupdate || '/' || b.pubdelete || '/' || b.pubtruncate
+            || ' tables=' || coalesce((SELECT string_agg(r.prrelid::regclass::text, ',' ORDER BY r.prrelid::regclass::text)
+                                       FROM pg_publication_rel AS r WHERE r.prpubid = b.oid), '-')
+            || ' schemas=' || coalesce((SELECT string_agg(s.pnnspid::regnamespace::text, ',' ORDER BY s.pnnspid::regnamespace::text)
+                                        FROM pg_publication_namespace AS s WHERE s.pnpubid = b.oid), '-')
+        FROM pg_publication AS b
+        UNION ALL
+        SELECT 'replication slot ' || s.slot_name || ' ' || s.slot_type || ' plugin=' || coalesce(s.plugin::text, '-')
+            || ' database=' || coalesce(s.database::text, '-')
+        FROM pg_replication_slots AS s
+        UNION ALL
+        -- GRANT SET / ALTER SYSTEM ON PARAMETER: cluster-wide, and no schema's teardown
+        -- takes it back. TRUE for the same reason as for types.
+        SELECT 'parameter ' || a.parname || ' acl=' || ci_install_lane.acl_text(a.paracl, ARRAY[]::ACLITEM [], TRUE)
+        FROM pg_parameter_acl AS a
+        UNION ALL
+        SELECT unnest(ci_install_lane.rows_outside_now())
         UNION ALL
         -- pg_authid, not pg_roles: whether a password is set, and which.
         SELECT 'role ' || r.rolname || ' super=' || r.rolsuper || ' login=' || r.rolcanlogin
@@ -219,6 +318,43 @@ RETURNS TEXT [] LANGUAGE sql STABLE AS $$
             || ' acl=' || ci_install_lane.acl_text(b.datacl, acldefault('d', b.datdba), _with_app)
         FROM pg_database AS b
         WHERE b.datname = current_database()
+    ) AS x;
+$$;
+
+-- One of haf_fyp's tables as text: what tests/ci_install_verify.sql pins, per table, as
+-- an md5. Nothing in it depends on the PostgreSQL major (NOT NULL is read from the
+-- columns, not from the constraints 18 added for it) or on who installed.
+CREATE OR REPLACE FUNCTION ci_install_lane.table_shape(_table REGCLASS)
+RETURNS TEXT LANGUAGE sql STABLE AS $$
+    SELECT string_agg(i, E'\n' ORDER BY i)
+    FROM (
+        SELECT '    table logged=' || (c.relpersistence = 'p') || ' rls=' || c.relrowsecurity || '/' || c.relforcerowsecurity
+            || ' owner=' || pg_get_userbyid(c.relowner) || ' options=' || coalesce(c.reloptions::text, '-')
+            || ' acl=' || ci_install_lane.acl_text(c.relacl, acldefault('r', c.relowner), TRUE) AS i
+        FROM pg_class AS c WHERE c.oid = _table
+        UNION ALL
+        SELECT '    column ' || a.attname || ' ' || format_type(a.atttypid, a.atttypmod) || ' notnull=' || a.attnotnull
+            || ' default=' || coalesce(pg_get_expr(d.adbin, d.adrelid), '-')
+            || ' identity=' || a.attidentity::text || ' generated=' || a.attgenerated::text
+            || ' acl=' || ci_install_lane.acl_text(a.attacl, ARRAY[]::ACLITEM [], TRUE)
+        FROM pg_attribute AS a
+        LEFT JOIN pg_attrdef AS d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+        WHERE a.attrelid = _table AND a.attnum > 0 AND NOT a.attisdropped
+        UNION ALL
+        SELECT '    ' || pg_get_indexdef(x.indexrelid) || ' valid=' || x.indisvalid || ' ready=' || x.indisready
+        FROM pg_index AS x WHERE x.indrelid = _table
+        UNION ALL
+        SELECT '    constraint ' || k.conname || ' ' || pg_get_constraintdef(k.oid) || ' validated=' || k.convalidated
+        FROM pg_constraint AS k WHERE k.conrelid = _table AND k.contype IN ('p', 'u', 'f', 'c', 'x')
+        UNION ALL
+        SELECT '    trigger ' || pg_get_triggerdef(t.oid) || ' enabled=' || t.tgenabled::text
+        FROM pg_trigger AS t WHERE t.tgrelid = _table AND NOT t.tgisinternal
+        UNION ALL
+        -- The triggers behind a foreign key: there, and disabled, means the key is not enforced.
+        SELECT '    ' || count(*) || ' internal triggers not enabled'
+        FROM pg_trigger AS t WHERE t.tgrelid = _table AND t.tgisinternal AND t.tgenabled <> 'O'
+        UNION ALL
+        SELECT '    policy ' || p.polname FROM pg_policy AS p WHERE p.polrelid = _table
     ) AS x;
 $$;
 
@@ -288,8 +424,25 @@ RETURNS TEXT [] LANGUAGE sql STABLE AS $$
     ];
 $$;
 
+-- HAF's log of context events, a line per row. An install and an uninstall add to it;
+-- neither may take from it. Asked for by name at run time, because the model keeps no
+-- such log: there this is an empty list, and the check on it says nothing.
+CREATE OR REPLACE FUNCTION ci_install_lane.context_log_now()
+RETURNS TEXT [] LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    _out TEXT [];
+BEGIN
+    IF to_regclass('hafd.contexts_log') IS NULL THEN
+        RETURN ARRAY[]::TEXT [];
+    END IF;
+    EXECUTE 'SELECT coalesce(array_agg(l::text ORDER BY l::text), ARRAY[]::TEXT []) FROM hafd.contexts_log AS l' INTO _out;
+    RETURN _out;
+END;
+$$;
+
 -- Taken last, so that it includes everything above.
 INSERT INTO ci_install_lane.note (name, item) VALUES
+('HAF''s context log at setup', ci_install_lane.context_log_now()),
 ('the other application at setup', ci_install_lane.bystander_now()),
 ('outside at setup', ci_install_lane.outside_now(FALSE)),
 ('outside at setup, with privileges', ci_install_lane.outside_now(TRUE));

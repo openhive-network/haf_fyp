@@ -64,21 +64,32 @@ $$;
 DO $$
 DECLARE
     _diff TEXT;
+    _now TEXT [] := ci_install_lane.outside_now(TRUE);
+    _was TEXT [];
 BEGIN
+    SELECT n.item INTO _was FROM ci_install_lane.note AS n WHERE n.name = 'outside at setup, with privileges';
     SELECT string_agg(d, E'\n' ORDER BY d) INTO _diff
     FROM (
         SELECT '  left behind, or changed: ' || a.i AS d
-        FROM (SELECT unnest(ci_install_lane.outside_now(TRUE))
-              EXCEPT SELECT unnest(n.item) FROM ci_install_lane.note AS n
-              WHERE n.name = 'outside at setup, with privileges') AS a (i)
+        FROM (SELECT unnest(_now) EXCEPT SELECT unnest(_was)) AS a (i)
         UNION ALL
         SELECT '  removed, or changed:     ' || b.i
-        FROM (SELECT unnest(n.item) FROM ci_install_lane.note AS n
-              WHERE n.name = 'outside at setup, with privileges'
-              EXCEPT SELECT unnest(ci_install_lane.outside_now(TRUE))) AS b (i)
+        FROM (SELECT unnest(_was) EXCEPT SELECT unnest(_now)) AS b (i)
     ) AS x;
     IF _diff IS NOT NULL THEN
         RAISE EXCEPTION E'after the uninstall the rest of the database is not as it was before the install:\n%', _diff;
+    END IF;
+    -- The comparison above goes item by item, through EXCEPT, which calls two NULLs
+    -- equal and counts a line that is there twice once. So: no NULL item (one operand
+    -- that is NULL makes a whole line NULL, and hides what it stood for), and the two
+    -- lists equal as lists.
+    IF EXISTS (SELECT 1 FROM unnest(_now) AS i WHERE i IS NULL)
+       OR EXISTS (SELECT 1 FROM unnest(_was) AS i WHERE i IS NULL) THEN
+        RAISE EXCEPTION 'an item in the list of what exists outside the app schemas is NULL: something in it was concatenated with a NULL';
+    END IF;
+    IF _now IS DISTINCT FROM _was THEN
+        RAISE EXCEPTION 'the two lists of what exists outside the app schemas differ (% and % items) but no differing item was found',
+            cardinality(_now), cardinality(_was);
     END IF;
 END
 $$;
@@ -93,6 +104,15 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'the uninstall terminated another application''s session';
     END IF;
+    -- ...and the one that was doing nothing at the time, which is what most sessions
+    -- on a node are. An uninstaller that swept away IDLE sessions would spare the busy
+    -- one above.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_stat_activity AS a WHERE a.application_name = 'ci-bystander-idle' AND a.state = 'idle'
+    ) THEN
+        RAISE EXCEPTION 'the uninstall terminated another application''s idle session (or the lane''s idle session is not idle: %)',
+            (SELECT string_agg(a.state, ',') FROM pg_stat_activity AS a WHERE a.application_name = 'ci-bystander-idle');
+    END IF;
 END
 $$;
 
@@ -103,6 +123,12 @@ BEGIN
     -- created it; the uninstaller does not own it.
     IF to_regtype('vector') IS NULL THEN
         RAISE EXCEPTION 'the uninstall dropped pgvector';
+    END IF;
+    -- The same extension, not one created again under the name: see section 4 of
+    -- tests/ci_install_verify.sql.
+    IF (SELECT ARRAY[e.oid::text, e.extversion, e.extnamespace::regnamespace::text] FROM pg_extension AS e WHERE e.extname = 'vector')
+       IS DISTINCT FROM (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'pgvector after the first install') THEN
+        RAISE EXCEPTION 'pgvector is not the extension the first install left: the uninstall dropped it and created it again, or moved it';
     END IF;
     IF (SELECT count(*) FROM pg_roles
         WHERE rolname IN ('haf_admin', 'hive_applications_group', 'hive_applications_owner_group',
@@ -128,6 +154,14 @@ $$;
 -- dependencies.
 DO $$
 BEGIN
+    -- HAF's log of context events only grows: every line it held before the first
+    -- install is still there.
+    IF NOT (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'HAF''s context log at setup')
+           <@ ci_install_lane.context_log_now() THEN
+        RAISE EXCEPTION 'lines that HAF''s log of context events held before the first install are gone: % then, % now',
+            (SELECT cardinality(n.item) FROM ci_install_lane.note AS n WHERE n.name = 'HAF''s context log at setup'),
+            cardinality(ci_install_lane.context_log_now());
+    END IF;
     IF ci_install_lane.bystander_now() IS DISTINCT FROM
        (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'the other application at setup') THEN
         RAISE EXCEPTION E'the uninstall changed how HAF holds another application:\n  was: %\n  is:  %',

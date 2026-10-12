@@ -124,10 +124,12 @@ class Flavour:
             "install-again": self.app(["install_app"], {"release-lock": DONE, "lock-holder": DONE}),
             "verify-again": self.verify("second", "install-again"),
             "bystander-session": self.sql(
+                f'sleep 1800 | PGAPPNAME=ci-bystander-idle {self.psql} & '
                 f'PGAPPNAME=ci-bystander-session {self.psql} -c "SET ROLE ci_bystander_owner" -c "SELECT pg_sleep(1800)"',
                 {"verify-again": DONE},
                 healthcheck=self.probe(
-                    "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'ci-bystander-session'")),
+                    "SELECT (count(*) = 2)::int FROM pg_stat_activity "
+                    "WHERE application_name IN ('ci-bystander-session', 'ci-bystander-idle')")),
             "uninstall": self.app(["uninstall_app", "--force"], {"bystander-session": HEALTHY}),
             LAST: self.sql(f"{self.psql} -f /ci_uninstall_verify.sql",
                            {"uninstall": DONE, "bystander-session": HEALTHY}, ("ci_uninstall_verify.sql",)),
@@ -392,7 +394,7 @@ def test_the_haf_the_real_lane_runs_is_the_one_the_repository_pins(ci):
         # Exactly one assignment, in the one spelling every reader of this file agrees
         # on. Compose takes the LAST of two and accepts `export KEY=` and `KEY = `; a
         # parser that does not would report the first, or none.
-        loose = re.findall(rf"^[ \t]*(?:export[ \t]+)?{key}[ \t]*=.*$", text, re.M)
+        loose = re.findall(rf"^[ \t]*(?:export[ \t]+)?{key}[ \t]*[=:].*$", text, re.M)
         assert len(loose) == 1 and loose[0].startswith(f"{key}=") and not loose[0].endswith((" ", "\t")), loose
     env = dict(line.split("=", 1) for line in text.splitlines()
                if "=" in line and not line.lstrip().startswith("#"))
@@ -436,10 +438,13 @@ def test_compose_validate_parses_the_lane(ci, flavour):
     assert f"{flavour.compose} config --quiet" in ci["compose-validate"]["script"]
 
 
-# How many times each of the lanes' SQL files can stop a lane. A floor, not an exact
-# count: adding a check needs no change here, removing one does.
-RAISES = {"ci_install_verify.sql": 59, "ci_uninstall_verify.sql": 12, "ci_install_lock_holder.sql": 1,
-          "ci_install_haf_model.sql": 7}
+# How many times each of the lanes' SQL files can stop a lane. EXACT. As a floor this
+# went stale the first time checks were added without raising it, and from then on that
+# many could be deleted, or turned into notices, with every test and both lanes green.
+# Adding a check means changing its file's number; so does removing one, which is the
+# point.
+RAISES = {"ci_install_verify.sql": 77, "ci_uninstall_verify.sql": 18, "ci_install_lock_holder.sql": 3,
+          "ci_install_haf_model.sql": 9, "ci_install_age.sql": 1, "ci_install_setup.sql": 0}
 LANE_SQL = sorted({"ci_install_haf_model.sql", "ci_install_setup.sql", "ci_install_verify.sql",
                    "ci_install_age.sql", "ci_install_lock_holder.sql", "ci_uninstall_verify.sql"})
 
@@ -454,7 +459,7 @@ def test_the_sql_the_lanes_run_cannot_be_switched_off_from_inside(name):
     meta = [line for line in text.splitlines() if line.lstrip().startswith("\\")]
     assert not meta, f"{name} uses psql meta-commands: {meta}"
     assert "ON_ERROR_STOP" not in text, name
-    assert len(re.findall(r"RAISE EXCEPTION", text)) >= RAISES.get(name, 0), name
+    assert len(re.findall(r"RAISE EXCEPTION", text)) == RAISES[name], name
 
 
 def test_every_lane_sql_file_is_one_of_those():
@@ -499,3 +504,5 @@ def test_the_unit_tests_that_guard_these_lanes_are_themselves_run(ci):
     (line,) = [s for s in job["script"] if "pytest" in s and "pip install" not in s]
     assert line.startswith("PYTHONPATH=. pytest tests/unit/ "), line
     assert not re.search(r"--ignore|--deselect|(^|\s)-k\b|(^|\s)-m\b|--co\b|--collect-only", line), line
+    # Nothing after the command that could forgive it: `|| true`, `; true`, a pipe.
+    assert not re.search(r"[|;&]", line), line

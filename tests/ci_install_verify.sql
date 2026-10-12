@@ -200,21 +200,64 @@ $$;
 DO $$
 DECLARE
     _diff TEXT;
+    _now TEXT [] := ci_install_lane.outside_now(FALSE);
+    _was TEXT [];
+    _missing TEXT;
 BEGIN
+    SELECT n.item INTO _was FROM ci_install_lane.note AS n WHERE n.name = 'outside at setup';
     SELECT string_agg(d, E'\n' ORDER BY d) INTO _diff
     FROM (
         SELECT '  new or changed: ' || a.i AS d
-        FROM (SELECT unnest(ci_install_lane.outside_now(FALSE))
-              EXCEPT SELECT unnest(n.item) FROM ci_install_lane.note AS n WHERE n.name = 'outside at setup') AS a (i)
+        FROM (SELECT unnest(_now) EXCEPT SELECT unnest(_was)) AS a (i)
         UNION ALL
         SELECT '  gone or changed: ' || b.i
-        FROM (SELECT unnest(n.item) FROM ci_install_lane.note AS n WHERE n.name = 'outside at setup'
-              EXCEPT SELECT unnest(ci_install_lane.outside_now(FALSE))) AS b (i)
+        FROM (SELECT unnest(_was) EXCEPT SELECT unnest(_now)) AS b (i)
     ) AS x;
     IF _diff IS NOT NULL THEN
         RAISE EXCEPTION E'the install touched what is not in haf_fyp''s schemas:\n%', _diff;
     END IF;
-    -- 155 over the model; 1944 over HAF 1.28.8, whose own objects are in it.
+    -- The comparison above goes item by item, through EXCEPT, which calls two NULLs
+    -- equal and counts a line that is there twice once. So: no NULL item (one operand
+    -- that is NULL makes a whole line NULL, and hides what it stood for), and the two
+    -- lists equal as lists.
+    IF EXISTS (SELECT 1 FROM unnest(_now) AS i WHERE i IS NULL)
+       OR EXISTS (SELECT 1 FROM unnest(_was) AS i WHERE i IS NULL) THEN
+        RAISE EXCEPTION 'an item in the list of what exists outside the app schemas is NULL: something in it was concatenated with a NULL';
+    END IF;
+    IF _now IS DISTINCT FROM _was THEN
+        RAISE EXCEPTION 'the two lists of what exists outside the app schemas differ (% and % items) but no differing item was found',
+            cardinality(_now), cardinality(_was);
+    END IF;
+
+    -- A list that has lost a whole kind of item compares equal to itself at every
+    -- step: the first version of this left out every extension member, and with them
+    -- all of HAF, and stayed green. So the list must HOLD what it exists to watch --
+    -- named lines of HAF's, and at least one line of every kind both lanes have.
+    SELECT string_agg(w, ', ') INTO _missing
+    FROM unnest(ARRAY[
+        'function hive.app_create_context(%', 'function hive.app_register(%', 'relation r hafd.contexts %',
+        'relation r hafd.applications %', 'column hafd.contexts.owner %', 'policy hafd.contexts %',
+        'schema hafd %', 'schema hive %', 'role haf_admin %', 'role ci_bystander_owner %',
+        'membership ci_bystander_owner in hive_applications_owner_group %',
+        'relation r ci_bystander_app.state %', 'rows of ci_bystander_app.state %',
+        'function ci_bystander_app.process_blocks(%', 'constraint %', 'type %', 'language plpgsql %', 'database %'
+    ]) AS w
+    WHERE NOT EXISTS (SELECT 1 FROM unnest(_was) AS i WHERE i LIKE w);
+    IF _missing IS NOT NULL THEN
+        RAISE EXCEPTION 'the list of what exists outside the app schemas has no line like: %', _missing;
+    END IF;
+    -- On HAF itself, also what only HAF has, and its size: about 2,500 lines when this
+    -- was written (the job's log gives the figure), 172 on the model.
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'hive_fork_manager') THEN
+        SELECT string_agg(w, ', ') INTO _missing
+        FROM unnest(ARRAY['extension hive_fork_manager %', 'event trigger %', 'rows of hafd.%', 'sequence value hafd.%']) AS w
+        WHERE NOT EXISTS (SELECT 1 FROM unnest(_was) AS i WHERE i LIKE w);
+        IF _missing IS NOT NULL OR cardinality(_was) < 1500 THEN
+            RAISE EXCEPTION 'on HAF the list of what exists outside the app schemas has % lines and none like: %',
+                cardinality(_was), coalesce(_missing, '(all present)');
+        END IF;
+    END IF;
+    -- 172 over the model. (Over HAF the floor is in the block above.)
     IF (SELECT cardinality(n.item) FROM ci_install_lane.note AS n WHERE n.name = 'outside at setup') < 100 THEN
         RAISE EXCEPTION 'the list of what exists outside the app schemas is implausibly short';
     END IF;
@@ -373,9 +416,65 @@ DECLARE
         'constraint user_interests_pkey on user_interests: PRIMARY KEY (username, community_id)',
         'constraint user_profile_vectors_pkey on user_profile_vectors: PRIMARY KEY (username)'
     ];
+    -- Each table as the installer must make it, as one md5: its columns (type, NOT
+    -- NULL, default, identity), its indexes as pg_get_indexdef gives them and whether
+    -- each is valid, its constraints, whether it is logged, row-level security (none:
+    -- a table with it enabled and no policy reads as EMPTY to the API role), triggers
+    -- (none of ours, and none of the foreign keys' own disabled), and everybody's
+    -- privileges on it. The names above say a thing exists; this says it is the right
+    -- thing -- a varchar(25) where 256 was meant, or an index on the wrong column, has
+    -- every name right and installs identically twice. Changing a table means changing
+    -- its line, and the failure prints what the table is now.
+    _want_shapes TEXT [] := ARRAY[
+        'active_users:5753072c3d3cdbcc07c251941e0a84c3',
+        'algorithm_versions:a01274e565cd6eb78c8410fc84be412b',
+        'app_config:f07016b330e78d404f25efd56e197825',
+        'app_status:a43c6b774c56f4685914098c50a2d10b',
+        'app_version:4ae27d34fdb2e1b24d65982fd39401c3',
+        'embedding_coverage_daily:a62045d4221bbc4aea03335c98a60744',
+        'engagement_metrics:7cf3981f79d4040049de58bb745de0e5',
+        'feed_cache:f0a1086f4b6cc5be47e6bc56e7c3bd2e',
+        'feed_events:00dd1fb16cf6d689d73e65f419fdb299',
+        'feed_events_rollup_state:ae22e3f207a74f0d4ee3b1c51a2d4c63',
+        'feed_metrics_daily:192c4d0610eb7c746f28d43819490adc',
+        'global_feed_cache:6e555692efeb7ea04564cb05d91a1dc6',
+        'post_bridge_cache:07e82e299618794650a8aa54106cbd15',
+        'post_candidates:a1f80ce318f64aeffc9d90d61d4c6b0a',
+        'post_commenters:51fd56360843ceca2b5ac0fab27ab1ad',
+        'post_lookup:2641796ea116347255fa0a4c034f2db6',
+        'user_communities:83146409c11276c9ea90534eabba3df9',
+        'user_interactions:b6df4fe3645eb96a2db8570667cf35df',
+        'user_interests:d99ba90cbdab04aae0fef51df1af940e',
+        'user_profile_vectors:60673f9d4a5cb857cc6b63ef6c6ea8d6'
+    ];
+    _shapes TEXT [];
     _has TEXT [];
     _diff TEXT;
 BEGIN
+    SELECT array_agg(t.relname || ':' || md5(ci_install_lane.table_shape(t.oid)) ORDER BY t.relname) INTO _shapes
+    FROM pg_class AS t
+    WHERE t.relnamespace = 'haf_fyp_app'::regnamespace AND t.relkind = 'r' AND t.relname <> 'haf_fyp';
+    SELECT string_agg(
+        E'\n  ' || split_part(s, ':', 1) || ' is ' || s || E', and reads:\n'
+        || ci_install_lane.table_shape(('haf_fyp_app.' || quote_ident(split_part(s, ':', 1)))::regclass),
+        ''
+    ) INTO _diff
+    FROM unnest(_shapes) AS s
+    WHERE s <> ALL(_want_shapes);
+    IF _diff IS NOT NULL OR _shapes IS DISTINCT FROM _want_shapes THEN
+        RAISE EXCEPTION 'these tables are not as tests/ci_install_verify.sql lists them (% listed, % installed):%',
+            cardinality(_want_shapes), cardinality(_shapes), coalesce(_diff, ' (a listed table is missing)');
+    END IF;
+
+    -- The two schemas' own privileges, whole: the owner, and USAGE for the API role.
+    SELECT string_agg(n.nspname || ' ' || ci_install_lane.acl_text(n.nspacl, acldefault('n', n.nspowner), TRUE), '; '
+                      ORDER BY n.nspname) INTO _diff
+    FROM pg_namespace AS n WHERE n.nspname IN ('haf_fyp_app', 'haf_fyp_endpoints');
+    IF _diff IS DISTINCT FROM 'haf_fyp_app haf_fyp_owner=UC/haf_fyp_owner,haf_fyp_user=U/haf_fyp_owner; '
+       'haf_fyp_endpoints haf_fyp_owner=UC/haf_fyp_owner,haf_fyp_user=U/haf_fyp_owner' THEN
+        RAISE EXCEPTION 'the privileges on the two schemas are: %', _diff;
+    END IF;
+
     SELECT array_agg(h.i) INTO _has
     FROM (
     SELECT 'index ' || i.relname || ' on ' || t.relname
@@ -449,6 +548,20 @@ BEGIN
          WHERE a.attrelid = 'haf_fyp_app.user_profile_vectors'::regclass AND a.attname = 'interest_vector')
     ) IS DISTINCT FROM 'vector(1024)' THEN
         RAISE EXCEPTION 'user_profile_vectors.interest_vector is not vector(1024)';
+    END IF;
+
+    -- The extension is the SAME one from here on, not merely one of the same name: a
+    -- DROP EXTENSION ... CASCADE followed by CREATE EXTENSION leaves `vector` resolving
+    -- and takes every other application's vector columns with it. tests/ci_uninstall_verify.sql
+    -- compares again after the uninstall.
+    IF current_setting('ci.phase') = 'first' THEN
+        INSERT INTO ci_install_lane.note (name, item)
+        SELECT 'pgvector after the first install', ARRAY[e.oid::text, e.extversion, e.extnamespace::regnamespace::text]
+        FROM pg_extension AS e WHERE e.extname = 'vector';
+    END IF;
+    IF (SELECT ARRAY[e.oid::text, e.extversion, e.extnamespace::regnamespace::text] FROM pg_extension AS e WHERE e.extname = 'vector')
+       IS DISTINCT FROM (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'pgvector after the first install') THEN
+        RAISE EXCEPTION 'pgvector is not the extension the first install left: it was dropped and created again, or moved';
     END IF;
 END
 $$;
@@ -714,9 +827,24 @@ BEGIN
     IF _bad IS DISTINCT FROM 'haf_fyp_user:SELECT:r in haf_fyp_app, haf_fyp_user:EXECUTE:f in haf_fyp_endpoints' THEN
         RAISE EXCEPTION 'default privileges in the application schemas: %', _bad;
     END IF;
+    -- ...and the application roles set none anywhere else. One of haf_fyp_owner's in
+    -- another schema, or in every schema, granting to PUBLIC, names no application role
+    -- as grantee, so neither the list below nor the snapshot of section 2 has it.
+    SELECT string_agg(pg_get_userbyid(d.defaclrole) || ' on ' || d.defaclobjtype::text || ' in '
+                      || CASE WHEN d.defaclnamespace = 0 THEN 'every schema' ELSE d.defaclnamespace::regnamespace::text END
+                      || ' = ' || d.defaclacl::text, '; ') INTO _bad
+    FROM pg_default_acl AS d
+    WHERE pg_get_userbyid(d.defaclrole) IN ('haf_fyp_owner', 'haf_fyp_user')
+      AND (d.defaclnamespace = 0 OR d.defaclnamespace::regnamespace::text NOT IN ('haf_fyp_app', 'haf_fyp_endpoints'));
+    IF _bad IS NOT NULL THEN
+        RAISE EXCEPTION 'an application role has default privileges outside the application schemas: %', _bad;
+    END IF;
 
-    -- EVERYTHING the application roles were granted outside their own schemas, as a
-    -- list. With no other application installed, db/cross_schema_grants.sql has two
+    -- What the application roles were granted outside their own schemas, as a list:
+    -- on relations, columns, schemas, functions, the database, and through default
+    -- privileges. (On types, languages and configuration parameters they are granted
+    -- nothing, and the snapshot of section 2 shows it if they are.)
+    -- With no other application installed, db/cross_schema_grants.sql has two
     -- things to grant, on hafd. One line more -- ALL on hafd's tables, say -- and the
     -- unauthenticated role can TRUNCATE hafd.contexts, which row-level security does
     -- not stop.
@@ -815,6 +943,14 @@ BEGIN
        OR has_table_privilege('haf_fyp_user', 'ci_bystander_app.state', 'SELECT')
        OR has_table_privilege('haf_fyp_owner', 'ci_bystander_app.state', 'SELECT') THEN
         RAISE EXCEPTION 'the install changed, or granted itself, another application''s table';
+    END IF;
+    -- HAF's log of context events only grows: every line it held before the first
+    -- install is still there.
+    IF NOT (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'HAF''s context log at setup')
+           <@ ci_install_lane.context_log_now() THEN
+        RAISE EXCEPTION 'lines that HAF''s log of context events held before the first install are gone: % then, % now',
+            (SELECT cardinality(n.item) FROM ci_install_lane.note AS n WHERE n.name = 'HAF''s context log at setup'),
+            cardinality(ci_install_lane.context_log_now());
     END IF;
 END
 $$;

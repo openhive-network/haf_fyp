@@ -215,11 +215,14 @@ services:
   # psql fails, the container exits non-zero, and verify-gone cannot start.
   bystander-session:
     <<: *sql
+    # Two sessions: one in the middle of a statement, and one connected and doing
+    # nothing -- a psql whose input never comes -- which is what most sessions on a
+    # node are. An uninstaller that swept away idle sessions would spare the first.
     command:
       - >-
-        PGAPPNAME=ci-bystander-session psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -c "SET ROLE ci_bystander_owner" -c "SELECT pg_sleep(1800)"
+        sleep 1800 | PGAPPNAME=ci-bystander-idle psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 & PGAPPNAME=ci-bystander-session psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1 -c "SET ROLE ci_bystander_owner" -c "SELECT pg_sleep(1800)"
     healthcheck:
-      test: ["CMD-SHELL", "psql -h postgres -U postgres -d haf_block_log -Atc \"SELECT count(*) FROM pg_stat_activity WHERE application_name = 'ci-bystander-session'\" | grep -qx 1"]
+      test: ["CMD-SHELL", "psql -h postgres -U postgres -d haf_block_log -Atc \"SELECT (count(*) = 2)::int FROM pg_stat_activity WHERE application_name IN ('ci-bystander-session', 'ci-bystander-idle')\" | grep -qx 1"]
       interval: 1s
       timeout: 3s
       retries: 30
