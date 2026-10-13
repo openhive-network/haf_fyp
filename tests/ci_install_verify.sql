@@ -84,6 +84,18 @@ BEGIN
     IF _held IS DISTINCT FROM 'haf_admin in haf_fyp_owner, haf_fyp_owner in haf_fyp_user' THEN
         RAISE EXCEPTION 'the members of the application roles are: %', _held;
     END IF;
+    -- ...and on the ordinary terms. A membership WITH INHERIT FALSE is there in every
+    -- list above and gives its member nothing until it says SET ROLE: the owner would
+    -- hold none of what is granted to the API role, and no step here logs in as it.
+    SELECT string_agg(pg_get_userbyid(m.member) || ' in ' || pg_get_userbyid(m.roleid)
+                      || ' (inherit ' || m.inherit_option || ', set ' || m.set_option || ')', ', ') INTO _held
+    FROM pg_auth_members AS m
+    WHERE (pg_get_userbyid(m.member) IN ('haf_fyp_owner', 'haf_fyp_user')
+           OR pg_get_userbyid(m.roleid) IN ('haf_fyp_owner', 'haf_fyp_user'))
+      AND NOT (m.inherit_option AND m.set_option);
+    IF _held IS NOT NULL THEN
+        RAISE EXCEPTION 'a membership of an application role does not inherit, or cannot be SET to: %', _held;
+    END IF;
 
     -- What only a real login would meet, and no step of this lane logs in as an
     -- application role: a connection limit (the API's pool would hit it on a fresh
@@ -231,8 +243,9 @@ BEGIN
 
     -- A list that has lost a whole kind of item compares equal to itself at every
     -- step: the first version of this left out every extension member, and with them
-    -- all of HAF, and stayed green. So the list must HOLD what it exists to watch --
-    -- named lines of HAF's, and at least one line of every kind both lanes have.
+    -- all of HAF, and stayed green. So the list must HOLD what it exists to watch:
+    -- named lines of HAF's and of the other application's, and a line of several kinds
+    -- (not of every kind: there is none here for triggers, views or sequences).
     SELECT string_agg(w, ', ') INTO _missing
     FROM unnest(ARRAY[
         'function hive.app_create_context(%', 'function hive.app_register(%', 'relation r hafd.contexts %',
@@ -240,7 +253,8 @@ BEGIN
         'schema hafd %', 'schema hive %', 'role haf_admin %', 'role ci_bystander_owner %',
         'membership ci_bystander_owner in hive_applications_owner_group %',
         'relation r ci_bystander_app.state %', 'rows of ci_bystander_app.state %',
-        'function ci_bystander_app.process_blocks(%', 'constraint %', 'type %', 'language plpgsql %', 'database %'
+        'function ci_bystander_app.process_blocks(%', 'constraint %', 'type %', 'language plpgsql %', 'database %',
+        'system relation pg_catalog.pg_authid %', 'system schema pg_catalog %', 'role ci_bystander_login %'
     ]) AS w
     WHERE NOT EXISTS (SELECT 1 FROM unnest(_was) AS i WHERE i LIKE w);
     IF _missing IS NOT NULL THEN
@@ -255,6 +269,12 @@ BEGIN
         IF _missing IS NOT NULL OR cardinality(_was) < 1500 THEN
             RAISE EXCEPTION 'on HAF the list of what exists outside the app schemas has % lines and none like: %',
                 cardinality(_was), coalesce(_missing, '(all present)');
+        END IF;
+        -- "HAF's context log only grows" (section 8) says nothing about a log that was
+        -- empty, or about a table this HAF no longer calls by that name.
+        IF coalesce((SELECT cardinality(n.item) FROM ci_install_lane.note AS n
+                     WHERE n.name = 'HAF''s context log at setup'), 0) < 1 THEN
+            RAISE EXCEPTION 'on HAF the record of the context log taken before the first install is empty: hafd.contexts_log is gone, renamed, or was not written when the other application was set up';
         END IF;
     END IF;
     -- 172 over the model. (Over HAF the floor is in the block above.)
@@ -434,7 +454,7 @@ DECLARE
         'embedding_coverage_daily:a62045d4221bbc4aea03335c98a60744',
         'engagement_metrics:7cf3981f79d4040049de58bb745de0e5',
         'feed_cache:f0a1086f4b6cc5be47e6bc56e7c3bd2e',
-        'feed_events:00dd1fb16cf6d689d73e65f419fdb299',
+        'feed_events:5b00275a46d51dfae529688ee0f0a532',
         'feed_events_rollup_state:ae22e3f207a74f0d4ee3b1c51a2d4c63',
         'feed_metrics_daily:192c4d0610eb7c746f28d43819490adc',
         'global_feed_cache:6e555692efeb7ea04564cb05d91a1dc6',
@@ -447,10 +467,113 @@ DECLARE
         'user_interests:d99ba90cbdab04aae0fef51df1af940e',
         'user_profile_vectors:60673f9d4a5cb857cc6b63ef6c6ea8d6'
     ];
+    -- Each function likewise, without its body (tests/ci_install_setup.sql says why):
+    -- what it returns, its arguments and their defaults, volatility, STRICT, SECURITY
+    -- DEFINER, settings, owner, and who may execute it.
+    _want_function_shapes TEXT [] := ARRAY[
+        'haf_fyp_app.allow_processing() = 42e67e6de14c07648262737fa0b0918a',
+        'haf_fyp_app.block_processor_lock_names() = 57b659a22df92bce1fc86c5cbc4513dd',
+        'haf_fyp_app.community_id_from_name(text) = 26fe8da601216b96dd4f70009cfb00d3',
+        'haf_fyp_app.community_membership_changes(integer,integer) = b58e2d6d837db56eba6b944eb11da25e',
+        'haf_fyp_app.context_claimed_by_other_app(text) = 3e11bd64ba6728246c921824fb3bd8b8',
+        'haf_fyp_app.continue_processing() = 1465acb6be0b5c3ee3cdda1ed60bec17',
+        'haf_fyp_app.create_context_if_not_exists() = a967f1b32caec08ccf85d72f4970fb78',
+        'haf_fyp_app.evict_unproductive_users(integer) = 47a59ce29e99ecf7b6623381be5380e4',
+        'haf_fyp_app.evict_unsubscribed_users(character varying[]) = 2bf9d3fbbbc50aa7d1720d2b754f57d2',
+        'haf_fyp_app.get_bridge_post(integer,integer,integer) = 21367c62940e9d817140e64d80f9b769',
+        'haf_fyp_app.main(hafd.context_name) = 997b25d8bd27a0c1b83d83a9c8e756f0',
+        'haf_fyp_app.process_block_range(integer,integer) = 63509946c93495bcef4527848f67839d',
+        'haf_fyp_app.process_blocks(hive.blocks_range) = b57ec7b3c13afef1995b8baf0c2df45b',
+        'haf_fyp_app.process_comments(integer,integer) = 63509946c93495bcef4527848f67839d',
+        'haf_fyp_app.process_communities(integer,integer) = 63509946c93495bcef4527848f67839d',
+        'haf_fyp_app.process_engagement(integer,integer) = 63509946c93495bcef4527848f67839d',
+        'haf_fyp_app.process_interactions(integer,integer) = 63509946c93495bcef4527848f67839d',
+        'haf_fyp_app.process_payout_windows(integer) = 624ecf8ebc2540da4295fb5df0adb754',
+        'haf_fyp_app.process_posts(integer,integer) = 63509946c93495bcef4527848f67839d',
+        'haf_fyp_app.process_reblogs(integer,integer) = 63509946c93495bcef4527848f67839d',
+        'haf_fyp_app.process_subscribe(integer,integer) = 63509946c93495bcef4527848f67839d',
+        'haf_fyp_app.process_unsubscribe(integer,integer) = 63509946c93495bcef4527848f67839d',
+        'haf_fyp_app.process_votes(integer,integer) = 63509946c93495bcef4527848f67839d',
+        'haf_fyp_app.prune_feed_events(integer,bigint,integer) = 30e81938121251b830a06679740ba68e',
+        'haf_fyp_app.refresh_embedding_coverage(integer) = db6595c42f6a01ad22f5d01eab9741f4',
+        'haf_fyp_app.repair_stranded_optins() = 0785848306c7c1a6027c8151dbcb594f',
+        'haf_fyp_app.resolve_hivemind_post_ids(timestamp without time zone,timestamp without time zone) = cb50820029a26a56cba07880894d0c17',
+        'haf_fyp_app.rollup_feed_events(integer) = 4df44510cbf4ea631897cfa6f0b99729',
+        'haf_fyp_app.run_hive_post_id_backfill(interval,numeric) = 159bfd154711c61acb04ffeb14a0cf9d',
+        'haf_fyp_app.safe_parse_json(text) = 9470f66402ac7387694615397e09b05c',
+        'haf_fyp_app.stop_processing() = 42e67e6de14c07648262737fa0b0918a',
+        'haf_fyp_app.sync_status() = fe8f5f4646a72521e5a543d42fc62301',
+        'haf_fyp_app.take_block_processor_locks() = a967f1b32caec08ccf85d72f4970fb78',
+        'haf_fyp_endpoints.get_algorithm() = 53d14f83dbe2498fd331423fea1f004a',
+        'haf_fyp_endpoints.get_feed_metrics(date,date,text,text) = 68e585d4563f3a7285e4f8535d002a6f',
+        'haf_fyp_endpoints.get_global_feed(integer,integer,integer,integer) = d2481ac525c42378151e6823f8251366',
+        'haf_fyp_endpoints.get_health() = 7bdb2db38614dd93de16bbcae08639c7',
+        'haf_fyp_endpoints.get_personalized_feed(text,integer,integer,integer) = 8c209b127b6ff9da861538a7724be254',
+        'haf_fyp_endpoints.get_score_explanation(text,bigint) = e40cc0b5821a9966a0243f919da929cb',
+        'haf_fyp_endpoints.get_sync_status() = 33dba2c778f9e4a5d74e1fbd237c944d',
+        'haf_fyp_endpoints.get_user_profile(text) = b753d667674c709140999f0816726c27',
+        'haf_fyp_endpoints.get_version() = 97abad59258ae3306fb7bded42a0a63c',
+        'haf_fyp_endpoints.list_algorithm_versions() = d5c54520b9e29c1281b33ada867a53bc',
+        'haf_fyp_endpoints.root() = 33dba2c778f9e4a5d74e1fbd237c944d'
+    ];
     _shapes TEXT [];
     _has TEXT [];
     _diff TEXT;
 BEGIN
+    SELECT array_agg(p.oid::regprocedure::text || ' = ' || md5(ci_install_lane.function_shape(p.oid::regprocedure))
+                     ORDER BY p.oid::regprocedure::text COLLATE "C") INTO _shapes
+    FROM pg_proc AS p
+    WHERE p.pronamespace IN ('haf_fyp_app'::regnamespace, 'haf_fyp_endpoints'::regnamespace);
+    SELECT string_agg(E'\n  ' || s || E' reads:\n    ' || reads, '') INTO _diff
+    FROM (SELECT s, ci_install_lane.function_shape(split_part(s, ' = ', 1)::regprocedure) AS reads
+          FROM unnest(_shapes) AS s WHERE s <> ALL(_want_function_shapes)) AS x;
+    IF _diff IS NOT NULL OR _shapes IS DISTINCT FROM _want_function_shapes THEN
+        RAISE EXCEPTION 'these functions are not as tests/ci_install_verify.sql lists them (% listed, % installed):%',
+            cardinality(_want_function_shapes), cardinality(_shapes), coalesce(_diff, ' (a listed function is missing)');
+    END IF;
+
+    -- What else is in the two schemas. Tables and functions are listed above; this is
+    -- everything that is neither. A view is not a table and runs with its OWNER's
+    -- rights: one over feed_cache, granted to the API role, is a way to write that
+    -- table which no grant on the table shows.
+    --   views: exactly the ones HAF makes for a context, which are the ones it made
+    --          for the other application (HAF's business which; the same for both);
+    --   sequences: the one behind feed_events.id, and the context table's own;
+    --   nothing else at all: no materialized view, foreign table, type or domain of
+    --   ours, and no relation of any kind among the endpoints.
+    SELECT string_agg(d, '; ' ORDER BY d) INTO _diff
+    FROM (
+        SELECT 'view ' || c.relname || ' is in haf_fyp_app and not among the other application''s' AS d
+        FROM pg_class AS c WHERE c.relnamespace = 'haf_fyp_app'::regnamespace AND c.relkind = 'v'
+          AND NOT EXISTS (SELECT 1 FROM pg_class AS o WHERE o.relnamespace = 'ci_bystander_app'::regnamespace
+                          AND o.relkind = 'v' AND o.relname = c.relname)
+        UNION ALL
+        SELECT 'view ' || o.relname || ' is among the other application''s and not in haf_fyp_app'
+        FROM pg_class AS o WHERE o.relnamespace = 'ci_bystander_app'::regnamespace AND o.relkind = 'v'
+          AND NOT EXISTS (SELECT 1 FROM pg_class AS c WHERE c.relnamespace = 'haf_fyp_app'::regnamespace
+                          AND c.relkind = 'v' AND c.relname = o.relname)
+        UNION ALL
+        SELECT 'sequence ' || c.relname || ' belongs to no listed column'
+        FROM pg_class AS c WHERE c.relnamespace = 'haf_fyp_app'::regnamespace AND c.relkind = 'S'
+          AND c.relname <> 'feed_events_id_seq'
+          AND NOT EXISTS (SELECT 1 FROM pg_depend AS d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
+                          AND d.refclassid = 'pg_class'::regclass AND d.refobjid = 'haf_fyp_app.haf_fyp'::regclass
+                          AND d.deptype IN ('a', 'i'))
+        UNION ALL
+        SELECT 'relation ' || c.oid::regclass::text || ' of kind ' || c.relkind::text
+        FROM pg_class AS c
+        WHERE (c.relnamespace = 'haf_fyp_app'::regnamespace AND c.relkind NOT IN ('r', 'i', 'S', 'v'))
+           OR c.relnamespace = 'haf_fyp_endpoints'::regnamespace
+        UNION ALL
+        SELECT 'type ' || t.oid::regtype::text
+        FROM pg_type AS t
+        WHERE t.typnamespace IN ('haf_fyp_app'::regnamespace, 'haf_fyp_endpoints'::regnamespace)
+          AND t.typtype <> 'c' AND NOT EXISTS (SELECT 1 FROM pg_type AS e WHERE e.typarray = t.oid)
+    ) AS x;
+    IF _diff IS NOT NULL THEN
+        RAISE EXCEPTION 'in the application schemas, and not listed in tests/ci_install_verify.sql: %', _diff;
+    END IF;
+
     SELECT array_agg(t.relname || ':' || md5(ci_install_lane.table_shape(t.oid)) ORDER BY t.relname) INTO _shapes
     FROM pg_class AS t
     WHERE t.relnamespace = 'haf_fyp_app'::regnamespace AND t.relkind = 'r' AND t.relname <> 'haf_fyp';
@@ -623,6 +746,12 @@ BEGIN
     IF _a.owner IS DISTINCT FROM 'haf_fyp_owner' THEN
         RAISE EXCEPTION 'the registry row is owned by %, not haf_fyp_owner', _a.owner;
     END IF;
+    -- db/register_app.sql registers a procedure and nothing to call when a block is
+    -- done. Read by name out of the row, so that a HAF without the column answers NULL.
+    IF (SELECT to_jsonb(a) ->> 'completed_block_function' FROM hafd.applications AS a WHERE a.name = 'haf_fyp') IS NOT NULL THEN
+        RAISE EXCEPTION 'haf_fyp is registered with a completed-block function: %',
+            (SELECT to_jsonb(a) ->> 'completed_block_function' FROM hafd.applications AS a WHERE a.name = 'haf_fyp');
+    END IF;
 
     -- The stages the context was created with: 10000 blocks a batch until 101 blocks
     -- from the head, then live. A batch of 1 there is a first sync that takes months.
@@ -685,6 +814,23 @@ BEGIN
     SELECT count(*) INTO _n FROM haf_fyp_app.algorithm_versions;
     IF _n <> 3 THEN
         RAISE EXCEPTION 'algorithm_versions holds % rows, the seed has 3', _n;
+    END IF;
+    -- On a first install, the seed by VALUE: three rows is also what a seed with one
+    -- weight ten times too large has. (Later the weights are the operator's.) And the
+    -- telemetry rollup starts from the beginning.
+    IF current_setting('ci.phase') = 'first' THEN
+        IF (SELECT md5(string_agg(v.version || ' ' || v.is_active || ' ' || v.weights::text, E'\n' ORDER BY v.version COLLATE "C"))
+            FROM haf_fyp_app.algorithm_versions AS v) IS DISTINCT FROM '176bde5dbeb40a10ed92de0980847aba' THEN
+            RAISE EXCEPTION E'the seeded algorithm versions are not the ones tests/ci_install_verify.sql pins (db/seed_data.sql changed?). They read, as md5 %:\n%',
+                (SELECT md5(string_agg(v.version || ' ' || v.is_active || ' ' || v.weights::text, E'\n' ORDER BY v.version COLLATE "C"))
+                 FROM haf_fyp_app.algorithm_versions AS v),
+                (SELECT string_agg(v.version || ' ' || v.is_active || ' ' || v.weights::text, E'\n' ORDER BY v.version COLLATE "C")
+                 FROM haf_fyp_app.algorithm_versions AS v);
+        END IF;
+        IF (SELECT s.last_rolled_id FROM haf_fyp_app.feed_events_rollup_state AS s) <> 0 THEN
+            RAISE EXCEPTION 'a fresh install starts the telemetry rollup at %, not 0',
+                (SELECT s.last_rolled_id FROM haf_fyp_app.feed_events_rollup_state AS s);
+        END IF;
     END IF;
     SELECT string_agg(v.version, ',' ORDER BY v.version) INTO _active
     FROM haf_fyp_app.algorithm_versions AS v WHERE v.is_active;
@@ -782,15 +928,24 @@ BEGIN
         FROM pg_class AS c
         INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
         CROSS JOIN unnest(ARRAY['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER']) AS priv
-        WHERE n.nspname = 'haf_fyp_app' AND c.relkind = 'r'
+        -- Views too: a write to a view is a write to its table, with the view OWNER's rights.
+        WHERE n.nspname IN ('haf_fyp_app', 'haf_fyp_endpoints') AND c.relkind IN ('r', 'v', 'm', 'f', 'p')
           AND has_table_privilege('haf_fyp_user', c.oid, priv)
+        UNION ALL
+        SELECT c.relname || ':sequence ' || priv
+        FROM pg_class AS c
+        INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        CROSS JOIN unnest(ARRAY['USAGE', 'UPDATE']) AS priv
+        WHERE n.nspname IN ('haf_fyp_app', 'haf_fyp_endpoints') AND c.relkind = 'S'
+          AND has_sequence_privilege('haf_fyp_user', c.oid, priv)
         UNION ALL
         SELECT c.relname || '.' || a.attname || ':' || priv
         FROM pg_attribute AS a
         INNER JOIN pg_class AS c ON c.oid = a.attrelid
         INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
         CROSS JOIN unnest(ARRAY['INSERT', 'UPDATE', 'REFERENCES']) AS priv
-        WHERE n.nspname = 'haf_fyp_app' AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped
+        WHERE n.nspname IN ('haf_fyp_app', 'haf_fyp_endpoints') AND c.relkind IN ('r', 'v', 'm', 'f', 'p')
+          AND a.attnum > 0 AND NOT a.attisdropped
           AND NOT has_table_privilege('haf_fyp_user', c.oid, priv)
           AND has_column_privilege('haf_fyp_user', c.oid, a.attnum, priv)
     ) AS g;

@@ -119,12 +119,13 @@ class Flavour:
                     "WHERE l.locktype = 'advisory' AND l.granted AND a.application_name = 'haf_fyp-ci-lock-holder'")),
             "install-locked": self.app(["install_app"], {"lock-holder": HEALTHY}),
             "verify-locked": self.verify("locked", "install-locked"),
-            "release-lock": self.sql(
-                f'{self.psql} -c "INSERT INTO ci_install_lane.lock_released DEFAULT VALUES"', {"verify-locked": DONE}),
+            "release-lock": self.sql(f"{self.psql} -f /ci_install_release.sql", {"verify-locked": DONE},
+                                     ("ci_install_release.sql",)),
             "install-again": self.app(["install_app"], {"release-lock": DONE, "lock-holder": DONE}),
             "verify-again": self.verify("second", "install-again"),
             "bystander-session": self.sql(
-                f'sleep 1800 | PGAPPNAME=ci-bystander-idle {self.psql} & '
+                f'sleep 1800 | PGAPPNAME=ci-bystander-idle '
+                f'psql -h {self.host} -U ci_bystander_login -d haf_block_log -v ON_ERROR_STOP=1 & '
                 f'PGAPPNAME=ci-bystander-session {self.psql} -c "SET ROLE ci_bystander_owner" -c "SELECT pg_sleep(1800)"',
                 {"verify-again": DONE},
                 healthcheck=self.probe(
@@ -443,10 +444,11 @@ def test_compose_validate_parses_the_lane(ci, flavour):
 # many could be deleted, or turned into notices, with every test and both lanes green.
 # Adding a check means changing its file's number; so does removing one, which is the
 # point.
-RAISES = {"ci_install_verify.sql": 77, "ci_uninstall_verify.sql": 18, "ci_install_lock_holder.sql": 3,
-          "ci_install_haf_model.sql": 9, "ci_install_age.sql": 1, "ci_install_setup.sql": 0}
+RAISES = {"ci_install_verify.sql": 84, "ci_uninstall_verify.sql": 18, "ci_install_lock_holder.sql": 3,
+          "ci_install_haf_model.sql": 9, "ci_install_age.sql": 1, "ci_install_setup.sql": 0, "ci_install_release.sql": 0}
 LANE_SQL = sorted({"ci_install_haf_model.sql", "ci_install_setup.sql", "ci_install_verify.sql",
-                   "ci_install_age.sql", "ci_install_lock_holder.sql", "ci_uninstall_verify.sql"})
+                   "ci_install_age.sql", "ci_install_lock_holder.sql", "ci_install_release.sql",
+                   "ci_uninstall_verify.sql"})
 
 
 @pytest.mark.parametrize("name", LANE_SQL)
@@ -459,7 +461,20 @@ def test_the_sql_the_lanes_run_cannot_be_switched_off_from_inside(name):
     meta = [line for line in text.splitlines() if line.lstrip().startswith("\\")]
     assert not meta, f"{name} uses psql meta-commands: {meta}"
     assert "ON_ERROR_STOP" not in text, name
-    assert len(re.findall(r"RAISE EXCEPTION", text)) == RAISES[name], name
+    # Counted as STATEMENTS, at the start of a line: the words left behind in a comment
+    # where a check used to be are not a check.
+    assert len(re.findall(r"^\s*RAISE EXCEPTION", text, re.M)) == RAISES[name], name
+    assert len(re.findall(r"RAISE EXCEPTION", text)) == RAISES[name], f"{name}: the words appear outside a statement"
+    # A handler that catches everything turns every check inside its block into nothing.
+    assert not re.search(r"WHEN\s+OTHERS", text, re.I), name
+
+
+def test_the_stub_the_model_lane_loads_cannot_switch_checking_off_either():
+    """tests/haf_stub.sql is loaded by the model lane's db-setup, in the same psql
+    conventions as the lane's own files, and is not one of them."""
+    text = (ROOT / "tests" / "haf_stub.sql").read_text(encoding="utf-8")
+    assert not [line for line in text.splitlines() if line.lstrip().startswith("\\")]
+    assert "ON_ERROR_STOP" not in text
 
 
 def test_every_lane_sql_file_is_one_of_those():
@@ -502,7 +517,7 @@ def test_the_unit_tests_that_guard_these_lanes_are_themselves_run(ci):
     assert "allow_failure" not in job and job.get("when", "on_success") == "on_success"
     assert job["rules"] == STANDARD_RULES
     (line,) = [s for s in job["script"] if "pytest" in s and "pip install" not in s]
-    assert line.startswith("PYTHONPATH=. pytest tests/unit/ "), line
-    assert not re.search(r"--ignore|--deselect|(^|\s)-k\b|(^|\s)-m\b|--co\b|--collect-only", line), line
-    # Nothing after the command that could forgive it: `|| true`, `; true`, a pipe.
-    assert not re.search(r"[|;&]", line), line
+    # The whole line. A list of flags to refuse missed `--setup-plan`, which collects
+    # every test and runs none; there is always one more such flag.
+    assert line == ("PYTHONPATH=. pytest tests/unit/ -v -rfEs --cov=haf_fyp --cov-report=term-missing "
+                    "--cov-fail-under=40"), line

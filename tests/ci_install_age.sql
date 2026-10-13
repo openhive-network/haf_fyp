@@ -60,8 +60,8 @@ RESET ROLE;
 UPDATE haf_fyp_app.app_version SET git_hash = 'aged-by-the-lane';
 UPDATE haf_fyp_app.app_config SET swagger_base_url = '/aged-by-the-lane';
 
--- Every table has a row now (the context's own table apart: HAF fills that, with
--- blocks). A table added later and not given one here stops the lane, here.
+-- Every table has a row now (the context's own table apart: it is HAF's, and holds
+-- none of ours). A table added later and not given one here stops the lane, here.
 DO $$
 DECLARE
     _rel REGCLASS;

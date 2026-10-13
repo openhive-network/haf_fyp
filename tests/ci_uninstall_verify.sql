@@ -58,9 +58,9 @@ BEGIN
 END
 $$;
 
--- Outside haf_fyp's schemas the database is, object for object and privilege for
--- privilege, what tests/ci_install_setup.sql made: nothing left behind there, nothing
--- taken away, and every grant the installer gave its roles gone with them.
+-- Outside haf_fyp's schemas the database is, by the snapshot tests/ci_install_setup.sql
+-- defines (which says what it holds and what it does not), what it was before the
+-- first install -- and every grant the installer gave its roles is gone with them.
 DO $$
 DECLARE
     _diff TEXT;
@@ -107,11 +107,14 @@ BEGIN
     -- ...and the one that was doing nothing at the time, which is what most sessions
     -- on a node are. An uninstaller that swept away IDLE sessions would spare the busy
     -- one above.
+    -- It is logged in as that application's own role: the busy one above is a
+    -- superuser's session wearing the application's name.
     IF NOT EXISTS (
-        SELECT 1 FROM pg_stat_activity AS a WHERE a.application_name = 'ci-bystander-idle' AND a.state = 'idle'
+        SELECT 1 FROM pg_stat_activity AS a
+        WHERE a.application_name = 'ci-bystander-idle' AND a.state = 'idle' AND a.usename = 'ci_bystander_login'
     ) THEN
-        RAISE EXCEPTION 'the uninstall terminated another application''s idle session (or the lane''s idle session is not idle: %)',
-            (SELECT string_agg(a.state, ',') FROM pg_stat_activity AS a WHERE a.application_name = 'ci-bystander-idle');
+        RAISE EXCEPTION 'the uninstall terminated another application''s idle session (or the lane''s idle session is not what it should be: %)',
+            (SELECT string_agg(a.usename || ' ' || a.state, ',') FROM pg_stat_activity AS a WHERE a.application_name = 'ci-bystander-idle');
     END IF;
 END
 $$;

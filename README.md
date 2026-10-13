@@ -1489,12 +1489,12 @@ docker compose -f docker/docker-compose-ci-install.yml down -v
 | step | what it does |
 |---|---|
 | `install` | `install_app` on a database that has never seen haf_fyp, with one other application on it |
-| `verify` | `tests/ci_install_verify.sql`: the roles and what they are members of; ownership; every table, function, index and constraint that must exist, by name, and each table's exact shape (columns, index definitions, privileges, no row-level security, no triggers); the HAF context and its registration; the one-row tables; the recorded version; what the API role may read, execute and write; the default privileges; the other application untouched, and able to use what is its own; and **the rest of the database** as it was before the install: the definitions and privileges of HAF's own functions, tables, types, policies and event triggers, the rows of its tables and where its sequences stand (the ones HAF writes for a context apart), every other role, membership and setting, casts, rules, publications. `tests/ci_install_setup.sql` lists what the snapshot holds and what it does not (operators, collations, comments and a few more) |
+| `verify` | `tests/ci_install_verify.sql`: the roles and what they are members of; ownership; every table, function, index and constraint that must exist, by name; each table's exact shape (columns, index definitions, privileges, no row-level security, no triggers) and each function's (what it returns, volatility, STRICT, settings, owner, who may execute it -- everything but its body); nothing else in the two schemas but HAF's own views for the context; the seed by value; the HAF context and its registration; the one-row tables; the recorded version; what the API role may read, execute and write; the default privileges; the other application untouched, and able to use what is its own; and **the rest of the database** as it was before the install: the definitions and privileges of HAF's own functions, tables, types, policies and event triggers, the rows of its tables and where its sequences stand (the ones HAF writes for a context apart), every other role, membership and setting, casts, rules, publications. `tests/ci_install_setup.sql` lists what the snapshot holds and what it does not (operators, collations, comments and a few more) |
 | `age` | `tests/ci_install_age.sql` changes what a running node changes: the sync pointer, the active algorithm version, a user's declared interests -- and leaves a row in every table, so that an install which emptied one would show |
 | `lock-holder`, `install-locked`, `verify-locked` | with a block processor's lock held, `install_app` exits 0 and changes nothing |
-| `release-lock`, `install-again`, `verify-again` | with the lock released, `install_app` runs over that database: everything the installer creates is identical to what `verify` recorded (function bodies and grants included), and everything `age` changed is still as `age` left it |
+| `release-lock`, `install-again`, `verify-again` | `release-lock` first breaks a few things the installer owns (`tests/ci_install_release.sql`: an endpoint function dropped, a function setting changed, an index dropped, a grant revoked), then lets the lock go. `install_app` runs over that database and must repair them: everything the installer creates is identical to what `verify` recorded (function bodies and grants included), and everything `age` changed is still as `age` left it |
 | `uninstall` | `uninstall_app --force` |
-| `verify-gone` | `tests/ci_uninstall_verify.sql`: nothing of haf_fyp is left; the rest of the database is, by the same snapshot, what it was before the first install, privileges included; pgvector is the same extension, not one created again; and two sessions of another application, one busy and one idle, are still connected |
+| `verify-gone` | `tests/ci_uninstall_verify.sql`: nothing of haf_fyp is left; the rest of the database is, by the same snapshot, what it was before the first install, privileges included; pgvector is the same extension, not one created again; and two other sessions are still connected: a busy one (a superuser's, under the other application's role and name) and an idle one logged in as a role of that application's own |
 
 `tests/unit/test_install_lane.py` states both compose files and both CI jobs in full and
 compares, so a change to either has to be made there too.
@@ -1504,7 +1504,11 @@ compares, so a change to either has to be made there too.
 - No block is processed: in the HAF lane hived stops before it syncs, and the model has
   no operation tables. That every processor exists is checked, that they work is not.
 - All three installs are the same commit, so a defect that only an upgrade from an older
-  commit shows is not seen.
+  commit shows is not seen. (That a later install does its work at all is seen: it has
+  damage to repair.)
+- What a function's body DOES is not this lane's: only that it is the same body after
+  every install. A processor that stopped calling one of its steps installs green.
+- The installer is never made to fail, so one that exits 0 after an error is not seen.
 - No other application's schema is present, so the parts of `db/cross_schema_grants.sql`
   that grant on hivemind, HiveSense, reputation_tracker and balance_tracker only print
   that they found nothing. `scripts/grant_cross_schema.sh` is not run.

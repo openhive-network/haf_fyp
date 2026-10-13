@@ -16,6 +16,13 @@ BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'ci_bystander_owner') THEN
         CREATE ROLE ci_bystander_owner NOLOGIN IN ROLE hive_applications_owner_group;
     END IF;
+    -- A login of that application's own: the session that sits idle through the
+    -- uninstall connects as this, not as the superuser every other step uses -- an
+    -- uninstaller that spared its own login's sessions would spare a superuser's.
+    -- (The password is for the model lane's server; HAF's lane trusts every host.)
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'ci_bystander_login') THEN
+        CREATE ROLE ci_bystander_login LOGIN PASSWORD 'postgres' IN ROLE ci_bystander_owner;
+    END IF;
 END
 $$;
 CREATE SCHEMA IF NOT EXISTS ci_bystander_app AUTHORIZATION ci_bystander_owner;
@@ -75,7 +82,9 @@ $$;
 -- PUBLIC on a HAF table is the installer changing HAF.
 CREATE OR REPLACE FUNCTION ci_install_lane.acl_text(_acl ACLITEM [], _default ACLITEM [], _with_app BOOLEAN)
 RETURNS TEXT LANGUAGE sql STABLE AS $$
-    SELECT coalesce(string_agg(a::text, ',' ORDER BY a::text), '(nothing)')
+    -- COLLATE "C": this text is pinned in tests/ci_install_verify.sql, and the order
+    -- of a database's own collation is the image's, not ours.
+    SELECT coalesce(string_agg(a::text, ',' ORDER BY a::text COLLATE "C"), '(nothing)')
     FROM unnest(coalesce(_acl, _default)) AS a
     WHERE _with_app OR a::text !~ '^"?haf_fyp_(owner|user)"?=';
 $$;
@@ -90,6 +99,11 @@ $$;
 -- uninstall legitimately do. What the contexts and applications tables hold FOR THE
 -- OTHER APPLICATION is compared whole by bystander_now() below, and for haf_fyp by
 -- data_now(). HAF's log of context events may only grow: context_log_now() below.
+-- So the sequences behind HAF's contexts tables are compared by nobody.
+--
+-- Only ordinary, logged tables: not unlogged ones, not materialized views. And each
+-- table is read whole into one string, which is right for a HAF with no blocks and
+-- would not be for a synced node (hafd.blocks alone passes PostgreSQL's 1 GB limit).
 CREATE OR REPLACE FUNCTION ci_install_lane.rows_outside_now()
 RETURNS TEXT [] LANGUAGE plpgsql STABLE AS $$
 DECLARE
@@ -134,9 +148,16 @@ $$;
 -- configuration parameters, the database's own privileges -- everybody's privileges on
 -- all of it -- and the rows and sequence values of rows_outside_now() above.
 --
--- NOT in it: operators, operator classes and access methods, collations, text search
--- objects, foreign servers, statistics objects, comments, security labels, large
--- objects. An installer that made one of those would not show here.
+-- Of PostgreSQL's own schemas (pg_catalog, information_schema) only the PRIVILEGES:
+-- a GRANT on pg_authid is the installer handing out every password hash.
+--
+-- NOT in it: operators, operator classes and access methods, aggregates' own
+-- definitions, collations, text search objects, foreign-data wrappers, servers and
+-- user mappings, subscriptions, statistics objects, tablespaces, comments, security
+-- labels, large objects; a sequence's definition (only where it stands); inheritance
+-- and partitioning; which extension an object belongs to; a function's cost and
+-- parallel safety; a column's collation; whether a foreign key's own triggers are
+-- enabled. An installer that made or changed one of those would not show here.
 --
 -- The installer has no business creating or changing any of
 -- it (beyond the grants to its own roles, which tests/ci_install_verify.sql lists),
@@ -243,6 +264,29 @@ RETURNS TEXT [] LANGUAGE sql STABLE AS $$
             || ' tags=' || coalesce(t.evttags::text, '-')
         FROM pg_event_trigger AS t
         UNION ALL
+        -- PostgreSQL's own schemas: who may do what, and nothing else about them.
+        SELECT 'system schema ' || n.nspname || ' acl=' || ci_install_lane.acl_text(n.nspacl, acldefault('n', n.nspowner), TRUE)
+        FROM pg_namespace AS n WHERE n.nspname IN ('pg_catalog', 'information_schema')
+        UNION ALL
+        SELECT 'system relation ' || n.nspname || '.' || c.relname
+            || ' acl=' || ci_install_lane.acl_text(c.relacl, acldefault('r', c.relowner), TRUE)
+        FROM pg_class AS c INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        WHERE n.nspname IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'v')
+        UNION ALL
+        SELECT 'system column ' || n.nspname || '.' || c.relname || '.' || a.attname
+            || ' acl=' || ci_install_lane.acl_text(a.attacl, ARRAY[]::ACLITEM [], TRUE)
+        FROM pg_attribute AS a
+        INNER JOIN pg_class AS c ON c.oid = a.attrelid
+        INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        WHERE n.nspname IN ('pg_catalog', 'information_schema') AND a.attacl IS NOT NULL
+        UNION ALL
+        -- Only the functions somebody has granted or revoked on: the rest, thousands,
+        -- have no list of their own, and a GRANT or REVOKE gives one to the function it names.
+        SELECT 'system function ' || p.oid::regprocedure::text
+            || ' acl=' || ci_install_lane.acl_text(p.proacl, acldefault('f', p.proowner), TRUE)
+        FROM pg_proc AS p INNER JOIN pg_namespace AS n ON n.oid = p.pronamespace
+        WHERE n.nspname IN ('pg_catalog', 'information_schema') AND p.proacl IS NOT NULL
+        UNION ALL
         -- 16384 is the first object id PostgreSQL gives to anything it did not ship.
         SELECT 'cast ' || format_type(k.castsource, NULL) || ' -> ' || format_type(k.casttarget, NULL)
             || ' context=' || k.castcontext::text || ' method=' || k.castmethod::text
@@ -322,11 +366,12 @@ RETURNS TEXT [] LANGUAGE sql STABLE AS $$
 $$;
 
 -- One of haf_fyp's tables as text: what tests/ci_install_verify.sql pins, per table, as
--- an md5. Nothing in it depends on the PostgreSQL major (NOT NULL is read from the
--- columns, not from the constraints 18 added for it) or on who installed.
+-- an md5. It reads the same on PostgreSQL 17 and 18 (NOT NULL is read from the
+-- columns, not from the constraints 18 added for it), whoever installed, and whatever
+-- the database's collation (the lines are put in "C" order).
 CREATE OR REPLACE FUNCTION ci_install_lane.table_shape(_table REGCLASS)
 RETURNS TEXT LANGUAGE sql STABLE AS $$
-    SELECT string_agg(i, E'\n' ORDER BY i)
+    SELECT string_agg(i, E'\n' ORDER BY i COLLATE "C")
     FROM (
         SELECT '    table logged=' || (c.relpersistence = 'p') || ' rls=' || c.relrowsecurity || '/' || c.relforcerowsecurity
             || ' owner=' || pg_get_userbyid(c.relowner) || ' options=' || coalesce(c.reloptions::text, '-')
@@ -355,7 +400,33 @@ RETURNS TEXT LANGUAGE sql STABLE AS $$
         FROM pg_trigger AS t WHERE t.tgrelid = _table AND t.tgisinternal AND t.tgenabled <> 'O'
         UNION ALL
         SELECT '    policy ' || p.polname FROM pg_policy AS p WHERE p.polrelid = _table
+        UNION ALL
+        -- The sequence behind an identity or serial column: one that wraps round at
+        -- 100000 hands out the same feed-event ids again.
+        SELECT '    sequence ' || s.seqrelid::regclass::text || ' ' || format_type(s.seqtypid, NULL)
+            || ' start=' || s.seqstart || ' increment=' || s.seqincrement || ' min=' || s.seqmin
+            || ' max=' || s.seqmax || ' cycle=' || s.seqcycle
+        FROM pg_sequence AS s
+        INNER JOIN pg_depend AS d ON d.classid = 'pg_class'::regclass AND d.objid = s.seqrelid
+        WHERE d.refclassid = 'pg_class'::regclass AND d.refobjid = _table AND d.deptype IN ('a', 'i')
     ) AS x;
+$$;
+
+-- One of haf_fyp's functions as text, for the same use: everything about it but its
+-- body. What a body DOES is the business of the lanes that call it; that a function is
+-- STABLE where PostgREST needs it to be, not STRICT where an argument may be NULL,
+-- returns the columns its callers read, runs as who it should and may be executed by
+-- who must, is the installer's file being the right file.
+CREATE OR REPLACE FUNCTION ci_install_lane.function_shape(_function REGPROCEDURE)
+RETURNS TEXT LANGUAGE sql STABLE AS $$
+    SELECT 'returns ' || coalesce(pg_get_function_result(p.oid), 'nothing (a procedure)')
+        || ' args=' || pg_get_function_arguments(p.oid)
+        || ' language=' || (SELECT l.lanname FROM pg_language AS l WHERE l.oid = p.prolang)
+        || ' volatile=' || p.provolatile::text || ' strict=' || p.proisstrict || ' secdef=' || p.prosecdef
+        || ' leakproof=' || p.proleakproof || ' parallel=' || p.proparallel::text
+        || ' config=' || coalesce(p.proconfig::text, '-') || ' owner=' || pg_get_userbyid(p.proowner)
+        || ' acl=' || ci_install_lane.acl_text(p.proacl, acldefault('f', p.proowner), TRUE)
+    FROM pg_proc AS p WHERE p.oid = _function;
 $$;
 
 -- Every row the app's tables hold, and where its sequences stand: one line per table.

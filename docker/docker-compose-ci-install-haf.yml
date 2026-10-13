@@ -216,7 +216,9 @@ services:
     <<: *sql
     command:
       - >-
-        psql -h haf -U haf_admin -d haf_block_log -v ON_ERROR_STOP=1 -c "INSERT INTO ci_install_lane.lock_released DEFAULT VALUES"
+        psql -h haf -U haf_admin -d haf_block_log -v ON_ERROR_STOP=1 -f /ci_install_release.sql
+    volumes:
+      - ../tests/ci_install_release.sql:/ci_install_release.sql:ro
     depends_on:
       verify-locked:
         condition: service_completed_successfully
@@ -251,9 +253,13 @@ services:
     # Two sessions: one in the middle of a statement, and one connected and doing
     # nothing -- a psql whose input never comes -- which is what most sessions on a
     # node are. An uninstaller that swept away idle sessions would spare the first.
+    # The busy one is a superuser's, wearing the other application's name and role; the
+    # idle one logs in as a role of that application's own. If the busy one is
+    # terminated this container exits; if the idle one is, it does not, and it is
+    # tests/ci_uninstall_verify.sql that says so.
     command:
       - >-
-        sleep 1800 | PGAPPNAME=ci-bystander-idle psql -h haf -U haf_admin -d haf_block_log -v ON_ERROR_STOP=1 & PGAPPNAME=ci-bystander-session psql -h haf -U haf_admin -d haf_block_log -v ON_ERROR_STOP=1 -c "SET ROLE ci_bystander_owner" -c "SELECT pg_sleep(1800)"
+        sleep 1800 | PGAPPNAME=ci-bystander-idle psql -h haf -U ci_bystander_login -d haf_block_log -v ON_ERROR_STOP=1 & PGAPPNAME=ci-bystander-session psql -h haf -U haf_admin -d haf_block_log -v ON_ERROR_STOP=1 -c "SET ROLE ci_bystander_owner" -c "SELECT pg_sleep(1800)"
     healthcheck:
       test: ["CMD-SHELL", "psql -h haf -U haf_admin -d haf_block_log -Atc \"SELECT (count(*) = 2)::int FROM pg_stat_activity WHERE application_name IN ('ci-bystander-session', 'ci-bystander-idle')\" | grep -qx 1"]
       interval: 1s
