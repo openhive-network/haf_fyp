@@ -4,7 +4,8 @@
 #
 # Nothing else notices a dead pin. compose-validate runs `docker compose config`, which parses
 # YAML and never contacts a registry; docker-compose-ci.yml runs plain PostgreSQL with
-# pgvector, so no CI lane pulls HAF; the guards in tests/unit/test_compose_contract.py are
+# pgvector, and the one lane that pulls a HAF pulls its own pin, not the stack's HAF_VERSION;
+# the guards in tests/unit/test_compose_contract.py are
 # offline by design. That is how #56 lived: the stack asked for an image nobody had published,
 # and every pipeline stayed green until an operator hit it on a cold cache.
 #
@@ -52,8 +53,8 @@ REPO_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 # docker/.env, not .env.local: this resolves what the repository SHIPS.
 ENV_FILE="${HAF_FYP_ENV_FILE:-${REPO_ROOT}/docker/.env}"
-# All three: docker-compose-ci.yml and docker-compose-ci-install.yml are what the test
-# lanes themselves run on.
+# All four: docker-compose-ci.yml and the two docker-compose-ci-install*.yml are what the
+# test lanes themselves run on.
 COMPOSE_FILES="${HAF_FYP_COMPOSE_FILES:-}"
 # An empty override must not mean "no Dockerfiles" (!77 skipped all three with exit 0 that
 # way): unset or blank, the repository's Dockerfile.* are found, and finding none is an error
@@ -102,7 +103,7 @@ blank() {
     esac
 }
 if blank "${COMPOSE_FILES}"; then
-    COMPOSE_FILES="${REPO_ROOT}/docker/docker-compose.yml ${REPO_ROOT}/docker/docker-compose-ci.yml ${REPO_ROOT}/docker/docker-compose-ci-install.yml"
+    COMPOSE_FILES="${REPO_ROOT}/docker/docker-compose.yml ${REPO_ROOT}/docker/docker-compose-ci.yml ${REPO_ROOT}/docker/docker-compose-ci-install.yml ${REPO_ROOT}/docker/docker-compose-ci-install-haf.yml"
 fi
 if blank "${DOCKERFILES}"; then
     DOCKERFILES=""

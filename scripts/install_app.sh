@@ -450,11 +450,11 @@ fi
 # 13. Post-install assertion for GET /sync-status (#16). SET ROLE drops superuser,
 #     so this runs the endpoint's exact query as the exact role, exercising the
 #     real EXECUTE grant, the SECURITY DEFINER hop, the definer's real group
-#     membership and HAF's real RLS policy. It is the ONLY place any of that is
-#     checked against HAF itself: the install-test lane (#47) runs this script, but
-#     over a model of HAF (tests/haf_stub.sql plus tests/ci_install_setup.sql, which
-#     carries the policies); and the fastapi-tests lane's haf_fyp_user is a superuser
-#     for whom every ACL and policy is bypassed.
+#     membership and HAF's real RLS policy. In CI this runs against HAF itself in
+#     the install-test-haf lane (#47), and against a model of HAF (tests/haf_stub.sql
+#     plus tests/ci_install_haf_model.sql, which carries the policies) in install-test;
+#     the fastapi-tests lane's haf_fyp_user is a superuser for whom every ACL and
+#     policy is bypassed. It stays here because a node is not CI.
 #     A zero-row result (not an error) is the signature of a missing or
 #     non-inheriting membership on the definer, so assert on the count.
 psql_cmd -v ON_ERROR_STOP=on -c "
@@ -613,9 +613,9 @@ fi
 psql_cmd -v git_hash="${GIT_HASH:-}" -f "${SCRIPT_DIR}/../scripts/set_version.sql"
 
 # 16. Assert the version row is a usable singleton. This is the only place the #20 fix
-#     is checked against a real node (the install-test lane, #47, runs it over the HAF
-#     stub). It asserts a usable row, not a real commit, so the GIT_HASH-unset path
-#     above still passes.
+#     is checked on a node (the two install lanes, #47, run it in CI: over a model of
+#     HAF and over a HAF image). It asserts a usable row, not a real commit, so the
+#     GIT_HASH-unset path above still passes.
 psql_cmd -c "
 DO \$\$
 DECLARE

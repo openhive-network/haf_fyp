@@ -467,9 +467,12 @@ def test_rewriter_proxies_to_the_postgrest_service_on_its_port(path, request):
 # when it was last run; only a run proves a tag is still there.
 HAF_SERVICE = "haf"
 
-# The oldest HAF RELEASE carrying src/hive_fork_manager/app_registry.sql (hive.app_register,
-# haf#341). 1.29.0-rc1 and every 1.28.x lack it, so an older pin installs and then fails
-# where the app registers itself. Move this only to a tag that has been run.
+# The oldest HAF tag this stack has been run on that carries
+# src/hive_fork_manager/app_registry.sql (hive.app_register, haf#341). 1.29.0-rc1 and the
+# 1.28 line up to 1.28.7 lack it, so an older pin installs and then fails where the app
+# registers itself. (1.28.8, released after this was written, has it: the install lane
+# runs on it. It sorts below this floor, so the stack's own pin cannot be moved to it
+# without changing how this floor is compared.) Move this only to a tag that has been run.
 HAF_MINIMUM_RELEASE = "1.29.0-rc2"
 
 _NUM = r"(0|[1-9][0-9]*)"
@@ -617,8 +620,8 @@ def test_the_pinned_haf_version_is_a_release_tag_that_has_the_app_registry():
         scripts/process_blocks.sh probes hafd.applications and keeps the legacy
         `CALL main()` loop, both deliberately (an operator may run such a HAF, and says
         so in .env.local). But it is not what the reference stack should DEFAULT to --
-        silently pre-#51 -- and no CI lane would notice: they run plain PostgreSQL with
-        pgvector and no hive_fork_manager at all.
+        silently pre-#51 -- and no CI lane would notice: the only one that runs a HAF
+        (install-test-haf, #47) pins its own release and does not read this one.
 
     Checked on the tag the stack ASKS FOR, not on the env line alone: the compose file can
     decorate `${HAF_VERSION}` (`:${HAF_VERSION}-arm64`, `:v${HAF_VERSION}`) into a

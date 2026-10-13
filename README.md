@@ -1359,13 +1359,13 @@ the work up regardless.
 ## Checking that the pinned images still exist
 
 `scripts/check_pinned_images.sh` resolves every image this repository pins — everything the
-compose files **pull** (`docker/docker-compose.yml`, `docker/docker-compose-ci.yml` and
-`docker/docker-compose-ci-install.yml`, through `docker/.env`), plus every `FROM` in `Dockerfile.*` — and fails when one of them no
-longer exists in its registry. Twelve references today.
+compose files **pull** (`docker/docker-compose.yml`, `docker/docker-compose-ci.yml` and the two
+`docker/docker-compose-ci-install*.yml`, through `docker/.env`), plus every `FROM` in `Dockerfile.*` — and fails when one of them no
+longer exists in its registry. Thirteen references today.
 
 It passes **only when every reference was positively resolved**
 ([#71](https://gitlab.syncad.com/hive/haf_fyp/-/issues/71)), and says how many that was:
-`positively resolved 12 of 12`. Each is one manifest `HEAD` to the registry's HTTP API:
+`positively resolved 13 of 13`. Each is one manifest `HEAD` to the registry's HTTP API:
 
 - `200` with a `Docker-Content-Digest` — resolved; the digest is printed.
 - `404` from the registry itself (it carries `Docker-Distribution-Api-Version`) — `MISSING`:
@@ -1396,7 +1396,7 @@ sh scripts/check_pinned_images.sh
 # ...
 # sha256:1b1d9202... registry.gitlab.syncad.com/hive/haf:1.29.0-rc2
 # ...
-# [check-pinned-images] positively resolved 12 of 12: 0 missing or unreadable, 0 unanswered
+# [check-pinned-images] positively resolved 13 of 13: 0 missing or unreadable, 0 unanswered
 ```
 
 Needs `docker` (the CLI with the compose plugin, for `docker compose config`), `curl` and
@@ -1415,7 +1415,8 @@ redirect the check away from the pin the repository actually ships.
 Nothing else notices a dead pin. `compose-validate` runs `docker compose config`, which
 parses YAML and never contacts a registry — and deliberately uses placeholder values, since
 a lane that cannot pull cannot tell a good reference from a dead one. `docker-compose-ci.yml`
-runs plain PostgreSQL with pgvector, so no test lane pulls HAF at all. The guards in
+runs plain PostgreSQL with pgvector, and the one lane that does pull a HAF
+(`install-test-haf`) pulls its own pin, not the stack's `HAF_VERSION`. The guards in
 `tests/unit/test_compose_contract.py` are offline by design: they keep the reference in the
 shape that resolved when it was last run. That combination is how
 [#56](https://gitlab.syncad.com/hive/haf_fyp/-/issues/56) lived — the stack asked for an
@@ -1464,11 +1465,19 @@ runs rather than another green tick.
 API_URL=http://localhost:3000 tavern-ci tests/tavern/test_endpoints.tavern.yaml
 ```
 
-### The install lane
+### The install lanes
 
-`install-test` in CI runs the installer and the uninstaller for real
+Two CI jobs run the installer and the uninstaller for real
 ([#47](https://gitlab.syncad.com/hive/haf_fyp/-/issues/47)), from the SQL image, as
-`haf_admin`, on PostgreSQL 17:
+`haf_admin`, through the same steps and the same check files:
+
+| job | compose file | the database |
+|---|---|---|
+| `install-test` | `docker/docker-compose-ci-install.yml` | PostgreSQL 18 with a **model** of HAF (`tests/haf_stub.sql`, `tests/ci_install_haf_model.sql`). Fast, pulls nothing large |
+| `install-test-haf` | `docker/docker-compose-ci-install-haf.yml` | **HAF itself**: the latest HAF release, pinned in `docker/.env` as `HAF_INSTALL_LANE_VERSION` (separately from the standalone stack's `HAF_VERSION`, which cannot move without a replay). Initialised once by hived (`--exit-before-sync`) and then served without it (`--skip-hived`). No replay, no blocks |
+
+The second is the one that says the installer works on HAF, and the one that goes red
+if HAF moves away from the model. To run either by hand (the model lane shown):
 
 ```bash
 docker compose -f docker/docker-compose-ci-install.yml up --detach --build
@@ -1480,25 +1489,26 @@ docker compose -f docker/docker-compose-ci-install.yml down -v
 | step | what it does |
 |---|---|
 | `install` | `install_app` on a database that has never seen haf_fyp, with one other application on it |
-| `verify` | `tests/ci_install_verify.sql`: the roles and what they are members of; ownership; every table and function that must exist, by name; the HAF context and its registration; the one-row tables; the recorded version; what the API role may read, execute and write; the default privileges; the other application untouched |
-| `age` | `tests/ci_install_age.sql` changes what a running node changes: the sync pointer, the active algorithm version, a user's declared interests |
+| `verify` | `tests/ci_install_verify.sql`: the roles and what they are members of; ownership; every table, function, index and constraint that must exist, by name; each table's exact shape (columns, index definitions, privileges, no row-level security, no triggers) and each function's (what it returns, volatility, STRICT, settings, owner, who may execute it -- everything but its body); nothing else in the two schemas but HAF's own views for the context; the seed by value; the HAF context and its registration; the one-row tables; the recorded version; what the API role may read, execute and write; the default privileges; the other application untouched, and able to use what is its own; and **the rest of the database** as it was before the install: the definitions and privileges of HAF's own functions, tables, types, policies and event triggers, the rows of its tables and where its sequences stand (the ones HAF writes for a context apart), every other role, membership and setting, casts, rules, publications. `tests/ci_install_setup.sql` lists what the snapshot holds and what it does not (operators, collations, comments and a few more) |
+| `age` | `tests/ci_install_age.sql` changes what a running node changes: the sync pointer, the active algorithm version, a user's declared interests -- and leaves a row in every table, so that an install which emptied one would show |
 | `lock-holder`, `install-locked`, `verify-locked` | with a block processor's lock held, `install_app` exits 0 and changes nothing |
-| `release-lock`, `install-again`, `verify-again` | with the lock released, `install_app` runs over that database: everything the installer creates is identical to what `verify` recorded (function bodies and grants included), and everything `age` changed is still as `age` left it |
+| `release-lock`, `install-again`, `verify-again` | `release-lock` first breaks a few things the installer owns (`tests/ci_install_release.sql`: an endpoint function dropped, a function setting changed, an index dropped, a grant revoked), then lets the lock go. `install_app` runs over that database and must repair them: everything the installer creates is identical to what `verify` recorded (function bodies and grants included), and everything `age` changed is still as `age` left it |
 | `uninstall` | `uninstall_app --force` |
-| `verify-gone` | `tests/ci_uninstall_verify.sql`: nothing of haf_fyp is left, and pgvector, HAF's roles and grants and the other application are |
+| `verify-gone` | `tests/ci_uninstall_verify.sql`: nothing of haf_fyp is left; the rest of the database is, by the same snapshot, what it was before the first install, privileges included; pgvector is the same extension, not one created again; and two other sessions are still connected: a busy one (a superuser's, under the other application's role and name) and an idle one logged in as a role of that application's own |
 
-`tests/unit/test_install_lane.py` states the compose file and the CI job in full and
+`tests/unit/test_install_lane.py` states both compose files and both CI jobs in full and
 compares, so a change to either has to be made there too.
 
-**What it does not cover.**
+**What neither covers.**
 
-- The database is PostgreSQL with pgvector, `tests/haf_stub.sql` and
-  `tests/ci_install_setup.sql`, which together model the HAF application API. It is not
-  HAF: a change in HAF itself does not turn this lane red.
-- No block is processed. The processors read HAF's operation tables, which the model
-  does not have; that they all exist is checked, that they work is not.
+- No block is processed: in the HAF lane hived stops before it syncs, and the model has
+  no operation tables. That every processor exists is checked, that they work is not.
 - All three installs are the same commit, so a defect that only an upgrade from an older
-  commit shows is not seen.
+  commit shows is not seen. (That a later install does its work at all is seen: it has
+  damage to repair.)
+- What a function's body DOES is not this lane's: only that it is the same body after
+  every install. A processor that stopped calling one of its steps installs green.
+- The installer is never made to fail, so one that exits 0 after an error is not seen.
 - No other application's schema is present, so the parts of `db/cross_schema_grants.sql`
   that grant on hivemind, HiveSense, reputation_tracker and balance_tracker only print
   that they found nothing. `scripts/grant_cross_schema.sh` is not run.
