@@ -260,8 +260,8 @@ BEGIN
     IF _missing IS NOT NULL THEN
         RAISE EXCEPTION 'the list of what exists outside the app schemas has no line like: %', _missing;
     END IF;
-    -- On HAF itself, also what only HAF has, and its size: about 2,500 lines when this
-    -- was written (the job's log gives the figure), 172 on the model.
+    -- On HAF itself, also what only HAF has, and its size: each verify prints the
+    -- figure (2920 on HAF 1.28.8 and 472 on the model, in pipeline 182128).
     IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'hive_fork_manager') THEN
         SELECT string_agg(w, ', ') INTO _missing
         FROM unnest(ARRAY['extension hive_fork_manager %', 'event trigger %', 'rows of hafd.%', 'sequence value hafd.%']) AS w
@@ -277,7 +277,7 @@ BEGIN
             RAISE EXCEPTION 'on HAF the record of the context log taken before the first install is empty: hafd.contexts_log is gone, renamed, or was not written when the other application was set up';
         END IF;
     END IF;
-    -- 172 over the model. (Over HAF the floor is in the block above.)
+    -- The model's list is several times this. (Over HAF the floor is in the block above.)
     IF (SELECT cardinality(n.item) FROM ci_install_lane.note AS n WHERE n.name = 'outside at setup') < 100 THEN
         RAISE EXCEPTION 'the list of what exists outside the app schemas is implausibly short';
     END IF;
