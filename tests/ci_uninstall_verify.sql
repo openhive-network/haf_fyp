@@ -58,27 +58,38 @@ BEGIN
 END
 $$;
 
--- Outside haf_fyp's schemas the database is, object for object and privilege for
--- privilege, what tests/ci_install_setup.sql made: nothing left behind there, nothing
--- taken away, and every grant the installer gave its roles gone with them.
+-- Outside haf_fyp's schemas the database is, by the snapshot tests/ci_install_setup.sql
+-- defines (which says what it holds and what it does not), what it was before the
+-- first install -- and every grant the installer gave its roles is gone with them.
 DO $$
 DECLARE
     _diff TEXT;
+    _now TEXT [] := ci_install_lane.outside_now(TRUE);
+    _was TEXT [];
 BEGIN
+    SELECT n.item INTO _was FROM ci_install_lane.note AS n WHERE n.name = 'outside at setup, with privileges';
     SELECT string_agg(d, E'\n' ORDER BY d) INTO _diff
     FROM (
         SELECT '  left behind, or changed: ' || a.i AS d
-        FROM (SELECT unnest(ci_install_lane.outside_now(TRUE))
-              EXCEPT SELECT unnest(n.item) FROM ci_install_lane.note AS n
-              WHERE n.name = 'outside at setup, with privileges') AS a (i)
+        FROM (SELECT unnest(_now) EXCEPT SELECT unnest(_was)) AS a (i)
         UNION ALL
         SELECT '  removed, or changed:     ' || b.i
-        FROM (SELECT unnest(n.item) FROM ci_install_lane.note AS n
-              WHERE n.name = 'outside at setup, with privileges'
-              EXCEPT SELECT unnest(ci_install_lane.outside_now(TRUE))) AS b (i)
+        FROM (SELECT unnest(_was) EXCEPT SELECT unnest(_now)) AS b (i)
     ) AS x;
     IF _diff IS NOT NULL THEN
         RAISE EXCEPTION E'after the uninstall the rest of the database is not as it was before the install:\n%', _diff;
+    END IF;
+    -- The comparison above goes item by item, through EXCEPT, which calls two NULLs
+    -- equal and counts a line that is there twice once. So: no NULL item (one operand
+    -- that is NULL makes a whole line NULL, and hides what it stood for), and the two
+    -- lists equal as lists.
+    IF EXISTS (SELECT 1 FROM unnest(_now) AS i WHERE i IS NULL)
+       OR EXISTS (SELECT 1 FROM unnest(_was) AS i WHERE i IS NULL) THEN
+        RAISE EXCEPTION 'an item in the list of what exists outside the app schemas is NULL: something in it was concatenated with a NULL';
+    END IF;
+    IF _now IS DISTINCT FROM _was THEN
+        RAISE EXCEPTION 'the two lists of what exists outside the app schemas differ (% and % items) but no differing item was found',
+            cardinality(_now), cardinality(_was);
     END IF;
 END
 $$;
@@ -93,6 +104,18 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'the uninstall terminated another application''s session';
     END IF;
+    -- ...and the one that was doing nothing at the time, which is what most sessions
+    -- on a node are. An uninstaller that swept away IDLE sessions would spare the busy
+    -- one above.
+    -- It is logged in as that application's own role: the busy one above is a
+    -- superuser's session wearing the application's name.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_stat_activity AS a
+        WHERE a.application_name = 'ci-bystander-idle' AND a.state = 'idle' AND a.usename = 'ci_bystander_login'
+    ) THEN
+        RAISE EXCEPTION 'the uninstall terminated another application''s idle session (or the lane''s idle session is not what it should be: %)',
+            (SELECT string_agg(a.usename || ' ' || a.state, ',') FROM pg_stat_activity AS a WHERE a.application_name = 'ci-bystander-idle');
+    END IF;
 END
 $$;
 
@@ -103,6 +126,12 @@ BEGIN
     -- created it; the uninstaller does not own it.
     IF to_regtype('vector') IS NULL THEN
         RAISE EXCEPTION 'the uninstall dropped pgvector';
+    END IF;
+    -- The same extension, not one created again under the name: see section 4 of
+    -- tests/ci_install_verify.sql.
+    IF (SELECT ARRAY[e.oid::text, e.extversion, e.extnamespace::regnamespace::text] FROM pg_extension AS e WHERE e.extname = 'vector')
+       IS DISTINCT FROM (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'pgvector after the first install') THEN
+        RAISE EXCEPTION 'pgvector is not the extension the first install left: the uninstall dropped it and created it again, or moved it';
     END IF;
     IF (SELECT count(*) FROM pg_roles
         WHERE rolname IN ('haf_admin', 'hive_applications_group', 'hive_applications_owner_group',
@@ -123,6 +152,28 @@ BEGIN
 END
 $$;
 
+-- HAF holds the other application exactly as it did before haf_fyp was installed:
+-- its registry row (`paused` included), its context row (stages included) and its
+-- dependencies.
+DO $$
+BEGIN
+    -- HAF's log of context events only grows: every line it held before the first
+    -- install is still there.
+    IF NOT (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'HAF''s context log at setup')
+           <@ ci_install_lane.context_log_now() THEN
+        RAISE EXCEPTION 'lines that HAF''s log of context events held before the first install are gone: % then, % now',
+            (SELECT cardinality(n.item) FROM ci_install_lane.note AS n WHERE n.name = 'HAF''s context log at setup'),
+            cardinality(ci_install_lane.context_log_now());
+    END IF;
+    IF ci_install_lane.bystander_now() IS DISTINCT FROM
+       (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'the other application at setup') THEN
+        RAISE EXCEPTION E'the uninstall changed how HAF holds another application:\n  was: %\n  is:  %',
+            (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'the other application at setup'),
+            ci_install_lane.bystander_now();
+    END IF;
+END
+$$;
+
 -- The other application, asked AS ITSELF: a superuser sees a table whatever was done to
 -- its grants.
 SET ROLE ci_bystander_owner;
@@ -130,9 +181,9 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM hafd.contexts AS c
-        INNER JOIN hafd.contexts_attachment AS t ON t.context_name = c.name
         WHERE c.name = 'ci_bystander' AND c.owner = 'ci_bystander_owner'
-          AND c.current_block_num = 4242 AND c.schema = 'ci_bystander_app' AND NOT t.is_attached
+          AND c.current_block_num = 4242 AND c.schema = 'ci_bystander_app'
+          AND NOT hive.app_context_is_attached('ci_bystander')
     ) THEN
         RAISE EXCEPTION 'the uninstall changed or removed another application''s context';
     END IF;
