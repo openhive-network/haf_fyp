@@ -444,7 +444,7 @@ def test_compose_validate_parses_the_lane(ci, flavour):
 # many could be deleted, or turned into notices, with every test and both lanes green.
 # Adding a check means changing its file's number; so does removing one, which is the
 # point.
-RAISES = {"ci_install_verify.sql": 84, "ci_uninstall_verify.sql": 18, "ci_install_lock_holder.sql": 3,
+RAISES = {"ci_install_verify.sql": 92, "ci_uninstall_verify.sql": 18, "ci_install_lock_holder.sql": 12,
           "ci_install_haf_model.sql": 9, "ci_install_age.sql": 1, "ci_install_setup.sql": 0, "ci_install_release.sql": 0}
 LANE_SQL = sorted({"ci_install_haf_model.sql", "ci_install_setup.sql", "ci_install_verify.sql",
                    "ci_install_age.sql", "ci_install_lock_holder.sql", "ci_install_release.sql",
