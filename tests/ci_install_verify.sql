@@ -1360,3 +1360,98 @@ BEGIN
     END IF;
 END
 $$;
+
+-- ---------------------------------------------------------------------------------
+-- 11. HAF's application locks: who holds what, and what another installer may take
+-- ---------------------------------------------------------------------------------
+-- Asked from OUTSIDE the session that holds them. In phase `locked` a block processor
+-- is running (tests/ci_install_lock_holder.sql); in the other two nobody is.
+--
+-- What this adds to the lock-holder's own checks and its healthcheck is small, and
+-- worth saying: that HAF's functions and this file agree on how a name becomes a key
+-- (on a real HAF they are HAF's, not a copy), that an installer which left a session
+-- behind holding a lock is seen, and the issue's sentence stated as a call -- another
+-- application's installer CAN take its lock while haf_fyp's processor runs.
+DO $$
+DECLARE
+    _class OID := hashtext('hive_fork_manager_app_lock')::OID;
+    _held TEXT;
+    _app TEXT;
+    _main TEXT;
+BEGIN
+    -- The legacy loop takes its locks FIRST, and never lets go of them. Read from the
+    -- installed function, because no step can run it: haf_fyp_app.main() does not
+    -- return. The lock-holder calls the function main() calls; this is what says
+    -- main() still calls it, before anything else, and keeps what it took.
+    SELECT regexp_replace(p.prosrc, '--[^\n]*', '', 'g') INTO _main
+    FROM pg_proc AS p WHERE p.oid = 'haf_fyp_app.main(hafd.context_name)'::regprocedure;
+    IF substring(_main FROM '\mBEGIN\M(.*)$') !~ '^\s+PERFORM haf_fyp_app\.take_block_processor_locks\(\);' THEN
+        RAISE EXCEPTION 'the first statement of haf_fyp_app.main() is not the call that takes the block processor''s locks';
+    END IF;
+    IF _main ~* 'advisory_unlock' OR (SELECT p.prosrc ~* 'advisory_unlock' FROM pg_proc AS p
+                                      WHERE p.oid = 'haf_fyp_app.take_block_processor_locks()'::regprocedure) THEN
+        RAISE EXCEPTION 'haf_fyp_app.main() or take_block_processor_locks() releases an advisory lock: the processor must hold its locks for as long as it runs';
+    END IF;
+
+    SELECT string_agg(
+        a.application_name || ' holds ' || l.mode || ' on '
+        || CASE l.objid
+            WHEN hashtext('haf_fyp')::OID THEN 'haf_fyp'
+            WHEN hashtext('hivemind')::OID THEN 'hivemind'
+            WHEN hashtext('ci_bystander')::OID THEN 'ci_bystander'
+            ELSE 'a name hashed to ' || l.objid::TEXT
+        END,
+        '; ' ORDER BY a.application_name, l.objid
+    ) INTO _held
+    FROM pg_locks AS l
+    INNER JOIN pg_stat_activity AS a ON a.pid = l.pid
+    WHERE l.locktype = 'advisory' AND l.classid = _class AND l.objsubid = 2 AND l.granted
+      AND l.database = (SELECT b.oid FROM pg_database AS b WHERE b.datname = current_database());
+
+    IF current_setting('ci.phase') <> 'locked' THEN
+        IF _held IS NOT NULL THEN
+            RAISE EXCEPTION 'in phase % an application lock is still held, with no installer and no processor running: %',
+                current_setting('ci.phase'), _held;
+        END IF;
+        -- ...nor an advisory lock of any other kind, in this database: an installer
+        -- that kept a session open with one would have it here.
+        SELECT string_agg(a.application_name || ' (' || l.mode || ', keys ' || l.classid || '/' || l.objid || ')', '; ')
+        INTO _held
+        FROM pg_locks AS l INNER JOIN pg_stat_activity AS a ON a.pid = l.pid
+        WHERE l.locktype = 'advisory'
+          AND l.database = (SELECT b.oid FROM pg_database AS b WHERE b.datname = current_database());
+        IF _held IS NOT NULL THEN
+            RAISE EXCEPTION 'in phase % an advisory lock is held, with no installer and no processor running: %',
+                current_setting('ci.phase'), _held;
+        END IF;
+        RETURN;
+    END IF;
+
+    -- The processor holds the lock of haf_fyp and of nothing else. This database has
+    -- no hivemind: a lock on `hivemind` here is #79, where hivemind's installer found
+    -- its lock held by haf_fyp's processor and skipped itself on a fresh node.
+    IF _held IS DISTINCT FROM 'haf_fyp-ci-lock-holder holds ShareLock on haf_fyp' THEN
+        RAISE EXCEPTION 'while the block processor runs, the application locks held are: % (expected its one shared lock on haf_fyp)', _held;
+    END IF;
+
+    -- So another application's installer can take its own lock while haf_fyp's
+    -- processor runs: the one that is on this database, and hivemind, which is not yet.
+    -- hive.try_acquire_app_install_lock is the function HAF gives installers for this
+    -- (src/hive_fork_manager/app_locks.sql).
+    FOREACH _app IN ARRAY ARRAY['ci_bystander', 'hivemind'] LOOP
+        IF NOT hive.try_acquire_app_install_lock(_app) THEN
+            RAISE EXCEPTION 'while haf_fyp''s block processor runs, the installer of % cannot take its install lock', _app;
+        END IF;
+        IF NOT pg_advisory_unlock(hashtext('hive_fork_manager_app_lock'), hashtext(_app)) THEN
+            RAISE EXCEPTION 'the install lock on % was reported taken, and was not held', _app;
+        END IF;
+    END LOOP;
+
+    -- ...and haf_fyp's own installer cannot: what the install-locked step relies on,
+    -- asked of HAF directly.
+    IF hive.try_acquire_app_install_lock('haf_fyp') THEN
+        PERFORM pg_advisory_unlock(hashtext('hive_fork_manager_app_lock'), hashtext('haf_fyp'));
+        RAISE EXCEPTION 'haf_fyp''s install lock could be taken while its block processor holds the shared lock';
+    END IF;
+END
+$$;
