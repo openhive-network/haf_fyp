@@ -34,7 +34,7 @@ CREATE TABLE hivemind_app.hive_posts (id INT PRIMARY KEY, is_muted BOOLEAN NOT N
 INSERT INTO hivemind_app.hive_accounts VALUES
     (1, 'reader'), (2, 'listkeeper'), (3, 'stranger'),
     (10, 'mutedbyreader'), (11, 'mutedbylist'), (12, 'mutedbystranger'),
-    (13, 'blacklistedbyreader'), (14, 'listkeeperalso');
+    (13, 'blacklisted.one'), (14, 'listkeeperalso');
 -- The reader mutes one author, and follows listkeeper's mute list.
 INSERT INTO hivemind_app.muted VALUES (1, 10, 100), (2, 11, 100), (3, 12, 100), (2, 14, 100);
 INSERT INTO hivemind_app.follow_muted VALUES (1, 2, 100);
@@ -94,7 +94,7 @@ def test_a_list_is_followed_one_way(conn):
 
 
 def test_a_blacklist_is_not_a_mute(conn):
-    assert "blacklistedbyreader" not in visibility.muted_authors(conn, "reader")
+    assert "blacklisted.one" not in visibility.muted_authors(conn, "reader")
 
 
 def test_an_account_hivemind_does_not_know_hides_nothing(conn):
