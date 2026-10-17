@@ -51,6 +51,7 @@ import psycopg2
 import psycopg2.extras
 import redis as redis_lib
 
+from haf_fyp import visibility
 from haf_fyp.credibility import credibility_failure_message, fetch_author_credibility
 from haf_fyp.embeddings import fetch_post_vectors_safe, register_vector_type
 from haf_fyp.scoring import (
@@ -586,7 +587,14 @@ def _fetch_candidates(conn) -> pd.DataFrame:
         rows = cur.fetchall()
     if not rows:
         return pd.DataFrame()
-    return pd.DataFrame(rows)
+    candidates = pd.DataFrame(rows)
+    # #89: a post its community has muted goes into nobody's feed, the global one
+    # included. Here rather than in the query so that a node whose hivemind cannot
+    # be read still gets candidates (see haf_fyp/visibility.py).
+    muted = visibility.community_muted_post_ids(conn, candidates["post_id"].tolist())
+    if muted:
+        log.info("%d candidate(s) left out: muted by their community", len(muted))
+    return visibility.without(candidates, post_ids=muted)
 
 
 def _fetch_author_credibility_safe(conn, authors: list[str]) -> dict:
@@ -877,6 +885,10 @@ def _rank_user(
     weights: dict,
 ) -> None:
     """Score and write feed_cache for a single user."""
+    # #89: nothing by an author this account has muted, directly or through a mute
+    # list it follows. Before scoring, so that the diversity cap and the 200-post cut
+    # are made over what the account can actually be shown.
+    candidates = visibility.without(candidates, authors=visibility.muted_authors(conn, username))
     # Explicit communities (on-chain subscriptions + declared interests) get the
     # full boost; engaged communities (top by interaction) get the smaller tier.
     subscribed = fetch_user_communities(conn, username) | fetch_user_interests(conn, username)

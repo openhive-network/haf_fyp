@@ -623,6 +623,16 @@ if post.community_id ∈ user_subscribed_communities:
 
 All weights are stored in `haf_fyp_app.algorithm_versions` and activated via `POST /v1/fyp/admin/algorithm`. The active version and its weights are returned by `/rpc/get_algorithm`. Every feed response includes per-signal component scores for full transparency; use `/rpc/get_score_explanation` for a detailed breakdown of any individual post.
 
+**Left out before scoring (#89).** Posts their community muted, and posts by authors the
+community muted (all feeds, the global one included); and, for each account, posts by
+authors it muted directly or through a mute list it follows. hivemind's own ranked lists
+return such posts greyed; a recommendation leaves them out. Not filtered: blacklists
+(front ends show them as a badge), authors hivemind greys for a low reputation, the
+account's own posts. The filter takes effect when an account is next ranked (see "How
+fresh a feed is"), and an account still on the cold-start global feed gets the community
+filters but not its own mutes. Read from hivemind; on a node where hivemind cannot be read
+the ranker writes feeds unfiltered and logs a warning until it can.
+
 **Cold start:** for new users without an interest vector, relevance is dropped and the remaining three weights are renormalised to sum to 1.0. Bootstrap priority:
 
 1. Recent votes and reblogs → weighted average of post embeddings
