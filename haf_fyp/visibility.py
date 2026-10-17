@@ -1,27 +1,40 @@
 """
-What a reader must not be shown (#89): posts their community has muted, and posts by
-authors the reader has muted.
+What a reader must not be shown (#89): posts their community has muted, posts by authors
+their community has muted, and posts by authors the reader has muted.
 
-Applied when the ranker WRITES a feed, not when it is served. A served page that drops
-posts comes back shorter than its page-size, and front ends read a short page as the end
-of the feed. The serving side cannot do it either: most posts are served from
+Applied when the ranker WRITES a feed, not when it is served. Dropping posts from a served
+page would make it shorter than its page-size, and front ends read a short page as the end
+of the feed. The serving side could not do it either: most posts are served from
 post_bridge_cache, rendered with observer 0 (#3), so a reader's own mute state is not in
-the response at all.
+the response at all. So a feed is filtered from the next time its account is ranked; a
+mute made after that shows until the one after. An account with no feed of its own yet is
+served the global feed, which carries the community filters and not the reader's.
 
-Read from hivemind:
-    hive_posts.is_muted      -- the post's community muted it
+Read from hivemind (the same sources its bridge API uses for an observer):
+    hive_posts.is_muted          -- the post was muted in its community: by a moderator, or
+                                    because the community does not let the author post there
+    hive_roles.role_id = -2      -- the author is muted in the post's community; this does
+                                    NOT set is_muted (keyed on hive_posts.community_id, which
+                                    is hivemind's id, not haf_fyp's community_id)
     muted (follower, following)        -- `follower` has muted `following`
-    follow_muted (follower, following) -- `follower` follows `following`'s mute list
-Account columns are hive_accounts ids. haf_fyp_owner, which the ranker connects as,
-holds SELECT on every hivemind_app table (db/cross_schema_grants.sql).
+    follow_muted (follower, following) -- `follower` follows `following`'s mute list (one
+                                          level: hivemind_app.muted_accounts_by_id_view)
+Account columns are hive_accounts ids. haf_fyp_owner, which the ranker connects as, can
+read them once scripts/grant_cross_schema.sh has run since hivemind was installed: the same
+grant the feed endpoints depend on.
 
-NOT done here: blacklists (`blacklisted`, `follow_blacklisted`). Hive front ends show a
-blacklisted author with a badge rather than hiding the post; hiding them in a feed would
-be a different policy from every other list the reader sees.
+Stricter than hivemind, on purpose: its ranked lists return these posts GREYED; a
+recommendation leaves them out.
 
-Best-effort, like credibility: a node whose hivemind cannot be read ranks unfiltered, and
-says so once per process rather than once per account. Lives outside ranker_daemon because
-.coveragerc omits that module.
+NOT done here: blacklists (`blacklisted`, `follow_blacklisted`), which front ends show as
+a badge rather than by hiding the post; authors hivemind greys for a low reputation; the
+reader's own posts and posts they already voted on.
+
+When hivemind is not there to read (no schema or table, no grant) the ranker writes feeds
+without these filters, warns once, and says when they work again. Any other failure (a
+statement timeout, a deadlock) is raised: written unfiltered, a feed would show muted
+posts until its account's next turn, hours away, where the ranker's own handling keeps the
+feed it had. Lives outside ranker_daemon because .coveragerc omits that module.
 """
 
 from __future__ import annotations
@@ -37,11 +50,16 @@ COMMUNITY_MUTED_SQL = """
     FROM haf_fyp_app.post_candidates AS pc
     JOIN hivemind_app.hive_posts AS hp ON hp.id = pc.hive_post_id
     WHERE pc.post_id = ANY(%(post_ids)s)
-      AND hp.is_muted
+      AND (hp.is_muted
+           OR EXISTS (SELECT 1 FROM hivemind_app.hive_roles AS role
+                      WHERE role.account_id = hp.author_id
+                        AND role.community_id = hp.community_id
+                        AND role.role_id = -2))
 """
 
-# Both halves start from the reader's own row, so each is one primary-key range scan
-# (muted_pkey and follow_muted_pkey lead with `follower`).
+# One range read of the reader's mutes (muted_pkey leads with `follower`), plus one per
+# mute list the reader follows. A reader following a large list gets all of it: the
+# heaviest on testapi (2026-10-17) came back with 132,166 names in under a second.
 MUTED_AUTHORS_SQL = """
     SELECT author.name
     FROM hivemind_app.hive_accounts AS reader
@@ -56,6 +74,10 @@ MUTED_AUTHORS_SQL = """
     JOIN hivemind_app.hive_accounts AS author ON author.id = m.following
     WHERE reader.name = %(username)s
 """
+
+# SQLSTATEs that mean "there is no hivemind to read here", not "this read went wrong":
+# invalid_schema_name, undefined_table, undefined_column, insufficient_privilege.
+_NOT_THERE = frozenset({"3F000", "42P01", "42703", "42501"})
 
 _warned: set[str] = set()
 
@@ -74,27 +96,27 @@ def _warn_once(what: str, exc: BaseException) -> None:
 
 
 def _read(conn, what: str, query: str, params: dict) -> set:
-    """Run one read; an empty set when it could not be made. A closed session is
-    re-raised: the ranker's reconnect path handles that, not a filter."""
+    """Run one read. An empty set when hivemind is not there to read; any other failure,
+    and a session that is gone, is raised (see the module docstring)."""
     try:
         with conn.cursor() as cur:
             cur.execute(query, params)
             rows = cur.fetchall()
-    except Exception as exc:  # noqa: BLE001 -- best-effort by design, see module docstring
-        if getattr(conn, "closed", False):
+    except Exception as exc:
+        if getattr(conn, "closed", False) or getattr(exc, "pgcode", None) not in _NOT_THERE:
             raise
-        try:
-            conn.rollback()
-        except Exception:  # noqa: BLE001
-            if getattr(conn, "closed", False):
-                raise
+        conn.rollback()
         _warn_once(what, exc)
         return set()
+    if what in _warned:
+        _warned.discard(what)
+        log.warning("%s can be read from hivemind again; feeds are filtered from now on", what)
     return {row[0] for row in rows}
 
 
 def community_muted_post_ids(conn, post_ids: list[int]) -> set[int]:
-    """haf_fyp post ids, among `post_ids`, whose community has muted the post."""
+    """haf_fyp post ids, among `post_ids`, that the post's community muted, or whose
+    author it muted."""
     if not post_ids:
         return set()
     return _read(conn, "community mutes", COMMUNITY_MUTED_SQL, {"post_ids": list(post_ids)})

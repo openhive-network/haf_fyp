@@ -95,20 +95,45 @@ def test_muted_authors_are_asked_for_the_reader():
     assert "JOIN hivemind_app.muted AS m ON m.follower = fm.following" in query
 
 
+class _PgError(Exception):
+    """Stands in for a psycopg2 error: what the code reads of one is its SQLSTATE."""
+
+    def __init__(self, pgcode, message="error"):
+        super().__init__(message)
+        self.pgcode = pgcode
+
+
+@pytest.mark.parametrize("pgcode", ["3F000", "42P01", "42703", "42501"])
 @pytest.mark.parametrize("read", [
     lambda conn: visibility.community_muted_post_ids(conn, [1]),
     lambda conn: visibility.muted_authors(conn, "alice"),
 ])
-def test_a_failed_read_filters_nothing_and_rolls_back(read, caplog):
-    conn, _cur = _conn(error=RuntimeError('relation "hivemind_app.muted" does not exist'))
+def test_no_hivemind_to_read_filters_nothing_and_rolls_back(read, pgcode, caplog):
+    conn, _cur = _conn(error=_PgError(pgcode, 'relation "hivemind_app.muted" does not exist'))
     with caplog.at_level(logging.WARNING, logger="haf_fyp.visibility"):
         assert read(conn) == set()
     conn.rollback.assert_called_once()
     assert "WITHOUT that filter" in caplog.text
 
 
+@pytest.mark.parametrize("error", [
+    _PgError("57014", "canceling statement due to statement timeout"),
+    _PgError("40P01", "deadlock detected"),
+    _PgError(None, "something else entirely"),
+    RuntimeError("not a database error at all"),
+])
+def test_any_other_failure_is_raised_not_written_unfiltered(error):
+    # Unfiltered, a feed would show muted posts until its account's next turn; raised,
+    # the ranker keeps the feed the account had (or abandons the cycle).
+    conn, _cur = _conn(error=error)
+    with pytest.raises(type(error)):
+        visibility.muted_authors(conn, "alice")
+    with pytest.raises(type(error)):
+        visibility.community_muted_post_ids(conn, [1])
+
+
 def test_the_warning_is_given_once_per_process_not_once_per_account(caplog):
-    conn, _cur = _conn(error=RuntimeError("permission denied for schema hivemind_app"))
+    conn, _cur = _conn(error=_PgError("42501", "permission denied for schema hivemind_app"))
     with caplog.at_level(logging.WARNING, logger="haf_fyp.visibility"):
         for name in ("a", "b", "c"):
             visibility.muted_authors(conn, name)
@@ -116,31 +141,44 @@ def test_the_warning_is_given_once_per_process_not_once_per_account(caplog):
 
 
 def test_the_two_filters_warn_separately(caplog):
-    conn, _cur = _conn(error=RuntimeError("no hivemind"))
+    conn, _cur = _conn(error=_PgError("3F000", "schema hivemind_app does not exist"))
     with caplog.at_level(logging.WARNING, logger="haf_fyp.visibility"):
         visibility.muted_authors(conn, "a")
         visibility.community_muted_post_ids(conn, [1])
     assert sum("WITHOUT that filter" in r.getMessage() for r in caplog.records) == 2
 
 
+def test_filtering_that_works_again_says_so_and_a_later_outage_warns_again(caplog):
+    broken, _ = _conn(error=_PgError("42P01", "no hivemind yet"))
+    working, _ = _conn(rows=[("bob",)])
+    with caplog.at_level(logging.WARNING, logger="haf_fyp.visibility"):
+        visibility.muted_authors(broken, "a")
+        assert visibility.muted_authors(working, "a") == {"bob"}
+        visibility.muted_authors(working, "a")      # nothing more to say
+        visibility.muted_authors(broken, "a")
+    messages = [r.getMessage() for r in caplog.records]
+    assert sum("WITHOUT that filter" in m for m in messages) == 2
+    assert sum("filtered from now on" in m for m in messages) == 1
+
+
 def test_a_closed_session_is_not_swallowed():
     # The ranker's reconnect path handles a session that is gone; a filter that
     # returned "nothing muted" would hide it.
-    conn, _cur = _conn(error=RuntimeError("server closed the connection"), closed=True)
-    with pytest.raises(RuntimeError):
+    conn, _cur = _conn(error=_PgError("42P01", "server closed the connection"), closed=True)
+    with pytest.raises(_PgError):
         visibility.muted_authors(conn, "alice")
+    conn.rollback.assert_not_called()
 
 
-def test_a_rollback_that_finds_the_session_gone_is_not_swallowed_either():
-    conn, cur = _conn(error=RuntimeError("terminating connection"))
-
-    def _gone():
-        conn.closed = True
-        raise RuntimeError("connection already closed")
-
-    conn.rollback.side_effect = _gone
-    with pytest.raises(RuntimeError):
-        visibility.community_muted_post_ids(conn, [1])
+def test_community_mutes_cover_muted_authors_as_well_as_muted_posts():
+    conn, cur = _conn(rows=[])
+    visibility.community_muted_post_ids(conn, [1])
+    query = cur.execute.call_args.args[0]
+    assert "hp.is_muted" in query
+    # hivemind marks an author muted in a community with role -2, and does NOT set
+    # is_muted on their posts; keyed on hivemind's community id, not haf_fyp's.
+    assert "role.role_id = -2" in query and "role.community_id = hp.community_id" in query
+    assert "role.account_id = hp.author_id" in query
 
 
 # ---- where the ranker applies them
@@ -155,7 +193,8 @@ def test_rank_user_scores_only_what_the_reader_can_be_shown(monkeypatch):
         seen["candidates"] = kw["candidates"]
         return pd.DataFrame()
 
-    monkeypatch.setattr(rd.visibility, "muted_authors", lambda _c, u: {"bob"} if u == "alice" else set())
+    monkeypatch.setattr(rd.visibility, "muted_authors",
+                        lambda _c, u: {"bob", "carol"} if u == "alice" else set())
     monkeypatch.setattr(rd, "fetch_user_communities", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_user_interests", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_top_communities", lambda _c, _u: [])
@@ -165,7 +204,7 @@ def test_rank_user_scores_only_what_the_reader_can_be_shown(monkeypatch):
     monkeypatch.setattr(rd, "write_feed_cache", lambda *a, **k: None)
 
     rd._rank_user(MagicMock(), "alice", _frame(), {}, {}, "1.2.0", {})
-    assert seen["candidates"]["author"].tolist() == ["alice", "carol"]
+    assert seen["candidates"]["author"].tolist() == ["alice"]
 
     rd._rank_user(MagicMock(), "dave", _frame(), {}, {}, "1.2.0", {})
     assert seen["candidates"]["post_id"].tolist() == [1, 2, 3, 4]

@@ -29,7 +29,11 @@ CREATE TABLE hivemind_app.follow_muted (follower INT NOT NULL, following INT NOT
                                         PRIMARY KEY (follower, following));
 CREATE TABLE hivemind_app.blacklisted (follower INT NOT NULL, following INT NOT NULL, block_num INT NOT NULL,
                                        PRIMARY KEY (follower, following));
-CREATE TABLE hivemind_app.hive_posts (id INT PRIMARY KEY, is_muted BOOLEAN NOT NULL DEFAULT FALSE);
+CREATE TABLE hivemind_app.hive_posts (id INT PRIMARY KEY, is_muted BOOLEAN NOT NULL DEFAULT FALSE,
+                                      author_id INT NOT NULL, community_id INT);
+-- role_id -2 is "muted in this community"; 2 is an ordinary member.
+CREATE TABLE hivemind_app.hive_roles (account_id INT NOT NULL, community_id INT NOT NULL, role_id SMALLINT NOT NULL,
+                                      PRIMARY KEY (account_id, community_id));
 
 INSERT INTO hivemind_app.hive_accounts VALUES
     (1, 'reader'), (2, 'listkeeper'), (3, 'stranger'),
@@ -101,20 +105,27 @@ def test_an_account_hivemind_does_not_know_hides_nothing(conn):
     assert visibility.muted_authors(conn, "nobody") == set()
 
 
-def test_only_posts_their_community_muted_are_left_out(conn):
+def test_only_posts_and_authors_their_community_muted_are_left_out(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT to_regclass('haf_fyp_app.post_candidates') IS NOT NULL")
         if not cur.fetchone()[0]:
             pytest.skip("no haf_fyp_app.post_candidates in this database")
-        cur.execute("DELETE FROM haf_fyp_app.post_candidates WHERE post_id IN (900001, 900002, 900003)")
+        ids = "(900001, 900002, 900003, 900004, 900005)"
+        cur.execute(f"DELETE FROM haf_fyp_app.post_candidates WHERE post_id IN {ids}")
         cur.execute(
             "INSERT INTO haf_fyp_app.post_candidates (post_id, created_at, hive_post_id) VALUES "
-            "(900001, now(), 501), (900002, now(), 502), (900003, now(), NULL)"
+            "(900001, now(), 501), (900002, now(), 502), (900003, now(), 503), (900004, now(), 504), "
+            "(900005, now(), NULL)"
         )
-        cur.execute("INSERT INTO hivemind_app.hive_posts VALUES (501, FALSE), (502, TRUE)")
-    # 900003 has no hivemind post yet: it cannot be served either, so it is left alone.
-    assert visibility.community_muted_post_ids(conn, [900001, 900002, 900003]) == {900002}
-    assert visibility.community_muted_post_ids(conn, [900001]) == set()
+        # 501 ordinary; 502 muted by a moderator; 503 and 504 by author 20, who is muted
+        # in community 7 and an ordinary member of community 8.
+        cur.execute("INSERT INTO hivemind_app.hive_posts VALUES "
+                    "(501, FALSE, 11, 7), (502, TRUE, 12, 7), (503, FALSE, 20, 7), (504, FALSE, 20, 8)")
+        cur.execute("INSERT INTO hivemind_app.hive_roles VALUES (20, 7, -2), (20, 8, 2), (11, 7, 2)")
+    # 900005 has no hivemind post yet: it cannot be served either, so it is left alone.
+    assert visibility.community_muted_post_ids(
+        conn, [900001, 900002, 900003, 900004, 900005]) == {900002, 900003}
+    assert visibility.community_muted_post_ids(conn, [900001, 900004]) == set()
 
 
 def test_without_hivemind_the_reads_filter_nothing_and_the_session_carries_on(conn):
