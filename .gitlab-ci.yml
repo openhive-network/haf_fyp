@@ -84,7 +84,13 @@ python-lint:
     # pre-existing UP045/BLE001/DTZ003 across files the MR never touched). Pin so
     # the lint result is reproducible; bump deliberately, cleaning findings in the
     # same commit.
-    - pip install ruff==0.15.12 mypy types-redis -q
+    # mypy and types-redis are pinned for the same reason (2.4.0 / 4.6.0.20241004 were
+    # the newest on PyPI when develop a9195025 last passed). Note what this mypy run
+    # is: requirements.txt is NOT installed, so with --ignore-missing-imports every
+    # fastapi/starlette/slowapi/psycopg2/pandas/numpy symbol is Any and goes unchecked
+    # (only redis is typed, via types-redis). It is a self-consistency pass over our own
+    # annotations, not type coverage of the framework code. Sizing for full checking: #42.
+    - pip install ruff==0.15.12 mypy==2.4.0 types-redis==4.6.0.20241004 -q
     - ruff check haf_fyp/
     - mypy haf_fyp/ --ignore-missing-imports
   rules: *standard_rules
