@@ -46,6 +46,13 @@ SKIP_DIRS = {".git", ".pytest_cache", "__pycache__", ".venv", "node_modules", ".
 # This file names every symbol it forbids, so it matches all of its own patterns.
 SELF = Path(__file__).name
 
+# The one other file allowed to: a byte-exact copy of the upstream shim itself, vendored so
+# test_haf_shim_drift.py can check SHIM_SHA256 offline. It ships nowhere and is never
+# applied to a database. Matched by exact directory and name pattern, not by a skipped
+# directory, so nothing else can hide there.
+VENDORED_SHIM_DIR = ROOT / "tests" / "unit" / "data"
+VENDORED_SHIM_GLOB = "compatibility_with_old_haf_apps@*.sql"
+
 # Symbol -> the canonical spelling to use instead.
 #
 # Verified against hive/haf's compatibility_with_old_haf_apps.sql, which is byte-identical
@@ -79,10 +86,17 @@ EXPECTED_SHIM_SYMBOLS = 4
 # What the ledger above was transcribed FROM: the shim at a pinned hive/haf commit (tag
 # 1.28.8), and the sha256 of its exact bytes there. scripts/check_haf_shim_drift.py (the
 # haf-shim-drift CI jobs, #52) fetches the file and treats ANY byte change against this hash
-# as drift -- it does not try to parse SQL to decide. When it fires: re-read the file,
-# update the ledger, then bump all three of HAF_SHIM_REF, SHIM_SHA256 and (if the count
-# moved) EXPECTED_SHIM_SYMBOLS together, in one commit. Keep every one a plain literal;
-# the script reads them with `ast` and refuses anything else.
+# as drift -- it does not try to parse SQL to decide. A byte-exact copy lives at
+# tests/unit/data/compatibility_with_old_haf_apps@<HAF_SHIM_REF>.sql, and python-tests
+# checks offline that its sha256 is SHIM_SHA256 and that its name carries HAF_SHIM_REF.
+#
+# To bump, in one commit:
+#   1. refresh the copy: delete the old one and save the new commit's file, byte for byte
+#      (e.g. the API's base64 `content`, decoded), as ...@<new full SHA>.sql;
+#   2. set HAF_SHIM_REF to that SHA;
+#   3. set SHIM_SHA256 to the copy's sha256 -- and re-read the file to update the ledger
+#      and EXPECTED_SHIM_SYMBOLS.
+# Keep every value a plain literal; the script reads them with `ast`.
 HAF_SHIM_REF = "38d51f261009904881da1fac87b7f5b7f6c3cb3a"
 SHIM_SHA256 = "92db49ca379e2d282e79c51d968bbd92428d7c8dcc0991b3b8c152928d3c5c77"
 
@@ -112,6 +126,8 @@ def _strip_comments(text: str) -> str:
 def _sql_bearing_files():
     for path in sorted(ROOT.rglob("*")):
         if not path.is_file() or path.name == SELF:
+            continue
+        if path.parent == VENDORED_SHIM_DIR and path.match(VENDORED_SHIM_GLOB):
             continue
         if any(part in SKIP_DIRS for part in path.parts):
             continue

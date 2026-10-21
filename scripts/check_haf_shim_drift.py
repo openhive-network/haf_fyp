@@ -20,12 +20,18 @@ a construct it misreads makes the hint wrong, not the verdict.
 The ledger (COMPAT_ALIASES, SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM, EXPECTED_SHIM_SYMBOLS,
 HAF_SHIM_REF, SHIM_SHA256) is READ from the test file with `ast`, never copied here or
 imported. Each name must be bound exactly once, by a plain top-level assignment of a
-literal; anything else (`|=`, `.update()`, `del`, a conditional rebind) is refused, because
-the value the test runs with would no longer be the value read here.
+literal, because the value the test runs with must be the value read here. Refused: any
+other binding (`|=`, a conditional or nested rebind, an annotated assignment, `del`),
+item assignment or `del X[k]`, an in-place method called on a ledger name or with one as an
+argument (`X.update(...)`, `dict.update(X, ...)`), a ledger name bound to another name
+(`_a = X`), and any call to globals/vars/locals/setattr/exec/eval in the file. Out of scope,
+because static analysis cannot follow them and the file is reviewed code: aliasing through
+a container or function argument and then mutating, and other dynamic tricks.
 
-To bump after a real upstream change: re-read the file, update COMPAT_ALIASES /
-SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM / EXPECTED_SHIM_SYMBOLS, and set HAF_SHIM_REF and
-SHIM_SHA256 to the new commit and hash -- together, in one commit.
+To bump after a real upstream change, in one commit: refresh the byte-exact copy in
+tests/unit/data/ (named ...@<full SHA>.sql), set HAF_SHIM_REF to that SHA, set SHIM_SHA256 to
+the copy's sha256 -- and re-read the file to update the ledger. python-tests checks the
+copy, the ref and the hash agree, offline; see the comment beside them in the test file.
 
 Usage:
     check_haf_shim_drift.py [--ledger PATH] (--pinned | --ref REF | --file PATH)...
@@ -33,8 +39,9 @@ Usage:
 Sources are checked in the order given. Exit codes, worst across all sources:
     0  every source is byte-identical to SHIM_SHA256
     1  drift: a source's bytes differ
-    2  the check could not run: a failed fetch, an unreadable file, an unreadable or
-       inconsistent ledger, or any unexpected exception. Never 1: an error must not be
+    2  the check could not run: a failed fetch (including a redirect, a non-text/plain
+       response such as a sign-in page, or an empty body), an unreadable or empty file, an
+       unreadable or inconsistent ledger, no source given, or any unexpected exception. Never 1: an error must not be
        mistaken for drift, nor either for a pass.
 
 Every diagnostic goes to stderr. A failure to fetch is NEVER reported as "no drift" --
@@ -48,7 +55,6 @@ import argparse
 import ast
 import hashlib
 import http.client
-import os
 import re
 import sys
 import urllib.error
@@ -58,8 +64,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LEDGER_FILE = ROOT / "tests" / "unit" / "test_haf_canonical_names.py"
 SHIM_PATH = "src/hive_fork_manager/types/operation/compatibility_with_old_haf_apps.sql"
-# Overridable so the tests can point the fetch at a local server that fails on purpose.
-RAW_BASE = os.environ.get("HAF_RAW_BASE_URL", "https://gitlab.syncad.com/hive/haf/-/raw")
+RAW_BASE = "https://gitlab.syncad.com/hive/haf/-/raw"
 FETCH_TIMEOUT = 30.0
 
 EXIT_OK, EXIT_DRIFT, EXIT_ERROR = 0, 1, 2
@@ -74,6 +79,10 @@ _MUTATORS = {
     "difference_update", "intersection_update", "symmetric_difference_update",
     "__setitem__", "__delitem__", "__ior__", "__iand__", "__isub__", "__ixor__",
 }
+
+
+# Calls that can rebind or mutate a module global without naming it as a target.
+_DYNAMIC = {"globals", "vars", "locals", "setattr", "exec", "eval"}
 
 
 class CheckError(Exception):
@@ -94,11 +103,22 @@ def _ledger_values(tree: ast.Module, path: Path) -> dict[str, object]:
         if isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del)):
             if isinstance(node.value, ast.Name) and node.value.id in stores:
                 raise CheckError(f"{node.value.id} is modified by item assignment or del in {path}")
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name) and node.func.value.id in stores
-                and node.func.attr in _MUTATORS):
-            raise CheckError(f"{node.func.value.id}.{node.func.attr}() is called in {path}; "
-                             f"the ledger must be a plain literal")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _MUTATORS:
+            if isinstance(node.func.value, ast.Name) and node.func.value.id in stores:
+                raise CheckError(f"{node.func.value.id}.{node.func.attr}() is called in {path}; "
+                                 f"the ledger must be a plain literal")
+            for arg in node.args:
+                if isinstance(arg, ast.Name) and arg.id in stores:
+                    raise CheckError(f"{arg.id} is passed to .{node.func.attr}() in {path}; "
+                                     f"the ledger must be a plain literal")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _DYNAMIC:
+            raise CheckError(f"{node.func.id}() is called in {path}, which could rebind the "
+                             f"ledger where this check cannot see it")
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            value = node.value
+            if isinstance(value, ast.Name) and value.id in stores:
+                raise CheckError(f"{value.id} is bound to another name in {path}; an alias "
+                                 f"could change it where this check cannot see")
     top_level = {}
     for stmt in tree.body:
         if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
@@ -153,15 +173,33 @@ def read_ledger(path: Path | None = None) -> dict[str, object]:
 # --- sources -------------------------------------------------------------------------
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect means the file is not where the pin says: an error, never followed."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, f"redirected to {newurl}", headers, fp)
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def fetch(ref: str) -> bytes:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", ref):
         raise CheckError(f"{ref!r} is not a valid git ref")
     url = f"{RAW_BASE}/{ref}/{SHIM_PATH}"
     try:
-        with urllib.request.urlopen(url, timeout=FETCH_TIMEOUT) as resp:  # noqa: S310 - fixed scheme
-            return resp.read()
+        with _OPENER.open(url, timeout=FETCH_TIMEOUT) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            data = resp.read()
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
         raise CheckError(f"could not fetch {url}: {type(exc).__name__}: {exc}") from exc
+    # Each of these is "we did not get the file", not "the file changed": a sign-in page, a
+    # moved file answered with a redirect, or an empty 200 must not be reported as drift.
+    if not ctype.lower().startswith("text/plain"):
+        raise CheckError(f"could not fetch {url}: Content-Type is {ctype!r}, not text/plain")
+    if not data:
+        raise CheckError(f"could not fetch {url}: the response body is empty")
+    return data
 
 
 # --- diagnostic only -----------------------------------------------------------------
@@ -239,7 +277,11 @@ def _main(argv: list[str] | None) -> int:
                         help="local copy of the shim")
     args = parser.parse_args(argv)
     if not args.sources:
-        parser.error("give at least one --pinned, --ref or --file")
+        # Not parser.error(): that raises SystemExit, and a check that was given nothing to
+        # check has to say so in the same exit code as every other "did not run".
+        print("ERROR: give at least one --pinned, --ref or --file; nothing was checked",
+              file=sys.stderr)
+        return EXIT_ERROR
 
     try:
         ledger = read_ledger(args.ledger)
@@ -253,6 +295,8 @@ def _main(argv: list[str] | None) -> int:
         label = value if kind == "file" else f"hive/haf@{ref}"
         try:
             data = Path(value).read_bytes() if kind == "file" else fetch(ref)
+            if not data:
+                raise CheckError("the file is empty")
         except CheckError as exc:
             print(f"ERROR [{label}]: {exc}", file=sys.stderr)
             rc = EXIT_ERROR

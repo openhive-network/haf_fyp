@@ -9,7 +9,13 @@ The tests run against a COPY of that ledger whose SHIM_SHA256 is the hash of a s
 shim built from the ledger's own names. Not a pasted upstream file, for a reason specific to
 this repo: test_haf_canonical_names.py scans every .py and .sql file for the literal shim
 spellings, so a verbatim copy here would fail that guard. The real bytes are checked by
-the haf-shim-drift job itself, against the real SHIM_SHA256.
+the haf-shim-drift job itself, against the real SHIM_SHA256 -- and OFFLINE, here, against
+tests/unit/data/compatibility_with_old_haf_apps@<HAF_SHIM_REF>.sql: a byte-exact copy of the
+upstream file at the pinned commit (from hive/haf's repository files API, decoded from its
+base64 `content`; GitLab's own content_sha256 for it is SHIM_SHA256). The copy must stay
+byte-exact -- .gitattributes marks it -text -- and is exempted by exact name from
+test_haf_canonical_names.py's scan. Its name carries the ref, so bumping HAF_SHIM_REF without
+refreshing the copy fails here, in blocking python-tests, not on the network.
 """
 
 from __future__ import annotations
@@ -19,6 +25,9 @@ import http.server
 import importlib.util
 import os
 import re
+import socket
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -33,6 +42,7 @@ except ImportError:  # pragma: no cover - depends on the environment, not the co
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "check_haf_shim_drift.py"
 LEDGER = ROOT / "tests" / "unit" / "test_haf_canonical_names.py"
+DATA = ROOT / "tests" / "unit" / "data"
 
 _spec = importlib.util.spec_from_file_location("check_haf_shim_drift", SCRIPT)
 drift = importlib.util.module_from_spec(_spec)
@@ -118,6 +128,47 @@ def test_the_real_ledger_reads_and_is_the_canonical_names_ledger(symbols):
     assert (led["ref"], led["sha256"]) == (canon.HAF_SHIM_REF, canon.SHIM_SHA256)
 
 
+def _vendored():
+    copies = sorted(DATA.glob("compatibility_with_old_haf_apps@*.sql"))
+    assert len(copies) == 1, f"expected exactly one vendored shim copy in {DATA}, found {copies}"
+    return copies[0]
+
+
+def test_the_pin_is_a_full_commit_sha():
+    import tests.unit.test_haf_canonical_names as canon
+
+    assert re.fullmatch(r"[0-9a-f]{40}", canon.HAF_SHIM_REF), "pin a full commit SHA, not a branch"
+
+
+def test_the_vendored_copy_is_the_pinned_file():
+    """Offline, blocking: a mistyped hash, or a ref bumped without refreshing the copy."""
+    import tests.unit.test_haf_canonical_names as canon
+
+    copy = _vendored()
+    assert copy.name == f"compatibility_with_old_haf_apps@{canon.HAF_SHIM_REF}.sql", (
+        "the vendored copy is not the HAF_SHIM_REF one: refresh the copy, the ref and the "
+        "hash together"
+    )
+    assert hashlib.sha256(copy.read_bytes()).hexdigest() == canon.SHIM_SHA256, (
+        "SHIM_SHA256 is not the sha256 of the vendored pinned copy"
+    )
+
+
+def test_the_script_passes_the_vendored_copy_against_the_real_ledger(capsys):
+    """The real ledger, unmodified, end to end: what the pin job sees when the network works."""
+    assert drift.main(["--file", str(_vendored())]) == drift.EXIT_OK
+    assert "byte-identical" in capsys.readouterr().out
+
+
+def test_the_canonical_names_scan_exempts_only_the_vendored_copy():
+    import tests.unit.test_haf_canonical_names as canon
+
+    scanned = {p.resolve() for p in canon._sql_bearing_files()}
+    assert _vendored().resolve() not in scanned
+    assert not (DATA / "compatibility_with_old_haf_apps_extra.sql").match(canon.VENDORED_SHIM_GLOB)
+    assert not (ROOT / "db" / "compatibility_with_old_haf_apps@x.sql").parent == canon.VENDORED_SHIM_DIR
+
+
 # --- the verdict is the hash -----------------------------------------------------------
 
 
@@ -164,14 +215,41 @@ def test_changes_a_parser_would_miss_are_still_drift(tmp_path, capsys, ledger, g
     assert "symbols now (best effort)" in err
 
 
-def test_a_page_that_is_not_the_shim_is_drift_with_a_hint(tmp_path, capsys, ledger):
+def test_a_local_file_that_is_not_the_shim_is_drift_with_a_hint(tmp_path, capsys, ledger):
+    """A FETCHED sign-in page is an error (see the server tests); a local file is what it is."""
     err = _drifted(tmp_path, capsys, ledger, b"<html><body>Sign in</body></html>")
     assert "none found -- is this the shim file?" in err
 
 
-def test_an_empty_body_is_drift(tmp_path, capsys, ledger):
-    err = _drifted(tmp_path, capsys, ledger, b"")
-    assert "(0 bytes)" in err
+def test_an_empty_file_is_an_error_not_drift(tmp_path, capsys, ledger):
+    assert _main(ledger, _file(tmp_path, b"")) == drift.EXIT_ERROR
+    assert "the file is empty" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("variant", ["crlf", "bom"])
+def test_bytes_are_hashed_exactly(tmp_path, capsys, ledger, good, variant):
+    """No normalisation: CRLF line endings and a BOM are changes, and are drift."""
+    data = good.replace(b"\n", b"\r\n") if variant == "crlf" else b"\xef\xbb\xbf" + good
+    _drifted(tmp_path, capsys, ledger, data)
+
+
+def test_stripping_carriage_returns_is_drift(tmp_path, capsys, symbols):
+    """The other direction: a ledger hashed over CRLF bytes rejects the LF version."""
+    crlf = _shim(symbols).replace(b"\n", b"\r\n")
+    ledger = _ledger_variant(tmp_path, (_real("SHIM_SHA256"),
+                                        f'SHIM_SHA256 = "{hashlib.sha256(crlf).hexdigest()}"'))
+    assert _main(ledger, _file(tmp_path, crlf, "crlf.sql")) == drift.EXIT_OK
+    capsys.readouterr()
+    _drifted(tmp_path, capsys, ledger, crlf.replace(b"\r", b""))
+
+
+@pytest.mark.parametrize("position", [16, 63])
+def test_the_whole_digest_is_compared(tmp_path, capsys, good, position):
+    """A recorded hash that differs from the real one in a single hex digit is not a match."""
+    real = hashlib.sha256(good).hexdigest()
+    near = real[:position] + ("0" if real[position] != "0" else "1") + real[position + 1:]
+    ledger = _ledger_variant(tmp_path, (_real("SHIM_SHA256"), f'SHIM_SHA256 = "{near}"'))
+    _drifted(tmp_path, capsys, ledger, good)
 
 
 def test_the_hint_never_decides_a_mismatch(tmp_path, capsys, ledger, symbols, monkeypatch):
@@ -302,6 +380,26 @@ def test_every_in_place_mutation_of_the_ledger_is_refused(tmp_path, capsys, good
     assert f"{target}.{method}() is called" in out.err
 
 
+@pytest.mark.parametrize("line,message", [
+    ('COMPAT_ALIASES.update({"x": "hafd.x"})', "COMPAT_ALIASES.update() is called"),
+    ('SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM.add("x")', "SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM.add() is called"),
+    ('COMPAT_ALIASES.pop("live_stage", None)', "COMPAT_ALIASES.pop() is called"),
+    ('dict.update(COMPAT_ALIASES, {"x": "hafd.x"})', "COMPAT_ALIASES is passed to .update()"),
+    ('set.add(SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM, "x")', "SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM is passed to .add()"),
+    ('_a = COMPAT_ALIASES\n_a.update({"x": "hafd.x"})', "COMPAT_ALIASES is bound to another name"),
+    ("_n: object = EXPECTED_SHIM_SYMBOLS", "EXPECTED_SHIM_SYMBOLS is bound to another name"),
+    ('globals()["EXPECTED_SHIM_SYMBOLS"] = 5', "globals() is called"),
+    ('vars()["SHIM_SHA256"] = "0" * 64', "vars() is called"),
+    ('setattr(sys.modules[__name__], "EXPECTED_SHIM_SYMBOLS", 5)', "setattr() is called"),
+    ('exec("EXPECTED_SHIM_SYMBOLS = 5")', "exec() is called"),
+])
+def test_indirect_changes_to_the_ledger_are_refused(tmp_path, capsys, good, line, message):
+    rc, out = _broken(tmp_path, capsys, good,
+                      ("EXPECTED_SHIM_SYMBOLS = 4", f"EXPECTED_SHIM_SYMBOLS = 4\n{line}"))
+    assert rc == drift.EXIT_ERROR, out.err
+    assert message in out.err
+
+
 def test_an_unparseable_ledger_is_refused(tmp_path, capsys, good):
     bad = tmp_path / "ledger.py"
     bad.write_text("COMPAT_ALIASES = {\n", encoding="utf-8")
@@ -321,15 +419,37 @@ def test_read_only_use_of_the_ledger_is_fine(tmp_path, capsys, ledger, good):
 # --- the exit-code contract ------------------------------------------------------------
 
 
-def test_an_unexpected_exception_exits_2_not_1(tmp_path, capsys, ledger, good, monkeypatch):
+@pytest.mark.parametrize("exc_type", [TypeError, RuntimeError, KeyError, AttributeError])
+def test_an_unexpected_exception_exits_2_not_1(tmp_path, capsys, ledger, good, monkeypatch, exc_type):
     """An uncaught exception exits 1, which is the drift code. It must never mean drift."""
     def boom(*_a, **_k):
-        raise TypeError("surprise")
+        raise exc_type("surprise")
 
     monkeypatch.setattr(drift, "check", boom)
     assert _main(ledger, _file(tmp_path, good)) == drift.EXIT_ERROR
     err = capsys.readouterr().err
     assert "internal failure" in err and "surprise" in err
+
+
+def test_no_source_is_an_error_not_a_pass(capsys, ledger):
+    assert _main(ledger) == drift.EXIT_ERROR
+    assert "nothing was checked" in capsys.readouterr().err
+
+
+def test_no_source_exits_2_as_a_process():
+    """The exit code the runner sees, not main()'s return value."""
+    proc = subprocess.run([sys.executable, "-I", str(SCRIPT)], capture_output=True, text=True,
+                          timeout=60, check=False)
+    assert proc.returncode == drift.EXIT_ERROR
+    assert "nothing was checked" in proc.stderr
+
+
+def test_drift_exits_1_as_a_process(tmp_path, ledger, good):
+    proc = subprocess.run([sys.executable, "-I", str(SCRIPT), "--ledger", str(ledger),
+                           "--file", str(_file(tmp_path, good + b"x"))],
+                          capture_output=True, text=True, timeout=60, check=False)
+    assert proc.returncode == drift.EXIT_DRIFT
+    assert "DRIFT [" in proc.stderr
 
 
 @pytest.mark.parametrize("ref", ["bad ref", "", "-x", "a\nb"])
@@ -366,8 +486,20 @@ def server(good, monkeypatch, no_proxy):
         def do_GET(self):  # noqa: N802 - stdlib name
             ref = self.path.split("/")[1]
             try:
-                if self.path != f"/{ref}/{drift.SHIM_PATH}" or ref not in ("good", PIN, "slow", "truncated"):
+                if self.path != f"/{ref}/{drift.SHIM_PATH}" or ref not in (
+                        "good", PIN, "slow", "truncated", "redirect", "html", "empty", "notype"):
                     self.send_error(404)
+                elif ref == "redirect":
+                    self.send_response(302)
+                    self.send_header("Location", f"/good/{drift.SHIM_PATH}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                elif ref == "html":
+                    self._send(b"<html><body>Sign in</body></html>", "text/html; charset=utf-8")
+                elif ref == "notype":
+                    self._send(good, None)
+                elif ref == "empty":
+                    self._send(b"")
                 elif ref == "slow":
                     stop.wait(3)
                     self._send(good)
@@ -383,8 +515,10 @@ def server(good, monkeypatch, no_proxy):
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 self.close_connection = True
 
-        def _send(self, body):
+        def _send(self, body, ctype="text/plain; charset=utf-8"):
             self.send_response(200)
+            if ctype:
+                self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -431,6 +565,21 @@ def test_a_truncated_body_is_a_per_source_error(server, capsys, ledger):
     assert "OK [hive/haf@good]" in out.out
 
 
+@pytest.mark.parametrize("ref,marker", [
+    ("redirect", "redirected to"),
+    ("html", "Content-Type is 'text/html; charset=utf-8', not text/plain"),
+    ("notype", "Content-Type is '', not text/plain"),
+    ("empty", "the response body is empty"),
+])
+def test_not_getting_the_file_is_an_error_not_drift(server, capsys, ledger, ref, marker):
+    """A sign-in page, a redirect or an empty 200 means we did not get the file."""
+    rc = _main(ledger, ["--ref", ref])
+    err = capsys.readouterr().err
+    assert rc == drift.EXIT_ERROR
+    assert f"ERROR [hive/haf@{ref}]: could not fetch" in err and marker in err
+    assert "DRIFT" not in err
+
+
 def test_a_hung_server_times_out(server, capsys, ledger, monkeypatch):
     monkeypatch.setattr(drift, "FETCH_TIMEOUT", 0.5)
     started = time.monotonic()
@@ -440,17 +589,32 @@ def test_a_hung_server_times_out(server, capsys, ledger, monkeypatch):
     assert "ERROR [hive/haf@slow]: could not fetch" in capsys.readouterr().err
 
 
+def _closed_port():
+    """A port that was bound a moment ago and is now closed: nothing listens there unless
+    another process grabs it in between, which a test run does not do."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 def test_an_unreachable_host_fails_loudly(monkeypatch, capsys, ledger, no_proxy):
-    monkeypatch.setattr(drift, "RAW_BASE", "http://127.0.0.1:9")
+    monkeypatch.setattr(drift, "RAW_BASE", f"http://127.0.0.1:{_closed_port()}")
     assert _main(ledger, ["--ref", "anything"]) == drift.EXIT_ERROR
     assert "ERROR [hive/haf@anything]: could not fetch" in capsys.readouterr().err
 
 
-def test_a_malformed_base_url_is_a_fetch_error_not_a_crash(monkeypatch, capsys, ledger, no_proxy):
-    """http.client raises InvalidURL / ValueError for a bad port: still exit 2, labelled."""
+def test_an_out_of_range_port_is_a_fetch_error(monkeypatch, capsys, ledger, no_proxy):
     monkeypatch.setattr(drift, "RAW_BASE", "http://127.0.0.1:99999")
     assert _main(ledger, ["--ref", "anything"]) == drift.EXIT_ERROR
     assert "ERROR [hive/haf@anything]: could not fetch" in capsys.readouterr().err
+
+
+def test_a_value_error_from_the_fetch_is_a_labelled_fetch_error(monkeypatch, capsys, ledger, no_proxy):
+    """A URL with no scheme makes urllib raise a genuine ValueError ("unknown url type")."""
+    monkeypatch.setattr(drift, "RAW_BASE", "gitlab.invalid/no-scheme")
+    assert _main(ledger, ["--ref", "anything"]) == drift.EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "ERROR [hive/haf@anything]: could not fetch" in err and "ValueError" in err
 
 
 # --- the CI job wiring -----------------------------------------------------------------
@@ -464,20 +628,18 @@ def _ci():
     return yaml.safe_load((ROOT / ".gitlab-ci.yml").read_text(encoding="utf-8"))
 
 
-def _script(job):
-    script = "\n".join(job["script"])
-    # Not `|| true`, not a subshell: the exit code is what colours the job.
-    assert "|| true" not in script and "$(" not in script
-    return script
+def _exact_script(job, command):
+    """The whole script is the one command: nothing can swallow its exit code (no `||`,
+    `; true`, `set +e`, `exit 0`) and nothing runs before or after it."""
+    assert job["script"] == [command]
+    assert "before_script" not in job and "after_script" not in job
 
 
 def test_the_pin_job_checks_the_pin_only_and_does_not_block():
     ci = _ci()
     job = ci["haf-shim-drift"]
     assert job.get("allow_failure") is True, "an upstream change must not block an unrelated MR"
-    script = _script(job)
-    assert "scripts/check_haf_shim_drift.py --pinned" in script
-    assert "develop" not in script, "develop drift belongs to the scheduled job"
+    _exact_script(job, "python scripts/check_haf_shim_drift.py --pinned")
     assert job["rules"] is ci[".standard-rules"], "MR and default-branch pipelines, like every lane"
 
 
@@ -492,7 +654,9 @@ def test_the_develop_job_runs_on_the_schedule_only_and_fails_red():
     # scheduled pipeline notifies nobody -- the blind spot #52 exists to close.
     assert job.get("allow_failure", False) is False
     assert _outcome_of(ci, "haf-shim-drift-develop", _schedule_pipeline()) == ("on_success", False)
-    assert "scripts/check_haf_shim_drift.py --ref develop" in _script(job)
+    _exact_script(job, "python scripts/check_haf_shim_drift.py --ref develop")
+    assert job.get("interruptible") is False, "auto-cancel must not cancel the scheduled check"
+    assert job.get("retry") == {"max": 2, "when": "runner_system_failure"}
     assert "haf-shim-drift-develop" in _running(_schedule_pipeline())
     assert "haf-shim-drift" not in _running(_schedule_pipeline())
     for env in (_mr_pipeline(), _push_pipeline()):

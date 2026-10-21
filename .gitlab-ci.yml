@@ -152,9 +152,9 @@ registry-resolution:
   # NOT interruptible. This project has auto-cancel-redundant-pipelines on, so a push to the
   # default branch shortly after the cron tick would otherwise cancel the sweep: no answer, no
   # red, nothing. (A job still waiting for a runner counts as interruptible whatever it says,
-  # so that narrow window remains; once it runs, it finishes.) It is the only job in a
-  # scheduled pipeline and never runs in a push or MR pipeline, so holding it costs nothing
-  # elsewhere -- the same reasoning as publish_tag.
+  # so that narrow window remains; once it runs, it finishes.) It and haf-shim-drift-develop
+  # are the only jobs in a scheduled pipeline, and neither runs in a push or MR pipeline, so
+  # holding it costs nothing elsewhere -- the same reasoning as publish_tag.
   interruptible: false
   # ABOVE the script's own budget, which the lane test holds it to: HAF_FYP_RESOLVE_DEADLINE
   # (420s) plus one in-flight attempt (HEAD + token + HEAD at 20s each) plus the image pull and
@@ -303,10 +303,13 @@ openapi-drift:
 # ledger, and change HAF_SHIM_REF and SHIM_SHA256 together. The test file is the single
 # place all of that lives; neither job carries a copy.
 #
-#   haf-shim-drift          MR + default-branch pipelines, the PINNED ref. Its result
-#                           changes only when this repo changes the ledger or the pin, and
-#                           it is allow_failure: an upstream change must never block an
-#                           unrelated MR.
+#   haf-shim-drift          MR + default-branch pipelines, the PINNED ref. A fixed commit
+#                           cannot change upstream, so this can only fail through our own
+#                           bump -- which python-tests already catches OFFLINE, against the
+#                           vendored copy in tests/unit/data/ -- or through the network:
+#                           gitlab.syncad.com unreachable or answering oddly. It is
+#                           allow_failure for that last reason only: a network blip must not
+#                           block an MR, and the blocking check is the offline one.
 #   haf-shim-drift-develop  the daily schedule (and the on-demand sweep): hive/haf develop
 #                           against the same hash. This is where upstream drift appears.
 #                           NOT allow_failure: it runs only where it blocks nothing, and an
@@ -327,7 +330,15 @@ haf-shim-drift:
 haf-shim-drift-develop:
   stage: lint
   image: python:3.11-slim
+  # NOT interruptible, as registry-resolution: auto-cancel-redundant-pipelines would otherwise
+  # let a push to develop just after the cron tick cancel the check -- no answer, no red.
+  interruptible: false
   timeout: 10m
+  # Infrastructure only, as registry-resolution: re-running on a real failure would report
+  # the same drift three times.
+  retry:
+    max: 2
+    when: runner_system_failure
   script:
     - python scripts/check_haf_shim_drift.py --ref develop
   rules:

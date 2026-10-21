@@ -1,4 +1,5 @@
-"""The scheduled registry-resolution lane: it has to run, and nothing else may (#71).
+"""The scheduled registry-resolution lane: it has to run, and nothing else may (#71) -- bar
+the read-only haf-shim-drift-develop check (#52), named in SCHEDULED below.
 
 Two halves, and the second is the one that is easy to miss.
 
