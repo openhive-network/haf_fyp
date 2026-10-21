@@ -20,9 +20,10 @@ or deleting something -- for that, hive/haf_stats has `scripts/check_haf_drift.s
 lines, network, pinned ref), which exists because that repo hand-transcribes large parts of
 HAF. This is the cheaper, different thing: a fixed list of known shim symbols asserted
 against everything this repo ships, which catches the mistake RECURRING. Upstream drift is
-the `haf-shim-drift` CI job's (scripts/check_haf_shim_drift.py, #52): it fetches the shim
-and diffs it against COMPAT_ALIASES, SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM and
-EXPECTED_SHIM_SYMBOLS below, read from this file -- so keep them plain literals.
+the `haf-shim-drift` CI jobs' (scripts/check_haf_shim_drift.py, #52): they fetch the shim
+and compare its bytes with SHIM_SHA256 below, and on a mismatch print the symbols it now
+defines against COMPAT_ALIASES and SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM. The script reads
+all of these from this file, so keep them plain literals.
 """
 
 from __future__ import annotations
@@ -74,6 +75,16 @@ COMPAT_ALIASES = {
 # the pattern spreading -- not an imminent removal.
 SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM = {"contexts_group"}
 EXPECTED_SHIM_SYMBOLS = 4
+
+# What the ledger above was transcribed FROM: the shim at a pinned hive/haf commit (tag
+# 1.28.8), and the sha256 of its exact bytes there. scripts/check_haf_shim_drift.py (the
+# haf-shim-drift CI jobs, #52) fetches the file and treats ANY byte change against this hash
+# as drift -- it does not try to parse SQL to decide. When it fires: re-read the file,
+# update the ledger, then bump all three of HAF_SHIM_REF, SHIM_SHA256 and (if the count
+# moved) EXPECTED_SHIM_SYMBOLS together, in one commit. Keep every one a plain literal;
+# the script reads them with `ast` and refuses anything else.
+HAF_SHIM_REF = "38d51f261009904881da1fac87b7f5b7f6c3cb3a"
+SHIM_SHA256 = "92db49ca379e2d282e79c51d968bbd92428d7c8dcc0991b3b8c152928d3c5c77"
 
 # A text guard that scans nothing reports clean. hive/haf_stats' check_haf_drift.sh shipped
 # exactly that bug -- its header records the first version printing "No drift" and exiting 0

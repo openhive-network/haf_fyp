@@ -294,41 +294,39 @@ openapi-drift:
 # tests/unit/test_haf_canonical_names.py forbids the hive.* names that exist only in HAF's
 # compatibility shim, from a hand-transcribed list. Nothing noticed upstream changing that
 # list, so a fifth alias, a rename or a deleted shim left that test green forever (#52).
-# These two jobs fetch the shim and diff its symbols against the test's ledger, which the
-# script reads from the test file itself -- the test stays the single source of truth.
 #
-# Two jobs, so the two questions never mask each other:
-#   haf-shim-drift          MR + default-branch pipelines, the PINNED ref only. Changes
-#                           only when this repo changes (the ledger or the pin), so an
-#                           orange here is about the MR in front of you.
-#   haf-shim-drift-develop  the daily schedule (and the on-demand sweep), hive/haf develop.
-#                           This is where upstream drift actually appears; checking develop
-#                           per-MR would turn every unrelated MR orange the day HAF moved,
-#                           and hide a real pin problem behind it.
+# Detection is a content fingerprint: the test file records HAF_SHIM_REF (the pinned
+# hive/haf commit the ledger was read from) and SHIM_SHA256 (the sha256 of the shim there),
+# and the script fails on ANY byte change -- no SQL parsing decides the verdict, so there is
+# no construct it can miss. On drift it prints the hive.* names the new file appears to
+# create against the ledger, as a reading aid. To bump: re-read the file, update the
+# ledger, and change HAF_SHIM_REF and SHIM_SHA256 together. The test file is the single
+# place all of that lives; neither job carries a copy.
 #
-# allow_failure on both: an upstream change is not a reason to block anything; it is a
-# reason for someone to go look. Both still go ORANGE on drift (exit 1) and on a check that
-# could not run (exit 2: unreachable host, bad ref, moved file, a construct the parser cannot
-# vouch for) -- never green. The fetch runs inside the script in the job's main shell, not in
-# a $(...) substitution, so its exit code is what the runner sees.
+#   haf-shim-drift          MR + default-branch pipelines, the PINNED ref. Its result
+#                           changes only when this repo changes the ledger or the pin, and
+#                           it is allow_failure: an upstream change must never block an
+#                           unrelated MR.
+#   haf-shim-drift-develop  the daily schedule (and the on-demand sweep): hive/haf develop
+#                           against the same hash. This is where upstream drift appears.
+#                           NOT allow_failure: it runs only where it blocks nothing, and an
+#                           orange job in a scheduled pipeline notifies nobody -- the blind
+#                           spot #52 exists to close.
 #
-# What the parser does and does not model is listed in the script's docstring.
+# Exit 1 is drift, exit 2 is a check that could not run (unreachable host, bad ref, moved
+# file, broken ledger); neither is ever green. The fetch runs inside the script in the job's
+# main shell, not in a $(...) substitution, so its exit code is what the runner sees.
 haf-shim-drift:
   stage: lint
   image: python:3.11-slim
   allow_failure: true
-  variables:
-    # Pinned, for the reason openapi-drift pins COMMON_CI_REF: this is the 1.28.8 release
-    # tag's commit, the HAF nodes actually run. Bump it deliberately with the ledger.
-    HAF_SHIM_REF: "38d51f261009904881da1fac87b7f5b7f6c3cb3a"
   script:
-    - python scripts/check_haf_shim_drift.py --ref "$HAF_SHIM_REF"
+    - python scripts/check_haf_shim_drift.py --pinned
   rules: *standard_rules
 
 haf-shim-drift-develop:
   stage: lint
   image: python:3.11-slim
-  allow_failure: true
   timeout: 10m
   script:
     - python scripts/check_haf_shim_drift.py --ref develop
