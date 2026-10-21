@@ -291,6 +291,32 @@ openapi-drift:
     - echo "served OpenAPI document is valid."
   rules: *standard_rules
 
+# tests/unit/test_haf_canonical_names.py forbids the hive.* names that exist only in HAF's
+# compatibility shim, from a hand-transcribed list. Nothing noticed upstream changing that
+# list, so a fifth alias, a rename or a deleted shim left that test green forever (#52).
+# This job fetches the shim and diffs its symbols against the test's ledger, which the
+# script reads from the test file itself -- the test stays the single source of truth.
+#
+# allow_failure: an upstream change is not a reason to block whichever unrelated MR ran
+# when HAF moved; it is a reason for someone to go look. The job still goes ORANGE on both
+# drift (exit 1) and a failed fetch (exit 2) -- an unreachable host, a bad ref or a moved
+# file is an error, never a pass. The fetch runs inside the script in the job's main shell,
+# not in a $(...) substitution, so its exit code is what the runner sees.
+haf-shim-drift:
+  stage: lint
+  image: python:3.11-slim
+  allow_failure: true
+  variables:
+    # Pinned, for the reason openapi-drift pins COMMON_CI_REF: this is the 1.28.8 release
+    # tag's commit, the HAF nodes actually run. Bump it deliberately with the ledger.
+    HAF_SHIM_REF: "38d51f261009904881da1fac87b7f5b7f6c3cb3a"
+  script:
+    # The pin makes the result reproducible; develop is the early warning, since a pinned
+    # file never changes on its own. Each ref is reported separately, labelled, so the log
+    # says which one moved. The worst exit code wins.
+    - python scripts/check_haf_shim_drift.py --ref "$HAF_SHIM_REF" --ref develop
+  rules: *standard_rules
+
 python-tests:
   extends: .python-cache
   stage: test

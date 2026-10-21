@@ -19,7 +19,10 @@ Scope, deliberately: this is NOT an upstream-drift checker. It cannot notice HAF
 or deleting something -- for that, hive/haf_stats has `scripts/check_haf_drift.sh` (323
 lines, network, pinned ref), which exists because that repo hand-transcribes large parts of
 HAF. This is the cheaper, different thing: a fixed list of known shim symbols asserted
-against everything this repo ships, which catches the mistake RECURRING.
+against everything this repo ships, which catches the mistake RECURRING. Upstream drift is
+the `haf-shim-drift` CI job's (scripts/check_haf_shim_drift.py, #52): it fetches the shim
+and diffs it against COMPAT_ALIASES, SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM and
+EXPECTED_SHIM_SYMBOLS below, read from this file -- so keep them plain literals.
 """
 
 from __future__ import annotations
