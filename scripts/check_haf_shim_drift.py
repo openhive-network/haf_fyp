@@ -19,19 +19,21 @@ a construct it misreads makes the hint wrong, not the verdict.
 
 The ledger (COMPAT_ALIASES, SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM, EXPECTED_SHIM_SYMBOLS,
 HAF_SHIM_REF, SHIM_SHA256) is READ from the test file with `ast`, never copied here or
-imported. Each name must be bound exactly once, by a plain top-level assignment of a
-literal, because the value the test runs with must be the value read here. Refused: any
-other binding (`|=`, a conditional or nested rebind, an annotated assignment, `del`),
-item assignment or `del X[k]`, an in-place method called on a ledger name or with one as an
-argument (`X.update(...)`, `dict.update(X, ...)`), a ledger name bound to another name
-(`_a = X`), and any call to globals/vars/locals/setattr/exec/eval in the file. Out of scope,
-because static analysis cannot follow them and the file is reviewed code: aliasing through
-a container or function argument and then mutating, and other dynamic tricks.
+imported (importing would need pytest in the CI job). The reader is deliberately simple:
+for each name it takes the one plain top-level `NAME = <literal>` statement, and refuses
+the file if there is none, more than one, or the value is not a literal of the right type.
+It does NOT try to spot later code that changes a value -- every attempt to enumerate the
+ways (item assignment, setitem, getattr, sys.modules, aliases, rebinding imports...) missed
+some. Instead python-tests imports the test module, after it has fully executed, and
+asserts its runtime values equal what this reader returns
+(test_haf_shim_drift.py::test_the_ledger_read_statically_is_the_ledger_the_test_runs_with),
+so any route that makes them differ fails a blocking job, whatever the mechanism.
 
 To bump after a real upstream change, in one commit: refresh the byte-exact copy in
 tests/unit/data/ (named ...@<full SHA>.sql), set HAF_SHIM_REF to that SHA, set SHIM_SHA256 to
-the copy's sha256 -- and re-read the file to update the ledger. python-tests checks the
-copy, the ref and the hash agree, offline; see the comment beside them in the test file.
+the copy's sha256 -- and re-read the file to update the ledger. python-tests checks the copy,
+the ref and the hash agree with EACH OTHER, offline; only this script's fetch ties them to
+upstream. See the comment beside them in the test file for the exact steps.
 
 Usage:
     check_haf_shim_drift.py [--ledger PATH] (--pinned | --ref REF | --file PATH)...
@@ -41,8 +43,9 @@ Sources are checked in the order given. Exit codes, worst across all sources:
     1  drift: a source's bytes differ
     2  the check could not run: a failed fetch (including a redirect, a non-text/plain
        response such as a sign-in page, or an empty body), an unreadable or empty file, an
-       unreadable or inconsistent ledger, no source given, or any unexpected exception. Never 1: an error must not be
-       mistaken for drift, nor either for a pass.
+       unreadable or inconsistent ledger, no source given, or any unexpected exception.
+       Never 1: an error must not be mistaken for drift, nor either for a pass. A body that
+       is present but differs -- even whitespace only -- is drift: the bytes differ.
 
 Every diagnostic goes to stderr. A failure to fetch is NEVER reported as "no drift" --
 hive/haf_stats' check_haf_drift.sh shipped a version that printed "No drift" after running
@@ -73,18 +76,6 @@ LEDGER_NAMES = (
     "COMPAT_ALIASES", "SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM", "EXPECTED_SHIM_SYMBOLS",
     "HAF_SHIM_REF", "SHIM_SHA256",
 )
-# Methods that change a dict or set in place without binding the name.
-_MUTATORS = {
-    "add", "update", "pop", "popitem", "clear", "discard", "remove", "setdefault",
-    "difference_update", "intersection_update", "symmetric_difference_update",
-    "__setitem__", "__delitem__", "__ior__", "__iand__", "__isub__", "__ixor__",
-}
-
-
-# Calls that can rebind or mutate a module global without naming it as a target.
-_DYNAMIC = {"globals", "vars", "locals", "setattr", "exec", "eval"}
-
-
 class CheckError(Exception):
     """The check could not run. Distinct from drift, and never treated as a pass."""
 
@@ -93,56 +84,29 @@ class CheckError(Exception):
 
 
 def _ledger_values(tree: ast.Module, path: Path) -> dict[str, object]:
-    stores: dict[str, list[ast.Name]] = {n: [] for n in LEDGER_NAMES}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and node.id in stores:
-            if isinstance(node.ctx, ast.Del):
-                raise CheckError(f"{node.id} is deleted in {path}")
-            if isinstance(node.ctx, ast.Store):
-                stores[node.id].append(node)
-        if isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del)):
-            if isinstance(node.value, ast.Name) and node.value.id in stores:
-                raise CheckError(f"{node.value.id} is modified by item assignment or del in {path}")
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _MUTATORS:
-            if isinstance(node.func.value, ast.Name) and node.func.value.id in stores:
-                raise CheckError(f"{node.func.value.id}.{node.func.attr}() is called in {path}; "
-                                 f"the ledger must be a plain literal")
-            for arg in node.args:
-                if isinstance(arg, ast.Name) and arg.id in stores:
-                    raise CheckError(f"{arg.id} is passed to .{node.func.attr}() in {path}; "
-                                     f"the ledger must be a plain literal")
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _DYNAMIC:
-            raise CheckError(f"{node.func.id}() is called in {path}, which could rebind the "
-                             f"ledger where this check cannot see it")
-        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
-            value = node.value
-            if isinstance(value, ast.Name) and value.id in stores:
-                raise CheckError(f"{value.id} is bound to another name in {path}; an alias "
-                                 f"could change it where this check cannot see")
-    top_level = {}
+    """The literal each ledger name is assigned at top level. Nothing more: whether later
+    code changes it is the runtime cross-check's job, not this reader's."""
+    found: dict[str, list[ast.Assign]] = {n: [] for n in LEDGER_NAMES}
     for stmt in tree.body:
         if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
-                and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id in stores):
-            top_level[stmt.targets[0].id] = stmt
+                and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id in found):
+            found[stmt.targets[0].id].append(stmt)
     values: dict[str, object] = {}
     for name in LEDGER_NAMES:
-        if not stores[name]:
-            raise CheckError(f"{path} no longer defines {name}")
-        if len(stores[name]) > 1:
-            raise CheckError(f"{name} is bound {len(stores[name])} times in {path}; it must be "
-                             f"assigned exactly once")
-        stmt = top_level.get(name)
-        if stmt is None or stmt.targets[0] is not stores[name][0]:
-            raise CheckError(f"{name} in {path} is not a plain top-level assignment")
+        if not found[name]:
+            raise CheckError(f"{path} has no top-level `{name} = <literal>` assignment")
+        if len(found[name]) > 1:
+            raise CheckError(f"{name} is assigned {len(found[name])} times at top level in {path}; "
+                             f"keep exactly one")
         try:
-            values[name] = ast.literal_eval(stmt.value)
+            values[name] = ast.literal_eval(found[name][0].value)
         except ValueError as exc:
             raise CheckError(f"{name} in {path} is no longer a literal") from exc
     return values
 
 
 def read_ledger(path: Path | None = None) -> dict[str, object]:
-    """The ledger, validated: symbols (set), expected count, pinned ref, sha256."""
+    """The ledger, validated: symbols, pinned ref, sha256, and the raw values read."""
     path = path or LEDGER_FILE
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -167,7 +131,7 @@ def read_ledger(path: Path | None = None) -> dict[str, object]:
             f"the ledger accounts for {len(symbols)} symbols but EXPECTED_SHIM_SYMBOLS is "
             f"{expected}; fix the test before comparing it to upstream"
         )
-    return {"symbols": symbols, "ref": ref, "sha256": sha}
+    return {"symbols": symbols, "ref": ref, "sha256": sha, "values": v}
 
 
 # --- sources -------------------------------------------------------------------------
@@ -240,7 +204,8 @@ def _describe(data: bytes, symbols: set[str]) -> None:
         print(f"  - hive.{name} no longer appears to be created", file=sys.stderr)
     if now == symbols:
         print("  the symbol set looks unchanged: read the diff anyway (a body, a schema or a "
-              "comment may have moved), then bump SHIM_SHA256 and HAF_SHIM_REF", file=sys.stderr)
+              "comment may have moved), then refresh the vendored copy and bump HAF_SHIM_REF and "
+              "SHIM_SHA256", file=sys.stderr)
 
 
 def check(label: str, data: bytes, ledger: dict[str, object]) -> int:
@@ -254,7 +219,8 @@ def check(label: str, data: bytes, ledger: dict[str, object]) -> int:
     print(f"  sha256 expected {ledger['sha256']} (hive/haf@{ledger['ref']})", file=sys.stderr)
     print(f"  sha256 got      {digest} ({len(data)} bytes)", file=sys.stderr)
     _describe(data, ledger["symbols"])  # type: ignore[arg-type]
-    print("  to resolve: re-read the file, update the ledger, and bump HAF_SHIM_REF and "
+    print("  to resolve: re-read the file, update the ledger, refresh the vendored copy in "
+          "tests/unit/data/, and bump HAF_SHIM_REF and "
           "SHIM_SHA256 together", file=sys.stderr)
     return EXIT_DRIFT
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import http.server
 import importlib.util
+import itertools
 import os
 import re
 import socket
@@ -160,13 +161,36 @@ def test_the_script_passes_the_vendored_copy_against_the_real_ledger(capsys):
     assert "byte-identical" in capsys.readouterr().out
 
 
-def test_the_canonical_names_scan_exempts_only_the_vendored_copy():
+def test_the_canonical_names_scan_skips_the_real_vendored_copy():
     import tests.unit.test_haf_canonical_names as canon
 
     scanned = {p.resolve() for p in canon._sql_bearing_files()}
     assert _vendored().resolve() not in scanned
-    assert not (DATA / "compatibility_with_old_haf_apps_extra.sql").match(canon.VENDORED_SHIM_GLOB)
-    assert not (ROOT / "db" / "compatibility_with_old_haf_apps@x.sql").parent == canon.VENDORED_SHIM_DIR
+    assert (ROOT / "tests" / "unit" / "test_haf_shim_drift.py").resolve() in scanned, "the scan ran"
+
+
+def test_the_canonical_names_scan_exempts_only_the_vendored_copy(tmp_path, monkeypatch):
+    """Run the real scan over a tree with look-alikes: only the exact copy is skipped."""
+    import tests.unit.test_haf_canonical_names as canon
+
+    data = tmp_path / "tests" / "unit" / "data"
+    files = {
+        "vendored": data / f"compatibility_with_old_haf_apps@{PIN}.sql",
+        "other name, same dir": data / "compatibility_with_old_haf_apps_extra.sql",
+        "unrelated, same dir": data / "notes.sql",
+        "same name, other dir": tmp_path / "db" / f"compatibility_with_old_haf_apps@{PIN}.sql",
+        "same name, subdir": data / "sub" / f"compatibility_with_old_haf_apps@{PIN}.sql",
+    }
+    for f in files.values():
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("-- x\n", encoding="utf-8")
+    monkeypatch.setattr(canon, "ROOT", tmp_path)
+    monkeypatch.setattr(canon, "VENDORED_SHIM_DIR", data)
+    scanned = set(canon._sql_bearing_files())
+    assert files["vendored"] not in scanned
+    for label, f in files.items():
+        if label != "vendored":
+            assert f in scanned, f"{label} ({f}) escaped the scan"
 
 
 # --- the verdict is the hash -----------------------------------------------------------
@@ -178,11 +202,17 @@ def test_identical_bytes_pass(tmp_path, capsys, ledger, good):
     assert "OK [" in out.out and "byte-identical" in out.out and not out.err
 
 
+_DRIFT_NAMES = (f"drifted{i}.sql" for i in itertools.count())
+
+
 def _drifted(tmp_path, capsys, ledger, data):
-    rc = _main(ledger, _file(tmp_path, data))
+    """Drift, reported against THIS source -- not merely some "DRIFT [" somewhere."""
+    path = _file(tmp_path, data, next(_DRIFT_NAMES))
+    rc = _main(ledger, path)
     out = capsys.readouterr()
     assert rc == drift.EXIT_DRIFT, out.err
-    assert "DRIFT [" in out.err and "sha256 expected" in out.err and "bump HAF_SHIM_REF" in out.err
+    assert f"DRIFT [{path}]" in out.err
+    assert "sha256 expected" in out.err and "refresh the vendored copy" in out.err
     assert "OK [" not in out.out
     return out.err
 
@@ -283,8 +313,9 @@ def test_the_hint_skips_comments_strings_and_bodies():
         f"CREATE DOMAIN archive.c5 AS int;\n"
         f'CREATE OR REPLACE FUNCTION "{HIVE}"."Real"() RETURNS int AS $$ select 1 $$;\n'
         f"CREATE MATERIALIZED VIEW {HIVE}.mv AS SELECT 1;\n"
+        f"CREATE TABLE IF NOT EXISTS {HIVE}.ine (x int);\n"
     ).encode()
-    assert drift.apparent_symbols(text) == {"real", "mv"}
+    assert drift.apparent_symbols(text) == {"real", "mv", "ine"}
 
 
 def test_a_missing_file_is_an_error(tmp_path, capsys, ledger):
@@ -302,7 +333,8 @@ def test_drift_in_one_source_survives_a_match_in_another(tmp_path, capsys, ledge
     rc = _main(ledger, *([bad, ok] if bad_first else [ok, bad]))
     out = capsys.readouterr()
     assert rc == drift.EXIT_DRIFT
-    assert "DRIFT [" in out.err and "OK [" in out.out
+    assert f"DRIFT [{bad}]" in out.err and f"OK [{ok}]" in out.out
+    assert f"DRIFT [{ok}]" not in out.err
 
 
 @pytest.mark.parametrize("error_first", [True, False])
@@ -311,7 +343,7 @@ def test_an_error_outranks_drift_in_either_order(tmp_path, capsys, ledger, good,
     rc = _main(ledger, *([broken, drifted] if error_first else [drifted, broken]))
     out = capsys.readouterr()
     assert rc == drift.EXIT_ERROR
-    assert "DRIFT [" in out.err and "ERROR [" in out.err, "both sources must be reported"
+    assert f"DRIFT [{drifted}]" in out.err and f"ERROR [{broken}]" in out.err, "both must be reported"
 
 
 def test_sources_are_reported_in_the_order_given(tmp_path, capsys, ledger, good):
@@ -322,6 +354,88 @@ def test_sources_are_reported_in_the_order_given(tmp_path, capsys, ledger, good)
 
 
 # --- the ledger ------------------------------------------------------------------------
+#
+# The reader takes each name's one top-level literal assignment. Whether later code changes
+# the value is checked by comparing with the module as it actually runs, not by trying to
+# list every way Python can mutate a global.
+
+
+_MISSING = object()
+_copies = itertools.count()
+
+
+def _runtime_values(path):
+    """Import a ledger file the way pytest does -- fully executed, registered in
+    sys.modules -- and return the five names as they ended up."""
+    name = f"_ledger_copy_{next(_copies)}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(name, None)
+    return {n: getattr(module, n, _MISSING) for n in drift.LEDGER_NAMES}
+
+
+def test_the_ledger_read_statically_is_the_ledger_the_test_runs_with():
+    """THE integrity check. Whatever later code does to the values -- item assignment,
+    setitem, getattr, sys.modules, an alias, a rebinding import -- shows up here as a
+    mismatch between what read_ledger parsed and what the test module holds at runtime."""
+    import tests.unit.test_haf_canonical_names as canon
+
+    static = drift.read_ledger()["values"]
+    runtime = {n: getattr(canon, n, _MISSING) for n in drift.LEDGER_NAMES}
+    assert static == runtime
+
+
+def _append(tmp_path, code, source=LEDGER):
+    """The ledger file with `code` appended at the END, after every assignment."""
+    path = tmp_path / "appended_ledger.py"
+    path.write_text(source.read_text(encoding="utf-8") + "\n\n" + code + "\n", encoding="utf-8")
+    return path
+
+
+# Every route the review rounds found past the old refusal list, plus the rebinding forms.
+@pytest.mark.parametrize("code", [
+    'COMPAT_ALIASES["x"] = "y"',
+    'import operator\noperator.setitem(COMPAT_ALIASES, "x", "y")',
+    "import sys\nsys.modules[__name__].EXPECTED_SHIM_SYMBOLS = 5",
+    "import os as SHIM_SHA256",
+    'getattr(COMPAT_ALIASES, "update")({"x": "y"})',
+    'SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM.__init__({"x"})',
+    '_a = COMPAT_ALIASES or {}\n_a.update({"x": "y"})',
+    '(_a := COMPAT_ALIASES).update({"x": "y"})',
+    "def EXPECTED_SHIM_SYMBOLS():\n    return 4",
+    "try:\n    raise ValueError\nexcept ValueError as SHIM_SHA256:\n    pass",
+    'if ROOT:\n    HAF_SHIM_REF = "0" * 40',
+    "del SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM",
+    'del COMPAT_ALIASES["live_stage"]',
+    'globals()["EXPECTED_SHIM_SYMBOLS"] = 5',
+])
+def test_any_runtime_change_to_the_ledger_is_a_mismatch(tmp_path, code):
+    path = _append(tmp_path, code)
+    try:
+        static = drift.read_ledger(path)["values"]
+    except drift.CheckError:
+        return  # refused by the reader: also a failure, which is the point
+    assert static != _runtime_values(path), f"not detected: {code!r}"
+
+
+@pytest.mark.parametrize("code", [
+    "_seen = set()\n_seen.update(COMPAT_ALIASES)",
+    "n = EXPECTED_SHIM_SYMBOLS",
+    "_KEYS = sorted(COMPAT_ALIASES.keys())",
+    "_copy = dict(COMPAT_ALIASES)\n_copy.update({'x': 'y'})",
+])
+def test_read_only_use_of_the_ledger_is_fine(tmp_path, capsys, good, code):
+    """Legitimate reads must neither be refused nor look like a mismatch."""
+    hashed = _ledger_variant(
+        tmp_path, (_real("SHIM_SHA256"), f'SHIM_SHA256 = "{hashlib.sha256(good).hexdigest()}"'))
+    path = _append(tmp_path, code, source=hashed)
+    assert drift.read_ledger(path)["values"] == _runtime_values(path)
+    assert _main(path, _file(tmp_path, good)) == drift.EXIT_OK
+    assert "OK [" in capsys.readouterr().out
 
 
 def _broken(tmp_path, capsys, good, *replacements):
@@ -335,25 +449,23 @@ def _broken(tmp_path, capsys, good, *replacements):
     ("EXPECTED_SHIM_SYMBOLS = 4", "EXPECTED_SHIM_SYMBOLS = 5", "EXPECTED_SHIM_SYMBOLS is 5"),
     ("EXPECTED_SHIM_SYMBOLS = 4", "EXPECTED_SHIM_SYMBOLS = len(COMPAT_ALIASES) + 1", "no longer a literal"),
     ("EXPECTED_SHIM_SYMBOLS = 4", "EXPECTED_SHIM_SYMBOLS = True", "not an int"),
-    ("EXPECTED_SHIM_SYMBOLS = 4", "EXPECTED_SHIM_SYMBOLS = 4\nEXPECTED_SHIM_SYMBOLS |= 0", "bound 2 times"),
-    ("EXPECTED_SHIM_SYMBOLS = 4", "EXPECTED_SHIM_SYMBOLS = 4\nif ROOT:\n    EXPECTED_SHIM_SYMBOLS = 5",
-     "bound 2 times"),
-    ("EXPECTED_SHIM_SYMBOLS = 4", "if ROOT:\n    EXPECTED_SHIM_SYMBOLS = 4", "not a plain top-level"),
-    ("EXPECTED_SHIM_SYMBOLS = 4", "EXPECTED_SHIM_SYMBOLS: int = 4", "not a plain top-level"),
+    ("EXPECTED_SHIM_SYMBOLS = 4", "EXPECTED_SHIM_SYMBOLS = 4\nEXPECTED_SHIM_SYMBOLS = 4",
+     "assigned 2 times at top level"),
+    ("EXPECTED_SHIM_SYMBOLS = 4", "if ROOT:\n    EXPECTED_SHIM_SYMBOLS = 4",
+     "no top-level `EXPECTED_SHIM_SYMBOLS = <literal>`"),
+    ("EXPECTED_SHIM_SYMBOLS = 4", "EXPECTED_SHIM_SYMBOLS: int = 4",
+     "no top-level `EXPECTED_SHIM_SYMBOLS = <literal>`"),
     ("SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM =", "RENAMED_EXEMPTIONS =",
-     "no longer defines SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM"),
+     "no top-level `SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM = <literal>`"),
     ('SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM = {"contexts_group"}',
      "SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM = None", "not a set of names"),
     ("COMPAT_ALIASES = {", "COMPAT_ALIASES = None\n_unused = {", "not a dict"),
     ("HAF_SHIM_REF = ", 'HAF_SHIM_REF = "develop"\n_unused = ', "not a full commit SHA"),
+    ("HAF_SHIM_REF = ", 'HAF_SHIM_REF = "38d51f2"\n_unused = ', "not a full commit SHA"),
+    ("HAF_SHIM_REF = ", 'HAF_SHIM_REF = "38d51f261009904881da1fac87b7f5b7f6c3cb3"\n_unused = ',
+     "not a full commit SHA"),
     ("SHIM_SHA256 = ", 'SHIM_SHA256 = "ABC"\n_unused = ', "not a lowercase sha256"),
-    ("SHIM_SHA256 = ", "_unused = ", "no longer defines SHIM_SHA256"),
-    ("EXPECTED_SHIM_SYMBOLS = 4", 'EXPECTED_SHIM_SYMBOLS = 4\nCOMPAT_ALIASES["x"] = "hafd.x"',
-     "item assignment or del"),
-    ("EXPECTED_SHIM_SYMBOLS = 4", 'EXPECTED_SHIM_SYMBOLS = 4\ndel COMPAT_ALIASES["live_stage"]',
-     "item assignment or del"),
-    ("EXPECTED_SHIM_SYMBOLS = 4", "EXPECTED_SHIM_SYMBOLS = 4\ndel SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM",
-     "is deleted"),
+    ("SHIM_SHA256 = ", "_unused = ", "no top-level `SHIM_SHA256 = <literal>`"),
 ])
 def test_a_broken_ledger_makes_main_exit_2(tmp_path, capsys, good, old, new, message):
     rc, out = _broken(tmp_path, capsys, good, (old, new))
@@ -362,58 +474,11 @@ def test_a_broken_ledger_makes_main_exit_2(tmp_path, capsys, good, old, new, mes
     assert "OK [" not in out.out
 
 
-# Written out, not read from drift._MUTATORS: a parametrization over the script's own set
-# shrinks with it, so deleting "update" there would delete its test here too.
-IN_PLACE_METHODS = [
-    "add", "update", "pop", "popitem", "clear", "discard", "remove", "setdefault",
-    "difference_update", "intersection_update", "symmetric_difference_update",
-    "__setitem__", "__delitem__", "__ior__", "__iand__", "__isub__", "__ixor__",
-]
-
-
-@pytest.mark.parametrize("method", IN_PLACE_METHODS)
-@pytest.mark.parametrize("target", ["COMPAT_ALIASES", "SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM"])
-def test_every_in_place_mutation_of_the_ledger_is_refused(tmp_path, capsys, good, method, target):
-    rc, out = _broken(tmp_path, capsys, good,
-                      ("EXPECTED_SHIM_SYMBOLS = 4", f"EXPECTED_SHIM_SYMBOLS = 4\n{target}.{method}()"))
-    assert rc == drift.EXIT_ERROR
-    assert f"{target}.{method}() is called" in out.err
-
-
-@pytest.mark.parametrize("line,message", [
-    ('COMPAT_ALIASES.update({"x": "hafd.x"})', "COMPAT_ALIASES.update() is called"),
-    ('SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM.add("x")', "SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM.add() is called"),
-    ('COMPAT_ALIASES.pop("live_stage", None)', "COMPAT_ALIASES.pop() is called"),
-    ('dict.update(COMPAT_ALIASES, {"x": "hafd.x"})', "COMPAT_ALIASES is passed to .update()"),
-    ('set.add(SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM, "x")', "SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM is passed to .add()"),
-    ('_a = COMPAT_ALIASES\n_a.update({"x": "hafd.x"})', "COMPAT_ALIASES is bound to another name"),
-    ("_n: object = EXPECTED_SHIM_SYMBOLS", "EXPECTED_SHIM_SYMBOLS is bound to another name"),
-    ('globals()["EXPECTED_SHIM_SYMBOLS"] = 5', "globals() is called"),
-    ('vars()["SHIM_SHA256"] = "0" * 64', "vars() is called"),
-    ('setattr(sys.modules[__name__], "EXPECTED_SHIM_SYMBOLS", 5)', "setattr() is called"),
-    ('exec("EXPECTED_SHIM_SYMBOLS = 5")', "exec() is called"),
-])
-def test_indirect_changes_to_the_ledger_are_refused(tmp_path, capsys, good, line, message):
-    rc, out = _broken(tmp_path, capsys, good,
-                      ("EXPECTED_SHIM_SYMBOLS = 4", f"EXPECTED_SHIM_SYMBOLS = 4\n{line}"))
-    assert rc == drift.EXIT_ERROR, out.err
-    assert message in out.err
-
-
 def test_an_unparseable_ledger_is_refused(tmp_path, capsys, good):
     bad = tmp_path / "ledger.py"
     bad.write_text("COMPAT_ALIASES = {\n", encoding="utf-8")
     assert _main(bad, _file(tmp_path, good)) == drift.EXIT_ERROR
     assert "cannot read the ledger" in capsys.readouterr().err
-
-
-def test_read_only_use_of_the_ledger_is_fine(tmp_path, capsys, ledger, good):
-    """The real test calls COMPAT_ALIASES.items(); only mutation is refused."""
-    src = ledger.read_text(encoding="utf-8").replace(
-        "EXPECTED_SHIM_SYMBOLS = 4", "EXPECTED_SHIM_SYMBOLS = 4\n_KEYS = sorted(COMPAT_ALIASES.keys())", 1)
-    ledger.write_text(src, encoding="utf-8")
-    assert _main(ledger, _file(tmp_path, good)) == drift.EXIT_OK
-    assert "OK [" in capsys.readouterr().out
 
 
 # --- the exit-code contract ------------------------------------------------------------
@@ -475,6 +540,9 @@ class _QuietServer(http.server.ThreadingHTTPServer):
         pass                    # a client that timed out and left is the point of one test
 
 
+REDIRECTS = (301, 302, 303, 307, 308)
+
+
 @pytest.fixture
 def server(good, monkeypatch, no_proxy):
     """Serves the synthetic shim at /<ref>/<SHIM_PATH> for a few refs, each failing its own way."""
@@ -487,10 +555,19 @@ def server(good, monkeypatch, no_proxy):
             ref = self.path.split("/")[1]
             try:
                 if self.path != f"/{ref}/{drift.SHIM_PATH}" or ref not in (
-                        "good", PIN, "slow", "truncated", "redirect", "html", "empty", "notype"):
+                        "good", PIN, "slow", "truncated", "html", "empty", "notype", "upper",
+                        "whitespace", "drifted", "crlf", *(f"redirect{c}" for c in REDIRECTS)):
                     self.send_error(404)
-                elif ref == "redirect":
-                    self.send_response(302)
+                elif ref == "upper":
+                    self._send(good, "Text/Plain; charset=UTF-8")
+                elif ref == "whitespace":
+                    self._send(b" \n\t\n")
+                elif ref == "drifted":
+                    self._send(good + b"CREATE DOMAIN " + HIVE.encode() + b".extra AS int;\n")
+                elif ref == "crlf":
+                    self._send(good.replace(b"\n", b"\r\n"))
+                elif ref.startswith("redirect"):
+                    self.send_response(int(ref[len("redirect"):]))
                     self.send_header("Location", f"/good/{drift.SHIM_PATH}")
                     self.send_header("Content-Length", "0")
                     self.end_headers()
@@ -566,7 +643,7 @@ def test_a_truncated_body_is_a_per_source_error(server, capsys, ledger):
 
 
 @pytest.mark.parametrize("ref,marker", [
-    ("redirect", "redirected to"),
+    *((f"redirect{c}", f"HTTP Error {c}: redirected to") for c in REDIRECTS),
     ("html", "Content-Type is 'text/html; charset=utf-8', not text/plain"),
     ("notype", "Content-Type is '', not text/plain"),
     ("empty", "the response body is empty"),
@@ -580,13 +657,30 @@ def test_not_getting_the_file_is_an_error_not_drift(server, capsys, ledger, ref,
     assert "DRIFT" not in err
 
 
+def test_content_type_is_matched_case_insensitively(server, capsys, ledger):
+    assert _main(ledger, ["--ref", "upper"]) == drift.EXIT_OK
+    assert "OK [hive/haf@upper]" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("ref", ["drifted", "crlf", "whitespace"])
+def test_fetched_bytes_that_differ_are_drift(server, capsys, ledger, ref):
+    """Through the real fetch path: the bytes served are the bytes hashed. A whitespace-only
+    body is drift, not "no body" -- it is present, and it is not the file."""
+    rc = _main(ledger, ["--ref", ref])
+    out = capsys.readouterr()
+    assert rc == drift.EXIT_DRIFT, out.err
+    assert f"DRIFT [hive/haf@{ref}]" in out.err and "ERROR" not in out.err
+
+
 def test_a_hung_server_times_out(server, capsys, ledger, monkeypatch):
     monkeypatch.setattr(drift, "FETCH_TIMEOUT", 0.5)
     started = time.monotonic()
     rc = _main(ledger, ["--ref", "slow"])
     assert rc == drift.EXIT_ERROR
     assert time.monotonic() - started < 2.5, "the fetch waited for the server, not the timeout"
-    assert "ERROR [hive/haf@slow]: could not fetch" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "ERROR [hive/haf@slow]: could not fetch" in err
+    assert "timed out" in err, "the failure was not the timeout"
 
 
 def _closed_port():
@@ -630,9 +724,17 @@ def _ci():
 
 def _exact_script(job, command):
     """The whole script is the one command: nothing can swallow its exit code (no `||`,
-    `; true`, `set +e`, `exit 0`) and nothing runs before or after it."""
+    `; true`, `set +e`, `exit 0`) and nothing runs before or after it -- including a
+    file-wide `default:` or legacy top-level before_script/after_script, which every job
+    inherits unless it opts out."""
     assert job["script"] == [command]
     assert "before_script" not in job and "after_script" not in job
+    ci = _ci()
+    for scope in (ci, ci.get("default") or {}):
+        assert "before_script" not in scope and "after_script" not in scope, (
+            "a global before_script/after_script now wraps the drift jobs; give them "
+            "`before_script: []` / `after_script: []` or update this check"
+        )
 
 
 def test_the_pin_job_checks_the_pin_only_and_does_not_block():

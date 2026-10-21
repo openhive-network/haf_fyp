@@ -89,10 +89,14 @@ EXPECTED_SHIM_SYMBOLS = 4
 # as drift -- it does not try to parse SQL to decide. A byte-exact copy lives at
 # tests/unit/data/compatibility_with_old_haf_apps@<HAF_SHIM_REF>.sql, and python-tests
 # checks offline that its sha256 is SHIM_SHA256 and that its name carries HAF_SHIM_REF.
+# That ties the copy, the ref and the hash to EACH OTHER as recorded in this repo -- not to
+# upstream. What ties them to upstream is the online haf-shim-drift job's fetch.
+# python-tests also checks these values are what the test actually runs with.
 #
 # To bump, in one commit:
-#   1. refresh the copy: delete the old one and save the new commit's file, byte for byte
-#      (e.g. the API's base64 `content`, decoded), as ...@<new full SHA>.sql;
+#   1. refresh the copy: `git rm` the old one, `mkdir -p tests/unit/data` (removing the
+#      only file removes the directory), and save the new commit's file byte for byte
+#      (e.g. the API's base64 `content`, decoded) as ...@<new full SHA>.sql;
 #   2. set HAF_SHIM_REF to that SHA;
 #   3. set SHIM_SHA256 to the copy's sha256 -- and re-read the file to update the ledger
 #      and EXPECTED_SHIM_SYMBOLS.

@@ -300,8 +300,9 @@ openapi-drift:
 # and the script fails on ANY byte change -- no SQL parsing decides the verdict, so there is
 # no construct it can miss. On drift it prints the hive.* names the new file appears to
 # create against the ledger, as a reading aid. To bump: re-read the file, update the
-# ledger, and change HAF_SHIM_REF and SHIM_SHA256 together. The test file is the single
-# place all of that lives; neither job carries a copy.
+# ledger, refresh the vendored copy in tests/unit/data/, and change HAF_SHIM_REF and
+# SHIM_SHA256 together (steps beside them in the test file). The test file is the single
+# place the values live; neither job carries a copy.
 #
 #   haf-shim-drift          MR + default-branch pipelines, the PINNED ref. A fixed commit
 #                           cannot change upstream, so this can only fail through our own
