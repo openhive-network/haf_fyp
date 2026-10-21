@@ -5,5 +5,5 @@
 *.png binary
 *.jpg binary
 
-# A byte-exact copy of upstream's file, checked against SHIM_SHA256: never normalise it.
+# A byte-exact copy of upstream's file, checked against the ledger's shim_sha256: never normalise it.
 tests/unit/data/compatibility_with_old_haf_apps@*.sql -text

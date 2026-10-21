@@ -72,6 +72,15 @@ def _shim(names) -> bytes:
     return ("\n".join(lines) + "\n").encode()
 
 
+def _fresh_name(taken, stem="not_in_the_ledger"):
+    """A symbol name guaranteed absent from `taken` -- never a name the next bump might add."""
+    name, n = stem, 0
+    while name in taken:
+        n += 1
+        name = f"{stem}_{n}"
+    return name
+
+
 @pytest.fixture
 def symbols():
     return set(REAL.symbols)
@@ -126,6 +135,16 @@ def test_the_guard_and_the_drift_script_share_one_ledger_object():
     execution of the file under another name."""
     assert canon.LEDGER is REAL
     assert REAL == drift.load_ledger(), "the shared ledger is not what the file says"
+
+
+def test_the_script_is_loaded_once_under_one_name():
+    """By design rather than by luck: the loader is registered in sys.modules, so a second
+    load returns the same module -- and with it the same Ledger class and load_ledger."""
+    from . import shim_ledger
+
+    assert sys.modules["check_haf_shim_drift"] is drift
+    assert shim_ledger._load_script() is drift
+    assert type(canon.LEDGER) is drift.Ledger
 
 
 def test_the_ledger_is_read_only():
@@ -233,8 +252,9 @@ def _drifted(tmp_path, capsys, ledger, data):
 
 
 def test_a_fifth_symbol_is_drift_and_named(tmp_path, capsys, ledger, symbols):
-    err = _drifted(tmp_path, capsys, ledger, _shim(symbols | {"block_range"}))
-    assert f"+ {HIVE}.block_range appears to be new" in err
+    new = _fresh_name(symbols)
+    err = _drifted(tmp_path, capsys, ledger, _shim(symbols | {new}))
+    assert f"+ {HIVE}.{new} appears to be new" in err
 
 
 def test_a_removed_symbol_is_drift_and_named(tmp_path, capsys, ledger, symbols):
@@ -380,21 +400,27 @@ def test_sources_are_reported_in_the_order_given(tmp_path, capsys, ledger, good)
 # tested here is that it refuses anything but exactly the expected shape.
 
 
+# Every "wrong" value is derived from the real ledger, never today's literal: a correct bump
+# (to five symbols, say) must not turn one of these into a false failure that then reads
+# as drift.
+_A_NAME = sorted(REAL.symbols)[0]
+
+
 @pytest.mark.parametrize("overrides,message", [
-    ({"expected_shim_symbols": 5}, "expected_shim_symbols is 5"),
-    ({"expected_shim_symbols": True}, "expected_shim_symbols in"),
-    ({"expected_shim_symbols": 4.0}, "is a float, not a int"),
-    ({"expected_shim_symbols": "4"}, "is a str, not a int"),
-    ({"compat_aliases": [["live_stage", "hafd.live_stage"]]}, "compat_aliases in"),
-    ({"compat_aliases": {"live_stage": 1, "context_name": "x", "application_stages": "y"}},
-     "must map symbol names to canonical names"),
-    ({"shim_symbols_with_no_canonical_form": "contexts_group"}, "is a str, not a list"),
-    ({"shim_symbols_with_no_canonical_form": ["contexts_group", "contexts_group"]}, "must be distinct names"),
+    ({"expected_shim_symbols": REAL.expected + 1}, f"expected_shim_symbols is {REAL.expected + 1}"),
+    ({"expected_shim_symbols": REAL.expected - 1}, f"expected_shim_symbols is {REAL.expected - 1}"),
+    ({"expected_shim_symbols": True}, "is a bool, not a int"),
+    ({"expected_shim_symbols": float(REAL.expected)}, "is a float, not a int"),
+    ({"expected_shim_symbols": str(REAL.expected)}, "is a str, not a int"),
+    ({"compat_aliases": [list(kv) for kv in REAL.compat_aliases.items()]}, "is a list, not a dict"),
+    ({"compat_aliases": {k: 1 for k in REAL.compat_aliases}}, "must map symbol names to canonical names"),
+    ({"shim_symbols_with_no_canonical_form": _A_NAME}, "is a str, not a list"),
+    ({"shim_symbols_with_no_canonical_form": [_A_NAME, _A_NAME]}, "must be distinct names"),
     ({"shim_symbols_with_no_canonical_form": [1]}, "must be distinct names"),
     ({"haf_shim_ref": "develop"}, "not a full commit SHA"),
-    ({"haf_shim_ref": "38d51f2"}, "not a full commit SHA"),
-    ({"haf_shim_ref": "38d51f261009904881da1fac87b7f5b7f6c3cb3"}, "not a full commit SHA"),
-    ({"haf_shim_ref": "38D51F261009904881DA1FAC87B7F5B7F6C3CB3A"}, "not a full commit SHA"),
+    ({"haf_shim_ref": REAL.ref[:7]}, "not a full commit SHA"),
+    ({"haf_shim_ref": REAL.ref[:39]}, "not a full commit SHA"),
+    ({"haf_shim_ref": REAL.ref.upper() if REAL.ref.upper() != REAL.ref else "A" * 40}, "not a full commit SHA"),
     ({"shim_sha256": "ABC"}, "not a lowercase sha256"),
     ({"extra": 1}, "must have exactly the keys"),
 ])
@@ -429,11 +455,11 @@ def test_an_unparseable_or_ambiguous_ledger_is_refused(tmp_path, capsys, good, t
 
 def test_a_duplicate_key_inside_the_aliases_is_refused(tmp_path, capsys, good):
     """json would silently keep the last one; the loader refuses."""
-    text = LEDGER_JSON.read_text(encoding="utf-8").replace(
-        '"live_stage": "hafd.live_stage",', '"live_stage": "hafd.live_stage",\n    "live_stage": "x",', 1)
+    text = json.dumps(_raw()).replace(
+        '"compat_aliases": {', f'"compat_aliases": {{"{_A_NAME}": "x", "{_A_NAME}": "y", ', 1)
     bad = _ledger_variant(tmp_path, text=text)
     assert _main(bad, _file(tmp_path, good)) == drift.EXIT_ERROR
-    assert "duplicate keys ['live_stage']" in capsys.readouterr().err
+    assert f"duplicate keys ['{_A_NAME}']" in capsys.readouterr().err
 
 
 # --- the exit-code contract ------------------------------------------------------------
