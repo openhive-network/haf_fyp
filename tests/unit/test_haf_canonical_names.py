@@ -21,9 +21,10 @@ lines, network, pinned ref), which exists because that repo hand-transcribes lar
 HAF. This is the cheaper, different thing: a fixed list of known shim symbols asserted
 against everything this repo ships, which catches the mistake RECURRING. Upstream drift is
 the `haf-shim-drift` CI jobs' (scripts/check_haf_shim_drift.py, #52): they fetch the shim
-and compare its bytes with SHIM_SHA256 below, and on a mismatch print the symbols it now
-defines against COMPAT_ALIASES and SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM. The script reads
-all of these from this file, so keep them plain literals.
+and compare its bytes with the ledger's shim_sha256, and on a mismatch print the symbols it
+now defines against the ledger. The ledger itself is tests/unit/data/haf_shim_ledger.json;
+this module and the script both get it from the script's load_ledger(), via
+tests/unit/shim_ledger.py, so they cannot disagree.
 """
 
 from __future__ import annotations
@@ -32,6 +33,8 @@ import re
 from pathlib import Path
 
 import pytest
+
+from .shim_ledger import LEDGER
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -47,25 +50,21 @@ SKIP_DIRS = {".git", ".pytest_cache", "__pycache__", ".venv", "node_modules", ".
 SELF = Path(__file__).name
 
 # The one other file allowed to: a byte-exact copy of the upstream shim itself, vendored so
-# test_haf_shim_drift.py can check SHIM_SHA256 offline. It ships nowhere and is never
+# test_haf_shim_drift.py can check the ledger's shim_sha256 offline. It ships nowhere and is never
 # applied to a database. Matched by exact directory and name pattern, not by a skipped
 # directory, so nothing else can hide there.
 VENDORED_SHIM_DIR = ROOT / "tests" / "unit" / "data"
 VENDORED_SHIM_GLOB = "compatibility_with_old_haf_apps@*.sql"
 
-# Symbol -> the canonical spelling to use instead.
+# THE LEDGER: LEDGER, loaded from tests/unit/data/haf_shim_ledger.json (read-only).
 #
-# Verified against hive/haf's compatibility_with_old_haf_apps.sql, which is byte-identical
-# at master and develop and defines FOUR symbols. Three are listed here; the fourth is
-# exempt for a reason worth reading before you "complete" this dict -- see
-# SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM.
-COMPAT_ALIASES = {
-    "application_stages": "hafd.application_stages",
-    "live_stage": "hafd.live_stage",
-    "context_name": "hafd.context_name",
-}
-
-# The fourth symbol, NOT enforced, and do not add it:
+# LEDGER.compat_aliases: symbol -> the canonical spelling to use instead. Verified against
+# hive/haf's compatibility_with_old_haf_apps.sql, which is byte-identical at master and
+# develop and defines FOUR symbols. Three are enforced; the fourth is exempt for a reason
+# worth reading before you "complete" the aliases.
+#
+# LEDGER.exempt (`shim_symbols_with_no_canonical_form`): the fourth symbol, contexts_group,
+# NOT enforced, and do not add it to the aliases:
 #
 #   1. There is no `hafd.contexts_group`. Searching hive/haf at ref=master for
 #      `CREATE DOMAIN hafd.contexts_group` returns nothing -- the compat file declares
@@ -80,29 +79,24 @@ COMPAT_ALIASES = {
 # It also means the shim cannot be dropped wholesale: it is load-bearing for HAF itself.
 # The case for this module is consistency with the consumer's declared types and stopping
 # the pattern spreading -- not an imminent removal.
-SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM = {"contexts_group"}
-EXPECTED_SHIM_SYMBOLS = 4
-
-# What the ledger above was transcribed FROM: the shim at a pinned hive/haf commit (tag
-# 1.28.8), and the sha256 of its exact bytes there. scripts/check_haf_shim_drift.py (the
-# haf-shim-drift CI jobs, #52) fetches the file and treats ANY byte change against this hash
-# as drift -- it does not try to parse SQL to decide. A byte-exact copy lives at
-# tests/unit/data/compatibility_with_old_haf_apps@<HAF_SHIM_REF>.sql, and python-tests
-# checks offline that its sha256 is SHIM_SHA256 and that its name carries HAF_SHIM_REF.
-# That ties the copy, the ref and the hash to EACH OTHER as recorded in this repo -- not to
-# upstream. What ties them to upstream is the online haf-shim-drift job's fetch.
-# python-tests also checks these values are what the test actually runs with.
+#
+# LEDGER.ref / LEDGER.sha256 (`haf_shim_ref`, `shim_sha256`): what the ledger was transcribed
+# FROM -- the shim at a pinned hive/haf commit (tag 1.28.8) and the sha256 of its exact bytes
+# there. The drift jobs fetch the file and treat ANY byte change against this hash as drift.
+# A byte-exact copy lives at tests/unit/data/compatibility_with_old_haf_apps@<ref>.sql, and
+# python-tests checks offline that its sha256 is the ledger's hash and that its name carries
+# the ledger's ref. That ties the copy, the ref and the hash to EACH OTHER as recorded in
+# this repo -- not to upstream: a copy renamed to a new ref without its bytes refreshed
+# still agrees with an unchanged hash. What ties them to upstream is the online
+# haf-shim-drift job's fetch.
 #
 # To bump, in one commit:
 #   1. refresh the copy: `git rm` the old one, `mkdir -p tests/unit/data` (removing the
 #      only file removes the directory), and save the new commit's file byte for byte
 #      (e.g. the API's base64 `content`, decoded) as ...@<new full SHA>.sql;
-#   2. set HAF_SHIM_REF to that SHA;
-#   3. set SHIM_SHA256 to the copy's sha256 -- and re-read the file to update the ledger
-#      and EXPECTED_SHIM_SYMBOLS.
-# Keep every value a plain literal; the script reads them with `ast`.
-HAF_SHIM_REF = "38d51f261009904881da1fac87b7f5b7f6c3cb3a"
-SHIM_SHA256 = "92db49ca379e2d282e79c51d968bbd92428d7c8dcc0991b3b8c152928d3c5c77"
+#   2. set haf_shim_ref in haf_shim_ledger.json to that SHA;
+#   3. set shim_sha256 to the copy's sha256 -- and re-read the file to update
+#      compat_aliases / shim_symbols_with_no_canonical_form / expected_shim_symbols.
 
 # A text guard that scans nothing reports clean. hive/haf_stats' check_haf_drift.sh shipped
 # exactly that bug -- its header records the first version printing "No drift" and exiting 0
@@ -176,7 +170,7 @@ def test_the_scan_actually_scans_something():
     )
 
 
-@pytest.mark.parametrize("alias,canonical", sorted(COMPAT_ALIASES.items()))
+@pytest.mark.parametrize("alias,canonical", sorted(LEDGER.compat_aliases.items()))
 def test_no_haf_compatibility_aliases(alias, canonical):
     """A shim spelling in shipped SQL fails only on an operator's node, at install."""
     offenders, _ = _scan(_qualified("hive", alias))
@@ -192,9 +186,9 @@ def test_the_shim_symbol_ledger_is_complete():
     If HAF grows a fifth, this is the number that tells a reader to go re-read the file
     rather than assume the dict above is current.
     """
-    accounted = set(COMPAT_ALIASES) | SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM
-    assert len(accounted) == EXPECTED_SHIM_SYMBOLS, (
-        f"{len(accounted)} shim symbols accounted for, expected {EXPECTED_SHIM_SYMBOLS}. "
+    accounted = set(LEDGER.compat_aliases) | LEDGER.exempt
+    assert len(accounted) == LEDGER.expected, (
+        f"{len(accounted)} shim symbols accounted for, expected {LEDGER.expected}. "
         f"Re-read compatibility_with_old_haf_apps.sql and either enforce the new symbol "
         f"or document why it has no canonical form."
     )

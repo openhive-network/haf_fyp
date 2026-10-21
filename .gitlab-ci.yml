@@ -295,22 +295,24 @@ openapi-drift:
 # compatibility shim, from a hand-transcribed list. Nothing noticed upstream changing that
 # list, so a fifth alias, a rename or a deleted shim left that test green forever (#52).
 #
-# Detection is a content fingerprint: the test file records HAF_SHIM_REF (the pinned
-# hive/haf commit the ledger was read from) and SHIM_SHA256 (the sha256 of the shim there),
-# and the script fails on ANY byte change -- no SQL parsing decides the verdict, so there is
-# no construct it can miss. On drift it prints the hive.* names the new file appears to
-# create against the ledger, as a reading aid. To bump: re-read the file, update the
-# ledger, refresh the vendored copy in tests/unit/data/, and change HAF_SHIM_REF and
-# SHIM_SHA256 together (steps beside them in the test file). The test file is the single
-# place the values live; neither job carries a copy.
+# Detection is a content fingerprint: tests/unit/data/haf_shim_ledger.json records
+# haf_shim_ref (the pinned hive/haf commit the ledger was read from) and shim_sha256 (the
+# sha256 of the shim there), and the script fails on ANY byte change -- no SQL parsing
+# decides the verdict, so there is no construct it can miss. On drift it prints the hive.*
+# names the new file appears to create against the ledger, as a reading aid. The guard and
+# the script read that one file through the same loader, so they cannot disagree. To bump:
+# re-read the file, refresh the vendored copy in tests/unit/data/, and update the ledger's
+# symbols, haf_shim_ref and shim_sha256 together (steps in the guard's comments).
 #
 #   haf-shim-drift          MR + default-branch pipelines, the PINNED ref. A fixed commit
-#                           cannot change upstream, so this can only fail through our own
-#                           bump -- which python-tests already catches OFFLINE, against the
-#                           vendored copy in tests/unit/data/ -- or through the network:
-#                           gitlab.syncad.com unreachable or answering oddly. It is
-#                           allow_failure for that last reason only: a network blip must not
-#                           block an MR, and the blocking check is the offline one.
+#                           cannot change upstream, so this fails only through our own
+#                           bump or the network. Offline, python-tests (blocking) checks the
+#                           vendored copy's name carries haf_shim_ref and its sha256 is
+#                           shim_sha256 -- which catches a mistyped hash or an unrenamed
+#                           copy, but NOT a copy renamed to a new ref with its old bytes:
+#                           that still agrees with an unchanged hash, and only this job's
+#                           fetch shows the bytes are not upstream's. allow_failure because
+#                           a network blip must not block an MR.
 #   haf-shim-drift-develop  the daily schedule (and the on-demand sweep): hive/haf develop
 #                           against the same hash. This is where upstream drift appears.
 #                           NOT allow_failure: it runs only where it blocks nothing, and an

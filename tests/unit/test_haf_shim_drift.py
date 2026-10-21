@@ -1,31 +1,33 @@
 """The haf-shim-drift jobs are drift detectors, so they have to be shown to detect.
 
 scripts/check_haf_shim_drift.py hashes hive/haf's compatibility_with_old_haf_apps.sql and
-compares it with SHIM_SHA256 in test_haf_canonical_names.py: any byte change is drift (1),
-anything that stops the check running is an error (2), and the best-effort symbol listing
-it prints on drift never decides either.
+compares it with shim_sha256 in tests/unit/data/haf_shim_ledger.json: any byte change is
+drift (1), anything that stops the check running is an error (2), and the best-effort
+symbol listing it prints on drift never decides either.
 
-The tests run against a COPY of that ledger whose SHIM_SHA256 is the hash of a synthetic
+The tests run against COPIES of that ledger whose shim_sha256 is the hash of a synthetic
 shim built from the ledger's own names. Not a pasted upstream file, for a reason specific to
 this repo: test_haf_canonical_names.py scans every .py and .sql file for the literal shim
-spellings, so a verbatim copy here would fail that guard. The real bytes are checked by
-the haf-shim-drift job itself, against the real SHIM_SHA256 -- and OFFLINE, here, against
-tests/unit/data/compatibility_with_old_haf_apps@<HAF_SHIM_REF>.sql: a byte-exact copy of the
+spellings, so a verbatim copy here would fail that guard. The real bytes are checked by the
+haf-shim-drift job itself, against the real shim_sha256 -- and OFFLINE, here, against
+tests/unit/data/compatibility_with_old_haf_apps@<haf_shim_ref>.sql: a byte-exact copy of the
 upstream file at the pinned commit (from hive/haf's repository files API, decoded from its
-base64 `content`; GitLab's own content_sha256 for it is SHIM_SHA256). The copy must stay
+base64 `content`; GitLab's own content_sha256 for it is shim_sha256). The copy must stay
 byte-exact -- .gitattributes marks it -text -- and is exempted by exact name from
-test_haf_canonical_names.py's scan. Its name carries the ref, so bumping HAF_SHIM_REF without
-refreshing the copy fails here, in blocking python-tests, not on the network.
+test_haf_canonical_names.py's scan. Its name carries the ref, so bumping haf_shim_ref without
+renaming the copy fails here, in blocking python-tests. (Renaming it without refreshing its
+bytes does not: offline, only the online pin job can tell the bytes are not upstream's.)
 """
 
 from __future__ import annotations
 
 import hashlib
 import http.server
-import importlib.util
 import itertools
+import json
 import os
 import re
+import dataclasses
 import socket
 import subprocess
 import sys
@@ -35,6 +37,10 @@ from pathlib import Path
 
 import pytest
 
+from . import test_haf_canonical_names as canon
+from .shim_ledger import LEDGER as REAL
+from .shim_ledger import drift
+
 try:
     import yaml
 except ImportError:  # pragma: no cover - depends on the environment, not the code
@@ -42,12 +48,10 @@ except ImportError:  # pragma: no cover - depends on the environment, not the co
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "check_haf_shim_drift.py"
-LEDGER = ROOT / "tests" / "unit" / "test_haf_canonical_names.py"
 DATA = ROOT / "tests" / "unit" / "data"
-
-_spec = importlib.util.spec_from_file_location("check_haf_shim_drift", SCRIPT)
-drift = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(drift)
+LEDGER_JSON = DATA / "haf_shim_ledger.json"
+# Written out, not taken from drift.SHIM_PATH: a typo there must make the fetch 404 here.
+UPSTREAM_PATH = "src/hive_fork_manager/types/operation/compatibility_with_old_haf_apps.sql"
 
 HIVE = "hive"  # kept apart from the names so no line here spells a shim symbol literally
 PIN = "0123456789abcdef0123456789abcdef01234567"
@@ -70,7 +74,7 @@ def _shim(names) -> bytes:
 
 @pytest.fixture
 def symbols():
-    return drift.read_ledger()["symbols"]
+    return set(REAL.symbols)
 
 
 @pytest.fixture
@@ -78,30 +82,25 @@ def good(symbols):
     return _shim(symbols)
 
 
-def _ledger_variant(tmp_path, *replacements, name="ledger.py"):
-    src = LEDGER.read_text(encoding="utf-8")
-    for old, new in replacements:
-        assert old in src, old
-        src = src.replace(old, new, 1)
+def _raw():
+    return json.loads(LEDGER_JSON.read_text(encoding="utf-8"))
+
+
+def _ledger_variant(tmp_path, name="ledger.json", text=None, **overrides):
+    """A copy of the real ledger file with some keys replaced (or `text` verbatim)."""
+    if text is None:
+        raw = _raw()
+        raw.update(overrides)
+        text = json.dumps(raw, indent=2)
     path = tmp_path / name
-    path.write_text(src, encoding="utf-8")
+    path.write_text(text, encoding="utf-8")
     return path
-
-
-def _real(name):
-    m = re.search(rf'(?m)^{name} = "([0-9a-f]+)"$', LEDGER.read_text(encoding="utf-8"))
-    assert m, name
-    return m.group(0)
 
 
 @pytest.fixture
 def ledger(tmp_path, good):
-    """The real ledger with SHIM_SHA256 = hash of the synthetic shim and a known pin."""
-    return _ledger_variant(
-        tmp_path,
-        (_real("SHIM_SHA256"), f'SHIM_SHA256 = "{hashlib.sha256(good).hexdigest()}"'),
-        (_real("HAF_SHIM_REF"), f'HAF_SHIM_REF = "{PIN}"'),
-    )
+    """The real ledger with shim_sha256 = hash of the synthetic shim and a known pin."""
+    return _ledger_variant(tmp_path, shim_sha256=hashlib.sha256(good).hexdigest(), haf_shim_ref=PIN)
 
 
 def _file(tmp_path, data: bytes, name="shim.sql"):
@@ -120,13 +119,34 @@ def _main(ledger, *sources):
 # --- the real ledger -------------------------------------------------------------------
 
 
-def test_the_real_ledger_reads_and_is_the_canonical_names_ledger(symbols):
-    import tests.unit.test_haf_canonical_names as canon
+def test_the_guard_and_the_drift_script_share_one_ledger_object():
+    """One source of truth by construction: the guard's LEDGER is the very object the drift
+    tests use, loaded once by the drift script's own load_ledger() from the ledger file.
+    `canon` is imported relatively, so it is the module pytest collected -- not a second
+    execution of the file under another name."""
+    assert canon.LEDGER is REAL
+    assert REAL == drift.load_ledger(), "the shared ledger is not what the file says"
 
-    led = drift.read_ledger()
-    assert symbols == set(canon.COMPAT_ALIASES) | canon.SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM
-    assert len(symbols) == canon.EXPECTED_SHIM_SYMBOLS
-    assert (led["ref"], led["sha256"]) == (canon.HAF_SHIM_REF, canon.SHIM_SHA256)
+
+def test_the_ledger_is_read_only():
+    """Nothing that receives the ledger can change it in place."""
+    with pytest.raises(TypeError):
+        REAL.compat_aliases["x"] = "y"  # type: ignore[index]
+    for name in ("pop", "update", "clear", "setdefault", "popitem"):
+        assert not hasattr(REAL.compat_aliases, name), name
+    assert type(REAL.exempt) is frozenset and type(REAL.symbols) is frozenset
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        REAL.sha256 = "0" * 64  # type: ignore[misc]
+
+
+def test_the_ledger_file_holds_exact_built_in_types():
+    raw = _raw()
+    assert type(raw["compat_aliases"]) is dict
+    assert all(type(k) is str and type(v) is str for k, v in raw["compat_aliases"].items())
+    assert type(raw["shim_symbols_with_no_canonical_form"]) is list
+    assert all(type(k) is str for k in raw["shim_symbols_with_no_canonical_form"])
+    assert type(raw["expected_shim_symbols"]) is int
+    assert type(raw["haf_shim_ref"]) is str and type(raw["shim_sha256"]) is str
 
 
 def _vendored():
@@ -136,22 +156,21 @@ def _vendored():
 
 
 def test_the_pin_is_a_full_commit_sha():
-    import tests.unit.test_haf_canonical_names as canon
-
-    assert re.fullmatch(r"[0-9a-f]{40}", canon.HAF_SHIM_REF), "pin a full commit SHA, not a branch"
+    assert re.fullmatch(r"[0-9a-f]{40}", REAL.ref), "pin a full commit SHA, not a branch"
 
 
 def test_the_vendored_copy_is_the_pinned_file():
-    """Offline, blocking: a mistyped hash, or a ref bumped without refreshing the copy."""
-    import tests.unit.test_haf_canonical_names as canon
+    """Offline, blocking: a mistyped hash, or a ref bumped without renaming the copy.
 
+    It ties copy, ref and hash to each other, not to upstream: a copy renamed to a new ref
+    with its old bytes still passes here. Only the online pin job catches that."""
     copy = _vendored()
-    assert copy.name == f"compatibility_with_old_haf_apps@{canon.HAF_SHIM_REF}.sql", (
-        "the vendored copy is not the HAF_SHIM_REF one: refresh the copy, the ref and the "
+    assert copy.name == f"compatibility_with_old_haf_apps@{REAL.ref}.sql", (
+        "the vendored copy is not the haf_shim_ref one: refresh the copy, the ref and the "
         "hash together"
     )
-    assert hashlib.sha256(copy.read_bytes()).hexdigest() == canon.SHIM_SHA256, (
-        "SHIM_SHA256 is not the sha256 of the vendored pinned copy"
+    assert hashlib.sha256(copy.read_bytes()).hexdigest() == REAL.sha256, (
+        "shim_sha256 is not the sha256 of the vendored pinned copy"
     )
 
 
@@ -162,8 +181,6 @@ def test_the_script_passes_the_vendored_copy_against_the_real_ledger(capsys):
 
 
 def test_the_canonical_names_scan_skips_the_real_vendored_copy():
-    import tests.unit.test_haf_canonical_names as canon
-
     scanned = {p.resolve() for p in canon._sql_bearing_files()}
     assert _vendored().resolve() not in scanned
     assert (ROOT / "tests" / "unit" / "test_haf_shim_drift.py").resolve() in scanned, "the scan ran"
@@ -171,8 +188,6 @@ def test_the_canonical_names_scan_skips_the_real_vendored_copy():
 
 def test_the_canonical_names_scan_exempts_only_the_vendored_copy(tmp_path, monkeypatch):
     """Run the real scan over a tree with look-alikes: only the exact copy is skipped."""
-    import tests.unit.test_haf_canonical_names as canon
-
     data = tmp_path / "tests" / "unit" / "data"
     files = {
         "vendored": data / f"compatibility_with_old_haf_apps@{PIN}.sql",
@@ -266,8 +281,7 @@ def test_bytes_are_hashed_exactly(tmp_path, capsys, ledger, good, variant):
 def test_stripping_carriage_returns_is_drift(tmp_path, capsys, symbols):
     """The other direction: a ledger hashed over CRLF bytes rejects the LF version."""
     crlf = _shim(symbols).replace(b"\n", b"\r\n")
-    ledger = _ledger_variant(tmp_path, (_real("SHIM_SHA256"),
-                                        f'SHIM_SHA256 = "{hashlib.sha256(crlf).hexdigest()}"'))
+    ledger = _ledger_variant(tmp_path, shim_sha256=hashlib.sha256(crlf).hexdigest())
     assert _main(ledger, _file(tmp_path, crlf, "crlf.sql")) == drift.EXIT_OK
     capsys.readouterr()
     _drifted(tmp_path, capsys, ledger, crlf.replace(b"\r", b""))
@@ -278,7 +292,7 @@ def test_the_whole_digest_is_compared(tmp_path, capsys, good, position):
     """A recorded hash that differs from the real one in a single hex digit is not a match."""
     real = hashlib.sha256(good).hexdigest()
     near = real[:position] + ("0" if real[position] != "0" else "1") + real[position + 1:]
-    ledger = _ledger_variant(tmp_path, (_real("SHIM_SHA256"), f'SHIM_SHA256 = "{near}"'))
+    ledger = _ledger_variant(tmp_path, shim_sha256=near)
     _drifted(tmp_path, capsys, ledger, good)
 
 
@@ -314,14 +328,21 @@ def test_the_hint_skips_comments_strings_and_bodies():
         f'CREATE OR REPLACE FUNCTION "{HIVE}"."Real"() RETURNS int AS $$ select 1 $$;\n'
         f"CREATE MATERIALIZED VIEW {HIVE}.mv AS SELECT 1;\n"
         f"CREATE TABLE IF NOT EXISTS {HIVE}.ine (x int);\n"
+        f"COMMENT ON TABLE x IS 'it''s not CREATE DOMAIN {HIVE}.c6 AS int';\n"
     ).encode()
     assert drift.apparent_symbols(text) == {"real", "mv", "ine"}
 
 
 def test_a_missing_file_is_an_error(tmp_path, capsys, ledger):
-    rc = _main(ledger, tmp_path / "nope.sql")
+    missing = tmp_path / "nope.sql"
+    rc = _main(ledger, missing)
     assert rc == drift.EXIT_ERROR
-    assert "ERROR [" in capsys.readouterr().err
+    assert f"ERROR [{missing}]" in capsys.readouterr().err
+
+
+def test_a_whitespace_only_file_is_drift(tmp_path, capsys, ledger):
+    """As on the fetch path: present, and not the file -- drift, not "empty"."""
+    _drifted(tmp_path, capsys, ledger, b" \n\t\n")
 
 
 # --- sources are independent and the worst wins, in either order -----------------------
@@ -353,132 +374,66 @@ def test_sources_are_reported_in_the_order_given(tmp_path, capsys, ledger, good)
     assert out.index("b.sql") < out.index("a.sql")
 
 
-# --- the ledger ------------------------------------------------------------------------
+# --- the ledger file ---------------------------------------------------------------------
 #
-# The reader takes each name's one top-level literal assignment. Whether later code changes
-# the value is checked by comparing with the module as it actually runs, not by trying to
-# list every way Python can mutate a global.
+# load_ledger() is the only reader, for the guard and the drift jobs alike, so what is
+# tested here is that it refuses anything but exactly the expected shape.
 
 
-_MISSING = object()
-_copies = itertools.count()
-
-
-def _runtime_values(path):
-    """Import a ledger file the way pytest does -- fully executed, registered in
-    sys.modules -- and return the five names as they ended up."""
-    name = f"_ledger_copy_{next(_copies)}"
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        sys.modules.pop(name, None)
-    return {n: getattr(module, n, _MISSING) for n in drift.LEDGER_NAMES}
-
-
-def test_the_ledger_read_statically_is_the_ledger_the_test_runs_with():
-    """THE integrity check. Whatever later code does to the values -- item assignment,
-    setitem, getattr, sys.modules, an alias, a rebinding import -- shows up here as a
-    mismatch between what read_ledger parsed and what the test module holds at runtime."""
-    import tests.unit.test_haf_canonical_names as canon
-
-    static = drift.read_ledger()["values"]
-    runtime = {n: getattr(canon, n, _MISSING) for n in drift.LEDGER_NAMES}
-    assert static == runtime
-
-
-def _append(tmp_path, code, source=LEDGER):
-    """The ledger file with `code` appended at the END, after every assignment."""
-    path = tmp_path / "appended_ledger.py"
-    path.write_text(source.read_text(encoding="utf-8") + "\n\n" + code + "\n", encoding="utf-8")
-    return path
-
-
-# Every route the review rounds found past the old refusal list, plus the rebinding forms.
-@pytest.mark.parametrize("code", [
-    'COMPAT_ALIASES["x"] = "y"',
-    'import operator\noperator.setitem(COMPAT_ALIASES, "x", "y")',
-    "import sys\nsys.modules[__name__].EXPECTED_SHIM_SYMBOLS = 5",
-    "import os as SHIM_SHA256",
-    'getattr(COMPAT_ALIASES, "update")({"x": "y"})',
-    'SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM.__init__({"x"})',
-    '_a = COMPAT_ALIASES or {}\n_a.update({"x": "y"})',
-    '(_a := COMPAT_ALIASES).update({"x": "y"})',
-    "def EXPECTED_SHIM_SYMBOLS():\n    return 4",
-    "try:\n    raise ValueError\nexcept ValueError as SHIM_SHA256:\n    pass",
-    'if ROOT:\n    HAF_SHIM_REF = "0" * 40',
-    "del SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM",
-    'del COMPAT_ALIASES["live_stage"]',
-    'globals()["EXPECTED_SHIM_SYMBOLS"] = 5',
+@pytest.mark.parametrize("overrides,message", [
+    ({"expected_shim_symbols": 5}, "expected_shim_symbols is 5"),
+    ({"expected_shim_symbols": True}, "expected_shim_symbols in"),
+    ({"expected_shim_symbols": 4.0}, "is a float, not a int"),
+    ({"expected_shim_symbols": "4"}, "is a str, not a int"),
+    ({"compat_aliases": [["live_stage", "hafd.live_stage"]]}, "compat_aliases in"),
+    ({"compat_aliases": {"live_stage": 1, "context_name": "x", "application_stages": "y"}},
+     "must map symbol names to canonical names"),
+    ({"shim_symbols_with_no_canonical_form": "contexts_group"}, "is a str, not a list"),
+    ({"shim_symbols_with_no_canonical_form": ["contexts_group", "contexts_group"]}, "must be distinct names"),
+    ({"shim_symbols_with_no_canonical_form": [1]}, "must be distinct names"),
+    ({"haf_shim_ref": "develop"}, "not a full commit SHA"),
+    ({"haf_shim_ref": "38d51f2"}, "not a full commit SHA"),
+    ({"haf_shim_ref": "38d51f261009904881da1fac87b7f5b7f6c3cb3"}, "not a full commit SHA"),
+    ({"haf_shim_ref": "38D51F261009904881DA1FAC87B7F5B7F6C3CB3A"}, "not a full commit SHA"),
+    ({"shim_sha256": "ABC"}, "not a lowercase sha256"),
+    ({"extra": 1}, "must have exactly the keys"),
 ])
-def test_any_runtime_change_to_the_ledger_is_a_mismatch(tmp_path, code):
-    path = _append(tmp_path, code)
-    try:
-        static = drift.read_ledger(path)["values"]
-    except drift.CheckError:
-        return  # refused by the reader: also a failure, which is the point
-    assert static != _runtime_values(path), f"not detected: {code!r}"
-
-
-@pytest.mark.parametrize("code", [
-    "_seen = set()\n_seen.update(COMPAT_ALIASES)",
-    "n = EXPECTED_SHIM_SYMBOLS",
-    "_KEYS = sorted(COMPAT_ALIASES.keys())",
-    "_copy = dict(COMPAT_ALIASES)\n_copy.update({'x': 'y'})",
-])
-def test_read_only_use_of_the_ledger_is_fine(tmp_path, capsys, good, code):
-    """Legitimate reads must neither be refused nor look like a mismatch."""
-    hashed = _ledger_variant(
-        tmp_path, (_real("SHIM_SHA256"), f'SHIM_SHA256 = "{hashlib.sha256(good).hexdigest()}"'))
-    path = _append(tmp_path, code, source=hashed)
-    assert drift.read_ledger(path)["values"] == _runtime_values(path)
-    assert _main(path, _file(tmp_path, good)) == drift.EXIT_OK
-    assert "OK [" in capsys.readouterr().out
-
-
-def _broken(tmp_path, capsys, good, *replacements):
-    bad = _ledger_variant(tmp_path, *replacements)
+def test_a_malformed_ledger_makes_main_exit_2(tmp_path, capsys, good, overrides, message):
+    bad = _ledger_variant(tmp_path, **overrides)
     rc = _main(bad, _file(tmp_path, good))
     out = capsys.readouterr()
-    return rc, out
-
-
-@pytest.mark.parametrize("old,new,message", [
-    ("EXPECTED_SHIM_SYMBOLS = 4", "EXPECTED_SHIM_SYMBOLS = 5", "EXPECTED_SHIM_SYMBOLS is 5"),
-    ("EXPECTED_SHIM_SYMBOLS = 4", "EXPECTED_SHIM_SYMBOLS = len(COMPAT_ALIASES) + 1", "no longer a literal"),
-    ("EXPECTED_SHIM_SYMBOLS = 4", "EXPECTED_SHIM_SYMBOLS = True", "not an int"),
-    ("EXPECTED_SHIM_SYMBOLS = 4", "EXPECTED_SHIM_SYMBOLS = 4\nEXPECTED_SHIM_SYMBOLS = 4",
-     "assigned 2 times at top level"),
-    ("EXPECTED_SHIM_SYMBOLS = 4", "if ROOT:\n    EXPECTED_SHIM_SYMBOLS = 4",
-     "no top-level `EXPECTED_SHIM_SYMBOLS = <literal>`"),
-    ("EXPECTED_SHIM_SYMBOLS = 4", "EXPECTED_SHIM_SYMBOLS: int = 4",
-     "no top-level `EXPECTED_SHIM_SYMBOLS = <literal>`"),
-    ("SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM =", "RENAMED_EXEMPTIONS =",
-     "no top-level `SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM = <literal>`"),
-    ('SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM = {"contexts_group"}',
-     "SHIM_SYMBOLS_WITH_NO_CANONICAL_FORM = None", "not a set of names"),
-    ("COMPAT_ALIASES = {", "COMPAT_ALIASES = None\n_unused = {", "not a dict"),
-    ("HAF_SHIM_REF = ", 'HAF_SHIM_REF = "develop"\n_unused = ', "not a full commit SHA"),
-    ("HAF_SHIM_REF = ", 'HAF_SHIM_REF = "38d51f2"\n_unused = ', "not a full commit SHA"),
-    ("HAF_SHIM_REF = ", 'HAF_SHIM_REF = "38d51f261009904881da1fac87b7f5b7f6c3cb3"\n_unused = ',
-     "not a full commit SHA"),
-    ("SHIM_SHA256 = ", 'SHIM_SHA256 = "ABC"\n_unused = ', "not a lowercase sha256"),
-    ("SHIM_SHA256 = ", "_unused = ", "no top-level `SHIM_SHA256 = <literal>`"),
-])
-def test_a_broken_ledger_makes_main_exit_2(tmp_path, capsys, good, old, new, message):
-    rc, out = _broken(tmp_path, capsys, good, (old, new))
     assert rc == drift.EXIT_ERROR, out.err
     assert message in out.err
     assert "OK [" not in out.out
 
 
-def test_an_unparseable_ledger_is_refused(tmp_path, capsys, good):
-    bad = tmp_path / "ledger.py"
-    bad.write_text("COMPAT_ALIASES = {\n", encoding="utf-8")
+@pytest.mark.parametrize("missing", sorted(drift.LEDGER_KEYS))
+def test_a_ledger_missing_any_key_is_refused(tmp_path, capsys, good, missing):
+    raw = _raw()
+    del raw[missing]
+    bad = _ledger_variant(tmp_path, text=json.dumps(raw))
     assert _main(bad, _file(tmp_path, good)) == drift.EXIT_ERROR
-    assert "cannot read the ledger" in capsys.readouterr().err
+    assert "must have exactly the keys" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("text,message", [
+    ('{"compat_aliases": {}, "compat_aliases": {}}', "duplicate keys ['compat_aliases']"),
+    ("{", "cannot read the ledger"),
+    ("[]", "must have exactly the keys"),
+])
+def test_an_unparseable_or_ambiguous_ledger_is_refused(tmp_path, capsys, good, text, message):
+    bad = _ledger_variant(tmp_path, text=text)
+    assert _main(bad, _file(tmp_path, good)) == drift.EXIT_ERROR
+    assert message in capsys.readouterr().err
+
+
+def test_a_duplicate_key_inside_the_aliases_is_refused(tmp_path, capsys, good):
+    """json would silently keep the last one; the loader refuses."""
+    text = LEDGER_JSON.read_text(encoding="utf-8").replace(
+        '"live_stage": "hafd.live_stage",', '"live_stage": "hafd.live_stage",\n    "live_stage": "x",', 1)
+    bad = _ledger_variant(tmp_path, text=text)
+    assert _main(bad, _file(tmp_path, good)) == drift.EXIT_ERROR
+    assert "duplicate keys ['live_stage']" in capsys.readouterr().err
 
 
 # --- the exit-code contract ------------------------------------------------------------
@@ -554,12 +509,17 @@ def server(good, monkeypatch, no_proxy):
         def do_GET(self):  # noqa: N802 - stdlib name
             ref = self.path.split("/")[1]
             try:
-                if self.path != f"/{ref}/{drift.SHIM_PATH}" or ref not in (
+                if self.path != f"/{ref}/{UPSTREAM_PATH}" or ref not in (
                         "good", PIN, "slow", "truncated", "html", "empty", "notype", "upper",
+                        "plainfoo", "plainx",
                         "whitespace", "drifted", "crlf", *(f"redirect{c}" for c in REDIRECTS)):
                     self.send_error(404)
                 elif ref == "upper":
-                    self._send(good, "Text/Plain; charset=UTF-8")
+                    self._send(good, "Text/Plain ; charset=UTF-8")
+                elif ref == "plainfoo":
+                    self._send(good, "text/plain-foo")
+                elif ref == "plainx":
+                    self._send(good, "text/plainx; charset=utf-8")
                 elif ref == "whitespace":
                     self._send(b" \n\t\n")
                 elif ref == "drifted":
@@ -568,7 +528,7 @@ def server(good, monkeypatch, no_proxy):
                     self._send(good.replace(b"\n", b"\r\n"))
                 elif ref.startswith("redirect"):
                     self.send_response(int(ref[len("redirect"):]))
-                    self.send_header("Location", f"/good/{drift.SHIM_PATH}")
+                    self.send_header("Location", f"/good/{UPSTREAM_PATH}")
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                 elif ref == "html":
@@ -646,6 +606,8 @@ def test_a_truncated_body_is_a_per_source_error(server, capsys, ledger):
     *((f"redirect{c}", f"HTTP Error {c}: redirected to") for c in REDIRECTS),
     ("html", "Content-Type is 'text/html; charset=utf-8', not text/plain"),
     ("notype", "Content-Type is '', not text/plain"),
+    ("plainfoo", "Content-Type is 'text/plain-foo', not text/plain"),
+    ("plainx", "Content-Type is 'text/plainx; charset=utf-8', not text/plain"),
     ("empty", "the response body is empty"),
 ])
 def test_not_getting_the_file_is_an_error_not_drift(server, capsys, ledger, ref, marker):
@@ -655,6 +617,33 @@ def test_not_getting_the_file_is_an_error_not_drift(server, capsys, ledger, ref,
     assert rc == drift.EXIT_ERROR
     assert f"ERROR [hive/haf@{ref}]: could not fetch" in err and marker in err
     assert "DRIFT" not in err
+
+
+@pytest.mark.parametrize("extra,want,label", [
+    (["--ref", "no-such-ref"], 2, "ERROR [hive/haf@no-such-ref]"),
+    (["--ref", "drifted"], 1, "DRIFT [hive/haf@drifted]"),
+    (["--ref", "good"], 0, "OK [hive/haf@good]"),
+])
+@pytest.mark.parametrize("pinned_first", [True, False])
+def test_pinned_mixed_with_other_sources_reports_the_worst(server, capsys, ledger, extra, want, label,
+                                                           pinned_first):
+    argv = (["--pinned"], extra) if pinned_first else (extra, ["--pinned"])
+    rc = _main(ledger, *argv)
+    out = capsys.readouterr()
+    assert rc == want, out.err
+    assert f"OK [hive/haf@{PIN}]" in out.out
+    assert label in (out.out + out.err)
+
+
+def test_pinned_mixed_with_a_drifted_file_is_drift(server, tmp_path, capsys, ledger, good):
+    drifted = _file(tmp_path, good + b"x", "drifted.sql")
+    assert _main(ledger, ["--pinned"], drifted) == drift.EXIT_DRIFT
+    out = capsys.readouterr()
+    assert f"DRIFT [{drifted}]" in out.err and f"OK [hive/haf@{PIN}]" in out.out
+
+
+def test_the_scripts_upstream_path_is_the_real_one():
+    assert drift.SHIM_PATH == UPSTREAM_PATH
 
 
 def test_content_type_is_matched_case_insensitively(server, capsys, ledger):
@@ -732,17 +721,59 @@ def _exact_script(job, command):
     ci = _ci()
     for scope in (ci, ci.get("default") or {}):
         assert "before_script" not in scope and "after_script" not in scope, (
-            "a global before_script/after_script now wraps the drift jobs; give them "
-            "`before_script: []` / `after_script: []` or update this check"
+            "a global before_script/after_script now wraps the drift jobs; remove it, or "
+            "change this check deliberately to allow it (the jobs' key allowlist below "
+            "rejects a job-level before_script, after_script or inherit)"
         )
 
 
-def test_the_pin_job_checks_the_pin_only_and_does_not_block():
-    ci = _ci()
+# Every key each drift job may carry, as test_registry_resolution_lane.py's JOB_KEYS does for
+# registry-resolution. Anything else -- `extends` above all, which can bring in
+# allow_failure, variables or a before_script from a template no assertion here reads --
+# fails loudly rather than being assumed harmless. `inherit` is excluded with it, so a
+# file-wide `default:` cannot be switched off for these jobs unseen either.
+PIN_JOB_KEYS = {"stage", "image", "allow_failure", "script", "rules"}
+DEVELOP_JOB_KEYS = {"stage", "image", "interruptible", "timeout", "retry", "script", "rules"}
+
+
+def _check_pin_job(ci):
     job = ci["haf-shim-drift"]
-    assert job.get("allow_failure") is True, "an upstream change must not block an unrelated MR"
+    assert set(job) == PIN_JOB_KEYS, f"haf-shim-drift keys changed: {sorted(set(job) ^ PIN_JOB_KEYS)}"
+    assert job["allow_failure"] is True, "an upstream change must not block an unrelated MR"
     _exact_script(job, "python scripts/check_haf_shim_drift.py --pinned")
     assert job["rules"] is ci[".standard-rules"], "MR and default-branch pipelines, like every lane"
+
+
+def _check_develop_job(ci):
+    job = ci["haf-shim-drift-develop"]
+    assert set(job) == DEVELOP_JOB_KEYS, (
+        f"haf-shim-drift-develop keys changed: {sorted(set(job) ^ DEVELOP_JOB_KEYS)}")
+    _exact_script(job, "python scripts/check_haf_shim_drift.py --ref develop")
+    assert job["interruptible"] is False, "auto-cancel must not cancel the scheduled check"
+    assert job["retry"] == {"max": 2, "when": "runner_system_failure"}
+
+
+@pytest.mark.parametrize("job,check", [("haf-shim-drift-develop", "_check_develop_job"),
+                                       ("haf-shim-drift", "_check_pin_job")])
+@pytest.mark.parametrize("smuggled", [
+    {"extends": ".drift-base"},
+    {"variables": {"X": "1"}},
+    {"inherit": {"default": False}},
+    {"before_script": ["true"]},
+    {"when": "manual"},
+])
+def test_a_job_cannot_be_changed_through_a_key_nobody_checks(job, check, smuggled):
+    """The review's case: `.drift-base: {allow_failure: true}` plus `extends:` turned the
+    develop job orange while every assertion on its own keys stayed green."""
+    ci = _ci()
+    ci[".drift-base"] = {"allow_failure": True}
+    ci[job] = {**ci[job], **smuggled}
+    with pytest.raises(AssertionError):
+        globals()[check](ci)
+
+
+def test_the_pin_job_checks_the_pin_only_and_does_not_block():
+    _check_pin_job(_ci())
 
 
 def test_the_develop_job_runs_on_the_schedule_only_and_fails_red():
@@ -751,14 +782,13 @@ def test_the_develop_job_runs_on_the_schedule_only_and_fails_red():
     )
 
     ci = _ci()
-    job = ci["haf-shim-drift-develop"]
     # Red, not orange: it runs only where it blocks nothing, and an orange job in a
-    # scheduled pipeline notifies nobody -- the blind spot #52 exists to close.
-    assert job.get("allow_failure", False) is False
+    # scheduled pipeline notifies nobody -- the blind spot #52 exists to close. The key
+    # allowlist in _check_develop_job is what makes "no allow_failure key" mean "not
+    # allow_failure": nothing can be inherited through extends.
+    _check_develop_job(ci)
+    assert "allow_failure" not in ci["haf-shim-drift-develop"]
     assert _outcome_of(ci, "haf-shim-drift-develop", _schedule_pipeline()) == ("on_success", False)
-    _exact_script(job, "python scripts/check_haf_shim_drift.py --ref develop")
-    assert job.get("interruptible") is False, "auto-cancel must not cancel the scheduled check"
-    assert job.get("retry") == {"max": 2, "when": "runner_system_failure"}
     assert "haf-shim-drift-develop" in _running(_schedule_pipeline())
     assert "haf-shim-drift" not in _running(_schedule_pipeline())
     for env in (_mr_pipeline(), _push_pipeline()):
