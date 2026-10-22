@@ -437,6 +437,7 @@ _A_NAME = sorted(REAL.symbols)[0]
     ({"haf_shim_ref": REAL.ref[:39]}, "not a full commit SHA"),
     ({"haf_shim_ref": REAL.ref.upper() if REAL.ref.upper() != REAL.ref else "A" * 40}, "not a full commit SHA"),
     ({"shim_sha256": "ABC"}, "not a lowercase sha256"),
+    ({"shim_sha256": REAL.sha256.upper()}, "not a lowercase sha256"),
     ({"extra": 1}, "must have exactly the keys"),
 ])
 def test_a_malformed_ledger_makes_main_exit_2(tmp_path, capsys, good, overrides, message):
@@ -774,7 +775,12 @@ def _exact_script(job, command):
 # allow_failure, variables or a before_script from a template no assertion here reads --
 # fails loudly rather than being assumed harmless. `inherit` is excluded with it, so a
 # file-wide `default:` cannot be switched off for these jobs unseen either.
-PIN_JOB_KEYS = {"stage", "image", "allow_failure", "script", "rules"}
+PIN_JOB_KEYS = {"stage", "image", "allow_failure", "timeout", "script", "rules"}
+
+
+def _check_common(ci, job):
+    assert job["stage"] in ci["stages"], "a stage that does not exist makes the pipeline invalid"
+    assert job["image"] == "python:3.11-slim", "the Python the rest of CI and the image run"
 DEVELOP_JOB_KEYS = {"stage", "image", "interruptible", "timeout", "retry", "script", "rules"}
 
 
@@ -785,6 +791,8 @@ def _check_pin_job(ci):
     # block; only "could not run" (2), a network blip, may not.
     assert job["allow_failure"] == {"exit_codes": [drift.EXIT_ERROR]}, (
         "only a check that could not run may be non-blocking")
+    assert job["timeout"] == "5m", "a hung fetch must not hold a runner for the default hour"
+    _check_common(ci, job)
     _exact_script(job, "python scripts/check_haf_shim_drift.py --pinned")
     assert job["rules"] is ci[".standard-rules"], "MR and default-branch pipelines, like every lane"
 
@@ -796,6 +804,8 @@ def _check_develop_job(ci):
     _exact_script(job, "python scripts/check_haf_shim_drift.py --ref develop")
     assert job["interruptible"] is False, "auto-cancel must not cancel the scheduled check"
     assert job["retry"] == {"max": 2, "when": "runner_system_failure"}
+    assert job["timeout"] == "10m"
+    _check_common(ci, job)
 
 
 @pytest.mark.parametrize("job,check", [("haf-shim-drift-develop", "_check_develop_job"),

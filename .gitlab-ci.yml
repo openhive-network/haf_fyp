@@ -328,6 +328,9 @@ haf-shim-drift:
   image: python:3.11-slim
   allow_failure:
     exit_codes: [2]
+  # One fetch with a 30s timeout; without this a hung job holds a runner for the project
+  # default, an hour, and as allow_failure nobody would notice.
+  timeout: 5m
   script:
     - python scripts/check_haf_shim_drift.py --pinned
   rules: *standard_rules
