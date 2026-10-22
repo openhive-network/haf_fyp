@@ -1,4 +1,5 @@
-"""The scheduled registry-resolution lane: it has to run, and nothing else may (#71).
+"""The scheduled registry-resolution lane: it has to run, and nothing else may (#71) -- bar
+the read-only haf-shim-drift-develop check (#52), named in SCHEDULED below.
 
 Two halves, and the second is the one that is easy to miss.
 
@@ -37,6 +38,10 @@ from .test_publish_tag_lane import (
 )
 
 JOB = "registry-resolution"
+# Everything a scheduled (or on-demand sweep) pipeline may run. The shim-drift develop check
+# joined in #52: it reads one public file and pushes nothing, which is the property the
+# "nothing else" tests below protect. Adding to this set is a decision, not a fix.
+SCHEDULED = {JOB, "haf-shim-drift-develop"}
 SCRIPT = "scripts/check_pinned_images.sh"
 
 
@@ -117,18 +122,18 @@ def test_a_scheduled_pipeline_runs_this_job():
 def test_a_scheduled_pipeline_runs_NOTHING_else():
     """The expensive half. `docker push` on a timer is the outcome being prevented."""
     running = _running(_schedule_pipeline())
-    assert running == {JOB}, (
+    assert running == SCHEDULED, (
         "a scheduled pipeline also runs %s. The branch lanes match on "
         "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH, and a schedule sets CI_COMMIT_BRANCH, so "
         "each one needs the `$CI_PIPELINE_SOURCE == \"schedule\" / when: never` rule that "
-        ".standard-rules carries" % sorted(running - {JOB})
+        ".standard-rules carries" % sorted(running - SCHEDULED)
     )
 
 
 def test_a_schedule_on_another_branch_is_still_only_this_job():
     """A schedule may be pointed at any ref, and often is while it is being set up."""
     running = _running(_schedule_pipeline("fix/something"))
-    assert running == {JOB}, sorted(running)
+    assert running == SCHEDULED, sorted(running)
 
 
 @pytest.mark.parametrize("env,label", [
@@ -308,8 +313,8 @@ def test_a_schedule_pointed_at_a_tag_does_not_republish_a_release():
     tag_schedule = _pipeline(CI_PIPELINE_SOURCE="schedule", CI_COMMIT_TAG="1.29.0-rc2",
                              CI_COMMIT_REF_NAME="1.29.0-rc2", CI_COMMIT_REF_PROTECTED="false")
     running = {name for name, _ in _jobs(ci) if _runs(ci, name, tag_schedule)}
-    assert running == {JOB}, (
-        "a scheduled pipeline on a tag also runs %s" % sorted(running - {JOB})
+    assert running == SCHEDULED, (
+        "a scheduled pipeline on a tag also runs %s" % sorted(running - SCHEDULED)
     )
 
 
@@ -360,7 +365,7 @@ def test_the_on_demand_hatch_works_and_is_off_by_default():
     with_var_on_schedule = _schedule_pipeline()
     with_var_on_schedule["RUN_REGISTRY_RESOLUTION"] = "true"
     running = {name for name, _ in _jobs(ci) if _runs(ci, name, with_var_on_schedule)}
-    assert running == {JOB}, sorted(running)
+    assert running == SCHEDULED, sorted(running)
 
 
 @pytest.mark.parametrize("env,label", [
@@ -383,7 +388,7 @@ def test_asking_for_the_sweep_runs_the_sweep_and_nothing_else(env, label):
     sets CI_COMMIT_BRANCH -- so without its own exclusion it matched every lane's default-
     branch rule, rerunning the whole pipeline and republishing :develop (found by review).
     On a tag, publish_tag would republish the release."""
-    assert _running(env) == {JOB}, "on %s: %s" % (label, sorted(_running(env)))
+    assert _running(env) == SCHEDULED, "on %s: %s" % (label, sorted(_running(env)))
 
 
 def test_a_workflow_that_excludes_schedules_is_not_invisible():

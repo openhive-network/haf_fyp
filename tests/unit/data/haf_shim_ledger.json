@@ -1,0 +1,12 @@
+{
+  "about": "The HAF compatibility-shim ledger (#49, #52). Read by tests/unit/test_haf_canonical_names.py (the guard) and scripts/check_haf_shim_drift.py (the drift jobs) through the same loader, so they cannot disagree. Why each symbol is enforced or exempt, and how to bump haf_shim_ref / shim_sha256 with the vendored copy beside this file, is in the guard's comments.",
+  "compat_aliases": {
+    "application_stages": "hafd.application_stages",
+    "live_stage": "hafd.live_stage",
+    "context_name": "hafd.context_name"
+  },
+  "shim_symbols_with_no_canonical_form": ["contexts_group"],
+  "expected_shim_symbols": 4,
+  "haf_shim_ref": "38d51f261009904881da1fac87b7f5b7f6c3cb3a",
+  "shim_sha256": "92db49ca379e2d282e79c51d968bbd92428d7c8dcc0991b3b8c152928d3c5c77"
+}
