@@ -59,9 +59,9 @@ VENDORED_SHIM_GLOB = "compatibility_with_old_haf_apps@*.sql"
 # THE LEDGER: LEDGER, loaded from tests/unit/data/haf_shim_ledger.json (read-only).
 #
 # LEDGER.compat_aliases: symbol -> the canonical spelling to use instead. Verified against
-# hive/haf's compatibility_with_old_haf_apps.sql, which is byte-identical at master and
-# develop and defines FOUR symbols. Three are enforced; the fourth is exempt for a reason
-# worth reading before you "complete" the aliases.
+# hive/haf's compatibility_with_old_haf_apps.sql, which was byte-identical at master and
+# develop on 2026-10-23 and defines FOUR symbols. Three are enforced; the fourth is exempt
+# for a reason worth reading before you "complete" the aliases.
 #
 # LEDGER.exempt (`shim_symbols_with_no_canonical_form`): the fourth symbol, contexts_group,
 # NOT enforced, and do not add it to the aliases:
@@ -97,6 +97,11 @@ VENDORED_SHIM_GLOB = "compatibility_with_old_haf_apps@*.sql"
 #   2. set haf_shim_ref in haf_shim_ledger.json to that SHA;
 #   3. set shim_sha256 to the copy's sha256 -- and re-read the file to update
 #      compat_aliases / shim_symbols_with_no_canonical_form / expected_shim_symbols.
+#      python-tests then checks every name the copy creates is in the ledger.
+# Which commit: the HAF release haf_fyp next ships against, not develop's tip -- a red
+# develop job means "this is coming", and the schedule stays red, daily, until the bump.
+# A symbol upstream REMOVED stays in the ledger, still enforced, while any HAF we support
+# has it: a removal is the strongest reason not to use it, and older nodes still accept it.
 
 # A text guard that scans nothing reports clean. hive/haf_stats' check_haf_drift.sh shipped
 # exactly that bug -- its header records the first version printing "No drift" and exiting 0

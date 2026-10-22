@@ -193,6 +193,17 @@ def test_the_vendored_copy_is_the_pinned_file():
     )
 
 
+def test_the_ledger_names_every_symbol_the_vendored_copy_creates():
+    """Offline, blocking: the hash ties the ledger to upstream's bytes, this ties its names to
+    them. A bump that refreshes the copy, ref and hash but not the symbols -- upstream adds a
+    fifth alias, nobody adds it to the ledger -- leaves the new alias unenforced, the failure
+    #52 exists for. One way only: a symbol upstream removed stays in the ledger (see the
+    guard's bump notes). If the best-effort hint ever misreads a new shim, this goes red and
+    a person reads the file: the right outcome either way."""
+    missing = drift.apparent_symbols(_vendored().read_bytes()) - set(REAL.symbols)
+    assert not missing, f"the vendored shim creates {sorted(missing)}, which the ledger omits"
+
+
 def test_the_script_passes_the_vendored_copy_against_the_real_ledger(capsys):
     """The real ledger, unmodified, end to end: what the pin job sees when the network works."""
     assert drift.main(["--file", str(_vendored())]) == drift.EXIT_OK
@@ -417,6 +428,10 @@ _A_NAME = sorted(REAL.symbols)[0]
     ({"shim_symbols_with_no_canonical_form": _A_NAME}, "is a str, not a list"),
     ({"shim_symbols_with_no_canonical_form": [_A_NAME, _A_NAME]}, "must be distinct names"),
     ({"shim_symbols_with_no_canonical_form": [1]}, "must be distinct names"),
+    ({"shim_symbols_with_no_canonical_form": [f"{HIVE}.{_A_NAME}"]}, "not bare lowercase identifiers"),
+    ({"shim_symbols_with_no_canonical_form": [f" {_A_NAME}"]}, "not bare lowercase identifiers"),
+    ({"shim_symbols_with_no_canonical_form": [_A_NAME.upper()]}, "not bare lowercase identifiers"),
+    ({"shim_symbols_with_no_canonical_form": sorted(REAL.compat_aliases)[:1]}, "both enforces and exempts"),
     ({"haf_shim_ref": "develop"}, "not a full commit SHA"),
     ({"haf_shim_ref": REAL.ref[:7]}, "not a full commit SHA"),
     ({"haf_shim_ref": REAL.ref[:39]}, "not a full commit SHA"),
@@ -617,6 +632,7 @@ def test_fetch_of_a_bad_ref_fails_loudly(server, capsys, ledger, order):
     out = capsys.readouterr()
     assert rc == drift.EXIT_ERROR, "a failed fetch must not be masked by a good one"
     assert "ERROR [hive/haf@no-such-ref]: could not fetch" in out.err and "404" in out.err
+    assert "moved or deleted upstream" in out.err, "a 404 must not read as a mere typo"
     assert "OK [hive/haf@good]" in out.out
 
 
@@ -765,7 +781,10 @@ DEVELOP_JOB_KEYS = {"stage", "image", "interruptible", "timeout", "retry", "scri
 def _check_pin_job(ci):
     job = ci["haf-shim-drift"]
     assert set(job) == PIN_JOB_KEYS, f"haf-shim-drift keys changed: {sorted(set(job) ^ PIN_JOB_KEYS)}"
-    assert job["allow_failure"] is True, "an upstream change must not block an unrelated MR"
+    # A pinned commit cannot change upstream, so drift (1) is our own bad bump and must
+    # block; only "could not run" (2), a network blip, may not.
+    assert job["allow_failure"] == {"exit_codes": [drift.EXIT_ERROR]}, (
+        "only a check that could not run may be non-blocking")
     _exact_script(job, "python scripts/check_haf_shim_drift.py --pinned")
     assert job["rules"] is ci[".standard-rules"], "MR and default-branch pipelines, like every lane"
 
@@ -798,7 +817,7 @@ def test_a_job_cannot_be_changed_through_a_key_nobody_checks(job, check, smuggle
         globals()[check](ci)
 
 
-def test_the_pin_job_checks_the_pin_only_and_does_not_block():
+def test_the_pin_job_checks_the_pin_only_and_blocks_only_on_drift():
     _check_pin_job(_ci())
 
 

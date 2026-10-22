@@ -134,6 +134,15 @@ def load_ledger(path: Path | None = None) -> Ledger:
         raise CheckError(f"compat_aliases in {path} must map symbol names to canonical names")
     if not all(type(k) is str for k in exempt) or len(set(exempt)) != len(exempt):
         raise CheckError(f"shim_symbols_with_no_canonical_form in {path} must be distinct names")
+    # Bare lowercase names, as the guard interpolates them after "hive.": a key spelled
+    # "hive.x" or " X" would make its guard test match nothing and pass.
+    bad = sorted(n for n in [*aliases, *exempt] if not re.fullmatch(r"[a-z_][a-z0-9_]*", n))
+    if bad:
+        raise CheckError(f"the ledger in {path} has symbol names that are not bare lowercase "
+                         f"identifiers: {bad}")
+    both = sorted(set(aliases) & set(exempt))
+    if both:
+        raise CheckError(f"the ledger in {path} both enforces and exempts {both}")
     if not re.fullmatch(r"[0-9a-f]{40}", raw["haf_shim_ref"]):
         raise CheckError(f"haf_shim_ref in {path} is not a full commit SHA; pin a commit, not a branch")
     if not re.fullmatch(r"[0-9a-f]{64}", raw["shim_sha256"]):
@@ -170,7 +179,11 @@ def fetch(ref: str) -> bytes:
             ctype = resp.headers.get("Content-Type", "")
             data = resp.read()
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
-        raise CheckError(f"could not fetch {url}: {type(exc).__name__}: {exc}") from exc
+        hint = ""
+        if isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
+            hint = (" -- if the ref is right, the shim was moved or deleted upstream, which is "
+                    "drift (#52): find where it went before touching the ledger")
+        raise CheckError(f"could not fetch {url}: {type(exc).__name__}: {exc}{hint}") from exc
     # Each of these is "we did not get the file", not "the file changed": a sign-in page, a
     # moved file answered with a redirect, or an empty 200 must not be reported as drift.
     if ctype.split(";", 1)[0].strip().lower() != "text/plain":

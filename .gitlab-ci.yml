@@ -311,8 +311,9 @@ openapi-drift:
 #                           shim_sha256 -- which catches a mistyped hash or an unrenamed
 #                           copy, but NOT a copy renamed to a new ref with its old bytes:
 #                           that still agrees with an unchanged hash, and only this job's
-#                           fetch shows the bytes are not upstream's. allow_failure because
-#                           a network blip must not block an MR.
+#                           fetch shows the bytes are not upstream's. So drift here (exit 1)
+#                           is our own bad bump and blocks; allow_failure only for exit 2,
+#                           because a network blip must not block an MR.
 #   haf-shim-drift-develop  the daily schedule (and the on-demand sweep): hive/haf develop
 #                           against the same hash. This is where upstream drift appears.
 #                           NOT allow_failure: it runs only where it blocks nothing, and an
@@ -325,7 +326,8 @@ openapi-drift:
 haf-shim-drift:
   stage: lint
   image: python:3.11-slim
-  allow_failure: true
+  allow_failure:
+    exit_codes: [2]
   script:
     - python scripts/check_haf_shim_drift.py --pinned
   rules: *standard_rules
