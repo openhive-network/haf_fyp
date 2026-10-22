@@ -172,9 +172,9 @@ registry-resolution:
   # NOT interruptible. This project has auto-cancel-redundant-pipelines on, so a push to the
   # default branch shortly after the cron tick would otherwise cancel the sweep: no answer, no
   # red, nothing. (A job still waiting for a runner counts as interruptible whatever it says,
-  # so that narrow window remains; once it runs, it finishes.) It is the only job in a
-  # scheduled pipeline and never runs in a push or MR pipeline, so holding it costs nothing
-  # elsewhere -- the same reasoning as publish_tag.
+  # so that narrow window remains; once it runs, it finishes.) It and haf-shim-drift-develop
+  # are the only jobs in a scheduled pipeline, and neither runs in a push or MR pipeline, so
+  # holding it costs nothing elsewhere -- the same reasoning as publish_tag.
   interruptible: false
   # ABOVE the script's own budget, which the lane test holds it to: HAF_FYP_RESOLVE_DEADLINE
   # (420s) plus one in-flight attempt (HEAD + token + HEAD at 20s each) plus the image pull and
@@ -310,6 +310,72 @@ openapi-drift:
       PYEOF
     - echo "served OpenAPI document is valid."
   rules: *standard_rules
+
+# tests/unit/test_haf_canonical_names.py forbids the hive.* names that exist only in HAF's
+# compatibility shim, from a hand-transcribed list. Nothing noticed upstream changing that
+# list, so a fifth alias, a rename or a deleted shim left that test green forever (#52).
+#
+# Detection is a content fingerprint: tests/unit/data/haf_shim_ledger.json records
+# haf_shim_ref (the pinned hive/haf commit the ledger was read from) and shim_sha256 (the
+# sha256 of the shim there), and the script fails on ANY byte change -- no SQL parsing
+# decides the verdict, so there is no construct it can miss. On drift it prints the hive.*
+# names the new file appears to create against the ledger, as a reading aid. The guard and
+# the script read that one file through the same loader, so they cannot disagree. To bump:
+# re-read the file, refresh the vendored copy in tests/unit/data/, and update the ledger's
+# symbols, haf_shim_ref and shim_sha256 together (steps in the guard's comments).
+#
+#   haf-shim-drift          MR + default-branch pipelines, the PINNED ref. A fixed commit
+#                           cannot change upstream, so this fails only through our own
+#                           bump or the network. Offline, python-tests (blocking) checks the
+#                           vendored copy's name carries haf_shim_ref and its sha256 is
+#                           shim_sha256 -- which catches a mistyped hash or an unrenamed
+#                           copy, but NOT a copy renamed to a new ref with its old bytes:
+#                           that still agrees with an unchanged hash, and only this job's
+#                           fetch shows the bytes are not upstream's. So drift here (exit 1,
+#                           which includes a pinned SHA that 404s) is our own bad bump and
+#                           blocks; allow_failure only for exit 2, the script's "could not
+#                           run", because a network blip must not block an MR.
+#   haf-shim-drift-develop  the daily schedule (and the on-demand sweep): hive/haf develop
+#                           against the same hash. This is where upstream drift appears.
+#                           NOT allow_failure: it runs only where it blocks nothing, and an
+#                           orange job in a scheduled pipeline notifies nobody -- the blind
+#                           spot #52 exists to close.
+#
+# Exit 1 is drift (including a pinned SHA that 404s), exit 2 is a check that could not run
+# (unreachable host, a --ref that 404s, a moved file, a broken ledger); neither is ever green. The fetch runs inside the script in the job's
+# main shell, not in a $(...) substitution, so its exit code is what the runner sees.
+haf-shim-drift:
+  stage: lint
+  image: python:3.11-slim
+  allow_failure:
+    exit_codes: [2]
+  # One fetch with a 30s timeout; without this a hung job would hold a runner for the
+  # project default, an hour. A job timeout is not exit 2, so it fails red.
+  timeout: 5m
+  script:
+    - python scripts/check_haf_shim_drift.py --pinned
+  rules: *standard_rules
+
+haf-shim-drift-develop:
+  stage: lint
+  image: python:3.11-slim
+  # NOT interruptible, as registry-resolution: auto-cancel-redundant-pipelines would otherwise
+  # let a push to develop just after the cron tick cancel the check -- no answer, no red.
+  interruptible: false
+  timeout: 10m
+  # Infrastructure only, as registry-resolution: re-running on a real failure would report
+  # the same drift three times.
+  retry:
+    max: 2
+    when: runner_system_failure
+  script:
+    - python scripts/check_haf_shim_drift.py --ref develop
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    # The scheduled sweep's on-demand hatch, shared with registry-resolution, so the job can
+    # be exercised without waiting for the cron tick.
+    - if: $RUN_REGISTRY_RESOLUTION == "true"
+    - when: never
 
 python-tests:
   extends: .python-cache
