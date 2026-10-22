@@ -55,6 +55,9 @@ UPSTREAM_PATH = "src/hive_fork_manager/types/operation/compatibility_with_old_ha
 
 HIVE = "hive"  # kept apart from the names so no line here spells a shim symbol literally
 PIN = "0123456789abcdef0123456789abcdef01234567"
+# Pinned refs (full SHAs, as the ledger requires) that fail some way other than a 404.
+PIN_REDIRECT = "3" * 40
+PIN_5XX = "5" * 40
 
 
 def _shim(names) -> bytes:
@@ -204,8 +207,21 @@ def test_the_ledger_names_every_symbol_the_vendored_copy_creates():
     reads that is not there goes red (a person then reads the file), but a CREATE it cannot
     see -- inside EXECUTE, behind search_path, after quoting it mis-blanks -- passes. Against
     that, the person reading the file at bump time is the check. Today's shim is plain DDL."""
-    missing = drift.apparent_symbols(_vendored().read_bytes()) - set(REAL.symbols)
+    missing = _unlisted(_vendored().read_bytes(), REAL.symbols)
     assert not missing, f"the vendored shim creates {sorted(missing)}, which the ledger omits"
+
+
+def _unlisted(data: bytes, ledger_symbols) -> set:
+    """Names the shim creates that the ledger does not list. One way: see the test above."""
+    return drift.apparent_symbols(data) - set(ledger_symbols)
+
+
+def test_the_names_check_is_one_way(symbols):
+    """The real shim equals the ledger today, so the real test cannot tell `-` from `^`."""
+    names = sorted(symbols)
+    extra = _fresh_name(symbols, "brand_new")
+    assert _unlisted(_shim(names[1:]), names) == set(), "a removed symbol may stay listed"
+    assert _unlisted(_shim([*names, extra]), names) == {extra}, "a new one must be caught"
 
 
 def test_a_symbol_upstream_removed_may_stay_in_the_ledger(tmp_path, capsys, good):
@@ -575,9 +591,16 @@ def server(good, monkeypatch, no_proxy):
             try:
                 if self.path != f"/{ref}/{UPSTREAM_PATH}" or ref not in (
                         "good", PIN, "slow", "truncated", "html", "empty", "notype", "upper",
-                        "plainfoo", "plainx",
+                        "plainfoo", "plainx", PIN_REDIRECT, PIN_5XX,
                         "whitespace", "drifted", "crlf", *(f"redirect{c}" for c in REDIRECTS)):
                     self.send_error(404)
+                elif ref == PIN_5XX:
+                    self.send_error(500)
+                elif ref == PIN_REDIRECT:
+                    self.send_response(302)
+                    self.send_header("Location", f"/good/{UPSTREAM_PATH}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
                 elif ref == "upper":
                     self._send(good, "Text/Plain ; charset=UTF-8")
                 elif ref == "plainfoo":
@@ -761,6 +784,24 @@ def test_an_unreachable_host_fails_loudly(monkeypatch, capsys, ledger, no_proxy)
     monkeypatch.setattr(drift, "RAW_BASE", f"http://127.0.0.1:{_closed_port()}")
     assert _main(ledger, ["--ref", "anything"]) == drift.EXIT_ERROR
     assert "ERROR [hive/haf@anything]: could not fetch" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("pin,marker", [(PIN_REDIRECT, "redirected"), (PIN_5XX, "500")])
+def test_a_pinned_failure_other_than_404_is_not_drift(server, tmp_path, capsys, good, pin, marker):
+    """Only a 404 at a fixed commit is our own bump; anything else on --pinned is the network
+    or GitLab, which allow_failure (exit 2 only) must keep from blocking an MR."""
+    bad = _ledger_variant(tmp_path, haf_shim_ref=pin, shim_sha256=hashlib.sha256(good).hexdigest())
+    rc = _main(bad, ["--pinned"])
+    err = capsys.readouterr().err
+    assert rc == drift.EXIT_ERROR, err
+    assert f"ERROR [hive/haf@{pin}]" in err and marker in err and "DRIFT" not in err
+
+
+def test_an_unreachable_host_on_pinned_is_not_drift(monkeypatch, capsys, ledger, no_proxy):
+    monkeypatch.setattr(drift, "RAW_BASE", f"http://127.0.0.1:{_closed_port()}")
+    assert _main(ledger, ["--pinned"]) == drift.EXIT_ERROR
+    err = capsys.readouterr().err
+    assert f"ERROR [hive/haf@{PIN}]: could not fetch" in err and "DRIFT" not in err
 
 
 def test_an_out_of_range_port_is_a_fetch_error(monkeypatch, capsys, ledger, no_proxy):

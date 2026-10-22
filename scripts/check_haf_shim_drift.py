@@ -44,7 +44,8 @@ Sources are checked in the order given. Exit codes, worst across all sources:
     0  every source is byte-identical to shim_sha256
     1  drift: a source's bytes differ -- or the PINNED ref answers 404: a file at a fixed
        commit cannot move, so that is our own bad bump (a mistyped SHA), not the network
-    2  the check could not run: a failed fetch (including a redirect, a non-text/plain
+    2  the check could not run: a failed fetch other than a pinned 404 (including a
+       404 on --ref, a redirect, a 5xx, an unreachable host, a non-text/plain
        response such as a sign-in page, or an empty body), an unreadable or empty file, an
        unreadable or inconsistent ledger, no source given, or any unexpected exception.
        Never 1: an error must not be mistaken for drift, nor either for a pass. A body that

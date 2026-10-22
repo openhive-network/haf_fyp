@@ -321,8 +321,8 @@ openapi-drift:
 #                           orange job in a scheduled pipeline notifies nobody -- the blind
 #                           spot #52 exists to close.
 #
-# Exit 1 is drift, exit 2 is a check that could not run (unreachable host, bad ref, moved
-# file, broken ledger); neither is ever green. The fetch runs inside the script in the job's
+# Exit 1 is drift (including a pinned SHA that 404s), exit 2 is a check that could not run
+# (unreachable host, a --ref that 404s, a moved file, a broken ledger); neither is ever green. The fetch runs inside the script in the job's
 # main shell, not in a $(...) substitution, so its exit code is what the runner sees.
 haf-shim-drift:
   stage: lint
