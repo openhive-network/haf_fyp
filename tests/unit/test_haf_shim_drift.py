@@ -194,14 +194,32 @@ def test_the_vendored_copy_is_the_pinned_file():
 
 
 def test_the_ledger_names_every_symbol_the_vendored_copy_creates():
-    """Offline, blocking: the hash ties the ledger to upstream's bytes, this ties its names to
-    them. A bump that refreshes the copy, ref and hash but not the symbols -- upstream adds a
-    fifth alias, nobody adds it to the ledger -- leaves the new alias unenforced, the failure
-    #52 exists for. One way only: a symbol upstream removed stays in the ledger (see the
-    guard's bump notes). If the best-effort hint ever misreads a new shim, this goes red and
-    a person reads the file: the right outcome either way."""
+    """Offline, blocking: the hash ties the ledger to the vendored copy's bytes, this ties its
+    names to them. A bump that refreshes the copy, ref and hash but not the symbols -- upstream
+    adds a fifth alias, nobody adds it to the ledger -- leaves the new alias unenforced, the
+    failure #52 exists for. One way only: a symbol upstream removed stays in the ledger (see
+    the guard's bump notes).
+
+    Only as complete as apparent_symbols(), a best-effort reader of plain DDL: a name it
+    reads that is not there goes red (a person then reads the file), but a CREATE it cannot
+    see -- inside EXECUTE, behind search_path, after quoting it mis-blanks -- passes. Against
+    that, the person reading the file at bump time is the check. Today's shim is plain DDL."""
     missing = drift.apparent_symbols(_vendored().read_bytes()) - set(REAL.symbols)
     assert not missing, f"the vendored shim creates {sorted(missing)}, which the ledger omits"
+
+
+def test_a_symbol_upstream_removed_may_stay_in_the_ledger(tmp_path, capsys, good):
+    """The one-way policy, pinned: a ledger naming more than the shim creates still loads and
+    passes, so a removed symbol can stay enforced while older HAF releases still have it."""
+    extra = _fresh_name(REAL.symbols, "removed_upstream")
+    bad = _ledger_variant(
+        tmp_path,
+        shim_symbols_with_no_canonical_form=[*REAL.exempt, extra],
+        expected_shim_symbols=REAL.expected + 1,
+        shim_sha256=hashlib.sha256(good).hexdigest(),
+    )
+    assert _main(bad, _file(tmp_path, good)) == drift.EXIT_OK, capsys.readouterr().err
+    assert extra in drift.load_ledger(bad).symbols
 
 
 def test_the_script_passes_the_vendored_copy_against_the_real_ledger(capsys):
@@ -431,6 +449,10 @@ _A_NAME = sorted(REAL.symbols)[0]
     ({"shim_symbols_with_no_canonical_form": [f"{HIVE}.{_A_NAME}"]}, "not bare lowercase identifiers"),
     ({"shim_symbols_with_no_canonical_form": [f" {_A_NAME}"]}, "not bare lowercase identifiers"),
     ({"shim_symbols_with_no_canonical_form": [_A_NAME.upper()]}, "not bare lowercase identifiers"),
+    # The alias keys are the names the guard turns into patterns: the case that matters.
+    ({"compat_aliases": {f"{HIVE}.{_A_NAME}": "x"}}, "not bare lowercase identifiers"),
+    ({"compat_aliases": {f" {_A_NAME}": "x"}}, "not bare lowercase identifiers"),
+    ({"compat_aliases": {_A_NAME.capitalize(): "x"}}, "not bare lowercase identifiers"),
     ({"shim_symbols_with_no_canonical_form": sorted(REAL.compat_aliases)[:1]}, "both enforces and exempts"),
     ({"haf_shim_ref": "develop"}, "not a full commit SHA"),
     ({"haf_shim_ref": REAL.ref[:7]}, "not a full commit SHA"),
@@ -626,6 +648,18 @@ def test_pinned_fetches_the_ledgers_own_ref(server, capsys, ledger):
     assert f"OK [hive/haf@{PIN}]" in capsys.readouterr().out
 
 
+def test_a_pinned_ref_that_404s_is_drift_not_a_network_error(server, tmp_path, capsys, good):
+    """A mistyped SHA, consistent in the copy's name and the ledger, passes python-tests and
+    the develop job; only the pin job sees it, and as exit 2 it would merge orange."""
+    wrong = PIN[:-1] + ("0" if PIN[-1] != "0" else "1")
+    bad = _ledger_variant(tmp_path, haf_shim_ref=wrong, shim_sha256=hashlib.sha256(good).hexdigest())
+    rc = _main(bad, ["--pinned"])
+    err = capsys.readouterr().err
+    assert rc == drift.EXIT_DRIFT, err
+    assert f"DRIFT [hive/haf@{wrong}]" in err and "check the bump" in err
+    assert "moved or deleted" not in err, "a file at a fixed commit cannot move"
+
+
 @pytest.mark.parametrize("order", [("good", "no-such-ref"), ("no-such-ref", "good")])
 def test_fetch_of_a_bad_ref_fails_loudly(server, capsys, ledger, order):
     """Both orders: a failure in either must survive the other succeeding."""
@@ -776,12 +810,12 @@ def _exact_script(job, command):
 # fails loudly rather than being assumed harmless. `inherit` is excluded with it, so a
 # file-wide `default:` cannot be switched off for these jobs unseen either.
 PIN_JOB_KEYS = {"stage", "image", "allow_failure", "timeout", "script", "rules"}
+DEVELOP_JOB_KEYS = {"stage", "image", "interruptible", "timeout", "retry", "script", "rules"}
 
 
 def _check_common(ci, job):
     assert job["stage"] in ci["stages"], "a stage that does not exist makes the pipeline invalid"
     assert job["image"] == "python:3.11-slim", "the Python the rest of CI and the image run"
-DEVELOP_JOB_KEYS = {"stage", "image", "interruptible", "timeout", "retry", "script", "rules"}
 
 
 def _check_pin_job(ci):

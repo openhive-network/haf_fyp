@@ -42,7 +42,8 @@ Usage:
 
 Sources are checked in the order given. Exit codes, worst across all sources:
     0  every source is byte-identical to shim_sha256
-    1  drift: a source's bytes differ
+    1  drift: a source's bytes differ -- or the PINNED ref answers 404: a file at a fixed
+       commit cannot move, so that is our own bad bump (a mistyped SHA), not the network
     2  the check could not run: a failed fetch (including a redirect, a non-text/plain
        response such as a sign-in page, or an empty body), an unreadable or empty file, an
        unreadable or inconsistent ledger, no source given, or any unexpected exception.
@@ -88,6 +89,10 @@ LEDGER_KEYS = {
 
 class CheckError(Exception):
     """The check could not run. Distinct from drift, and never treated as a pass."""
+
+
+class NotFound(CheckError):
+    """The ref or the file is not there (404). What that means depends on the source."""
 
 
 # --- the ledger ----------------------------------------------------------------------
@@ -179,11 +184,8 @@ def fetch(ref: str) -> bytes:
             ctype = resp.headers.get("Content-Type", "")
             data = resp.read()
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
-        hint = ""
-        if isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
-            hint = (" -- if the ref is right, the shim was moved or deleted upstream, which is "
-                    "drift (#52): find where it went before touching the ledger")
-        raise CheckError(f"could not fetch {url}: {type(exc).__name__}: {exc}{hint}") from exc
+        kind = NotFound if isinstance(exc, urllib.error.HTTPError) and exc.code == 404 else CheckError
+        raise kind(f"could not fetch {url}: {type(exc).__name__}: {exc}") from exc
     # Each of these is "we did not get the file", not "the file changed": a sign-in page, a
     # moved file answered with a redirect, or an empty 200 must not be reported as drift.
     if ctype.split(";", 1)[0].strip().lower() != "text/plain":
@@ -290,6 +292,16 @@ def _main(argv: list[str] | None) -> int:
             data = Path(value).read_bytes() if kind == "file" else fetch(ref)
             if not data:
                 raise CheckError("the file is empty")
+        except NotFound as exc:
+            if kind == "pinned":
+                print(f"DRIFT [{label}]: {exc} -- the file at a fixed commit cannot move, so "
+                      "haf_shim_ref is wrong: check the bump", file=sys.stderr)
+                rc = EXIT_DRIFT
+            else:
+                print(f"ERROR [{label}]: {exc} -- if the ref is right, the shim was moved or "
+                      "deleted upstream, which is drift (#52): find where it went before "
+                      "touching the ledger", file=sys.stderr)
+                rc = EXIT_ERROR
         except CheckError as exc:
             print(f"ERROR [{label}]: {exc}", file=sys.stderr)
             rc = EXIT_ERROR
