@@ -84,7 +84,27 @@ python-lint:
     # pre-existing UP045/BLE001/DTZ003 across files the MR never touched). Pin so
     # the lint result is reproducible; bump deliberately, cleaning findings in the
     # same commit.
-    - pip install ruff==0.15.12 mypy types-redis -q
+    # mypy and types-redis are pinned for the same reason, and so are mypy's own runtime
+    # dependencies: ast-serialize and librt are compiled parts of mypy 2.x that move on
+    # their own (ast-serialize 0.13.0 -> 0.13.1 on 2026-10-17), so pinning mypy alone
+    # would not hold its behaviour still. These are the versions pip resolved for this
+    # job on python:3.11-slim on 2026-10-21. Left floating: cryptography/cffi/pycparser
+    # and types-cffi/types-setuptools, which types-redis drags in and our code never
+    # touches.
+    #
+    # What this mypy step checks: requirements.txt is NOT installed, so with
+    # --ignore-missing-imports every third-party import except redis (fastapi,
+    # starlette, pydantic, slowapi, limits, anyio, psycopg2, pandas, numpy, pgvector,
+    # coincurve, base58) is Any and unchecked. It is a self-consistency pass over
+    # our own annotations, not type coverage of the framework code. The redis types come
+    # from types-redis 4.6, which predates requirements.txt's redis>=5.0; the redis it
+    # resolves today (8.x) ships its own py.typed, so once requirements.txt is installed
+    # here types-redis must be dropped. Sizing and remaining steps: #42.
+    - >-
+      pip install -q ruff==0.15.12
+      mypy==2.4.0 ast-serialize==0.13.1 librt==0.16.0 pathspec==1.1.1
+      typing_extensions==4.16.0 mypy_extensions==1.1.0
+      types-redis==4.6.0.20241004 types-pyOpenSSL==24.1.0.20240722
     - ruff check haf_fyp/
     - mypy haf_fyp/ --ignore-missing-imports
   rules: *standard_rules
