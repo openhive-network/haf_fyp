@@ -168,13 +168,17 @@ def test_note_does_nothing_without_reads():
 
 def test_note_stamps_in_one_statement_and_commits(monkeypatch):
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 123)
-    conn, cur = _mock_conn([[("bob",)]])
+    monkeypatch.setattr(rd, "_read_filter_days", 30)
+    monkeypatch.setattr(rd, "_reads_unearned", 0)
+    # The statement's last row has no name and counts the reads that earned nothing.
+    conn, cur = _mock_conn([[("bob", None), (None, 4)]])
 
     assert rd._note_feed_reads(conn, {"bob", "alice"}, 7) == {"bob"}
+    assert rd._reads_unearned == 4
 
     (call,) = cur.execute.call_args_list
-    # (READER_ACTIVE_WITHIN_DAYS twice, the names, min age, limit)
-    assert call.args[1] == (0, 0, ["alice", "bob"], 123, 7)
+    # (the filter's days twice, the names, min age, limit)
+    assert call.args[1] == (30, 30, ["alice", "bob"], 123, 7)
     assert "last_read_at" in call.args[0]
     conn.commit.assert_called_once()
 
@@ -208,13 +212,14 @@ def test_readers_come_first_and_the_rest_fills_the_cycle(monkeypatch):
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 3600)
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 77)
+    monkeypatch.setattr(rd, "_read_filter_days", 30)
     conn, cur = _mock_conn([[("r1",), ("r2",)], [("s1",), ("s2",), ("s3",)]])
 
     assert rd._fetch_personalised_users(conn, 10) == ["r1", "r2", "s1", "s2", "s3"]
 
     reader_call, rest_call = cur.execute.call_args_list
-    # (window, min age, READER_ACTIVE_WITHIN_DAYS twice, slots)
-    assert reader_call.args[1] == (3600, 77, 0, 0, 5), "readers may take at most the share"
+    # (window, min age, the filter's days twice, slots)
+    assert reader_call.args[1] == (3600, 77, 30, 30, 5), "readers may take at most the share"
     # The remainder excludes the readers already taken and fills what is left of the
     # cycle, so two readers leave eight slots, not five.
     assert rest_call.args[1] == (["r1", "r2"], 8)
@@ -1110,6 +1115,80 @@ def test_a_setting_below_its_minimum_stops_the_ranker_and_says_which(name, value
     )
     assert out.returncode != 0, f"{name}={value} was accepted"
     assert f"ValueError: {name}='{value}' is below its minimum" in out.stderr, out.stderr[-500:]
+
+
+def test_the_activity_filter_has_a_ceiling():
+    """A cutoff further back than PostgreSQL's dates would fail both statements on every
+    pass, and the lane with them."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("READER_")}
+    for value, ok in (("36500", True), ("36501", False)):
+        out = subprocess.run(
+            [sys.executable, "-c", "import haf_fyp.ranker_daemon as rd; print(rd.READER_ACTIVE_WITHIN_DAYS)"],
+            cwd=REPO, env={**env, "PYTHONPATH": REPO, "READER_ACTIVE_WITHIN_DAYS": value},
+            capture_output=True, text=True,
+        )
+        if ok:
+            assert out.returncode == 0 and out.stdout.strip() == value, out.stderr[-300:]
+        else:
+            assert "ValueError: READER_ACTIVE_WITHIN_DAYS='36501' is above its maximum, 36500" in out.stderr
+
+
+@pytest.mark.parametrize("setting, caught_up, effective", [
+    (0, True, 0),     # off: nothing to check
+    (30, True, 30),
+    (30, False, 0),   # replay or catch-up: every account would look lapsed
+    (30, RuntimeError("no app_status"), 0),  # cannot tell: every read counts
+])
+def test_the_activity_filter_waits_for_block_processing(monkeypatch, caplog, setting, caught_up, effective):
+    monkeypatch.setattr(rd, "READER_ACTIVE_WITHIN_DAYS", setting)
+    monkeypatch.setattr(rd, "_read_filter_days", 0 if effective else 30)  # so a change is logged
+    asked = []
+
+    def _caught_up(_cur):
+        asked.append(True)
+        if isinstance(caught_up, BaseException):
+            raise caught_up
+        return caught_up
+
+    monkeypatch.setattr(rd, "_sync_caught_up", _caught_up)
+    conn, _cur = _mock_conn([])
+    with caplog.at_level(logging.INFO, logger=rd.log.name):
+        rd._refresh_read_filter(conn)
+
+    assert rd._read_filter_days == effective
+    assert bool(asked) == bool(setting), "the setting off must cost no query"
+    if setting:
+        assert any("READER_ACTIVE_WITHIN_DAYS=30" in r.getMessage() for r in caplog.records)
+
+
+def test_a_lost_connection_while_checking_the_filter_is_not_swallowed(monkeypatch):
+    monkeypatch.setattr(rd, "READER_ACTIVE_WITHIN_DAYS", 30)
+
+    def _gone(_cur):
+        raise psycopg2.OperationalError("gone")
+
+    monkeypatch.setattr(rd, "_sync_caught_up", _gone)
+    conn, _cur = _mock_conn([])
+    with pytest.raises(psycopg2.OperationalError):
+        rd._refresh_read_filter(conn)
+
+
+@pytest.mark.parametrize("setting, effective, line", [
+    (0, 0, None),
+    (30, 30, "feed reads since the last cycle that earned no slot (READER_ACTIVE_WITHIN_DAYS=30): 5"),
+    (30, 0, "feed reads since the last cycle that earned no slot (READER_ACTIVE_WITHIN_DAYS=30, "
+            "filter off while block processing catches up): 5"),
+])
+def test_the_cycle_line_says_how_many_reads_earned_nothing(monkeypatch, caplog, setting, effective, line):
+    monkeypatch.setattr(rd, "_reads_supported", True)
+    monkeypatch.setattr(rd, "READER_ACTIVE_WITHIN_DAYS", setting)
+    monkeypatch.setattr(rd, "_read_filter_days", effective)
+    monkeypatch.setattr(rd, "_reads_unearned", 5)
+    with caplog.at_level(logging.INFO, logger=rd.log.name):
+        rd._log_feed_read_summary()
+    said = [r.getMessage() for r in caplog.records if "earned no slot" in r.getMessage()]
+    assert said == ([line] if line else [])
+    assert rd._reads_unearned == 0, "the count is per cycle"
 
 
 @pytest.mark.parametrize("raw, ok", [("3", True), ("2", True), ("1", False), (" ", True)])

@@ -546,7 +546,8 @@ def fetch_credibility_sources(conn) -> dict | None:
 #       readers_due
 # On a node that changed either, those three describe a lane the ranker does not run:
 # with a shorter window, accounts the ranker no longer treats as readers are counted
-# here, and their feeds are as old as the rotation.
+# here, and their feeds are as old as the rotation. The same with READER_ACTIVE_WITHIN_DAYS
+# (#84) set: every recorded read is counted, including those that earned no slot.
 READER_FIRST_WINDOW_SECONDS = 24 * 60 * 60
 READER_FIRST_DUE_AFTER_SECONDS = 600
 

@@ -711,8 +711,8 @@ start with a log line naming the variable. The others are held to their range.
 | `READER_WINDOW_SECONDS` | 86400 | How long one read keeps an account eligible for the reader lane. |
 | `READ_REFRESH_MIN_AGE_SECONDS` | 600 | A feed younger than this is not re-ranked on read, and does not take a lane slot. |
 | `READ_REFRESH_MAX_PER_CYCLE` | `MAX_USERS_PER_CYCLE` x `READER_CYCLE_SHARE`, at most 300 | Re-ranks on read per cycle period: between two scheduled cycles, and ahead of their turn during one (a cycle grows by at most this many accounts). 0 turns them off. Between cycles they run in the 300 s the ranker waits: keep this times seconds-per-account well under `CYCLE_SECONDS`, or they start delaying the cycle. |
-| `READER_ACTIVE_WITHIN_DAYS` | 0 | Off at 0. Otherwise a read earns a lane slot or an early re-rank only for an account active on chain within this many days, or with saved interests: a forged read for an account that does not use Hive then costs nothing. It narrows a flood, it does not stop one (tens of thousands of accounts are active on a full node). At 30 days it would have turned away about 1 real reader in 16 on testapi. |
 | `READ_REFRESH_BATCH_SECONDS` | 30 | After one read-triggered re-rank, the next waits this long and takes everyone who became due meanwhile. Each one fetches the candidates before ranking anyone (about 8 s on a full node), so they are grouped. 0 turns the grouping off. |
+| `READER_ACTIVE_WITHIN_DAYS` | 0 | Off at 0; at most 36500. Otherwise a read earns a lane slot or an early re-rank only for an account that voted on or reblogged a post this app tracks within this many days (posting or commenting alone does not count), or that saved interests (interests do not lapse). A forged read for any other account then costs nothing; it is still recorded. It narrows a flood, it does not stop one: 12,888 accounts had voted or reblogged within 30 days on testapi. At 30 days it would have turned away at most 1 of the 16 readers seen there on 2026-10-12. Off by itself while block processing is more than `ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS` behind, when every account looks lapsed; the ranker logs when it turns on and off, and how many reads earned nothing. |
 
 What to expect, and what this does not do:
 
@@ -737,10 +737,10 @@ What to expect, and what this does not do:
   `1 - READER_CYCLE_SHARE` of the old rotation speed, half at the default, for as long
   as it is kept up. That is the worst this can do. Telling a reader from a crawler
   needs an authenticated read, which this app does not have. `READER_ACTIVE_WITHIN_DAYS`
-  narrows it: set, a read counts only for an account active on chain within that many
-  days or with saved interests, so reading accounts that do not use Hive buys nothing.
-  The active accounts of a full node are still far more than a lane holds. During a
-  flood, `READER_CYCLE_SHARE=0` turns the lane off for everyone.
+  narrows it: set, a read counts only for an account that voted or reblogged within
+  that many days or saved interests, so reading other accounts buys nothing. Accounts
+  that vote are still far more than a lane holds. During a flood,
+  `READER_CYCLE_SHARE=0` turns the lane off for everyone.
 * **Paging.** A feed rewritten while someone scrolls can repeat or skip a post between
   page 1 and page 2. Readers' feeds are rewritten more often than others'.
 * **The signal is visible inside the database.** It is a Postgres notification on the
@@ -781,7 +781,10 @@ The 24 h and the 10 min are the defaults of `READER_WINDOW_SECONDS` and
 the defaults, and the section says which (`window_seconds`, `due_after_seconds`). On a
 node that changed either setting, do not apply the rules above to those three: with a
 shorter window they count accounts the ranker no longer treats as readers, and read as
-trouble when there is none.
+trouble when there is none. The same goes for `READER_ACTIVE_WITHIN_DAYS`: with it set,
+the three still count every recorded read, including those that earned no slot, whose
+feeds age at rotation speed. Read the ranker's cycle line instead, which gives the lane
+it took and how many reads earned nothing.
 
 `state` is `ok`, `unsupported` (the installed SQL has no `last_read_at`: re-run the
 install with the block processor and the ranker stopped) or `unknown` (the figures
