@@ -183,12 +183,18 @@ def test_a_local_file_needs_to_be_told_its_release(tmp_path, capsys):
 @pytest.mark.parametrize("env_example, want", [
     ("HIVE_API_NODE_VERSION=1.28.8\n# HAF_FYP_VERSION=${HIVE_API_NODE_VERSION}\n", "1.28.8"),
     ("HIVE_API_NODE_VERSION=1.28.8\nHAF_FYP_VERSION=a9195025\n", "a9195025"),
+    # its own commented line, uncommented as written: the default spelled out
+    ("HIVE_API_NODE_VERSION=1.28.8\nHAF_FYP_VERSION=${HIVE_API_NODE_VERSION}\n", "1.28.8"),
+    ('HIVE_API_NODE_VERSION=1.28.8\nHAF_FYP_VERSION="1.29.0"\n', "1.29.0"),
+    ("HIVE_API_NODE_VERSION='1.28.8'\n", "1.28.8"),
+    ("HIVE_API_NODE_VERSION=1.28.8\nHAF_FYP_VERSION=\n", "1.28.8"),   # set empty: unset
 ])
 def test_the_pinned_release_is_read_from_env_example(env_example, want):
     assert check.pinned_release(env_example) == want
 
 
-@pytest.mark.parametrize("env_example", ["", "HIVE_API_NODE_VERSION=${X}\n"])
+@pytest.mark.parametrize("env_example", ["", "HIVE_API_NODE_VERSION=${X}\n",
+                                         "HIVE_API_NODE_VERSION=1.28.8\nHAF_FYP_VERSION=${OTHER}\n"])
 def test_an_unreadable_pin_is_an_error(env_example):
     with pytest.raises(check.CheckError):
         check.pinned_release(env_example)
@@ -265,6 +271,67 @@ def test_refs_are_checked_before_any_fetch(monkeypatch, capsys, ref):
     monkeypatch.setattr(check.urllib.request, "urlopen", lambda *a, **k: pytest.fail("fetched"))
     assert check.main([f"--ref={ref}"]) == check.EXIT_ERROR
     assert "not a valid git ref" in capsys.readouterr().err
+
+
+RELEASE_WITH_BOUNDS = '''
+A = _tuning("MAX_USERS_PER_CYCLE", "200", int, minimum=0)
+B = _tuning("FEED_EVENTS_MAINT_SECONDS", str(60 * 60), int, minimum=60)
+C = _tuning("READER_ACTIVE_WITHIN_DAYS", "0", int, minimum=0, maximum=36500)
+S = _tuning("READER_CYCLE_SHARE", "0.5", float)
+'''
+
+
+@pytest.mark.parametrize("copied, rc", [("0", 0), ("36500", 1), ("36501", 1)])
+def test_a_copy_above_the_releases_maximum_is_drift(tmp_path, capsys, copied, rc):
+    """36500 is in range but not the release's default (drift for that); 36501 is out of range."""
+    here = RELEASE_WITH_BOUNDS
+    env = {**GOOD, "READER_ACTIVE_WITHIN_DAYS": f"${{HAF_FYP_READER_ACTIVE_WITHIN_DAYS:-{copied}}}"}
+    got, out = _run(tmp_path, capsys, env, release=RELEASE_WITH_BOUNDS, here=here)
+    assert got == rc, out
+    if copied == "36501":
+        assert "outside the pinned release's maximum, 36500" in out
+
+
+def test_the_maximum_itself_is_allowed(tmp_path, capsys):
+    bounded = RELEASE_WITH_BOUNDS.replace('"READER_ACTIVE_WITHIN_DAYS", "0"', '"READER_ACTIVE_WITHIN_DAYS", "36500"')
+    env = {**GOOD, "READER_ACTIVE_WITHIN_DAYS": "${HAF_FYP_READER_ACTIVE_WITHIN_DAYS:-36500}"}
+    got, out = _run(tmp_path, capsys, env, release=bounded, here=bounded)
+    assert got == check.EXIT_OK, out
+
+
+def test_a_wrong_form_for_a_setting_only_the_release_reads_is_drift(tmp_path, capsys):
+    """This checkout dropped it; the pinned image still reads it, so a literal there counts."""
+    here = HERE.replace('B = _tuning("FEED_EVENTS_MAINT_SECONDS", str(60 * 60), int, minimum=60)\n', "")
+    rc, out = _run(tmp_path, capsys, {**GOOD, "FEED_EVENTS_MAINT_SECONDS": "3600"}, here=here)
+    assert rc == check.EXIT_DRIFT and "not as ${HAF_FYP_FEED_EVENTS_MAINT_SECONDS" in out, out
+
+
+def test_the_pin_is_read_from_the_ref_being_checked(monkeypatch, capsys):
+    """--ref feat/x must judge feat/x by feat/x's own .env.example, not develop's."""
+    urls = []
+    bodies = {
+        "haf_fyp.yaml": _yaml(GOOD),
+        ".env.example": "HIVE_API_NODE_VERSION=1.28.8\n",
+        "ranker_daemon.py": RELEASE,
+    }
+
+    def _open(url, timeout):
+        urls.append(url)
+        return _Resp(next(b for k, b in bodies.items() if url.endswith(k)), "text/plain; charset=utf-8")
+
+    monkeypatch.setattr(check.urllib.request, "urlopen", _open)
+    assert check.main(["--ref", "feat/x"]) == check.EXIT_OK, capsys.readouterr()
+    assert "https://gitlab.syncad.com/hive/haf_api_node/-/raw/feat/x/.env.example" in urls
+    assert "https://gitlab.syncad.com/hive/haf_fyp/-/raw/1.28.8/haf_fyp/ranker_daemon.py" in urls
+    assert "the version it pins" in capsys.readouterr().out
+
+
+def test_a_release_given_by_hand_is_not_called_the_pinned_one(tmp_path, capsys):
+    (tmp_path / "haf_fyp.yaml").write_text(_yaml(GOOD), encoding="utf-8")
+    (tmp_path / "r.py").write_text(RELEASE, encoding="utf-8")
+    assert check.main(["--file", str(tmp_path / "haf_fyp.yaml"), "--release", "1.28.8",
+                       "--release-ranker", str(tmp_path / "r.py")]) == check.EXIT_OK
+    assert "the version it pins" not in capsys.readouterr().out
 
 
 # The job, held like haf-shim-drift-develop's: red and never quietly orange, on the schedule

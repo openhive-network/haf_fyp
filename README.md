@@ -1488,6 +1488,11 @@ of the three, so open the failed job:
 | `haf-shim-drift-develop` | hive/haf's compatibility shim changed since `tests/unit/data/haf_shim_ledger.json` was written (#52) | the ledger here, after reading the change |
 | `haf-api-node-ranker-settings` | hive/haf_api_node's `haf_fyp.yaml` passes a ranker setting with a name or default that is wrong for the haf_fyp release it pins (#87). Changes on this repository's develop are only printed, as pending for its next version bump | hive/haf_api_node |
 
+Each of the three is also red when it cannot run at all (a registry or `gitlab.syncad.com`
+unreachable); the job log says which. The pending lines of `haf-api-node-ranker-settings` are
+in a green job's log, so read them when preparing haf_api_node's `HAF_FYP_VERSION` bump:
+the job turns red only after that bump has merged, at the next schedule.
+
 Worth knowing before creating it: a scheduled pipeline is a pipeline for the default branch's
 head, so it shows in that branch's status like any other. A red sweep turns `develop` red
 until the next push, and a green one can sit on top of a red push pipeline; its failure mail

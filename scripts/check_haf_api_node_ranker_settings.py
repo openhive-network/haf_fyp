@@ -115,8 +115,16 @@ def passed_settings(text: str, known: set) -> dict:
 
 
 def pinned_release(env_example: str) -> str:
-    """The haf_fyp version a stock haf_api_node node runs."""
-    found = dict(re.findall(r"(?m)^(HAF_FYP_VERSION|HIVE_API_NODE_VERSION)=(\S+)", env_example))
+    """The haf_fyp version a stock haf_api_node node runs: HAF_FYP_VERSION if its
+    .env.example sets it, else HIVE_API_NODE_VERSION -- the order haf_fyp.yaml's image
+    tag uses. A node whose own .env sets another runs another image; this cannot see it."""
+    found = {}
+    for name, value in re.findall(r"(?m)^(HAF_FYP_VERSION|HIVE_API_NODE_VERSION)=(\S*)", env_example):
+        found[name] = value.strip("'\"")
+    # Its own commented-out line is `HAF_FYP_VERSION=${HIVE_API_NODE_VERSION}`: uncommented,
+    # that is the default spelled out, and compose resolves it so.
+    if found.get("HAF_FYP_VERSION") in ("${HIVE_API_NODE_VERSION}", "$HIVE_API_NODE_VERSION"):
+        found["HAF_FYP_VERSION"] = found.get("HIVE_API_NODE_VERSION", "")
     ref = found.get("HAF_FYP_VERSION") or found.get("HIVE_API_NODE_VERSION")
     if not ref or not _REF.fullmatch(ref):
         raise CheckError(f"cannot tell which haf_fyp version haf_api_node pins (found {found})")
@@ -132,15 +140,18 @@ def _against(r: Ranker, name: str, default: str) -> str | None:
     want = r.defaults[name]
     if want is COMPUTED:
         return f"{r.label} computes its default; a copied {default!r} is wrong once the settings it follows change"
-    if default != want:
-        return f"haf_api_node's default is {default!r}, {r.label}'s is {want!r}"
+    # Bounds first: a copy outside them stops the ranker at start, which matters more
+    # than that it differs (and the release's own default is always inside them).
     for bound, bad in (("minimum", lambda v, b: v < b), ("maximum", lambda v, b: v > b)):
         if name in getattr(r, bound):
             try:
                 if bad(float(default), getattr(r, bound)[name]):
-                    return f"{default!r} is outside {r.label}'s {bound}, {getattr(r, bound)[name]}"
+                    return (f"{default!r} is outside {r.label}'s {bound}, {getattr(r, bound)[name]}: "
+                            "the ranker would refuse to start")
             except ValueError:
                 return f"{default!r} is not a number"
+    if default != want:
+        return f"haf_api_node's default is {default!r}, {r.label}'s is {want!r}"
     return None
 
 
@@ -163,7 +174,7 @@ def compare(release: Ranker, here: Ranker, passed: dict) -> tuple[list, list, li
             why = _against(here, name, default)
             if why:
                 pending.append(f"{name}: {why}")
-        elif name in release.defaults:
+        elif name in release.defaults and name not in here.reads:
             pending.append(f"{name}: {here.label} no longer reads it")
     not_passed = sorted(n for n, d in here.defaults.items() if d is not COMPUTED and n not in passed)
     return drift, pending, not_passed
@@ -191,6 +202,7 @@ def _run(args) -> int:
     else:
         text = fetch(NODE_RAW.format(ref=args.ref, path="haf_fyp.yaml"))
         label = f"hive/haf_api_node@{args.ref}"
+    pinned = args.release is None and not args.release_ranker
     if args.release_ranker:
         release = parse_ranker(args.release_ranker.read_text(encoding="utf-8"), "the pinned release")
     else:
@@ -202,7 +214,7 @@ def _run(args) -> int:
         release = parse_ranker(fetch(FYP_RAW.format(ref=ref)), f"haf_fyp {ref}")
     drift, pending, not_passed = compare(release, here, passed_settings(text, release.reads | here.reads))
 
-    print(f"{label}, judged against {release.label}, the version it pins")
+    print(f"{label}, judged against {release.label}" + (", the version it pins" if pinned else ""))
     if not_passed:
         print(f"not passed yet: {', '.join(not_passed)}")
     for line in pending:
