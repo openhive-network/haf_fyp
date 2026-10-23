@@ -1936,6 +1936,40 @@ def test_the_readme_table_shows_the_daemons_defaults():
         assert f"| `{name}` | {shown[name]} |" in readme, f"README and docker/.env disagree on {name}"
 
 
+def _coded_minimums() -> dict:
+    """{name: minimum} as written in ranker_daemon.py's _tuning() calls."""
+    import ast
+
+    out = {}
+    for node in ast.walk(ast.parse(RANKER_SOURCE.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "_tuning":
+            kw = {k.arg: k.value for k in node.keywords}
+            if "minimum" in kw:
+                out[node.args[0].value] = ast.literal_eval(kw["minimum"])
+    return out
+
+
+RETENTION = ("FEED_EVENTS_MAINT_SECONDS", "FEED_EVENTS_RETAIN_DAYS", "FEED_EVENTS_MAX_ROWS",
+             "EMBEDDING_COVERAGE_DAYS", "ACTIVE_USERS_MAX_EVICTIONS",
+             "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS")
+
+
+def test_the_readme_retention_table_shows_the_daemons_defaults_and_minimums():
+    """The same drift guard as the reader table's, plus the Minimum column, which is read
+    from the code's minimum= so a changed minimum cannot leave the README behind."""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    shown = dict(re.findall(r"(?m)^# ([A-Z_]+)=(\S*)$", ENV_FILE.read_text(encoding="utf-8")))
+    minimums = _coded_minimums()
+    rows = re.findall(r"(?m)^\| `([A-Z_]+)` \| ([^|]*) \| ([^|]*) \| [^|]+ \|$", readme)
+    table = {name: (default, minimum) for name, default, minimum in rows if name in RETENTION}
+    assert sorted(table) == sorted(RETENTION), (
+        f"README's retention table lists {sorted(table)}, not the six")
+    for name in RETENTION:
+        assert table[name] == (shown[name], str(minimums[name])), (
+            f"README shows {name} as {table[name]}; docker/.env and the code say "
+            f"({shown[name]!r}, {str(minimums[name])!r})")
+
+
 def test_the_documented_recreate_command_reads_the_operators_file_and_builds():
     """Without --env-file the value just set is ignored; without --build a ranker image
     from before #87 runs, and stops on a blank line; without --no-deps `up` reaches haf."""

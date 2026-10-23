@@ -966,7 +966,7 @@ def settings():
         },
         "retention_set": {name: str(value + 1) for name, value in RETENTION.items()},
         "at_the_minimums": {
-            "MAX_USERS_PER_CYCLE": "1",
+            "MAX_USERS_PER_CYCLE": "0",
             "FEED_EVENTS_MAINT_SECONDS": "60",
             "FEED_EVENTS_RETAIN_DAYS": "1",
             "FEED_EVENTS_MAX_ROWS": "1",
@@ -1022,9 +1022,46 @@ def test_the_retention_settings_are_read_from_the_environment(settings):
     assert {name: got[name] for name in RETENTION} == {n: v + 1 for n, v in RETENTION.items()}
 
 
+def test_counts_stay_whole_numbers(settings):
+    """They reach SQL functions declared int / bigint, and 20000000.0 == 20000000 in Python:
+    read as a float, the prune would be called with a numeric and fail every pass, and the
+    flood ceiling on the events table with it. JSON keeps the difference."""
+    for case in ("defaults", "blank_in_env_file", "retention_set", "at_the_minimums"):
+        for name in (*RETENTION, "MAX_USERS_PER_CYCLE", "READ_REFRESH_MAX_PER_CYCLE"):
+            assert type(settings[case][name]) is int, (case, name)
+
+
+def test_main_says_so_before_it_ranks_anything():
+    """The warning is only worth having if main() gives it, and gives it at start."""
+    import ast
+    import inspect
+
+    body = ast.parse(inspect.getsource(rd.main)).body[0].body
+    calls = [ast.unparse(stmt.value.func) for stmt in body
+             if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)]
+    assert "_warn_if_nothing_is_ranked_on_schedule" in calls, "main() does not warn"
+    assert calls.index("_warn_if_nothing_is_ranked_on_schedule") < calls.index("_install_stop_handler")
+
+
+@pytest.mark.parametrize("cycle, warned", [(0, True), (1, False), (200, False)])
+def test_no_scheduled_ranking_is_said_at_start(monkeypatch, caplog, cycle, warned):
+    monkeypatch.setattr(rd, "MAX_USERS_PER_CYCLE", cycle)
+    monkeypatch.setattr(rd, "READ_REFRESH_MAX_PER_CYCLE", 7)
+    with caplog.at_level(logging.WARNING, logger=rd.log.name):
+        rd._warn_if_nothing_is_ranked_on_schedule()
+    said = [r.getMessage() for r in caplog.records]
+    if warned:
+        assert said == ["MAX_USERS_PER_CYCLE=0: no personal feed is refreshed on schedule; only "
+                        "the global feed, opt-in refreshes and up to 7 read-triggered re-rank(s) "
+                        "per cycle (READ_REFRESH_MAX_PER_CYCLE) run"]
+    else:
+        assert said == []
+
+
 def test_a_setting_at_its_minimum_is_taken(settings):
     got = settings["at_the_minimums"]
-    assert got["MAX_USERS_PER_CYCLE"] == 1
+    assert got["MAX_USERS_PER_CYCLE"] == 0
+    assert got["READ_REFRESH_MAX_PER_CYCLE"] == 0  # its default follows the cycle size
     assert got["FEED_EVENTS_MAINT_SECONDS"] == 60
     assert got["ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS"] == 0
     for name in ("FEED_EVENTS_RETAIN_DAYS", "FEED_EVENTS_MAX_ROWS", "EMBEDDING_COVERAGE_DAYS",
@@ -1033,8 +1070,8 @@ def test_a_setting_at_its_minimum_is_taken(settings):
 
 
 @pytest.mark.parametrize("name, value", [
-    # 0 ranked nobody and said nothing; a negative value reached a LIMIT.
-    ("MAX_USERS_PER_CYCLE", "0"),
+    # A negative value reached a LIMIT and failed every cycle. (0 is a mode: see below.)
+    ("MAX_USERS_PER_CYCLE", "-1"),
     ("MAX_USERS_PER_CYCLE", "-5"),
     # The maintenance pass, with its multi-second scan, on every five-second poll.
     ("FEED_EVENTS_MAINT_SECONDS", "59"),
