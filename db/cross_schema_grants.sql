@@ -30,15 +30,45 @@
 --   btracker_backend — same balances, block-explorer layout (a VIEW)
 --   hafbe_bal        — same balances, block-explorer layout
 --   hafd             — core HAF accounts table (name → id resolution)
+--
+-- Concurrent catalog updates (#90): GRANT ... ON ALL TABLES IN SCHEMA s rewrites the
+-- pg_class row (relacl) of every table in s. When another session updates one of those
+-- same rows at the same moment -- another app's installer granting on its own schema,
+-- that app's own maintenance -- PostgreSQL raises XX000 "tuple concurrently updated".
+-- psql runs this file with ON_ERROR_STOP, so one such collision used to fail the whole
+-- install (exit 3) although a retry seconds later succeeds. Each schema-guarded block
+-- below therefore runs its grants in a retry loop: up to 5 attempts, each in its own
+-- subtransaction (the BEGIN ... EXCEPTION block), sleeping 0.5 s, 1 s, 2 s, 4 s between
+-- them. ONLY that one error is retried -- the handler catches internal_error (XX000) and
+-- re-raises unless SQLERRM is exactly 'tuple concurrently updated' -- and it is re-raised
+-- after the last attempt, so every other failure still reaches ON_ERROR_STOP at once.
+-- The grants are idempotent, so repeating them after a rolled-back attempt is safe. The
+-- success NOTICE stays after the loop, so a retried block still prints it exactly once.
 
 DO $$
+DECLARE
+    _attempt      int := 0;
+    _max_attempts CONSTANT int := 5;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata
         WHERE schema_name = 'hivesense_app'
     ) THEN
-        GRANT USAGE ON SCHEMA hivesense_app TO haf_fyp_user, haf_fyp_owner;
-        GRANT SELECT ON ALL TABLES IN SCHEMA hivesense_app TO haf_fyp_user, haf_fyp_owner;
+        LOOP
+            _attempt := _attempt + 1;
+            BEGIN
+                GRANT USAGE ON SCHEMA hivesense_app TO haf_fyp_user, haf_fyp_owner;
+                GRANT SELECT ON ALL TABLES IN SCHEMA hivesense_app TO haf_fyp_user, haf_fyp_owner;
+                EXIT;
+            EXCEPTION WHEN internal_error THEN
+                IF SQLERRM <> 'tuple concurrently updated' OR _attempt >= _max_attempts THEN
+                    RAISE;
+                END IF;
+                RAISE NOTICE 'hivesense_app: tuple concurrently updated (attempt % of %), retrying in % s',
+                    _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
+            END;
+        END LOOP;
         RAISE NOTICE 'hivesense_app: granted SELECT to haf_fyp_user, haf_fyp_owner';
     ELSE
         RAISE NOTICE 'hivesense_app not found — install HiveSense then re-run grant_cross_schema.sh';
@@ -58,23 +88,39 @@ $$;
 -- SECURITY INVOKER and run as the caller). GRANT SELECT ON ALL TABLES covers
 -- views such as hive_accounts_view that those builders read.
 DO $$
+DECLARE
+    _attempt      int := 0;
+    _max_attempts CONSTANT int := 5;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata
         WHERE schema_name = 'hivemind_app'
     ) THEN
-        GRANT USAGE ON SCHEMA hivemind_app TO haf_fyp_user;
-        GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_app TO haf_fyp_user;
-        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_app TO haf_fyp_user;
-        -- The block processor (haf_fyp_owner) also resolves (author, permlink) ->
-        -- hive_posts.id via resolve_hivemind_post_ids() to precompute
-        -- post_candidates.hive_post_id, so it needs read access to the three bridge
-        -- tables (hive_accounts / hive_permlink_data / hive_posts). SELECT on ALL
-        -- TABLES covers them; the resolver is exception-guarded, so it degrades to a
-        -- no-op if this grant has not been applied yet.
-        GRANT USAGE ON SCHEMA hivemind_app TO haf_fyp_owner;
-        GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_app TO haf_fyp_owner;
-        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_app TO haf_fyp_owner;
+        LOOP
+            _attempt := _attempt + 1;
+            BEGIN
+                GRANT USAGE ON SCHEMA hivemind_app TO haf_fyp_user;
+                GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_app TO haf_fyp_user;
+                GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_app TO haf_fyp_user;
+                -- The block processor (haf_fyp_owner) also resolves (author, permlink) ->
+                -- hive_posts.id via resolve_hivemind_post_ids() to precompute
+                -- post_candidates.hive_post_id, so it needs read access to the three bridge
+                -- tables (hive_accounts / hive_permlink_data / hive_posts). SELECT on ALL
+                -- TABLES covers them; the resolver is exception-guarded, so it degrades to a
+                -- no-op if this grant has not been applied yet.
+                GRANT USAGE ON SCHEMA hivemind_app TO haf_fyp_owner;
+                GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_app TO haf_fyp_owner;
+                GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_app TO haf_fyp_owner;
+                EXIT;
+            EXCEPTION WHEN internal_error THEN
+                IF SQLERRM <> 'tuple concurrently updated' OR _attempt >= _max_attempts THEN
+                    RAISE;
+                END IF;
+                RAISE NOTICE 'hivemind_app: tuple concurrently updated (attempt % of %), retrying in % s',
+                    _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
+            END;
+        END LOOP;
         RAISE NOTICE 'hivemind_app: granted SELECT + EXECUTE to haf_fyp_user, SELECT to haf_fyp_owner';
     ELSE
         RAISE NOTICE 'hivemind_app not found — install Hivemind then re-run grant_cross_schema.sh';
@@ -99,14 +145,30 @@ $$;
 -- SELECT ON ALL TABLES here too, and the self-healing pass at the bottom of this
 -- file keeps it granted across recreations.
 DO $$
+DECLARE
+    _attempt      int := 0;
+    _max_attempts CONSTANT int := 5;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata
         WHERE schema_name = 'hivemind_postgrest_utilities'
     ) THEN
-        GRANT USAGE ON SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
-        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
-        GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
+        LOOP
+            _attempt := _attempt + 1;
+            BEGIN
+                GRANT USAGE ON SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
+                GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
+                GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
+                EXIT;
+            EXCEPTION WHEN internal_error THEN
+                IF SQLERRM <> 'tuple concurrently updated' OR _attempt >= _max_attempts THEN
+                    RAISE;
+                END IF;
+                RAISE NOTICE 'hivemind_postgrest_utilities: tuple concurrently updated (attempt % of %), retrying in % s',
+                    _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
+            END;
+        END LOOP;
         RAISE NOTICE 'hivemind_postgrest_utilities: granted EXECUTE + SELECT to haf_fyp_user, haf_fyp_owner';
     ELSE
         RAISE NOTICE 'hivemind_postgrest_utilities not found — install Hivemind then re-run grant_cross_schema.sh';
@@ -115,13 +177,29 @@ END
 $$;
 
 DO $$
+DECLARE
+    _attempt      int := 0;
+    _max_attempts CONSTANT int := 5;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata
         WHERE schema_name = 'reptracker_app'
     ) THEN
-        GRANT USAGE ON SCHEMA reptracker_app TO haf_fyp_user, haf_fyp_owner;
-        GRANT SELECT ON ALL TABLES IN SCHEMA reptracker_app TO haf_fyp_user, haf_fyp_owner;
+        LOOP
+            _attempt := _attempt + 1;
+            BEGIN
+                GRANT USAGE ON SCHEMA reptracker_app TO haf_fyp_user, haf_fyp_owner;
+                GRANT SELECT ON ALL TABLES IN SCHEMA reptracker_app TO haf_fyp_user, haf_fyp_owner;
+                EXIT;
+            EXCEPTION WHEN internal_error THEN
+                IF SQLERRM <> 'tuple concurrently updated' OR _attempt >= _max_attempts THEN
+                    RAISE;
+                END IF;
+                RAISE NOTICE 'reptracker_app: tuple concurrently updated (attempt % of %), retrying in % s',
+                    _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
+            END;
+        END LOOP;
         RAISE NOTICE 'reptracker_app: granted SELECT to haf_fyp_user, haf_fyp_owner';
     ELSE
         RAISE NOTICE 'reptracker_app not found — install reputation_tracker then re-run grant_cross_schema.sh';
@@ -130,13 +208,29 @@ END
 $$;
 
 DO $$
+DECLARE
+    _attempt      int := 0;
+    _max_attempts CONSTANT int := 5;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata
         WHERE schema_name = 'btracker_app'
     ) THEN
-        GRANT USAGE ON SCHEMA btracker_app TO haf_fyp_user, haf_fyp_owner;
-        GRANT SELECT ON ALL TABLES IN SCHEMA btracker_app TO haf_fyp_user, haf_fyp_owner;
+        LOOP
+            _attempt := _attempt + 1;
+            BEGIN
+                GRANT USAGE ON SCHEMA btracker_app TO haf_fyp_user, haf_fyp_owner;
+                GRANT SELECT ON ALL TABLES IN SCHEMA btracker_app TO haf_fyp_user, haf_fyp_owner;
+                EXIT;
+            EXCEPTION WHEN internal_error THEN
+                IF SQLERRM <> 'tuple concurrently updated' OR _attempt >= _max_attempts THEN
+                    RAISE;
+                END IF;
+                RAISE NOTICE 'btracker_app: tuple concurrently updated (attempt % of %), retrying in % s',
+                    _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
+            END;
+        END LOOP;
         RAISE NOTICE 'btracker_app: granted SELECT to haf_fyp_user, haf_fyp_owner';
     ELSE
         RAISE NOTICE 'btracker_app not found — install balance_tracker then re-run grant_cross_schema.sh';
@@ -151,20 +245,49 @@ $$;
 DO $$
 DECLARE
     _found int := 0;
+    _attempt      int := 0;
+    _max_attempts CONSTANT int := 5;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata WHERE schema_name = 'btracker_backend'
     ) THEN
-        GRANT USAGE ON SCHEMA btracker_backend TO haf_fyp_user, haf_fyp_owner;
-        GRANT SELECT ON ALL TABLES IN SCHEMA btracker_backend TO haf_fyp_user, haf_fyp_owner;
+        LOOP
+            _attempt := _attempt + 1;
+            BEGIN
+                GRANT USAGE ON SCHEMA btracker_backend TO haf_fyp_user, haf_fyp_owner;
+                GRANT SELECT ON ALL TABLES IN SCHEMA btracker_backend TO haf_fyp_user, haf_fyp_owner;
+                EXIT;
+            EXCEPTION WHEN internal_error THEN
+                IF SQLERRM <> 'tuple concurrently updated' OR _attempt >= _max_attempts THEN
+                    RAISE;
+                END IF;
+                RAISE NOTICE 'btracker_backend: tuple concurrently updated (attempt % of %), retrying in % s',
+                    _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
+            END;
+        END LOOP;
         RAISE NOTICE 'btracker_backend: granted SELECT to haf_fyp_user, haf_fyp_owner';
         _found := _found + 1;
     END IF;
+    _attempt := 0;
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata WHERE schema_name = 'hafbe_bal'
     ) THEN
-        GRANT USAGE ON SCHEMA hafbe_bal TO haf_fyp_user, haf_fyp_owner;
-        GRANT SELECT ON ALL TABLES IN SCHEMA hafbe_bal TO haf_fyp_user, haf_fyp_owner;
+        LOOP
+            _attempt := _attempt + 1;
+            BEGIN
+                GRANT USAGE ON SCHEMA hafbe_bal TO haf_fyp_user, haf_fyp_owner;
+                GRANT SELECT ON ALL TABLES IN SCHEMA hafbe_bal TO haf_fyp_user, haf_fyp_owner;
+                EXIT;
+            EXCEPTION WHEN internal_error THEN
+                IF SQLERRM <> 'tuple concurrently updated' OR _attempt >= _max_attempts THEN
+                    RAISE;
+                END IF;
+                RAISE NOTICE 'hafbe_bal: tuple concurrently updated (attempt % of %), retrying in % s',
+                    _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
+            END;
+        END LOOP;
         RAISE NOTICE 'hafbe_bal: granted SELECT to haf_fyp_user, haf_fyp_owner';
         _found := _found + 1;
     END IF;
