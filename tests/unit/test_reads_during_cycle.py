@@ -45,7 +45,7 @@ class _Reads:
 
 def _cycle(
     monkeypatch, users, reads, *, per_account=0.0, clock=None, evict=(), fail=(),
-    absent=(), closed=0, members=None,
+    absent=(), closed=0, members=None, seen=None,
 ):
     """run_cycle with everything around the per-account loop stubbed. Each account
     takes `per_account` seconds of the clock. Returns (result, order ranked, conn,
@@ -59,6 +59,7 @@ def _cycle(
     conn, _ = _mock_conn([])
     conn.closed = closed
     order = []
+    seen = {} if seen is None else seen
     opted_out, no_row = set(evict) if not callable(evict) else set(), set(absent)
     if isinstance(reads, _Reads):
         reads.opted_out = opted_out
@@ -89,16 +90,19 @@ def _cycle(
     monkeypatch.setattr(
         rd, "_rotation_members", members or (lambda _c, names: set(names) - no_row)
     )
-    monkeypatch.setattr(
-        rd, "_fetch_personalised_users", lambda _c, _limit: [u for u in users if u not in no_row]
-    )
+    def _personalised(_c, limit):
+        seen.setdefault("limits", []).append(limit)
+        return [u for u in users if u not in no_row][:limit]
+
+    monkeypatch.setattr(rd, "_fetch_personalised_users", _personalised)
     monkeypatch.setattr(rd, "_fetch_algorithm", lambda _c: ("1.0.0", {}))
     monkeypatch.setattr(
         rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
     )
     monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
-    monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)
+    monkeypatch.setattr(rd, "write_global_feed_cache",
+                        lambda *a, **k: seen.setdefault("global", []).append(a))
     monkeypatch.setattr(rd, "compute_scores", lambda **k: pd.DataFrame())
     monkeypatch.setattr(rd, "_log_user_failure", lambda _u, _e: None)
     monkeypatch.setattr(rd, "_rank_user", _rank)
@@ -187,6 +191,20 @@ def test_a_reader_heard_after_the_last_account_is_still_ranked_by_this_cycle(mon
 
     assert order == ["u1", "zed"]
     assert result == {"u1", "zed"}
+
+
+@pytest.mark.parametrize("reads, ranked", [(set(), []), ({"zed"}, ["zed"])])
+def test_a_cycle_of_size_zero_still_writes_the_global_feed_and_serves_a_reader(
+        monkeypatch, reads, ranked):
+    """MAX_USERS_PER_CYCLE=0 is a mode (#87): the cycle asks for no account, and still
+    writes the global feed and ranks whoever reads hands it."""
+    monkeypatch.setattr(rd, "MAX_USERS_PER_CYCLE", 0)
+    seen = {}
+    result, order, _conn, _ = _cycle(monkeypatch, ["u1", "u2"], _Reads([reads]), seen=seen)
+
+    assert len(seen.get("global", [])) == 1, "the global feed was not written"
+    assert seen["limits"] and set(seen["limits"]) == {0}, seen.get("limits")
+    assert order == ranked and result == set(ranked)
 
 
 def test_a_cycle_with_nobody_in_the_rotation_still_serves_a_reader(monkeypatch, caplog):

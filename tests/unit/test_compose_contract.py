@@ -1745,21 +1745,20 @@ TUNING = {
     "READ_REFRESH_MIN_AGE_SECONDS",
     "READ_REFRESH_MAX_PER_CYCLE",
     "READ_REFRESH_BATCH_SECONDS",
-}
-
-# Read by the ranker and deliberately NOT passed by docker-compose.yml: retention and
-# maintenance settings nobody has needed to change, and two connection settings whose
-# defaults are the stack's own. Passing one is fine -- take it off this list, and read
-# it through something that survives an empty value.
-RANKER_READS_NOT_PASSED = {
-    "POSTGRES_PASSWORD",
-    "POSTGRES_PORT",
     "FEED_EVENTS_MAINT_SECONDS",
     "FEED_EVENTS_RETAIN_DAYS",
     "FEED_EVENTS_MAX_ROWS",
     "EMBEDDING_COVERAGE_DAYS",
     "ACTIVE_USERS_MAX_EVICTIONS",
     "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS",
+}
+
+# Read by the ranker and deliberately NOT passed by docker-compose.yml: two connection
+# settings whose defaults are the stack's own. Passing one is fine -- take it off this
+# list, and read it through something that survives an empty value.
+RANKER_READS_NOT_PASSED = {
+    "POSTGRES_PASSWORD",
+    "POSTGRES_PORT",
 }
 
 _ENV_READERS = ("_tuning", "os.environ.get", "os.getenv", "env_or_default")
@@ -1820,7 +1819,7 @@ def _ranker_environment(services) -> dict:
     return env
 
 
-def test_the_tuning_variables_are_the_documented_six():
+def test_the_tuning_variables_are_the_documented_ones():
     assert _ranker_env_reads()["_tuning"] == TUNING
 
 
@@ -1935,6 +1934,55 @@ def test_the_readme_table_shows_the_daemons_defaults():
     for name in ("MAX_USERS_PER_CYCLE", "READER_CYCLE_SHARE", "READER_WINDOW_SECONDS",
                  "READ_REFRESH_MIN_AGE_SECONDS", "READ_REFRESH_BATCH_SECONDS"):
         assert f"| `{name}` | {shown[name]} |" in readme, f"README and docker/.env disagree on {name}"
+
+
+def _coded_minimums() -> dict:
+    """{name: minimum} as written in ranker_daemon.py's _tuning() calls."""
+    import ast
+
+    out = {}
+    for node in ast.walk(ast.parse(RANKER_SOURCE.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "_tuning":
+            kw = {k.arg: k.value for k in node.keywords}
+            if "minimum" in kw:
+                out[node.args[0].value] = ast.literal_eval(kw["minimum"])
+    return out
+
+
+RETENTION = ("FEED_EVENTS_MAINT_SECONDS", "FEED_EVENTS_RETAIN_DAYS", "FEED_EVENTS_MAX_ROWS",
+             "EMBEDDING_COVERAGE_DAYS", "ACTIVE_USERS_MAX_EVICTIONS",
+             "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS")
+
+
+def test_the_readme_retention_table_shows_the_daemons_defaults_and_minimums():
+    """The same drift guard as the reader table's, plus the Minimum column, which is read
+    from the code's minimum= so a changed minimum cannot leave the README behind."""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    shown = dict(re.findall(r"(?m)^# ([A-Z_]+)=(\S*)$", ENV_FILE.read_text(encoding="utf-8")))
+    minimums = _coded_minimums()
+    rows = re.findall(r"(?m)^\| `([A-Z_]+)` \| ([^|]*) \| ([^|]*) \| [^|]+ \|$", readme)
+    table = {name: (default, minimum) for name, default, minimum in rows if name in RETENTION}
+    assert sorted(table) == sorted(RETENTION), (
+        f"README's retention table lists {sorted(table)}, not the six")
+    for name in RETENTION:
+        assert table[name] == (shown[name], str(minimums[name])), (
+            f"README shows {name} as {table[name]}; docker/.env and the code say "
+            f"({shown[name]!r}, {str(minimums[name])!r})")
+
+
+def test_the_retention_section_follows_the_reader_material_at_its_own_level():
+    """Inserted as a sub-heading after the reader table, it once took over the reader-first
+    material below it (what to expect, the cycle log line, the /metrics fields)."""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    headings = re.findall(r"(?m)^(#{2,4}) (.+)$", readme)
+    names = [name for _, name in headings]
+    fresh, retention = names.index("How fresh a feed is"), names.index("Retention and maintenance")
+    assert headings[retention][0] == headings[fresh][0], "not at the reader section's level"
+    assert all(level.startswith("####") for level, _ in headings[fresh + 1:retention]), (
+        "a heading between the reader section and the retention one")
+    reader_text = readme[readme.index("### How fresh a feed is"):readme.index("### Retention and maintenance")]
+    for marker in ("What to expect", "`readers_due`"):
+        assert marker in reader_text, f"{marker!r} is no longer under 'How fresh a feed is'"
 
 
 def test_the_documented_recreate_command_reads_the_operators_file_and_builds():

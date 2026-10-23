@@ -25,8 +25,11 @@ def _sql_calls(cur):
     return [c.args[0] for c in cur.execute.call_args_list]
 
 
-def test_rolls_up_before_pruning_and_commits():
+def test_rolls_up_before_pruning_and_commits(monkeypatch):
     conn, cur = _mock_conn((123,))
+    # Unusual values, so a literal default written at the call cannot pass by coincidence.
+    monkeypatch.setattr(rd, "FEED_EVENTS_RETAIN_DAYS", 3)
+    monkeypatch.setattr(rd, "FEED_EVENTS_MAX_ROWS", 77)
     rd._run_feed_events_maintenance(conn)
 
     calls = _sql_calls(cur)
@@ -35,7 +38,7 @@ def test_rolls_up_before_pruning_and_commits():
     assert roll < prune, "rollup must run before prune (capture aggregates before deleting raw)"
 
     prune_call = next(c for c in cur.execute.call_args_list if "prune_feed_events" in c.args[0])
-    assert prune_call.args[1] == (rd.FEED_EVENTS_RETAIN_DAYS, rd.FEED_EVENTS_MAX_ROWS)
+    assert prune_call.args[1] == (3, 77)
 
     conn.commit.assert_called_once()
     conn.rollback.assert_not_called()
@@ -65,17 +68,18 @@ def test_reraises_operational_error_for_reconnect():
 # --------------------------------------------------------------------------
 
 
-def test_sweeps_then_repairs_in_one_transaction():
+def test_sweeps_then_repairs_in_one_transaction(monkeypatch):
     conn, cur = _mock_conn()
     # (last_processed_block, chain head) for the sync gate, then the eviction
     # count, then the repair count.
     cur.fetchone.side_effect = [(10_000_000, 10_000_000), (3,), (0,)]
+    monkeypatch.setattr(rd, "ACTIVE_USERS_MAX_EVICTIONS", 7)
     rd._run_active_users_maintenance(conn)
 
     evict_call = next(
         c for c in cur.execute.call_args_list if "evict_unproductive_users" in c.args[0]
     )
-    assert evict_call.args[1] == (rd.ACTIVE_USERS_MAX_EVICTIONS,)
+    assert evict_call.args[1] == (7,)
 
     calls = _sql_calls(cur)
     evict = next(i for i, s in enumerate(calls) if "evict_unproductive_users" in s)
