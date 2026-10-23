@@ -193,6 +193,16 @@ def test_a_reader_heard_after_the_last_account_is_still_ranked_by_this_cycle(mon
     assert result == {"u1", "zed"}
 
 
+def test_the_cycle_refreshes_the_read_filter_before_it_takes_anyone(monkeypatch):
+    """Without the call the setting would do nothing: the filter would stay at 0."""
+    events = []
+    monkeypatch.setattr(rd, "_refresh_read_filter", lambda _c: events.append("refresh"))
+    # The reconcile runs on the users the cycle fetched, so it marks "after the fetch".
+    _cycle(monkeypatch, ["u1"], _Reads([]), evict=lambda _c, names: events.append("users") or set())
+
+    assert events and events[0] == "refresh", events
+
+
 @pytest.mark.parametrize("reads, ranked", [(set(), []), ({"zed"}, ["zed"])])
 def test_a_cycle_of_size_zero_still_writes_the_global_feed_and_serves_a_reader(
         monkeypatch, reads, ranked):

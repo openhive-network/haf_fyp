@@ -712,6 +712,7 @@ start with a log line naming the variable. The others are held to their range.
 | `READ_REFRESH_MIN_AGE_SECONDS` | 600 | A feed younger than this is not re-ranked on read, and does not take a lane slot. |
 | `READ_REFRESH_MAX_PER_CYCLE` | `MAX_USERS_PER_CYCLE` x `READER_CYCLE_SHARE`, at most 300 | Re-ranks on read per cycle period: between two scheduled cycles, and ahead of their turn during one (a cycle grows by at most this many accounts). 0 turns them off. Between cycles they run in the 300 s the ranker waits: keep this times seconds-per-account well under `CYCLE_SECONDS`, or they start delaying the cycle. |
 | `READ_REFRESH_BATCH_SECONDS` | 30 | After one read-triggered re-rank, the next waits this long and takes everyone who became due meanwhile. Each one fetches the candidates before ranking anyone (about 8 s on a full node), so they are grouped. 0 turns the grouping off. |
+| `READER_ACTIVE_WITHIN_DAYS` | 0 | Off at 0; at most 36500. Otherwise a read earns a lane slot or an early re-rank only for an account that voted on or reblogged a post this app tracks within this many days (posting or commenting alone does not count), or that saved interests (interests do not lapse). A forged read for any other account then costs nothing; it is still recorded. It narrows a flood, it does not stop one: 12,888 accounts had voted or reblogged within 30 days on testapi. At 30 days it would have turned away at most 1 of the 16 readers seen there on 2026-10-12. Off by itself while block processing is more than `ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS` behind, when every account looks lapsed, or while that cannot be told; the ranker logs when it turns on and off, and how many reads earned nothing. |
 
 What to expect, and what this does not do:
 
@@ -735,7 +736,11 @@ What to expect, and what this does not do:
   ranked in one cycle is under the minimum age for the next) holds everyone else at
   `1 - READER_CYCLE_SHARE` of the old rotation speed, half at the default, for as long
   as it is kept up. That is the worst this can do. Telling a reader from a crawler
-  needs an authenticated read, which this app does not have.
+  needs an authenticated read, which this app does not have. `READER_ACTIVE_WITHIN_DAYS`
+  narrows it: set, a read counts only for an account that voted or reblogged within
+  that many days or saved interests, so reading other accounts buys nothing. Accounts
+  that vote are still far more than a lane holds. During a flood,
+  `READER_CYCLE_SHARE=0` turns the lane off for everyone.
 * **Paging.** A feed rewritten while someone scrolls can repeat or skip a post between
   page 1 and page 2. Readers' feeds are rewritten more often than others'.
 * **The signal is visible inside the database.** It is a Postgres notification on the
@@ -746,6 +751,9 @@ What to expect, and what this does not do:
 
 After every scheduled cycle the ranker logs one line:
 `feed reads since the last cycle: N account(s) heard, M queued for an early re-rank; reader lane L of S slot(s)`.
+With `READER_ACTIVE_WITHIN_DAYS` set, a second one follows:
+`read filter since the last cycle: K read(s) earned no slot (READER_ACTIVE_WITHIN_DAYS=D)`, with
+`; filter off: block processing is behind or not known` inside the brackets while the filter is off.
 (After a cycle that failed, the lane figures read 0 of 0.) "Queued" includes readers the
 cycle itself ranked ahead of their turn. The cycle's own line,
 `refreshed personalized feeds for N/M cached users`, counts those too, so M can exceed
@@ -776,7 +784,10 @@ The 24 h and the 10 min are the defaults of `READER_WINDOW_SECONDS` and
 the defaults, and the section says which (`window_seconds`, `due_after_seconds`). On a
 node that changed either setting, do not apply the rules above to those three: with a
 shorter window they count accounts the ranker no longer treats as readers, and read as
-trouble when there is none.
+trouble when there is none. The same goes for `READER_ACTIVE_WITHIN_DAYS`: with it set,
+the three still count every recorded read, including those that earned no slot, whose
+feeds age at rotation speed. Read the ranker's two cycle lines instead, which give the
+lane it took and how many reads earned nothing.
 
 `state` is `ok`, `unsupported` (the installed SQL has no `last_read_at`: re-run the
 install with the block processor and the ranker stopped) or `unknown` (the figures

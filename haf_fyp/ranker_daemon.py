@@ -78,7 +78,7 @@ _Number = TypeVar("_Number", int, float)
 
 
 def _tuning(key: str, default: str, convert: Callable[[str], _Number],
-            minimum: _Number | None = None) -> _Number:
+            minimum: _Number | None = None, maximum: _Number | None = None) -> _Number:
     """A tuning variable, with unset and empty meaning the same thing: the default (#87).
 
     docker/docker-compose.yml passes these to the ranker by name, so `NAME=` left blank
@@ -101,6 +101,8 @@ def _tuning(key: str, default: str, convert: Callable[[str], _Number],
         raise ValueError(f"{key}={raw!r} is not a valid {convert.__name__}") from None
     if minimum is not None and value < minimum:
         raise ValueError(f"{key}={raw!r} is below its minimum, {minimum}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{key}={raw!r} is above its maximum, {maximum}")
     return value
 
 
@@ -190,6 +192,43 @@ READ_REFRESH_MAX_PER_CYCLE = max(0, _tuning(
 # trickle of reads for different accounts keep the ranker fetching between cycles. The
 # first read after a quiet spell is not held back. 0 turns the grouping off.
 READ_REFRESH_BATCH_SECONDS = max(0, _tuning("READ_REFRESH_BATCH_SECONDS", "30", int))
+# Opt-in (#84): honour a read only from an account that voted on or reblogged a post
+# haf_fyp tracks in the last this-many days (active_users.last_interaction_at, which
+# process_interactions writes from those two operations only), or that saved interests
+# (a signed request: the new users FYP is for have often done neither). 0, the default,
+# honours every read. A forged read for any other account then takes no lane slot and
+# no early re-rank. It does NOT stop a flood: on testapi 12,888 accounts had voted or
+# reblogged within 30 days, far more than a lane holds. It keeps the lane to accounts
+# worth ranking anyway; at 30 days it would have turned away at most 1 of the 16 readers
+# seen on testapi on 2026-10-12.
+#
+# Such a read is still stamped (last_read_at): the feed function notifies at most once
+# per ten minutes per account BECAUSE the read is stamped, so not stamping would let a
+# forger raise one notification per request instead.
+#
+# At most 100 years: a cutoff further back leaves PostgreSQL's date range, and both
+# statements below would fail on every pass.
+READER_ACTIVE_WITHIN_DAYS = _tuning(
+    "READER_ACTIVE_WITHIN_DAYS", "0", int, minimum=0, maximum=36500
+)
+# What the two statements use: READER_ACTIVE_WITHIN_DAYS while block processing is
+# caught up, 0 otherwise. last_interaction_at is block time, so during a replay or a long
+# catch-up every account looks lapsed and the filter would turn away every reader without
+# interests -- the reason eviction waits for _sync_caught_up too. Set by
+# _refresh_read_filter at the start of each cycle.
+_read_filter_days = 0
+# Reads stamped since the last cycle that did not earn a slot, for the cycle line.
+_reads_unearned = 0
+# Whether a read from active_users row `au` earns a slot: the condition, and its two
+# parameters (both _read_filter_days). Shared by the early re-rank and the lane.
+# COALESCE: last_interaction_at is NULL for an account that never voted or reblogged,
+# which would make the whole condition NULL rather than false -- no slot either way, but
+# NOT NULL is NULL too, and the count of reads that earned nothing would miss it.
+_READ_EARNS_SQL = """COALESCE((
+    %s = 0
+    OR au.last_interaction_at >= (NOW() AT TIME ZONE 'utc') - make_interval(days => %s)
+    OR EXISTS (SELECT 1 FROM haf_fyp_app.user_interests ui WHERE ui.username = au.username)
+), false)"""
 # Notifications held on the connection between drains. psycopg2 appends to
 # conn.notifies whenever it reads the socket, i.e. during every query of a cycle, and
 # nothing else bounds that list; the oldest are discarded past this. It is also the
@@ -369,6 +408,8 @@ def _connect() -> psycopg2.extensions.connection:
             _current_conn = conn
             _take_app_locks(conn)
             _listen_for_feed_reads(conn)
+            # Before the first cycle as well: main() handles reads before it runs one.
+            _refresh_read_filter(conn)
             return conn
         except psycopg2.OperationalError as exc:
             log.warning("database not ready (%s) — retrying in 5s", exc)
@@ -469,33 +510,45 @@ def _note_feed_reads(conn, usernames: set[str], rerank_limit: int) -> set[str]:
     misses this one stamp. An account with no row is not a member and is left out, the
     same rule _run_targeted_refresh applies.
     """
+    global _reads_unearned
     if not usernames:
         return set()
     with conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             WITH picked AS (
-                SELECT username, last_scored_at
-                  FROM haf_fyp_app.active_users
-                 WHERE username = ANY(%s)
-                   FOR UPDATE SKIP LOCKED
+                SELECT au.username, au.last_scored_at, {_READ_EARNS_SQL} AS earns
+                  FROM haf_fyp_app.active_users au
+                 WHERE au.username = ANY(%s)
+                   FOR UPDATE OF au SKIP LOCKED
             ), stamped AS (
                 UPDATE haf_fyp_app.active_users au
                    SET last_read_at = (NOW() AT TIME ZONE 'utc')
                   FROM picked
                  WHERE au.username = picked.username
-             RETURNING au.username, picked.last_scored_at
+             RETURNING au.username, picked.last_scored_at, picked.earns
             )
-            SELECT username
-              FROM stamped
-             WHERE last_scored_at IS NULL
-                OR last_scored_at < (NOW() AT TIME ZONE 'utc') - make_interval(secs => %s)
-             ORDER BY last_scored_at ASC NULLS FIRST
-             LIMIT %s
+            SELECT username, NULL::bigint
+              FROM (SELECT username
+                      FROM stamped
+                     WHERE earns
+                       AND (last_scored_at IS NULL
+                            OR last_scored_at < (NOW() AT TIME ZONE 'utc') - make_interval(secs => %s))
+                     ORDER BY last_scored_at ASC NULLS FIRST
+                     LIMIT %s) AS due
+            UNION ALL
+            -- One row with no name: how many of these reads did not earn a slot.
+            SELECT NULL, count(*) FROM stamped WHERE NOT earns
             """,
-            (sorted(usernames), READ_REFRESH_MIN_AGE_SECONDS, max(0, rerank_limit)),
+            (_read_filter_days, _read_filter_days, sorted(usernames),
+             READ_REFRESH_MIN_AGE_SECONDS, max(0, rerank_limit)),
         )
-        stale = {r[0] for r in cur.fetchall()}
+        stale = set()
+        for row in cur.fetchall():
+            if row[0] is None:
+                _reads_unearned += row[1] or 0
+            else:
+                stale.add(row[0])
     conn.commit()
     return stale
 
@@ -512,18 +565,27 @@ def _handle_feed_reads(conn, rerank_budget: int) -> set[str]:
 
 
 def _log_feed_read_summary() -> None:
-    """One line per cycle period. A lane that stays full means the rest of the rotation
+    """One line per cycle period (two with READER_ACTIVE_WITHIN_DAYS set: the second
+    counts the reads that earned no slot). A lane that stays full means the rest of the rotation
     is running slower; a heard count in the thousands means someone is requesting
     other people's feeds; nothing heard for days on a node whose feed is in use means
     the signal is not arriving."""
-    global _reads_heard, _reads_reranked
+    global _reads_heard, _reads_reranked, _reads_unearned
     if _reads_supported:
         log.info(
             "feed reads since the last cycle: %d account(s) heard, %d queued for an "
             "early re-rank; reader lane %d of %d slot(s)",
             _reads_heard, _reads_reranked, _lane_taken, _lane_slots,
         )
-    _reads_heard = _reads_reranked = 0
+        if READER_ACTIVE_WITHIN_DAYS:
+            log.info(
+                "read filter since the last cycle: %d read(s) earned no slot "
+                "(READER_ACTIVE_WITHIN_DAYS=%d%s)",
+                _reads_unearned,
+                READER_ACTIVE_WITHIN_DAYS,
+                "" if _read_filter_days else "; filter off: block processing is behind or not known",
+            )
+    _reads_heard = _reads_reranked = _reads_unearned = 0
 
 
 def _log_feed_read_failure() -> None:
@@ -694,17 +756,19 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
             # speed, half at the default, for nothing. Such an account simply competes in
             # the remainder, where a fresh feed sorts last.
             cur.execute(
-                """
+                f"""
                 SELECT username
-                  FROM haf_fyp_app.active_users
+                  FROM haf_fyp_app.active_users au
                  WHERE last_read_at >= (NOW() AT TIME ZONE 'utc') - make_interval(secs => %s)
                    AND (last_scored_at IS NULL
                         OR last_scored_at < (NOW() AT TIME ZONE 'utc') - make_interval(secs => %s))
+                   AND {_READ_EARNS_SQL}
                  ORDER BY last_scored_at ASC NULLS FIRST,
                           last_read_at DESC
                  LIMIT %s
                 """,
-                (READER_WINDOW_SECONDS, READ_REFRESH_MIN_AGE_SECONDS, reader_slots),
+                (READER_WINDOW_SECONDS, READ_REFRESH_MIN_AGE_SECONDS,
+                 _read_filter_days, _read_filter_days, reader_slots),
             )
             readers = [r[0] for r in cur.fetchall()]
         _lane_taken, _lane_slots = len(readers), reader_slots
@@ -998,6 +1062,7 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
     global _lane_taken, _lane_slots
     _lane_taken = _lane_slots = 0  # a cycle that stops before the lane query took nobody
     register_vector_type(conn)
+    _refresh_read_filter(conn)
 
     algo_version, weights = _fetch_algorithm(conn)
     candidates = _fetch_candidates(conn)
@@ -1250,6 +1315,34 @@ def _run_embedding_coverage_maintenance(conn) -> None:
     except Exception:
         conn.rollback()
         log.exception("embedding-coverage maintenance failed — skipping")
+
+
+def _refresh_read_filter(conn) -> None:
+    """Turn the #84 read filter on only while block processing is caught up; see
+    _read_filter_days. Logs each change. A failed check leaves the filter off: every read
+    counts, as it did before the setting existed."""
+    global _read_filter_days
+    if not READER_ACTIVE_WITHIN_DAYS:
+        _read_filter_days = 0
+        return
+    try:
+        with conn.cursor() as cur:
+            caught_up = _sync_caught_up(cur)
+        conn.commit()
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        raise
+    except Exception:  # noqa: BLE001 - a missing app_status must not stop the cycle
+        conn.rollback()
+        log.exception("could not tell whether block processing is caught up")
+        caught_up = False
+    days = READER_ACTIVE_WITHIN_DAYS if caught_up else 0
+    if days != _read_filter_days:
+        if days:
+            log.info("READER_ACTIVE_WITHIN_DAYS=%d: only active or opted-in readers earn a slot", days)
+        else:
+            log.warning("READER_ACTIVE_WITHIN_DAYS=%d is off while block processing is behind "
+                        "or that cannot be told: every read earns a slot", READER_ACTIVE_WITHIN_DAYS)
+    _read_filter_days = days
 
 
 def _sync_caught_up(cur) -> bool:
