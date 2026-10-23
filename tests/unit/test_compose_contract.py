@@ -17,6 +17,7 @@ import json
 import os
 import posixpath
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -177,20 +178,238 @@ def test_no_inverted_pipeline_assertions_in_ci():
     assert not offenders, f"inverted-pipeline assertions cannot fail a job: {offenders}"
 
 
+# Readers that may stop reading before the writer is done: under the runner's `pipefail`
+# the writer's SIGPIPE fails the job even though the reader found what it wanted.
+_GREPS = {"grep", "egrep", "fgrep"}
+_GREP_LONG_EARLY = ("--quiet", "--silent", "--max-count")
+# Short grep options that take an argument: in a cluster like `-e-q` the rest is that
+# argument, not more flags.
+_GREP_SHORT_WITH_ARG = set("efABCdD")
+# A sed `q`/`Q` command: at the start, or after an address (digit, `$`, `/`) or a
+# separator; then an optional exit code and the end or a separator.
+_SED_QUIT = re.compile(r"(?:^|[;{}\s\d$/])[qQ]\d*\s*(?:$|[;}])")
+_AWK_EXIT = re.compile(r"\bexit\b")
+
+
+def _pipeline_segments(line: str) -> list[tuple[str, str]]:
+    """(operator before it, text) for each simple command on one shell line.
+
+    Quote-aware: a `|` inside '...' or "..." is not a pipe, except inside a `$(...)` or
+    backticks within double quotes. An unquoted `#` at the start of a word begins a
+    comment. `||`, `&&`, `;`, `&`, `(`, `)` and the edges of `$(...)` and backticks
+    separate commands too, so only a segment whose operator is `|` (or `|&`) reads a pipe.
+    """
+    segs: list[tuple[str, str]] = []
+    op, buf = "", []
+    stack: list[str] = []  # "'", '"', "$(" or "`"
+    i, n = 0, len(line)
+
+    def cut(new_op: str) -> None:
+        nonlocal op, buf
+        segs.append((op, "".join(buf)))
+        op, buf = new_op, []
+
+    while i < n:
+        c, top = line[i], (stack[-1] if stack else "")
+        if top == "'":
+            if c == "'":
+                stack.pop()
+            buf.append(c)
+        elif c == "\\" and i + 1 < n:
+            buf.append(line[i:i + 2])
+            i += 1
+        elif top == '"':
+            if c == '"':
+                stack.pop()
+                buf.append(c)
+            elif line.startswith("$(", i):
+                stack.append("$(")
+                cut("$(")
+                i += 1
+            elif c == "`":
+                stack.append("`")
+                cut("`")
+            else:
+                buf.append(c)
+        # below: unquoted, or directly inside a command substitution
+        elif c in "'\"":
+            stack.append(c)
+            buf.append(c)
+        elif c == "#" and (i == 0 or line[i - 1].isspace()):
+            break
+        elif line.startswith("$(", i):
+            stack.append("$(")
+            cut("$(")
+            i += 1
+        elif c == ")" and top == "$(":
+            stack.pop()
+            cut(")")
+        elif c == "`":
+            if top == "`":
+                stack.pop()
+            else:
+                stack.append("`")
+            cut("`")
+        elif line.startswith(("||", "&&"), i):
+            cut(line[i:i + 2])
+            i += 1
+        elif line.startswith("|&", i):
+            cut("|")
+            i += 1
+        elif c in "|;&()":
+            cut(c)
+        else:
+            buf.append(c)
+        i += 1
+    cut("")
+    return [(o, t) for o, t in segs if t.strip()]
+
+
+def _words(text: str) -> list[str]:
+    try:
+        return shlex.split(text)
+    except ValueError:  # a fragment cut at the edge of a quoted $(...)
+        return text.split()
+
+
+def _early_exit_reader(segment: str) -> str | None:
+    """Why the command in `segment` may stop reading early, or None if it reads to EOF."""
+    words = _words(segment)
+    while words and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
+        words = words[1:]  # FOO=bar grep ...
+    if not words:
+        return None
+    cmd, args = posixpath.basename(words[0]), words[1:]
+    if cmd == "head":
+        return "head"
+    if cmd in _GREPS:
+        takes_next = False  # the previous word was an option still owed its argument
+        for a in args:
+            if takes_next:
+                takes_next = False
+            elif a == "--":
+                break
+            elif a.startswith(_GREP_LONG_EARLY):
+                return f"{cmd} {a}"
+            elif a in ("--regexp", "--file"):
+                takes_next = True
+            elif a.startswith("-") and not a.startswith("--"):
+                for k, ch in enumerate(a[1:], 1):
+                    if ch in "qm":
+                        return f"{cmd} {a}"
+                    if ch in _GREP_SHORT_WITH_ARG:
+                        takes_next = k == len(a) - 1
+                        break
+        return None
+    if cmd == "sed":
+        if any(_SED_QUIT.search(a) for a in args if not a.startswith("-")):
+            return "sed ...q"
+        return None
+    if cmd in ("awk", "gawk", "mawk", "nawk"):
+        if any(_AWK_EXIT.search(a) for a in args):
+            return f"{cmd} ...exit"
+    return None
+
+
+def early_exit_readers(ci_text: str) -> list[tuple[int, str, str]]:
+    """(line number, line, reason) for each early-exit reader that follows a `|`."""
+    found = []
+    for n, line in enumerate(ci_text.splitlines(), 1):
+        if line.strip().startswith("#"):
+            continue
+        for op, seg in _pipeline_segments(line):
+            why = _early_exit_reader(seg) if op == "|" else None
+            if why:
+                found.append((n, line.strip(), why))
+    return found
+
+
 def test_no_early_exit_reader_after_a_pipe_in_ci():
     """`cmd | grep -q X` fails a job for having FOUND X: -q exits at its first match, a
     writer still streaming (the docker CLI in docker-build-sql's smoke step, job
     3337137) dies of SIGPIPE, and the runner's `pipefail` reports the pipeline as
-    failed. `head` and `grep -m` close the pipe early the same way. Use `grep -c`,
-    which reads to EOF and still exits 1 on no match.
+    failed. `head`, `grep -m`, `sed ...q` and `awk ...exit` close the pipe early the
+    same way. Use `grep -c`, which reads to EOF and still exits 1 on no match.
     """
-    offenders = [
-        (n, line.strip())
-        for n, line in enumerate(CI.read_text(encoding="utf-8").splitlines(), 1)
-        if not line.strip().startswith("#")
-        and re.search(r"\|\s*(?:grep\s+(?:-[A-Za-z]*[qm]|--quiet|--silent|--max-count)|head\b)", line)
-    ]
-    assert not offenders, f"early-exit reader after a pipe races under pipefail: {offenders}"
+    offenders = early_exit_readers(CI.read_text(encoding="utf-8"))
+    assert not offenders, (
+        "early-exit reader after a pipe races the writer under pipefail; use `grep -c` "
+        "(reads to EOF, still exits 1 on no match):\n"
+        + "\n".join(f"  .gitlab-ci.yml:{n}: {why}: {line}" for n, line, why in offenders)
+    )
+
+
+@pytest.mark.parametrize("line", [
+    "x | grep -q y",
+    "x | grep -Fq y",
+    "x | grep -F -q y",
+    "x | grep -s -q y",
+    "x | grep -i -q y",
+    "x | grep -m1 y",
+    "x | grep -m 1 y",
+    "x | grep -i --quiet y",
+    "x | grep -E --silent y",
+    "x | grep -F --max-count=1 y",
+    "x | grep -F --max-count 1 y",
+    "x | egrep -q y",
+    "x | fgrep -q y",
+    "x | /bin/grep -q y",
+    "x |grep -q y",
+    "x |& grep -q y",
+    "x | LC_ALL=C grep -q y",
+    "x | grep -c a | grep -q 1",
+    "x | head",
+    "x | head -1",
+    "x | head -n 1 >/tmp/o",
+    "x | sed q",
+    "x | sed 1q",
+    "x | sed -n '1p;q'",
+    'x | sed -n "1p;q"',
+    "x | sed -e 's/a/b/' -e q",
+    "x | sed '/y/q'",
+    "x | awk 'NR==1{print; exit}'",
+    "x | awk '/y/ {exit 0}'",
+    'test -n "$(x | head -1)"',
+    'test -n "$(echo $(x) | head -1)"',
+    "y=$(x | grep -q z)",
+    "y=`x | grep -q z`",
+    "- x | grep -q y",
+    "  - x | grep -q y || exit 1",
+    "x | grep -q y  # trailing comment",
+])
+def test_the_early_exit_matcher_catches(line):
+    assert early_exit_readers(line), f"not caught: {line}"
+
+
+@pytest.mark.parametrize("line", [
+    "# x | grep -q y",
+    "    # x | head -1",
+    "x  # | grep -q y",
+    "x || grep -q y",
+    "x || head -1",
+    "x && grep -q y",
+    "x; grep -q y /tmp/f",
+    "grep -q y /tmp/f || { echo FAIL; exit 1; }",
+    "x | grep -c y",
+    "x | grep -Ec 'a|b'",
+    "x | grep -c -- --quiet",
+    "x | grep -e -q",
+    "x | grep -c 'a | head'",
+    'x | grep -c "a | grep -q"',
+    "x | grep -c y  # not grep -q",
+    "echo 'a # b' | grep -c b",
+    "x | tr / -",
+    "x | sed 's/q/x/'",
+    "x | sed -n '/quiet/p'",
+    "x | awk '{print $1}'",
+    "x | awk '{print 1}'  # exit",
+    "x | docker login --password-stdin",
+    'case "$rc" in 0|124|125) return 1 ;; esac',
+    "script: |",
+    "- |",
+])
+def test_the_early_exit_matcher_passes(line):
+    assert not early_exit_readers(line), early_exit_readers(line)
 
 
 # --- published ports: uniqueness AND ownership (#38) --------------------------------
