@@ -177,6 +177,22 @@ def test_no_inverted_pipeline_assertions_in_ci():
     assert not offenders, f"inverted-pipeline assertions cannot fail a job: {offenders}"
 
 
+def test_no_early_exit_reader_after_a_pipe_in_ci():
+    """`cmd | grep -q X` fails a job for having FOUND X: -q exits at its first match, a
+    writer still streaming (the docker CLI in docker-build-sql's smoke step, job
+    3337137) dies of SIGPIPE, and the runner's `pipefail` reports the pipeline as
+    failed. `head` and `grep -m` close the pipe early the same way. Use `grep -c`,
+    which reads to EOF and still exits 1 on no match.
+    """
+    offenders = [
+        (n, line.strip())
+        for n, line in enumerate(CI.read_text(encoding="utf-8").splitlines(), 1)
+        if not line.strip().startswith("#")
+        and re.search(r"\|\s*(?:grep\s+(?:-[A-Za-z]*[qm]|--quiet|--silent|--max-count)|head\b)", line)
+    ]
+    assert not offenders, f"early-exit reader after a pipe races under pipefail: {offenders}"
+
+
 # --- published ports: uniqueness AND ownership (#38) --------------------------------
 #
 # 3001 must reach the rewriter, which serves the /v1/fyp/... paths the README documents;
