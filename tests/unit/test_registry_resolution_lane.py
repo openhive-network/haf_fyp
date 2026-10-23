@@ -1,5 +1,6 @@
 """The scheduled registry-resolution lane: it has to run, and nothing else may (#71) -- bar
-the read-only haf-shim-drift-develop check (#52), named in SCHEDULED below.
+the read-only haf-shim-drift-develop (#52) and haf-api-node-ranker-settings (#87) checks,
+named in SCHEDULED below.
 
 Two halves, and the second is the one that is easy to miss.
 
@@ -41,7 +42,7 @@ JOB = "registry-resolution"
 # Everything a scheduled (or on-demand sweep) pipeline may run. The shim-drift develop check
 # joined in #52: it reads one public file and pushes nothing, which is the property the
 # "nothing else" tests below protect. Adding to this set is a decision, not a fix.
-SCHEDULED = {JOB, "haf-shim-drift-develop"}
+SCHEDULED = {JOB, "haf-shim-drift-develop", "haf-api-node-ranker-settings"}
 SCRIPT = "scripts/check_pinned_images.sh"
 
 

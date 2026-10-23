@@ -377,6 +377,31 @@ haf-shim-drift-develop:
     - if: $RUN_REGISTRY_RESOLUTION == "true"
     - when: never
 
+# hive/haf_api_node's haf_fyp.yaml passes the ranker its settings with haf_fyp's defaults
+# COPIED (`NAME: ${HAF_FYP_NAME:-<default>}`), so that an image which reads an empty value
+# with int() still starts. Nobody changing a default in haf_fyp/ranker_daemon.py reads that
+# file; this does, against haf_api_node develop. Red (exit 1) when a setting it passes has
+# another name or default than the ranker's, or is no longer read; settings it does not pass
+# yet are only listed. Schedule and on-demand sweep only, as haf-shim-drift-develop and for
+# its reasons: it reads another repository, which no MR here can change. Locally:
+#   python scripts/check_haf_api_node_ranker_settings.py [--ref <haf_api_node ref>]
+haf-api-node-ranker-settings:
+  stage: lint
+  image: python:3.11-slim
+  interruptible: false
+  timeout: 10m
+  retry:
+    max: 2
+    when: runner_system_failure
+  script:
+    # The one dependency, pinned like the lint tools.
+    - pip install -q pyyaml==6.0.3
+    - python scripts/check_haf_api_node_ranker_settings.py --ref develop
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $RUN_REGISTRY_RESOLUTION == "true"
+    - when: never
+
 python-tests:
   extends: .python-cache
   stage: test
