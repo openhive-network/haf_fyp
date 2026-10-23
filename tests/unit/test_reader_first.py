@@ -1195,6 +1195,15 @@ def test_the_cycle_line_says_how_many_reads_earned_nothing(monkeypatch, caplog, 
     assert sum("feed reads since the last cycle" in r.getMessage() for r in caplog.records) == 1
 
 
+def test_a_read_with_no_interaction_at_all_earns_nothing_and_is_counted():
+    """last_interaction_at is NULL for an account that never voted or reblogged; without
+    the COALESCE, or with it defaulting to true, the condition is NULL or true for it --
+    uncounted, or a slot for the very account a forger would use. The database test
+    shows the effect; this keeps the shape where a unit run sees it."""
+    sql = " ".join(rd._READ_EARNS_SQL.split())
+    assert sql.startswith("COALESCE(( ") and sql.endswith(" ), false)"), sql
+
+
 def test_the_unearned_count_adds_up_over_a_cycles_passes(monkeypatch):
     monkeypatch.setattr(rd, "_reads_unearned", 0)
     for unearned in (3, 4):

@@ -1340,8 +1340,8 @@ def _refresh_read_filter(conn) -> None:
         if days:
             log.info("READER_ACTIVE_WITHIN_DAYS=%d: only active or opted-in readers earn a slot", days)
         else:
-            log.warning("READER_ACTIVE_WITHIN_DAYS=%d is off while block processing catches "
-                        "up: every read earns a slot", READER_ACTIVE_WITHIN_DAYS)
+            log.warning("READER_ACTIVE_WITHIN_DAYS=%d is off while block processing is behind "
+                        "or that cannot be told: every read earns a slot", READER_ACTIVE_WITHIN_DAYS)
     _read_filter_days = days
 
 

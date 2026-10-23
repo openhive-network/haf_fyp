@@ -752,8 +752,8 @@ What to expect, and what this does not do:
 After every scheduled cycle the ranker logs one line:
 `feed reads since the last cycle: N account(s) heard, M queued for an early re-rank; reader lane L of S slot(s)`.
 With `READER_ACTIVE_WITHIN_DAYS` set, a second one follows:
-`read filter since the last cycle: K read(s) earned no slot (READER_ACTIVE_WITHIN_DAYS=D)`, ending
-`; filter off: block processing is behind or not known` while the filter is off.
+`read filter since the last cycle: K read(s) earned no slot (READER_ACTIVE_WITHIN_DAYS=D)`, with
+`; filter off: block processing is behind or not known` inside the brackets while the filter is off.
 (After a cycle that failed, the lane figures read 0 of 0.) "Queued" includes readers the
 cycle itself ranked ahead of their turn. The cycle's own line,
 `refreshed personalized feeds for N/M cached users`, counts those too, so M can exceed
