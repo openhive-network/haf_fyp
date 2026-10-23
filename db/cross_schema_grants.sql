@@ -30,15 +30,49 @@
 --   btracker_backend — same balances, block-explorer layout (a VIEW)
 --   hafbe_bal        — same balances, block-explorer layout
 --   hafd             — core HAF accounts table (name → id resolution)
+--
+-- Concurrent catalog updates (#90): GRANT ... ON ALL TABLES IN SCHEMA s rewrites the
+-- pg_class row (relacl) of every table in s. When another session updates one of those
+-- same rows at the same moment -- another app's installer granting on its own schema,
+-- that app's own maintenance -- PostgreSQL raises XX000 "tuple concurrently updated",
+-- or, when the two sessions reach the rows in a different order, 40P01 "deadlock
+-- detected" (seen on PostgreSQL 17, which HAF 1.28.8 runs). psql runs this file with
+-- ON_ERROR_STOP, so one such collision used to fail the whole install (exit 3) although
+-- a retry seconds later succeeds. Each schema-guarded block below, and the hafd grants
+-- after them, therefore run their grants in a retry loop: up to 5 attempts, each in its own subtransaction (the
+-- BEGIN ... EXCEPTION block, whose rollback releases the row and tuple locks the
+-- attempt took), sleeping 0.5 s, 1 s, 2 s, 4 s between them. ONLY those two errors are
+-- retried: the handler catches internal_error (XX000) and deadlock_detected (40P01),
+-- re-raises an XX000 unless SQLERRM is exactly 'tuple concurrently updated', and
+-- re-raises either after the last attempt, so every other failure still reaches
+-- ON_ERROR_STOP at once. The grants are idempotent, so repeating them after a
+-- rolled-back attempt is safe. The success NOTICE stays after the loop, so a retried
+-- block still prints it exactly once.
 
 DO $$
+DECLARE
+    _attempt      int := 0;
+    _max_attempts CONSTANT int := 5;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata
         WHERE schema_name = 'hivesense_app'
     ) THEN
-        GRANT USAGE ON SCHEMA hivesense_app TO haf_fyp_user, haf_fyp_owner;
-        GRANT SELECT ON ALL TABLES IN SCHEMA hivesense_app TO haf_fyp_user, haf_fyp_owner;
+        LOOP
+            _attempt := _attempt + 1;
+            BEGIN
+                GRANT USAGE ON SCHEMA hivesense_app TO haf_fyp_user, haf_fyp_owner;
+                GRANT SELECT ON ALL TABLES IN SCHEMA hivesense_app TO haf_fyp_user, haf_fyp_owner;
+                EXIT;
+            EXCEPTION WHEN internal_error OR deadlock_detected THEN
+                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
+                    RAISE;
+                END IF;
+                RAISE NOTICE 'hivesense_app: % (attempt % of %), retrying in % s',
+                    SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
+            END;
+        END LOOP;
         RAISE NOTICE 'hivesense_app: granted SELECT to haf_fyp_user, haf_fyp_owner';
     ELSE
         RAISE NOTICE 'hivesense_app not found — install HiveSense then re-run grant_cross_schema.sh';
@@ -58,23 +92,39 @@ $$;
 -- SECURITY INVOKER and run as the caller). GRANT SELECT ON ALL TABLES covers
 -- views such as hive_accounts_view that those builders read.
 DO $$
+DECLARE
+    _attempt      int := 0;
+    _max_attempts CONSTANT int := 5;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata
         WHERE schema_name = 'hivemind_app'
     ) THEN
-        GRANT USAGE ON SCHEMA hivemind_app TO haf_fyp_user;
-        GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_app TO haf_fyp_user;
-        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_app TO haf_fyp_user;
-        -- The block processor (haf_fyp_owner) also resolves (author, permlink) ->
-        -- hive_posts.id via resolve_hivemind_post_ids() to precompute
-        -- post_candidates.hive_post_id, so it needs read access to the three bridge
-        -- tables (hive_accounts / hive_permlink_data / hive_posts). SELECT on ALL
-        -- TABLES covers them; the resolver is exception-guarded, so it degrades to a
-        -- no-op if this grant has not been applied yet.
-        GRANT USAGE ON SCHEMA hivemind_app TO haf_fyp_owner;
-        GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_app TO haf_fyp_owner;
-        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_app TO haf_fyp_owner;
+        LOOP
+            _attempt := _attempt + 1;
+            BEGIN
+                GRANT USAGE ON SCHEMA hivemind_app TO haf_fyp_user;
+                GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_app TO haf_fyp_user;
+                GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_app TO haf_fyp_user;
+                -- The block processor (haf_fyp_owner) also resolves (author, permlink) ->
+                -- hive_posts.id via resolve_hivemind_post_ids() to precompute
+                -- post_candidates.hive_post_id, so it needs read access to the three bridge
+                -- tables (hive_accounts / hive_permlink_data / hive_posts). SELECT on ALL
+                -- TABLES covers them; the resolver is exception-guarded, so it degrades to a
+                -- no-op if this grant has not been applied yet.
+                GRANT USAGE ON SCHEMA hivemind_app TO haf_fyp_owner;
+                GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_app TO haf_fyp_owner;
+                GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_app TO haf_fyp_owner;
+                EXIT;
+            EXCEPTION WHEN internal_error OR deadlock_detected THEN
+                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
+                    RAISE;
+                END IF;
+                RAISE NOTICE 'hivemind_app: % (attempt % of %), retrying in % s',
+                    SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
+            END;
+        END LOOP;
         RAISE NOTICE 'hivemind_app: granted SELECT + EXECUTE to haf_fyp_user, SELECT to haf_fyp_owner';
     ELSE
         RAISE NOTICE 'hivemind_app not found — install Hivemind then re-run grant_cross_schema.sh';
@@ -99,14 +149,30 @@ $$;
 -- SELECT ON ALL TABLES here too, and the self-healing pass at the bottom of this
 -- file keeps it granted across recreations.
 DO $$
+DECLARE
+    _attempt      int := 0;
+    _max_attempts CONSTANT int := 5;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata
         WHERE schema_name = 'hivemind_postgrest_utilities'
     ) THEN
-        GRANT USAGE ON SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
-        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
-        GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
+        LOOP
+            _attempt := _attempt + 1;
+            BEGIN
+                GRANT USAGE ON SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
+                GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
+                GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
+                EXIT;
+            EXCEPTION WHEN internal_error OR deadlock_detected THEN
+                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
+                    RAISE;
+                END IF;
+                RAISE NOTICE 'hivemind_postgrest_utilities: % (attempt % of %), retrying in % s',
+                    SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
+            END;
+        END LOOP;
         RAISE NOTICE 'hivemind_postgrest_utilities: granted EXECUTE + SELECT to haf_fyp_user, haf_fyp_owner';
     ELSE
         RAISE NOTICE 'hivemind_postgrest_utilities not found — install Hivemind then re-run grant_cross_schema.sh';
@@ -115,13 +181,29 @@ END
 $$;
 
 DO $$
+DECLARE
+    _attempt      int := 0;
+    _max_attempts CONSTANT int := 5;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata
         WHERE schema_name = 'reptracker_app'
     ) THEN
-        GRANT USAGE ON SCHEMA reptracker_app TO haf_fyp_user, haf_fyp_owner;
-        GRANT SELECT ON ALL TABLES IN SCHEMA reptracker_app TO haf_fyp_user, haf_fyp_owner;
+        LOOP
+            _attempt := _attempt + 1;
+            BEGIN
+                GRANT USAGE ON SCHEMA reptracker_app TO haf_fyp_user, haf_fyp_owner;
+                GRANT SELECT ON ALL TABLES IN SCHEMA reptracker_app TO haf_fyp_user, haf_fyp_owner;
+                EXIT;
+            EXCEPTION WHEN internal_error OR deadlock_detected THEN
+                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
+                    RAISE;
+                END IF;
+                RAISE NOTICE 'reptracker_app: % (attempt % of %), retrying in % s',
+                    SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
+            END;
+        END LOOP;
         RAISE NOTICE 'reptracker_app: granted SELECT to haf_fyp_user, haf_fyp_owner';
     ELSE
         RAISE NOTICE 'reptracker_app not found — install reputation_tracker then re-run grant_cross_schema.sh';
@@ -130,13 +212,29 @@ END
 $$;
 
 DO $$
+DECLARE
+    _attempt      int := 0;
+    _max_attempts CONSTANT int := 5;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata
         WHERE schema_name = 'btracker_app'
     ) THEN
-        GRANT USAGE ON SCHEMA btracker_app TO haf_fyp_user, haf_fyp_owner;
-        GRANT SELECT ON ALL TABLES IN SCHEMA btracker_app TO haf_fyp_user, haf_fyp_owner;
+        LOOP
+            _attempt := _attempt + 1;
+            BEGIN
+                GRANT USAGE ON SCHEMA btracker_app TO haf_fyp_user, haf_fyp_owner;
+                GRANT SELECT ON ALL TABLES IN SCHEMA btracker_app TO haf_fyp_user, haf_fyp_owner;
+                EXIT;
+            EXCEPTION WHEN internal_error OR deadlock_detected THEN
+                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
+                    RAISE;
+                END IF;
+                RAISE NOTICE 'btracker_app: % (attempt % of %), retrying in % s',
+                    SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
+            END;
+        END LOOP;
         RAISE NOTICE 'btracker_app: granted SELECT to haf_fyp_user, haf_fyp_owner';
     ELSE
         RAISE NOTICE 'btracker_app not found — install balance_tracker then re-run grant_cross_schema.sh';
@@ -151,20 +249,49 @@ $$;
 DO $$
 DECLARE
     _found int := 0;
+    _attempt      int := 0;
+    _max_attempts CONSTANT int := 5;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata WHERE schema_name = 'btracker_backend'
     ) THEN
-        GRANT USAGE ON SCHEMA btracker_backend TO haf_fyp_user, haf_fyp_owner;
-        GRANT SELECT ON ALL TABLES IN SCHEMA btracker_backend TO haf_fyp_user, haf_fyp_owner;
+        LOOP
+            _attempt := _attempt + 1;
+            BEGIN
+                GRANT USAGE ON SCHEMA btracker_backend TO haf_fyp_user, haf_fyp_owner;
+                GRANT SELECT ON ALL TABLES IN SCHEMA btracker_backend TO haf_fyp_user, haf_fyp_owner;
+                EXIT;
+            EXCEPTION WHEN internal_error OR deadlock_detected THEN
+                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
+                    RAISE;
+                END IF;
+                RAISE NOTICE 'btracker_backend: % (attempt % of %), retrying in % s',
+                    SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
+            END;
+        END LOOP;
         RAISE NOTICE 'btracker_backend: granted SELECT to haf_fyp_user, haf_fyp_owner';
         _found := _found + 1;
     END IF;
+    _attempt := 0;
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata WHERE schema_name = 'hafbe_bal'
     ) THEN
-        GRANT USAGE ON SCHEMA hafbe_bal TO haf_fyp_user, haf_fyp_owner;
-        GRANT SELECT ON ALL TABLES IN SCHEMA hafbe_bal TO haf_fyp_user, haf_fyp_owner;
+        LOOP
+            _attempt := _attempt + 1;
+            BEGIN
+                GRANT USAGE ON SCHEMA hafbe_bal TO haf_fyp_user, haf_fyp_owner;
+                GRANT SELECT ON ALL TABLES IN SCHEMA hafbe_bal TO haf_fyp_user, haf_fyp_owner;
+                EXIT;
+            EXCEPTION WHEN internal_error OR deadlock_detected THEN
+                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
+                    RAISE;
+                END IF;
+                RAISE NOTICE 'hafbe_bal: % (attempt % of %), retrying in % s',
+                    SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
+            END;
+        END LOOP;
         RAISE NOTICE 'hafbe_bal: granted SELECT to haf_fyp_user, haf_fyp_owner';
         _found := _found + 1;
     END IF;
@@ -185,8 +312,33 @@ $$;
 -- haf_fyp_app.user_interactions table (populated by process_interactions), so
 -- the ranker no longer reads hive.* or hafd operation_types/blocks directly —
 -- those are used only by the block processor, which runs as haf_fyp_owner.
-GRANT USAGE ON SCHEMA hafd TO haf_fyp_user;
-GRANT SELECT ON hafd.accounts TO haf_fyp_user;
+--
+-- Unguarded on purpose (a missing hafd still fails the install), but in the same
+-- retry loop as the blocks above (#90): every HAF app's installer grants on hafd, so
+-- these two rows -- hafd's pg_namespace row and hafd.accounts' pg_class row -- are
+-- the ones other installers are most likely to be updating at the same moment.
+DO $$
+DECLARE
+    _attempt      int := 0;
+    _max_attempts CONSTANT int := 5;
+BEGIN
+    LOOP
+        _attempt := _attempt + 1;
+        BEGIN
+            GRANT USAGE ON SCHEMA hafd TO haf_fyp_user;
+            GRANT SELECT ON hafd.accounts TO haf_fyp_user;
+            EXIT;
+        EXCEPTION WHEN internal_error OR deadlock_detected THEN
+            IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
+                RAISE;
+            END IF;
+            RAISE NOTICE 'hafd: % (attempt % of %), retrying in % s',
+                SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+            PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
+        END;
+    END LOOP;
+END
+$$;
 
 -- =============================================================================
 -- Self-healing SELECT grants
