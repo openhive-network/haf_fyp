@@ -58,6 +58,10 @@ PIN = "0123456789abcdef0123456789abcdef01234567"
 # Pinned refs (full SHAs, as the ledger requires) that fail some way other than a 404.
 PIN_REDIRECT = "3" * 40
 PIN_5XX = "5" * 40
+# A 4xx other than 404 is GitLab refusing (403) or throttling (429) us, not the pin being
+# wrong: "any 4xx is NotFound" would turn a rate limit into a blocking DRIFT.
+PIN_403 = "4" * 40
+PIN_429 = "9" * 40
 
 
 def _shim(names) -> bytes:
@@ -591,11 +595,15 @@ def server(good, monkeypatch, no_proxy):
             try:
                 if self.path != f"/{ref}/{UPSTREAM_PATH}" or ref not in (
                         "good", PIN, "slow", "truncated", "html", "empty", "notype", "upper",
-                        "plainfoo", "plainx", PIN_REDIRECT, PIN_5XX,
+                        "plainfoo", "plainx", PIN_REDIRECT, PIN_5XX, PIN_403, PIN_429,
                         "whitespace", "drifted", "crlf", *(f"redirect{c}" for c in REDIRECTS)):
                     self.send_error(404)
                 elif ref == PIN_5XX:
                     self.send_error(500)
+                elif ref == PIN_403:
+                    self.send_error(403)
+                elif ref == PIN_429:
+                    self.send_error(429)
                 elif ref == PIN_REDIRECT:
                     self.send_response(302)
                     self.send_header("Location", f"/good/{UPSTREAM_PATH}")
@@ -786,7 +794,8 @@ def test_an_unreachable_host_fails_loudly(monkeypatch, capsys, ledger, no_proxy)
     assert "ERROR [hive/haf@anything]: could not fetch" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("pin,marker", [(PIN_REDIRECT, "redirected"), (PIN_5XX, "500")])
+@pytest.mark.parametrize("pin,marker", [(PIN_REDIRECT, "redirected"), (PIN_5XX, "500"),
+                                        (PIN_403, "403"), (PIN_429, "429")])
 def test_a_pinned_failure_other_than_404_is_not_drift(server, tmp_path, capsys, good, pin, marker):
     """Only a 404 at a fixed commit is our own bump; anything else on --pinned is the network
     or GitLab, which allow_failure (exit 2 only) must keep from blocking an MR."""
