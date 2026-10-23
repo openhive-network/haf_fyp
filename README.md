@@ -736,7 +736,11 @@ What to expect, and what this does not do:
   ranked in one cycle is under the minimum age for the next) holds everyone else at
   `1 - READER_CYCLE_SHARE` of the old rotation speed, half at the default, for as long
   as it is kept up. That is the worst this can do. Telling a reader from a crawler
-  needs an authenticated read, which this app does not have.
+  needs an authenticated read, which this app does not have. `READER_ACTIVE_WITHIN_DAYS`
+  narrows it: set, a read counts only for an account active on chain within that many
+  days or with saved interests, so reading accounts that do not use Hive buys nothing.
+  The active accounts of a full node are still far more than a lane holds. During a
+  flood, `READER_CYCLE_SHARE=0` turns the lane off for everyone.
 * **Paging.** A feed rewritten while someone scrolls can repeat or skip a post between
   page 1 and page 2. Readers' feeds are rewritten more often than others'.
 * **The signal is visible inside the database.** It is a Postgres notification on the
