@@ -706,7 +706,7 @@ start with a log line naming the variable. The others are held to their range.
 
 | Variable | Default | What it bounds |
 |---|---|---|
-| `MAX_USERS_PER_CYCLE` | 200 | Accounts ranked per scheduled cycle. At about 0.2 s each the default uses a fraction of the cycle; raising it shortens the rotation for everyone. 0 refreshes no personal feed on schedule: the global feed, opt-in refreshes and re-ranks on read still run, and the ranker warns at start. |
+| `MAX_USERS_PER_CYCLE` | 200 | Accounts ranked per scheduled cycle. At about 0.2 s each the default uses a fraction of the cycle; raising it shortens the rotation for everyone. 0 refreshes no personal feed on schedule: the global feed and opt-in refreshes still run, and re-ranks on read only if `READ_REFRESH_MAX_PER_CYCLE` is set (its default is then 0). The ranker warns at start. |
 | `READER_CYCLE_SHARE` | 0.5 | Share of a cycle recent readers may take (capped at 0.9). 0 turns the reader lane off. |
 | `READER_WINDOW_SECONDS` | 86400 | How long one read keeps an account eligible for the reader lane. |
 | `READ_REFRESH_MIN_AGE_SECONDS` | 600 | A feed younger than this is not re-ranked on read, and does not take a lane slot. |
@@ -852,17 +852,18 @@ same way as those in "How fresh a feed is" (haf_api_node's `haf_fyp.yaml` does n
 them yet, #87). Few nodes need to change them.
 
 A minimum only refuses a value that is plainly wrong. Small values above it can still
-do damage (`FEED_EVENTS_MAX_ROWS=1` keeps one event), and huge ones fail: a
-`FEED_EVENTS_RETAIN_DAYS` in the millions makes the prune fail on every pass, and the row
-ceiling with it; `EMBEDDING_COVERAGE_DAYS` or `ACTIVE_USERS_MAX_EVICTIONS` at 2^31 or more
-fails its pass the same way.
+do damage (`FEED_EVENTS_MAX_ROWS=1` keeps one event), and huge ones fail. A
+`FEED_EVENTS_RETAIN_DAYS` above about 2.4 million (a cutoff before 4713 BC, where
+PostgreSQL's dates end) makes the prune fail on every pass, and the row ceiling with it;
+`EMBEDDING_COVERAGE_DAYS` fails its pass from the same size, and
+`ACTIVE_USERS_MAX_EVICTIONS` from 2^31.
 
 | Variable | Default | Minimum | What it bounds |
 |---|---|---|---|
 | `FEED_EVENTS_MAINT_SECONDS` | 3600 | 60 | How often the maintenance pass runs: feed-event rollup and prune, the embedding-coverage rollup, and eviction from the rotation. |
 | `FEED_EVENTS_RETAIN_DAYS` | 14 | 1 | Days of raw feed events (`POST /v1/fyp/events`) kept; the daily rollup outlives them. |
 | `FEED_EVENTS_MAX_ROWS` | 20000000 | 1 | Raw feed events kept at most, whatever their age: the ceiling on a flood of the unauthenticated endpoint. |
-| `EMBEDDING_COVERAGE_DAYS` | 14 | 1 | Days of embedding coverage recomputed on each pass. `GET /metrics` also shows up to 7 older days, as last computed. |
+| `EMBEDDING_COVERAGE_DAYS` | 14 | 1 | Days of embedding coverage recomputed on each pass, plus today. `GET /metrics` also shows up to 7 older days, as last computed. |
 | `ACTIVE_USERS_MAX_EVICTIONS` | 1000 | 1 | Accounts with nothing to personalize from removed from the rotation per pass. |
 | `ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS` | 1000 | 0 | Eviction waits until block processing is within this many blocks of the head. |
 

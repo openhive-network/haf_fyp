@@ -131,7 +131,8 @@ CANDIDATE_LIMIT = 5000
 # pass stays bounded no matter how large the subscriber base grows.
 #
 # 0 is a mode, not a mistake: no personal feed is refreshed on schedule, while the global
-# feed, opt-in refreshes and read-triggered re-ranks still run. main() says so at start.
+# feed and opt-in refreshes still run, and re-ranks on read if READ_REFRESH_MAX_PER_CYCLE
+# is set (its default follows this one, to 0). main() says which at start.
 # A negative value reached a LIMIT and failed every cycle.
 MAX_USERS_PER_CYCLE = _tuning("MAX_USERS_PER_CYCLE", "200", int, minimum=0)
 
@@ -1376,10 +1377,18 @@ def _safe_rollback(conn) -> None:
 
 def _warn_if_nothing_is_ranked_on_schedule() -> None:
     """MAX_USERS_PER_CYCLE=0 is allowed (see its comment); it should not be a surprise."""
-    if MAX_USERS_PER_CYCLE == 0:
+    if MAX_USERS_PER_CYCLE != 0:
+        return
+    if READ_REFRESH_MAX_PER_CYCLE == 0:
+        log.warning(
+            "MAX_USERS_PER_CYCLE=0: no personal feed is refreshed on schedule, and none on "
+            "read either (READ_REFRESH_MAX_PER_CYCLE is 0; set it to keep re-ranks on "
+            "read); only the global feed and opt-in refreshes run"
+        )
+    else:
         log.warning(
             "MAX_USERS_PER_CYCLE=0: no personal feed is refreshed on schedule; only the "
-            "global feed, opt-in refreshes and up to %d read-triggered re-rank(s) per cycle "
+            "global feed, opt-in refreshes and up to %d re-rank(s) on read per cycle "
             "(READ_REFRESH_MAX_PER_CYCLE) run",
             READ_REFRESH_MAX_PER_CYCLE,
         )

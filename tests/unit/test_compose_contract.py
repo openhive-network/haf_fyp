@@ -1970,6 +1970,21 @@ def test_the_readme_retention_table_shows_the_daemons_defaults_and_minimums():
             f"({shown[name]!r}, {str(minimums[name])!r})")
 
 
+def test_the_retention_section_follows_the_reader_material_at_its_own_level():
+    """Inserted as a sub-heading after the reader table, it once took over the reader-first
+    material below it (what to expect, the cycle log line, the /metrics fields)."""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    headings = re.findall(r"(?m)^(#{2,4}) (.+)$", readme)
+    names = [name for _, name in headings]
+    fresh, retention = names.index("How fresh a feed is"), names.index("Retention and maintenance")
+    assert headings[retention][0] == headings[fresh][0], "not at the reader section's level"
+    assert all(level.startswith("####") for level, _ in headings[fresh + 1:retention]), (
+        "a heading between the reader section and the retention one")
+    reader_text = readme[readme.index("### How fresh a feed is"):readme.index("### Retention and maintenance")]
+    for marker in ("What to expect", "`readers_due`"):
+        assert marker in reader_text, f"{marker!r} is no longer under 'How fresh a feed is'"
+
+
 def test_the_documented_recreate_command_reads_the_operators_file_and_builds():
     """Without --env-file the value just set is ignored; without --build a ranker image
     from before #87 runs, and stops on a blank line; without --no-deps `up` reaches haf."""

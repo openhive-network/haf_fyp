@@ -1043,19 +1043,27 @@ def test_main_says_so_before_it_ranks_anything():
     assert calls.index("_warn_if_nothing_is_ranked_on_schedule") < calls.index("_install_stop_handler")
 
 
-@pytest.mark.parametrize("cycle, warned", [(0, True), (1, False), (200, False)])
-def test_no_scheduled_ranking_is_said_at_start(monkeypatch, caplog, cycle, warned):
+_ZERO_WITH_READS = ("MAX_USERS_PER_CYCLE=0: no personal feed is refreshed on schedule; only the "
+                    "global feed, opt-in refreshes and up to 7 re-rank(s) on read per cycle "
+                    "(READ_REFRESH_MAX_PER_CYCLE) run")
+# The default: READ_REFRESH_MAX_PER_CYCLE follows the cycle size down to 0.
+_ZERO_NO_READS = ("MAX_USERS_PER_CYCLE=0: no personal feed is refreshed on schedule, and none on "
+                  "read either (READ_REFRESH_MAX_PER_CYCLE is 0; set it to keep re-ranks on read); "
+                  "only the global feed and opt-in refreshes run")
+
+
+@pytest.mark.parametrize("cycle, budget, said_at_start", [
+    (0, 7, [_ZERO_WITH_READS]),
+    (0, 0, [_ZERO_NO_READS]),
+    (1, 0, []),
+    (200, 100, []),
+])
+def test_no_scheduled_ranking_is_said_at_start(monkeypatch, caplog, cycle, budget, said_at_start):
     monkeypatch.setattr(rd, "MAX_USERS_PER_CYCLE", cycle)
-    monkeypatch.setattr(rd, "READ_REFRESH_MAX_PER_CYCLE", 7)
+    monkeypatch.setattr(rd, "READ_REFRESH_MAX_PER_CYCLE", budget)
     with caplog.at_level(logging.WARNING, logger=rd.log.name):
         rd._warn_if_nothing_is_ranked_on_schedule()
-    said = [r.getMessage() for r in caplog.records]
-    if warned:
-        assert said == ["MAX_USERS_PER_CYCLE=0: no personal feed is refreshed on schedule; only "
-                        "the global feed, opt-in refreshes and up to 7 read-triggered re-rank(s) "
-                        "per cycle (READ_REFRESH_MAX_PER_CYCLE) run"]
-    else:
-        assert said == []
+    assert [r.getMessage() for r in caplog.records] == said_at_start
 
 
 def test_a_setting_at_its_minimum_is_taken(settings):
