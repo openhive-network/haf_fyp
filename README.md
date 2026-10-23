@@ -1476,7 +1476,17 @@ otherwise a push to the default branch just after the tick cancels the sweep wit
 
 Create it under **Build → Pipeline schedules** (`/-/pipeline_schedules`) on the default
 branch; a daily or weekly cadence is plenty. To run it without waiting for a tick, run a
-pipeline with `RUN_REGISTRY_RESOLUTION=true` — that pipeline runs the sweep and nothing else.
+pipeline with `RUN_REGISTRY_RESOLUTION=true` — that pipeline runs the scheduled jobs and
+nothing else.
+
+The same schedule runs two read-only checks of other repositories. A red schedule can be any
+of the three, so open the failed job:
+
+| Job | Red when | Fix it in |
+|---|---|---|
+| `registry-resolution` | an image reference in `docker/.env` no longer resolves | this repository |
+| `haf-shim-drift-develop` | hive/haf's compatibility shim changed since `tests/unit/data/haf_shim_ledger.json` was written (#52) | the ledger here, after reading the change |
+| `haf-api-node-ranker-settings` | hive/haf_api_node's `haf_fyp.yaml` passes a ranker setting with a name or default that is wrong for the haf_fyp release it pins (#87). Changes on this repository's develop are only printed, as pending for its next version bump | hive/haf_api_node |
 
 Worth knowing before creating it: a scheduled pipeline is a pipeline for the default branch's
 head, so it shows in that branch's status like any other. A red sweep turns `develop` red

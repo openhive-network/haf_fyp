@@ -150,7 +150,8 @@ compose-validate:
 # changes without anyone touching this repository, so an MR is the wrong moment to ask it and
 # the wrong thing to block on a registry being reachable. Set the schedule up in
 # Build > Pipeline schedules on the default branch. Nothing else in this file runs in a
-# scheduled pipeline: every other lane carries .standard-rules, and publish_tag -- which is
+# scheduled pipeline but the two read-only checks haf-shim-drift-develop and
+# haf-api-node-ranker-settings: every other lane carries .standard-rules, and publish_tag -- which is
 # not a branch lane and so does not -- carries the same exclusion of its own, because a
 # schedule may target a TAG.
 #
@@ -172,9 +173,10 @@ registry-resolution:
   # NOT interruptible. This project has auto-cancel-redundant-pipelines on, so a push to the
   # default branch shortly after the cron tick would otherwise cancel the sweep: no answer, no
   # red, nothing. (A job still waiting for a runner counts as interruptible whatever it says,
-  # so that narrow window remains; once it runs, it finishes.) It and haf-shim-drift-develop
-  # are the only jobs in a scheduled pipeline, and neither runs in a push or MR pipeline, so
-  # holding it costs nothing elsewhere -- the same reasoning as publish_tag.
+  # so that narrow window remains; once it runs, it finishes.) It, haf-shim-drift-develop and
+  # haf-api-node-ranker-settings are the only jobs in a scheduled pipeline, and none runs in a
+  # push or MR pipeline, so holding it costs nothing elsewhere -- the same reasoning as
+  # publish_tag.
   interruptible: false
   # ABOVE the script's own budget, which the lane test holds it to: HAF_FYP_RESOLVE_DEADLINE
   # (420s) plus one in-flight attempt (HEAD + token + HEAD at 20s each) plus the image pull and
@@ -380,11 +382,14 @@ haf-shim-drift-develop:
 # hive/haf_api_node's haf_fyp.yaml passes the ranker its settings with haf_fyp's defaults
 # COPIED (`NAME: ${HAF_FYP_NAME:-<default>}`), so that an image which reads an empty value
 # with int() still starts. Nobody changing a default in haf_fyp/ranker_daemon.py reads that
-# file; this does, against haf_api_node develop. Red (exit 1) when a setting it passes has
-# another name or default than the ranker's, or is no longer read; settings it does not pass
-# yet are only listed. Schedule and on-demand sweep only, as haf-shim-drift-develop and for
-# its reasons: it reads another repository, which no MR here can change. Locally:
-#   python scripts/check_haf_api_node_ranker_settings.py [--ref <haf_api_node ref>]
+# file; this does. A node runs the haf_fyp release haf_api_node pins (its .env.example), so
+# red (exit 1) means the copy is wrong for THAT release, which an MR there can fix now. What
+# this checkout changed since is printed as "pending for haf_api_node's next HAF_FYP_VERSION
+# bump" and stays green: haf_api_node must not follow develop before it pins a release that
+# has the change, so a red here would last until it did and hide the other scheduled checks.
+# Schedule and on-demand sweep only, as haf-shim-drift-develop and for its reasons: it reads
+# other repositories, which no MR here can change. Locally:
+#   python scripts/check_haf_api_node_ranker_settings.py [--ref <haf_api_node ref>] [--release <haf_fyp ref>]
 haf-api-node-ranker-settings:
   stage: lint
   image: python:3.11-slim
