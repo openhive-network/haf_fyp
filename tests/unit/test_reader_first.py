@@ -901,6 +901,16 @@ def test_a_large_refresh_is_logged_as_a_count(monkeypatch, caplog):
 # Settings: each one is a ceiling on work a caller can cause
 # --------------------------------------------------------------------------
 
+# Retention and maintenance (#87): passed like the reader settings, so read like them.
+RETENTION = {
+    "FEED_EVENTS_MAINT_SECONDS": 3600,
+    "FEED_EVENTS_RETAIN_DAYS": 14,
+    "FEED_EVENTS_MAX_ROWS": 20000000,
+    "EMBEDDING_COVERAGE_DAYS": 14,
+    "ACTIVE_USERS_MAX_EVICTIONS": 1000,
+    "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS": 1000,
+}
+
 _NAMES = (
     "READER_WINDOW_SECONDS",
     "READER_CYCLE_SHARE",
@@ -910,6 +920,7 @@ _NAMES = (
     "READ_REFRESH_BATCH_SECONDS",
     "_READ_REFRESH_DEFAULT_CEILING",
     "_FEED_READ_BACKLOG_MAX",
+    *RETENTION,
 )
 _PROBE = f"""
 import importlib, json, os, sys
@@ -919,7 +930,8 @@ out = []
 import haf_fyp.ranker_daemon as rd
 for env in envs:
     for key in list(os.environ):
-        if key.startswith(("READER_", "READ_REFRESH_", "MAX_USERS_PER_CYCLE")):
+        if key.startswith(("READER_", "READ_REFRESH_", "MAX_USERS_PER_CYCLE",
+                           "FEED_EVENTS_", "EMBEDDING_COVERAGE_", "ACTIVE_USERS_")):
             del os.environ[key]
     os.environ.update(env)
     rd = importlib.reload(rd)
@@ -950,6 +962,17 @@ def settings():
             "READ_REFRESH_MIN_AGE_SECONDS": "",
             "READ_REFRESH_MAX_PER_CYCLE": "",
             "READ_REFRESH_BATCH_SECONDS": "",
+            **{name: "" for name in RETENTION},
+        },
+        "retention_set": {name: str(value + 1) for name, value in RETENTION.items()},
+        "at_the_minimums": {
+            "MAX_USERS_PER_CYCLE": "1",
+            "FEED_EVENTS_MAINT_SECONDS": "60",
+            "FEED_EVENTS_RETAIN_DAYS": "1",
+            "FEED_EVENTS_MAX_ROWS": "1",
+            "EMBEDDING_COVERAGE_DAYS": "1",
+            "ACTIVE_USERS_MAX_EVICTIONS": "1",
+            "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS": "0",
         },
         "cycle_only_rest_empty": {
             "MAX_USERS_PER_CYCLE": "3000",
@@ -990,7 +1013,63 @@ def test_the_reader_defaults_are_the_documented_ones(settings):
         "READ_REFRESH_BATCH_SECONDS": 30,
         "_READ_REFRESH_DEFAULT_CEILING": 300,
         "_FEED_READ_BACKLOG_MAX": 20000,
+        **RETENTION,
     }
+
+
+def test_the_retention_settings_are_read_from_the_environment(settings):
+    got = settings["retention_set"]
+    assert {name: got[name] for name in RETENTION} == {n: v + 1 for n, v in RETENTION.items()}
+
+
+def test_a_setting_at_its_minimum_is_taken(settings):
+    got = settings["at_the_minimums"]
+    assert got["MAX_USERS_PER_CYCLE"] == 1
+    assert got["FEED_EVENTS_MAINT_SECONDS"] == 60
+    assert got["ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS"] == 0
+    for name in ("FEED_EVENTS_RETAIN_DAYS", "FEED_EVENTS_MAX_ROWS", "EMBEDDING_COVERAGE_DAYS",
+                 "ACTIVE_USERS_MAX_EVICTIONS"):
+        assert got[name] == 1, name
+
+
+@pytest.mark.parametrize("name, value", [
+    # 0 ranked nobody and said nothing; a negative value reached a LIMIT.
+    ("MAX_USERS_PER_CYCLE", "0"),
+    ("MAX_USERS_PER_CYCLE", "-5"),
+    # The maintenance pass, with its multi-second scan, on every five-second poll.
+    ("FEED_EVENTS_MAINT_SECONDS", "59"),
+    ("FEED_EVENTS_MAINT_SECONDS", "0"),
+    # Every raw feed event pruned on each pass.
+    ("FEED_EVENTS_RETAIN_DAYS", "0"),
+    ("FEED_EVENTS_MAX_ROWS", "0"),
+    ("FEED_EVENTS_MAX_ROWS", "-1"),
+    ("EMBEDDING_COVERAGE_DAYS", "0"),
+    ("ACTIVE_USERS_MAX_EVICTIONS", "0"),
+    ("ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS", "-1"),
+])
+def test_a_setting_below_its_minimum_stops_the_ranker_and_says_which(name, value):
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("MAX_USERS_PER_CYCLE", "FEED_EVENTS_", "EMBEDDING_COVERAGE_",
+                                "ACTIVE_USERS_"))}
+    out = subprocess.run(
+        [sys.executable, "-c", "import haf_fyp.ranker_daemon"],
+        cwd=REPO,
+        env={**env, "PYTHONPATH": REPO, name: value},
+        capture_output=True,
+        text=True,
+    )
+    assert out.returncode != 0, f"{name}={value} was accepted"
+    assert f"ValueError: {name}='{value}' is below its minimum" in out.stderr, out.stderr[-500:]
+
+
+@pytest.mark.parametrize("raw, ok", [("3", True), ("2", True), ("1", False), (" ", True)])
+def test_a_minimum_is_checked_after_the_default_is_taken(monkeypatch, raw, ok):
+    monkeypatch.setenv("HAF_FYP_TEST_TUNING", raw)
+    if ok:
+        assert rd._tuning("HAF_FYP_TEST_TUNING", "5", int, minimum=2) == int(raw.strip() or 5)
+    else:
+        with pytest.raises(ValueError, match="^HAF_FYP_TEST_TUNING='1' is below its minimum, 2$"):
+            rd._tuning("HAF_FYP_TEST_TUNING", "5", int, minimum=2)
 
 
 def test_settings_left_blank_in_the_env_file_are_the_defaults(settings):

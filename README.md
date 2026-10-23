@@ -701,18 +701,30 @@ the next `up` of the ranker without it puts the ranker back. haf_api_node's
 `haf_fyp.yaml` does not pass them yet (#87): there, add them to that service's
 `environment:`.
 
-The ranker reads six more settings that are not passed and not listed here (retention
-and maintenance: `FEED_EVENTS_*`, `EMBEDDING_COVERAGE_DAYS`, `ACTIVE_USERS_*`). Changing
-one of those still means adding it to the service's `environment:`.
+A value that is not a number, or is below a setting's minimum, stops the ranker at
+start with a log line naming the variable.
 
 | Variable | Default | What it bounds |
 |---|---|---|
-| `MAX_USERS_PER_CYCLE` | 200 | Accounts ranked per scheduled cycle. At about 0.2 s each the default uses a fraction of the cycle; raising it shortens the rotation for everyone. |
+| `MAX_USERS_PER_CYCLE` | 200 | Accounts ranked per scheduled cycle, at least 1. At about 0.2 s each the default uses a fraction of the cycle; raising it shortens the rotation for everyone. |
 | `READER_CYCLE_SHARE` | 0.5 | Share of a cycle recent readers may take (capped at 0.9). 0 turns the reader lane off. |
 | `READER_WINDOW_SECONDS` | 86400 | How long one read keeps an account eligible for the reader lane. |
 | `READ_REFRESH_MIN_AGE_SECONDS` | 600 | A feed younger than this is not re-ranked on read, and does not take a lane slot. |
 | `READ_REFRESH_MAX_PER_CYCLE` | `MAX_USERS_PER_CYCLE` x `READER_CYCLE_SHARE`, at most 300 | Re-ranks on read per cycle period: between two scheduled cycles, and ahead of their turn during one (a cycle grows by at most this many accounts). 0 turns them off. Between cycles they run in the 300 s the ranker waits: keep this times seconds-per-account well under `CYCLE_SECONDS`, or they start delaying the cycle. |
 | `READ_REFRESH_BATCH_SECONDS` | 30 | After one read-triggered re-rank, the next waits this long and takes everyone who became due meanwhile. Each one fetches the candidates before ranking anyone (about 8 s on a full node), so they are grouped. 0 turns the grouping off. |
+
+#### Retention and maintenance
+
+Passed and read the same way as the settings above. Few nodes need to change them.
+
+| Variable | Default | Minimum | What it bounds |
+|---|---|---|---|
+| `FEED_EVENTS_MAINT_SECONDS` | 3600 | 60 | How often the maintenance pass runs: feed-event rollup and prune, the embedding-coverage rollup, and eviction from the rotation. |
+| `FEED_EVENTS_RETAIN_DAYS` | 14 | 1 | Days of raw feed events (`POST /v1/fyp/events`) kept; the daily rollup outlives them. |
+| `FEED_EVENTS_MAX_ROWS` | 20000000 | 1 | Raw feed events kept at most, whatever their age: the ceiling on a flood of the unauthenticated endpoint. |
+| `EMBEDDING_COVERAGE_DAYS` | 14 | 1 | The window `GET /metrics` reports embedding coverage over. |
+| `ACTIVE_USERS_MAX_EVICTIONS` | 1000 | 1 | Accounts with nothing to personalize from removed from the rotation per pass. |
+| `ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS` | 1000 | 0 | Eviction waits until block processing is within this many blocks of the head. |
 
 What to expect, and what this does not do:
 

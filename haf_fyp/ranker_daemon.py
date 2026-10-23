@@ -77,7 +77,8 @@ POLL_SECONDS = 5
 _Number = TypeVar("_Number", int, float)
 
 
-def _tuning(key: str, default: str, convert: Callable[[str], _Number]) -> _Number:
+def _tuning(key: str, default: str, convert: Callable[[str], _Number],
+            minimum: _Number | None = None) -> _Number:
     """A tuning variable, with unset and empty meaning the same thing: the default (#87).
 
     docker/docker-compose.yml passes these to the ranker by name, so `NAME=` left blank
@@ -87,28 +88,37 @@ def _tuning(key: str, default: str, convert: Callable[[str], _Number]) -> _Numbe
     dbenv.env_or_default refuses it, because nothing here is concatenated into a
     connection string.
 
-    A value `convert` rejects still stops the daemon, and the error says which variable.
+    A value `convert` rejects, or one below `minimum`, still stops the daemon, and the
+    error says which variable. Refused, not raised to the minimum: where a minimum is
+    given, a smaller value deletes data or quietly does no work (0 accounts ranked, every
+    feed event pruned), so it is far more likely a mistake than a choice.
     """
     raw = os.environ.get(key, "").strip()
     try:
-        return convert(raw or default)
+        value = convert(raw or default)
     except ValueError:
         raise ValueError(f"{key}={raw!r} is not a valid {convert.__name__}") from None
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{key}={raw!r} is below its minimum, {minimum}")
+    return value
 
 
 # Feed-events (#12) retention + rollup, run periodically off the same loop.
 # Hourly by default: the raw log is unauthenticated, so a shorter interval bounds
 # the worst-case flood window between prune passes (the rollup is incremental and
-# the prune a bounded delete, so running often is cheap).
-FEED_EVENTS_MAINT_SECONDS = int(os.environ.get("FEED_EVENTS_MAINT_SECONDS", str(60 * 60)))
-FEED_EVENTS_RETAIN_DAYS = int(os.environ.get("FEED_EVENTS_RETAIN_DAYS", "14"))
-FEED_EVENTS_MAX_ROWS = int(os.environ.get("FEED_EVENTS_MAX_ROWS", "20000000"))
+# the prune a bounded delete, so running often is cheap). Not below a minute: the
+# main loop polls every POLL_SECONDS, and at 0 the multi-second coverage scan and the
+# eviction pass would run on every poll.
+FEED_EVENTS_MAINT_SECONDS = _tuning("FEED_EVENTS_MAINT_SECONDS", str(60 * 60), int, minimum=60)
+# At 0 or less, prune_feed_events deletes every raw event on each pass.
+FEED_EVENTS_RETAIN_DAYS = _tuning("FEED_EVENTS_RETAIN_DAYS", "14", int, minimum=1)
+FEED_EVENTS_MAX_ROWS = _tuning("FEED_EVENTS_MAX_ROWS", "20000000", int, minimum=1)
 
 # Embedding-coverage rollup (#15) — trailing window the GET /metrics health signal
 # reports. Refreshed on the same hourly cadence as feed-events maintenance; the
 # underlying candidate scan is multi-second, which is exactly why it runs here in
 # the background rather than inline in the endpoint.
-EMBEDDING_COVERAGE_DAYS = int(os.environ.get("EMBEDDING_COVERAGE_DAYS", "14"))
+EMBEDDING_COVERAGE_DAYS = _tuning("EMBEDDING_COVERAGE_DAYS", "14", int, minimum=1)
 CANDIDATE_LIMIT = 5000
 
 # Personalized feeds are computed on demand, not bulk-precomputed for every
@@ -118,7 +128,9 @@ CANDIDATE_LIMIT = 5000
 # _run_targeted_refresh. The scheduled cycle then only keeps already-cached
 # (i.e. active) users fresh, oldest-first, capped at MAX_USERS_PER_CYCLE so each
 # pass stays bounded no matter how large the subscriber base grows.
-MAX_USERS_PER_CYCLE = _tuning("MAX_USERS_PER_CYCLE", "200", int)
+#
+# At least 1: 0 ranked nobody and said nothing, and a negative value reached a LIMIT.
+MAX_USERS_PER_CYCLE = _tuning("MAX_USERS_PER_CYCLE", "200", int, minimum=1)
 
 # Readers first (#81). The rotation holds every account there is something to
 # personalize for; almost none of them ever open their feed. Ranked round-robin, a
@@ -214,13 +226,14 @@ _missing_column_warned_at: float | None = None
 # Per-pass ceiling. Bounds the blast radius of any capacity miscalculation: even if
 # the observed period collapses and reports a huge excess, one pass can only take
 # this many. The rest goes on later passes, an hour apart, with a log line to notice.
-ACTIVE_USERS_MAX_EVICTIONS = int(os.environ.get("ACTIVE_USERS_MAX_EVICTIONS", "1000"))
+# evict_unproductive_users refuses anything below 1.
+ACTIVE_USERS_MAX_EVICTIONS = _tuning("ACTIVE_USERS_MAX_EVICTIONS", "1000", int, minimum=1)
 # Eviction reads last_interaction_at, which is meaningless while the block
 # processor is still replaying from block 0 (most of the eventual interacted
 # population still looks like a lurker). Skip until sync is within this many
 # blocks of the chain head.
-ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS = int(
-    os.environ.get("ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS", "1000")
+ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS = _tuning(
+    "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS", "1000", int, minimum=0
 )
 
 # Bounds the post-eviction top-up below. Each round either fills the cycle or

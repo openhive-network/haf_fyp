@@ -301,6 +301,13 @@ services:
       READ_REFRESH_MIN_AGE_SECONDS:
       READ_REFRESH_MAX_PER_CYCLE:
       READ_REFRESH_BATCH_SECONDS:
+      # Retention and maintenance (README, "Retention and maintenance"), the same way.
+      FEED_EVENTS_MAINT_SECONDS:
+      FEED_EVENTS_RETAIN_DAYS:
+      FEED_EVENTS_MAX_ROWS:
+      EMBEDDING_COVERAGE_DAYS:
+      ACTIVE_USERS_MAX_EVICTIONS:
+      ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS:
     depends_on:
       haf-fyp-setup:
         condition: service_completed_successfully

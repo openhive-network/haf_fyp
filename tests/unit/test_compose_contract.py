@@ -1745,21 +1745,20 @@ TUNING = {
     "READ_REFRESH_MIN_AGE_SECONDS",
     "READ_REFRESH_MAX_PER_CYCLE",
     "READ_REFRESH_BATCH_SECONDS",
-}
-
-# Read by the ranker and deliberately NOT passed by docker-compose.yml: retention and
-# maintenance settings nobody has needed to change, and two connection settings whose
-# defaults are the stack's own. Passing one is fine -- take it off this list, and read
-# it through something that survives an empty value.
-RANKER_READS_NOT_PASSED = {
-    "POSTGRES_PASSWORD",
-    "POSTGRES_PORT",
     "FEED_EVENTS_MAINT_SECONDS",
     "FEED_EVENTS_RETAIN_DAYS",
     "FEED_EVENTS_MAX_ROWS",
     "EMBEDDING_COVERAGE_DAYS",
     "ACTIVE_USERS_MAX_EVICTIONS",
     "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS",
+}
+
+# Read by the ranker and deliberately NOT passed by docker-compose.yml: two connection
+# settings whose defaults are the stack's own. Passing one is fine -- take it off this
+# list, and read it through something that survives an empty value.
+RANKER_READS_NOT_PASSED = {
+    "POSTGRES_PASSWORD",
+    "POSTGRES_PORT",
 }
 
 _ENV_READERS = ("_tuning", "os.environ.get", "os.getenv", "env_or_default")
@@ -1820,7 +1819,7 @@ def _ranker_environment(services) -> dict:
     return env
 
 
-def test_the_tuning_variables_are_the_documented_six():
+def test_the_tuning_variables_are_the_documented_ones():
     assert _ranker_env_reads()["_tuning"] == TUNING
 
 
