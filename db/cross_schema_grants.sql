@@ -34,16 +34,20 @@
 -- Concurrent catalog updates (#90): GRANT ... ON ALL TABLES IN SCHEMA s rewrites the
 -- pg_class row (relacl) of every table in s. When another session updates one of those
 -- same rows at the same moment -- another app's installer granting on its own schema,
--- that app's own maintenance -- PostgreSQL raises XX000 "tuple concurrently updated".
--- psql runs this file with ON_ERROR_STOP, so one such collision used to fail the whole
--- install (exit 3) although a retry seconds later succeeds. Each schema-guarded block
--- below therefore runs its grants in a retry loop: up to 5 attempts, each in its own
--- subtransaction (the BEGIN ... EXCEPTION block), sleeping 0.5 s, 1 s, 2 s, 4 s between
--- them. ONLY that one error is retried -- the handler catches internal_error (XX000) and
--- re-raises unless SQLERRM is exactly 'tuple concurrently updated' -- and it is re-raised
--- after the last attempt, so every other failure still reaches ON_ERROR_STOP at once.
--- The grants are idempotent, so repeating them after a rolled-back attempt is safe. The
--- success NOTICE stays after the loop, so a retried block still prints it exactly once.
+-- that app's own maintenance -- PostgreSQL raises XX000 "tuple concurrently updated",
+-- or, when the two sessions reach the rows in a different order, 40P01 "deadlock
+-- detected" (seen on PostgreSQL 17, which HAF 1.28.8 runs). psql runs this file with
+-- ON_ERROR_STOP, so one such collision used to fail the whole install (exit 3) although
+-- a retry seconds later succeeds. Each schema-guarded block below therefore runs its
+-- grants in a retry loop: up to 5 attempts, each in its own subtransaction (the
+-- BEGIN ... EXCEPTION block, whose rollback releases the row and tuple locks the
+-- attempt took), sleeping 0.5 s, 1 s, 2 s, 4 s between them. ONLY those two errors are
+-- retried: the handler catches internal_error (XX000) and deadlock_detected (40P01),
+-- re-raises an XX000 unless SQLERRM is exactly 'tuple concurrently updated', and
+-- re-raises either after the last attempt, so every other failure still reaches
+-- ON_ERROR_STOP at once. The grants are idempotent, so repeating them after a
+-- rolled-back attempt is safe. The success NOTICE stays after the loop, so a retried
+-- block still prints it exactly once.
 
 DO $$
 DECLARE
@@ -60,12 +64,12 @@ BEGIN
                 GRANT USAGE ON SCHEMA hivesense_app TO haf_fyp_user, haf_fyp_owner;
                 GRANT SELECT ON ALL TABLES IN SCHEMA hivesense_app TO haf_fyp_user, haf_fyp_owner;
                 EXIT;
-            EXCEPTION WHEN internal_error THEN
-                IF SQLERRM <> 'tuple concurrently updated' OR _attempt >= _max_attempts THEN
+            EXCEPTION WHEN internal_error OR deadlock_detected THEN
+                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
                     RAISE;
                 END IF;
-                RAISE NOTICE 'hivesense_app: tuple concurrently updated (attempt % of %), retrying in % s',
-                    _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                RAISE NOTICE 'hivesense_app: % (attempt % of %), retrying in % s',
+                    SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
                 PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
             END;
         END LOOP;
@@ -112,12 +116,12 @@ BEGIN
                 GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_app TO haf_fyp_owner;
                 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_app TO haf_fyp_owner;
                 EXIT;
-            EXCEPTION WHEN internal_error THEN
-                IF SQLERRM <> 'tuple concurrently updated' OR _attempt >= _max_attempts THEN
+            EXCEPTION WHEN internal_error OR deadlock_detected THEN
+                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
                     RAISE;
                 END IF;
-                RAISE NOTICE 'hivemind_app: tuple concurrently updated (attempt % of %), retrying in % s',
-                    _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                RAISE NOTICE 'hivemind_app: % (attempt % of %), retrying in % s',
+                    SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
                 PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
             END;
         END LOOP;
@@ -160,12 +164,12 @@ BEGIN
                 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
                 GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
                 EXIT;
-            EXCEPTION WHEN internal_error THEN
-                IF SQLERRM <> 'tuple concurrently updated' OR _attempt >= _max_attempts THEN
+            EXCEPTION WHEN internal_error OR deadlock_detected THEN
+                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
                     RAISE;
                 END IF;
-                RAISE NOTICE 'hivemind_postgrest_utilities: tuple concurrently updated (attempt % of %), retrying in % s',
-                    _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                RAISE NOTICE 'hivemind_postgrest_utilities: % (attempt % of %), retrying in % s',
+                    SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
                 PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
             END;
         END LOOP;
@@ -191,12 +195,12 @@ BEGIN
                 GRANT USAGE ON SCHEMA reptracker_app TO haf_fyp_user, haf_fyp_owner;
                 GRANT SELECT ON ALL TABLES IN SCHEMA reptracker_app TO haf_fyp_user, haf_fyp_owner;
                 EXIT;
-            EXCEPTION WHEN internal_error THEN
-                IF SQLERRM <> 'tuple concurrently updated' OR _attempt >= _max_attempts THEN
+            EXCEPTION WHEN internal_error OR deadlock_detected THEN
+                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
                     RAISE;
                 END IF;
-                RAISE NOTICE 'reptracker_app: tuple concurrently updated (attempt % of %), retrying in % s',
-                    _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                RAISE NOTICE 'reptracker_app: % (attempt % of %), retrying in % s',
+                    SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
                 PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
             END;
         END LOOP;
@@ -222,12 +226,12 @@ BEGIN
                 GRANT USAGE ON SCHEMA btracker_app TO haf_fyp_user, haf_fyp_owner;
                 GRANT SELECT ON ALL TABLES IN SCHEMA btracker_app TO haf_fyp_user, haf_fyp_owner;
                 EXIT;
-            EXCEPTION WHEN internal_error THEN
-                IF SQLERRM <> 'tuple concurrently updated' OR _attempt >= _max_attempts THEN
+            EXCEPTION WHEN internal_error OR deadlock_detected THEN
+                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
                     RAISE;
                 END IF;
-                RAISE NOTICE 'btracker_app: tuple concurrently updated (attempt % of %), retrying in % s',
-                    _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                RAISE NOTICE 'btracker_app: % (attempt % of %), retrying in % s',
+                    SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
                 PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
             END;
         END LOOP;
@@ -257,12 +261,12 @@ BEGIN
                 GRANT USAGE ON SCHEMA btracker_backend TO haf_fyp_user, haf_fyp_owner;
                 GRANT SELECT ON ALL TABLES IN SCHEMA btracker_backend TO haf_fyp_user, haf_fyp_owner;
                 EXIT;
-            EXCEPTION WHEN internal_error THEN
-                IF SQLERRM <> 'tuple concurrently updated' OR _attempt >= _max_attempts THEN
+            EXCEPTION WHEN internal_error OR deadlock_detected THEN
+                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
                     RAISE;
                 END IF;
-                RAISE NOTICE 'btracker_backend: tuple concurrently updated (attempt % of %), retrying in % s',
-                    _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                RAISE NOTICE 'btracker_backend: % (attempt % of %), retrying in % s',
+                    SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
                 PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
             END;
         END LOOP;
@@ -279,12 +283,12 @@ BEGIN
                 GRANT USAGE ON SCHEMA hafbe_bal TO haf_fyp_user, haf_fyp_owner;
                 GRANT SELECT ON ALL TABLES IN SCHEMA hafbe_bal TO haf_fyp_user, haf_fyp_owner;
                 EXIT;
-            EXCEPTION WHEN internal_error THEN
-                IF SQLERRM <> 'tuple concurrently updated' OR _attempt >= _max_attempts THEN
+            EXCEPTION WHEN internal_error OR deadlock_detected THEN
+                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
                     RAISE;
                 END IF;
-                RAISE NOTICE 'hafbe_bal: tuple concurrently updated (attempt % of %), retrying in % s',
-                    _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+                RAISE NOTICE 'hafbe_bal: % (attempt % of %), retrying in % s',
+                    SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
                 PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
             END;
         END LOOP;

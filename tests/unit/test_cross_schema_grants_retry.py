@@ -3,7 +3,7 @@
 The behaviour is exercised against a real PostgreSQL in
 tests/integration/test_cross_schema_grants_retry_db.py (fastapi-tests job). This file pins
 the structure in the job that has no database, so a block added later without the retry,
-or a handler widened to catch more than the one conflict, fails here too.
+or a handler widened to catch more than the two conflict errors, fails here too.
 """
 
 import os
@@ -12,8 +12,9 @@ import re
 GRANTS_SQL = os.path.join(os.path.dirname(__file__), "..", "..", "db", "cross_schema_grants.sql")
 
 HANDLER = (
-    "EXCEPTION WHEN internal_error THEN\n"
-    "{pad}        IF SQLERRM <> 'tuple concurrently updated' OR _attempt >= _max_attempts THEN\n"
+    "EXCEPTION WHEN internal_error OR deadlock_detected THEN\n"
+    "{pad}        IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated')"
+    " OR _attempt >= _max_attempts THEN\n"
     "{pad}            RAISE;\n"
     "{pad}        END IF;\n"
 )
@@ -58,13 +59,13 @@ def test_every_schema_grant_in_a_guarded_block_is_inside_a_retry_loop():
     assert loops == 7
 
 
-def test_handler_catches_only_internal_error():
+def test_handler_catches_only_the_two_conflict_errors():
     sql = _sql()
     handlers = re.findall(r"EXCEPTION WHEN ([^\n]*) THEN", sql)
     # 7 retry loops + the self-heal pass's insufficient_privilege fallback; nothing wider.
-    assert handlers.count("internal_error") == 7
+    assert handlers.count("internal_error OR deadlock_detected") == 7
     assert "OTHERS" not in " ".join(handlers)
-    assert sorted(set(handlers)) == ["insufficient_privilege", "internal_error"]
+    assert sorted(set(handlers)) == ["insufficient_privilege", "internal_error OR deadlock_detected"]
 
 
 def test_attempt_counter_is_reset_for_the_second_guard_of_the_balance_block():

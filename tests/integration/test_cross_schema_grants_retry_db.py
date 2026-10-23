@@ -3,18 +3,20 @@
 `GRANT ... ON ALL TABLES IN SCHEMA s` rewrites the pg_class row of every table in s. When
 another session updates one of those rows at the same moment, PostgreSQL raises XX000
 "tuple concurrently updated", and with ON_ERROR_STOP the whole haf-fyp-install used to exit
-3. Every schema-guarded block now retries that one error -- and only that one -- up to 5
-times with a 0.5 s, 1 s, 2 s, 4 s backoff.
+3. On PostgreSQL 17 the same race can also end in 40P01 "deadlock detected", when the two
+sessions reach the rows in a different order. Every schema-guarded block now retries those
+two errors -- and only those -- up to 5 times with a 0.5 s, 1 s, 2 s, 4 s backoff.
 
 Two halves:
 
 * The race itself. A background session loops GRANT/REVOKE on a schema of 400 tables while
   the shipped file runs. A bare GRANT under the same churn is the negative control: it must
-  fail at least once, or the harness is not reproducing the race and proves nothing.
+  fail (conflict or deadlock) at least once, or the harness is not reproducing the race and
+  proves nothing. The shipped file must pass every round.
 * The handler. Each retry loop is cut out of the shipped file and its grants replaced by an
   injected error, so the matching is pinned exactly: XX000 + 'tuple concurrently updated' is
-  retried with backoff and re-raised after the 5th attempt; the same message under another
-  SQLSTATE, and XX000 with another message, fail on the first attempt.
+  retried with backoff and re-raised after the 5th attempt, and so is 40P01; the conflict
+  message under another SQLSTATE, and XX000 with another message, fail on the first attempt.
 
 Everything runs in a throwaway database created and dropped here (roles are cluster-wide;
 only the ones created here are dropped). Runs in the fastapi-tests job; skipped when no
@@ -34,6 +36,9 @@ GRANTS_SQL = os.path.join(HERE, "..", "..", "db", "cross_schema_grants.sql")
 TEST_DB = "haf_fyp_test_grants_retry"
 CHURN_ROLE = "haf_fyp_test_churn_reader"
 CONFLICT = "tuple concurrently updated"
+DEADLOCK = "deadlock detected"
+# (SQLSTATE, message) pairs the handler must retry.
+RETRIED = [("XX000", CONFLICT), ("40P01", DEADLOCK)]
 MAX_ATTEMPTS = 5
 TOTAL_BACKOFF = 0.5 + 1 + 2 + 4
 CHURN_TABLES = 400
@@ -175,24 +180,23 @@ def _many_tables(conn):
 
 def test_negative_control_bare_grant_hits_the_conflict(conn):
     """Without a retry, the same churn breaks a bare GRANT. If this ever passes, the
-    harness has stopped reproducing #90 and the test below proves nothing."""
+    harness has stopped reproducing #90 and the test below proves nothing. Both ways the
+    race ends count: the conflict, and (PostgreSQL 17) a deadlock."""
     _many_tables(conn)
-    failures = deadlocks = 0
+    conflicts = deadlocks = 0
     for _ in range(ROUNDS):
         err = _under_churn(
             conn, ["GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_app TO haf_fyp_user, haf_fyp_owner"])
         if err is None:
             continue
-        # Two sessions updating the same pg_class rows in different heap order can also
-        # deadlock (seen on PostgreSQL 17). Not the error #90 is about, so not counted.
         if err.pgcode == "40P01":
             deadlocks += 1
             continue
         assert err.pgcode == "XX000" and CONFLICT in str(err), err
-        failures += 1
-    print(f"negative control: {failures}/{ROUNDS} bare GRANTs failed with '{CONFLICT}' "
-          f"({deadlocks} deadlocked)")
-    assert failures >= 1
+        conflicts += 1
+    print(f"negative control: {conflicts + deadlocks}/{ROUNDS} bare GRANTs failed "
+          f"({conflicts} '{CONFLICT}', {deadlocks} '{DEADLOCK}')")
+    assert conflicts + deadlocks >= 1
 
 
 def test_shipped_file_survives_a_concurrent_grant_writer(conn):
@@ -204,7 +208,7 @@ def test_shipped_file_survives_a_concurrent_grant_writer(conn):
         err = _under_churn(conn, statements)
         assert err is None, f"round {round_no}: {err.pgcode} {err}"
         notices = "".join(conn.notices)
-        retries += notices.count("hivemind_app: tuple concurrently updated (attempt")
+        retries += len(re.findall(r"hivemind_app: [^\n]* \(attempt \d of 5\), retrying", notices))
         # Same NOTICEs as before the fix: the success line, exactly once per run.
         assert notices.count("hivemind_app: granted SELECT + EXECUTE") == 1, notices
     print(f"shipped file: {ROUNDS}/{ROUNDS} runs passed, {retries} retried attempts")
@@ -271,19 +275,21 @@ def _run_injected(conn, schema, code, message, fail_times):
 
 
 @pytest.mark.parametrize("schema", LOOP_SCHEMAS)
-def test_conflict_is_retried_with_backoff_then_succeeds(conn, schema):
-    err, attempts, elapsed, notices = _run_injected(conn, schema, "XX000", CONFLICT, fail_times=2)
+@pytest.mark.parametrize("code,message", RETRIED)
+def test_conflict_is_retried_with_backoff_then_succeeds(conn, schema, code, message):
+    err, attempts, elapsed, notices = _run_injected(conn, schema, code, message, fail_times=2)
     assert err is None, err
     assert attempts == 3
     assert elapsed >= 0.5 + 1 - 0.05, f"no backoff: {elapsed:.2f}s"
-    assert notices.count(f"{schema}: tuple concurrently updated (attempt") == 2, notices
+    assert notices.count(f"{schema}: {message} (attempt") == 2, notices
     assert notices.count(f"{schema}: granted ") == 1, notices
 
 
 @pytest.mark.parametrize("schema", LOOP_SCHEMAS)
-def test_conflict_is_reraised_after_the_last_attempt(conn, schema):
-    err, attempts, elapsed, _ = _run_injected(conn, schema, "XX000", CONFLICT, fail_times=99)
-    assert err is not None and err.pgcode == "XX000" and CONFLICT in str(err)
+@pytest.mark.parametrize("code,message", RETRIED)
+def test_conflict_is_reraised_after_the_last_attempt(conn, schema, code, message):
+    err, attempts, elapsed, _ = _run_injected(conn, schema, code, message, fail_times=99)
+    assert err is not None and err.pgcode == code and message in str(err)
     assert attempts == MAX_ATTEMPTS
     assert elapsed >= TOTAL_BACKOFF - 0.05, f"backoff too short: {elapsed:.2f}s"
 
