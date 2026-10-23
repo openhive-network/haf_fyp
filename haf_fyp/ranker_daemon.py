@@ -221,11 +221,14 @@ _read_filter_days = 0
 _reads_unearned = 0
 # Whether a read from active_users row `au` earns a slot: the condition, and its two
 # parameters (both _read_filter_days). Shared by the early re-rank and the lane.
-_READ_EARNS_SQL = """(
+# COALESCE: last_interaction_at is NULL for an account that never voted or reblogged,
+# which would make the whole condition NULL rather than false -- no slot either way, but
+# NOT NULL is NULL too, and the count of reads that earned nothing would miss it.
+_READ_EARNS_SQL = """COALESCE((
     %s = 0
     OR au.last_interaction_at >= (NOW() AT TIME ZONE 'utc') - make_interval(days => %s)
     OR EXISTS (SELECT 1 FROM haf_fyp_app.user_interests ui WHERE ui.username = au.username)
-)"""
+), false)"""
 # Notifications held on the connection between drains. psycopg2 appends to
 # conn.notifies whenever it reads the socket, i.e. during every query of a cycle, and
 # nothing else bounds that list; the oldest are discarded past this. It is also the
@@ -405,6 +408,8 @@ def _connect() -> psycopg2.extensions.connection:
             _current_conn = conn
             _take_app_locks(conn)
             _listen_for_feed_reads(conn)
+            # Before the first cycle as well: main() handles reads before it runs one.
+            _refresh_read_filter(conn)
             return conn
         except psycopg2.OperationalError as exc:
             log.warning("database not ready (%s) — retrying in 5s", exc)
@@ -560,7 +565,8 @@ def _handle_feed_reads(conn, rerank_budget: int) -> set[str]:
 
 
 def _log_feed_read_summary() -> None:
-    """One line per cycle period. A lane that stays full means the rest of the rotation
+    """One line per cycle period (two with READER_ACTIVE_WITHIN_DAYS set: the second
+    counts the reads that earned no slot). A lane that stays full means the rest of the rotation
     is running slower; a heard count in the thousands means someone is requesting
     other people's feeds; nothing heard for days on a node whose feed is in use means
     the signal is not arriving."""
@@ -573,11 +579,11 @@ def _log_feed_read_summary() -> None:
         )
         if READER_ACTIVE_WITHIN_DAYS:
             log.info(
-                "feed reads since the last cycle that earned no slot "
-                "(READER_ACTIVE_WITHIN_DAYS=%d%s): %d",
-                READER_ACTIVE_WITHIN_DAYS,
-                "" if _read_filter_days else ", filter off while block processing catches up",
+                "read filter since the last cycle: %d read(s) earned no slot "
+                "(READER_ACTIVE_WITHIN_DAYS=%d%s)",
                 _reads_unearned,
+                READER_ACTIVE_WITHIN_DAYS,
+                "" if _read_filter_days else "; filter off: block processing is behind or not known",
             )
     _reads_heard = _reads_reranked = _reads_unearned = 0
 

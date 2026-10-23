@@ -1157,6 +1157,8 @@ def test_the_activity_filter_waits_for_block_processing(monkeypatch, caplog, set
 
     assert rd._read_filter_days == effective
     assert bool(asked) == bool(setting), "the setting off must cost no query"
+    # A failed check is rolled back, or the session is left in an aborted transaction.
+    assert conn.rollback.called == isinstance(caught_up, BaseException)
     if setting:
         assert any("READER_ACTIVE_WITHIN_DAYS=30" in r.getMessage() for r in caplog.records)
 
@@ -1175,9 +1177,9 @@ def test_a_lost_connection_while_checking_the_filter_is_not_swallowed(monkeypatc
 
 @pytest.mark.parametrize("setting, effective, line", [
     (0, 0, None),
-    (30, 30, "feed reads since the last cycle that earned no slot (READER_ACTIVE_WITHIN_DAYS=30): 5"),
-    (30, 0, "feed reads since the last cycle that earned no slot (READER_ACTIVE_WITHIN_DAYS=30, "
-            "filter off while block processing catches up): 5"),
+    (30, 30, "read filter since the last cycle: 5 read(s) earned no slot (READER_ACTIVE_WITHIN_DAYS=30)"),
+    (30, 0, "read filter since the last cycle: 5 read(s) earned no slot (READER_ACTIVE_WITHIN_DAYS=30; "
+            "filter off: block processing is behind or not known)"),
 ])
 def test_the_cycle_line_says_how_many_reads_earned_nothing(monkeypatch, caplog, setting, effective, line):
     monkeypatch.setattr(rd, "_reads_supported", True)
@@ -1189,6 +1191,16 @@ def test_the_cycle_line_says_how_many_reads_earned_nothing(monkeypatch, caplog, 
     said = [r.getMessage() for r in caplog.records if "earned no slot" in r.getMessage()]
     assert said == ([line] if line else [])
     assert rd._reads_unearned == 0, "the count is per cycle"
+    # The cycle line itself stays one, whatever the setting.
+    assert sum("feed reads since the last cycle" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_the_unearned_count_adds_up_over_a_cycles_passes(monkeypatch):
+    monkeypatch.setattr(rd, "_reads_unearned", 0)
+    for unearned in (3, 4):
+        conn, _cur = _mock_conn([[(None, unearned)]])
+        rd._note_feed_reads(conn, {"x"}, 10)
+    assert rd._reads_unearned == 7
 
 
 @pytest.mark.parametrize("raw, ok", [("3", True), ("2", True), ("1", False), (" ", True)])

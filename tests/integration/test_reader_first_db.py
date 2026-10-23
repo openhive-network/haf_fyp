@@ -214,6 +214,7 @@ def test_with_the_activity_filter_only_an_active_or_opted_in_reader_is_reranked(
     """#84: a forged read for an account that does not use Hive earns nothing."""
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
     monkeypatch.setattr(rd, "_read_filter_days", 30)
+    monkeypatch.setattr(rd, "_reads_unearned", 0)
     _user(conn, "active", scored="1 hour", interacted="3 days")
     _user(conn, "lapsed", scored="1 hour", interacted="31 days")
     _user(conn, "never", scored="1 hour")             # no interaction at all
@@ -223,6 +224,8 @@ def test_with_the_activity_filter_only_an_active_or_opted_in_reader_is_reranked(
     stale = rd._note_feed_reads(conn, {"active", "lapsed", "never", "picker"}, 10)
 
     assert stale == {"active", "picker"}
+    # Both that earned nothing are counted, the one with no interaction at all (NULL) too.
+    assert rd._reads_unearned == 2
     # Every read is still stamped: the feed function rations its notification on the
     # stamp, so an unstamped account would notify on every request.
     for name in ("active", "lapsed", "never", "picker"):

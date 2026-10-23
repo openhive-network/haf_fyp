@@ -111,6 +111,18 @@ def test_every_connection_takes_the_lock(monkeypatch):
     assert any("acquire_app_block_processor_locks(%s)" in s for s in _sql(cur))
 
 
+def test_every_connection_sets_the_read_filter_before_any_read_is_handled(monkeypatch):
+    """main() handles reads before its first cycle: the filter must be set by then (#84)."""
+    conn, _cur = _mock_conn()
+    order = []
+    monkeypatch.setattr(rd, "_current_conn", None)
+    monkeypatch.setattr(rd.psycopg2, "connect", lambda dsn: conn)
+    monkeypatch.setattr(rd, "_listen_for_feed_reads", lambda c: order.append("listen"))
+    monkeypatch.setattr(rd, "_refresh_read_filter", lambda c: order.append(("filter", c)))
+    assert rd._connect() is conn
+    assert order == ["listen", ("filter", conn)]
+
+
 # --- stopping and reconnecting must not leave a session holding the lock ------------
 
 
