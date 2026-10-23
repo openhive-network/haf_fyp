@@ -38,8 +38,8 @@
 -- or, when the two sessions reach the rows in a different order, 40P01 "deadlock
 -- detected" (seen on PostgreSQL 17, which HAF 1.28.8 runs). psql runs this file with
 -- ON_ERROR_STOP, so one such collision used to fail the whole install (exit 3) although
--- a retry seconds later succeeds. Each schema-guarded block below therefore runs its
--- grants in a retry loop: up to 5 attempts, each in its own subtransaction (the
+-- a retry seconds later succeeds. Each schema-guarded block below, and the hafd grants
+-- after them, therefore run their grants in a retry loop: up to 5 attempts, each in its own subtransaction (the
 -- BEGIN ... EXCEPTION block, whose rollback releases the row and tuple locks the
 -- attempt took), sleeping 0.5 s, 1 s, 2 s, 4 s between them. ONLY those two errors are
 -- retried: the handler catches internal_error (XX000) and deadlock_detected (40P01),
@@ -312,8 +312,33 @@ $$;
 -- haf_fyp_app.user_interactions table (populated by process_interactions), so
 -- the ranker no longer reads hive.* or hafd operation_types/blocks directly —
 -- those are used only by the block processor, which runs as haf_fyp_owner.
-GRANT USAGE ON SCHEMA hafd TO haf_fyp_user;
-GRANT SELECT ON hafd.accounts TO haf_fyp_user;
+--
+-- Unguarded on purpose (a missing hafd still fails the install), but in the same
+-- retry loop as the blocks above (#90): every HAF app's installer grants on hafd, so
+-- these two rows -- hafd's pg_namespace row and hafd.accounts' pg_class row -- are
+-- the ones other installers are most likely to be updating at the same moment.
+DO $$
+DECLARE
+    _attempt      int := 0;
+    _max_attempts CONSTANT int := 5;
+BEGIN
+    LOOP
+        _attempt := _attempt + 1;
+        BEGIN
+            GRANT USAGE ON SCHEMA hafd TO haf_fyp_user;
+            GRANT SELECT ON hafd.accounts TO haf_fyp_user;
+            EXIT;
+        EXCEPTION WHEN internal_error OR deadlock_detected THEN
+            IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
+                RAISE;
+            END IF;
+            RAISE NOTICE 'hafd: % (attempt % of %), retrying in % s',
+                SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
+            PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
+        END;
+    END LOOP;
+END
+$$;
 
 -- =============================================================================
 -- Self-healing SELECT grants

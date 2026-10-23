@@ -27,6 +27,7 @@ import os
 import re
 import threading
 import time
+import warnings
 
 import psycopg2
 import pytest
@@ -47,7 +48,8 @@ CHURN_TABLES = 400
 CHURN_SECONDS = 2.0
 ROUNDS = 5
 
-# Every schema a retry loop guards, in file order.
+# Every schema a retry loop grants on, in file order. hafd's loop is the unguarded one and
+# prints no success NOTICE (it never did).
 LOOP_SCHEMAS = [
     "hivesense_app",
     "hivemind_app",
@@ -56,6 +58,7 @@ LOOP_SCHEMAS = [
     "btracker_app",
     "btracker_backend",
     "hafbe_bal",
+    "hafd",
 ]
 
 
@@ -120,7 +123,7 @@ def conn(db):
     c.autocommit = True
     try:
         with c.cursor() as cur:
-            for schema in LOOP_SCHEMAS + ["hafd"]:
+            for schema in LOOP_SCHEMAS:
                 cur.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
             cur.execute("DROP SEQUENCE IF EXISTS public.attempts_a, public.attempts_b")
             cur.execute("CREATE SCHEMA hafd")
@@ -169,6 +172,11 @@ def _under_churn(conn, statements):
     return error
 
 
+def _report(line):
+    print(line)
+    warnings.warn(line, stacklevel=2)
+
+
 def _many_tables(conn):
     with conn.cursor() as cur:
         cur.execute("CREATE SCHEMA hivemind_app")
@@ -194,8 +202,9 @@ def test_negative_control_bare_grant_hits_the_conflict(conn):
             continue
         assert err.pgcode == "XX000" and CONFLICT in str(err), err
         conflicts += 1
-    print(f"negative control: {conflicts + deadlocks}/{ROUNDS} bare GRANTs failed "
-          f"({conflicts} '{CONFLICT}', {deadlocks} '{DEADLOCK}')")
+    # A warning, not only a print, so the numbers reach the CI log under plain -v.
+    _report(f"negative control: {conflicts + deadlocks}/{ROUNDS} bare GRANTs failed "
+            f"({conflicts} '{CONFLICT}', {deadlocks} '{DEADLOCK}')")
     assert conflicts + deadlocks >= 1
 
 
@@ -211,7 +220,7 @@ def test_shipped_file_survives_a_concurrent_grant_writer(conn):
         retries += len(re.findall(r"hivemind_app: [^\n]* \(attempt \d of 5\), retrying", notices))
         # Same NOTICEs as before the fix: the success line, exactly once per run.
         assert notices.count("hivemind_app: granted SELECT + EXECUTE") == 1, notices
-    print(f"shipped file: {ROUNDS}/{ROUNDS} runs passed, {retries} retried attempts")
+    _report(f"shipped file: {ROUNDS}/{ROUNDS} runs passed, {retries} retried attempts")
     # Proves the conflict was actually met and retried, not merely avoided.
     assert retries >= 1
     with conn.cursor() as cur:
@@ -228,7 +237,9 @@ def test_shipped_file_survives_a_concurrent_grant_writer(conn):
 def _block_for(sql, schema):
     """The DO block holding the retry loop for schema."""
     for block in re.findall(r"(?ms)^DO \$\$\n.*?^\$\$;", sql):
-        if f"schema_name = '{schema}'" in block and "LOOP\n" in block:
+        guards = f"schema_name = '{schema}'" in block or (
+            schema == "hafd" and "ON SCHEMA hafd TO" in block)
+        if guards and "LOOP\n" in block:
             return block
     raise AssertionError(f"no retry loop guards {schema}")
 
@@ -240,7 +251,7 @@ def _inject(block, schema, sequence, code, message, fail_times):
     lines = block.split("\n")
     out, injected = [], False
     for ln in lines:
-        if re.match(rf"\s+GRANT \S+ ON (SCHEMA|ALL \w+ IN SCHEMA) {schema} ", ln):
+        if re.match(rf"\s+GRANT \S+ ON ((SCHEMA|ALL \w+ IN SCHEMA) {schema} |{schema}\.)", ln):
             if not injected:
                 pad = ln[: len(ln) - len(ln.lstrip())]
                 out.append(
@@ -256,7 +267,7 @@ def _inject(block, schema, sequence, code, message, fail_times):
 def _run_injected(conn, schema, code, message, fail_times):
     sql = open(GRANTS_SQL, encoding="utf-8").read()
     with conn.cursor() as cur:
-        cur.execute(f"CREATE SCHEMA {schema}")
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")  # the fixture makes hafd
         cur.execute("CREATE SEQUENCE public.attempts_a")
     block = _inject(_block_for(sql, schema), schema, "attempts_a", code, message, fail_times)
     del conn.notices[:]
@@ -282,7 +293,7 @@ def test_conflict_is_retried_with_backoff_then_succeeds(conn, schema, code, mess
     assert attempts == 3
     assert elapsed >= 0.5 + 1 - 0.05, f"no backoff: {elapsed:.2f}s"
     assert notices.count(f"{schema}: {message} (attempt") == 2, notices
-    assert notices.count(f"{schema}: granted ") == 1, notices
+    assert notices.count(f"{schema}: granted ") == (0 if schema == "hafd" else 1), notices
 
 
 @pytest.mark.parametrize("schema", LOOP_SCHEMAS)

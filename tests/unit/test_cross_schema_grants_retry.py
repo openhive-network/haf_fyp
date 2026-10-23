@@ -33,17 +33,30 @@ def _guarded_blocks():
     return [b for b in _do_blocks() if "IF EXISTS (\n        SELECT 1 FROM information_schema.schemata" in b]
 
 
-def test_every_guarded_block_declares_five_attempts():
-    blocks = _guarded_blocks()
-    assert len(blocks) == 6
+def _grant_blocks():
+    """Every block that runs a GRANT statement: the 6 schema-guarded ones plus the
+    unguarded hafd one. (The self-heal pass only builds GRANT text for EXECUTE.)"""
+    return [b for b in _do_blocks() if re.search(r"^\s*GRANT ", b, re.M)]
+
+
+def test_no_grant_runs_outside_a_do_block():
+    outside = re.sub(r"(?ms)^DO \$\$\n.*?^\$\$;", "", _sql())
+    assert not re.search(r"^\s*GRANT ", outside, re.M)
+
+
+def test_every_grant_block_declares_five_attempts():
+    assert len(_guarded_blocks()) == 6
+    blocks = _grant_blocks()
+    assert len(blocks) == 7
+    assert any("ON SCHEMA hafd TO" in b and "ON hafd.accounts TO" in b for b in blocks)
     for b in blocks:
         assert "_max_attempts CONSTANT int := 5;" in b
         assert "_attempt      int := 0;" in b
 
 
-def test_every_schema_grant_in_a_guarded_block_is_inside_a_retry_loop():
+def test_every_grant_in_a_block_is_inside_a_retry_loop():
     loops = 0
-    for b in _guarded_blocks():
+    for b in _grant_blocks():
         # Split into retry loops and what is outside them; no GRANT may be outside.
         inside = re.findall(r"(?ms)^(\s*)LOOP\n.*?^\1END LOOP;", b)
         outside = re.sub(r"(?ms)^(\s*)LOOP\n.*?^\1END LOOP;", "", b)
@@ -56,14 +69,14 @@ def test_every_schema_grant_in_a_guarded_block_is_inside_a_retry_loop():
             assert f"{pad}        EXIT;\n{pad}    " + HANDLER.format(pad=pad) in body, body
             assert f"PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));\n{pad}    END;\n" in body
         assert inside
-    assert loops == 7
+    assert loops == 8
 
 
 def test_handler_catches_only_the_two_conflict_errors():
     sql = _sql()
     handlers = re.findall(r"EXCEPTION WHEN ([^\n]*) THEN", sql)
-    # 7 retry loops + the self-heal pass's insufficient_privilege fallback; nothing wider.
-    assert handlers.count("internal_error OR deadlock_detected") == 7
+    # 8 retry loops + the self-heal pass's insufficient_privilege fallback; nothing wider.
+    assert handlers.count("internal_error OR deadlock_detected") == 8
     assert "OTHERS" not in " ".join(handlers)
     assert sorted(set(handlers)) == ["insufficient_privilege", "internal_error OR deadlock_detected"]
 
@@ -78,6 +91,6 @@ def test_attempt_counter_is_reset_for_the_second_guard_of_the_balance_block():
 
 def test_success_notices_stay_after_the_loop():
     # One success line per schema, printed once even when a block retried.
-    for b in _guarded_blocks():
+    for b in _grant_blocks():
         for m in re.finditer(r"(?ms)^(\s*)LOOP\n.*?^\1END LOOP;", b):
             assert "granted" not in m.group(0)
