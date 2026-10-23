@@ -301,6 +301,7 @@ services:
       READ_REFRESH_MIN_AGE_SECONDS:
       READ_REFRESH_MAX_PER_CYCLE:
       READ_REFRESH_BATCH_SECONDS:
+      READER_ACTIVE_WITHIN_DAYS:
       # Retention and maintenance (README, "Retention and maintenance"), the same way. A
       # ranker image from before they were passed reads a blank one with int() and stops.
       FEED_EVENTS_MAINT_SECONDS:

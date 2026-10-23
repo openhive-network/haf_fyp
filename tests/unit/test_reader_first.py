@@ -173,7 +173,8 @@ def test_note_stamps_in_one_statement_and_commits(monkeypatch):
     assert rd._note_feed_reads(conn, {"bob", "alice"}, 7) == {"bob"}
 
     (call,) = cur.execute.call_args_list
-    assert call.args[1] == (["alice", "bob"], 123, 7)
+    # (READER_ACTIVE_WITHIN_DAYS twice, the names, min age, limit)
+    assert call.args[1] == (0, 0, ["alice", "bob"], 123, 7)
     assert "last_read_at" in call.args[0]
     conn.commit.assert_called_once()
 
@@ -185,7 +186,7 @@ def test_note_never_sends_a_negative_limit():
 
     rd._note_feed_reads(conn, {"alice"}, -5)
 
-    assert cur.execute.call_args.args[1][2] == 0
+    assert cur.execute.call_args.args[1][-1] == 0  # the LIMIT
 
 
 def test_note_does_not_commit_when_the_statement_fails():
@@ -212,7 +213,8 @@ def test_readers_come_first_and_the_rest_fills_the_cycle(monkeypatch):
     assert rd._fetch_personalised_users(conn, 10) == ["r1", "r2", "s1", "s2", "s3"]
 
     reader_call, rest_call = cur.execute.call_args_list
-    assert reader_call.args[1] == (3600, 77, 5), "readers may take at most the share"
+    # (window, min age, READER_ACTIVE_WITHIN_DAYS twice, slots)
+    assert reader_call.args[1] == (3600, 77, 0, 0, 5), "readers may take at most the share"
     # The remainder excludes the readers already taken and fills what is left of the
     # cycle, so two readers leave eight slots, not five.
     assert rest_call.args[1] == (["r1", "r2"], 8)
@@ -251,7 +253,7 @@ def test_the_reader_share_of_an_odd_cycle_rounds_down(monkeypatch, limit, slots)
 
     rd._fetch_personalised_users(conn, limit)
 
-    assert cur.execute.call_args_list[0].args[1][2] == slots
+    assert cur.execute.call_args_list[0].args[1][-1] == slots  # the LIMIT
 
 
 def test_a_cycle_of_one_goes_to_the_rotation_not_to_a_reader(monkeypatch):
@@ -918,6 +920,7 @@ _NAMES = (
     "READ_REFRESH_MIN_AGE_SECONDS",
     "READ_REFRESH_MAX_PER_CYCLE",
     "READ_REFRESH_BATCH_SECONDS",
+    "READER_ACTIVE_WITHIN_DAYS",
     "_READ_REFRESH_DEFAULT_CEILING",
     "_FEED_READ_BACKLOG_MAX",
     *RETENTION,
@@ -1011,6 +1014,7 @@ def test_the_reader_defaults_are_the_documented_ones(settings):
         "READ_REFRESH_MIN_AGE_SECONDS": 600,
         "READ_REFRESH_MAX_PER_CYCLE": 100,
         "READ_REFRESH_BATCH_SECONDS": 30,
+        "READER_ACTIVE_WITHIN_DAYS": 0,  # off: every read counts (#84)
         "_READ_REFRESH_DEFAULT_CEILING": 300,
         "_FEED_READ_BACKLOG_MAX": 20000,
         **RETENTION,
@@ -1091,6 +1095,7 @@ def test_a_setting_at_its_minimum_is_taken(settings):
     ("EMBEDDING_COVERAGE_DAYS", "0"),
     ("ACTIVE_USERS_MAX_EVICTIONS", "0"),
     ("ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS", "-1"),
+    ("READER_ACTIVE_WITHIN_DAYS", "-1"),
 ])
 def test_a_setting_below_its_minimum_stops_the_ranker_and_says_which(name, value):
     env = {k: v for k, v in os.environ.items()

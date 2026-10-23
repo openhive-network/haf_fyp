@@ -184,6 +184,89 @@ def test_a_spent_budget_still_stamps_every_reader(conn, monkeypatch):
     assert _read_age_seconds(conn, "old") is not None
 
 
+@pytest.fixture()
+def interests(conn):
+    """Saved interests for the given names, removed again after the test."""
+    added = []
+
+    def add(name):
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO haf_fyp_app.user_interests (username, community_id, declared_at) "
+                "VALUES (%s, 1, NOW() AT TIME ZONE 'utc')",
+                (name,),
+            )
+        conn.commit()
+        added.append(name)
+
+    yield add
+    conn.rollback()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM haf_fyp_app.user_interests WHERE username = ANY(%s)", (added,))
+    conn.commit()
+
+
+def test_with_the_activity_filter_only_an_active_or_opted_in_reader_is_reranked(
+        conn, monkeypatch, interests):
+    """#84: a forged read for an account that does not use Hive earns nothing."""
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    monkeypatch.setattr(rd, "READER_ACTIVE_WITHIN_DAYS", 30)
+    _user(conn, "active", scored="1 hour", interacted="3 days")
+    _user(conn, "lapsed", scored="1 hour", interacted="31 days")
+    _user(conn, "never", scored="1 hour")             # no interaction at all
+    _user(conn, "picker", scored="1 hour")            # never interacted, saved interests
+    interests("picker")
+
+    stale = rd._note_feed_reads(conn, {"active", "lapsed", "never", "picker"}, 10)
+
+    assert stale == {"active", "picker"}
+    # Every read is still stamped: the feed function rations its notification on the
+    # stamp, so an unstamped account would notify on every request.
+    for name in ("active", "lapsed", "never", "picker"):
+        assert _read_age_seconds(conn, name) is not None, name
+
+
+def test_with_the_activity_filter_off_every_read_counts(conn, monkeypatch):
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    monkeypatch.setattr(rd, "READER_ACTIVE_WITHIN_DAYS", 0)
+    _user(conn, "lapsed", scored="1 hour", interacted="400 days")
+    _user(conn, "never", scored="1 hour")
+
+    assert rd._note_feed_reads(conn, {"lapsed", "never"}, 10) == {"lapsed", "never"}
+
+
+def test_with_the_activity_filter_the_lane_takes_only_active_or_opted_in_readers(
+        conn, monkeypatch, interests):
+    monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
+    monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    monkeypatch.setattr(rd, "READER_ACTIVE_WITHIN_DAYS", 30)
+    # Stalest first, so without the filter "forged" (stalest) would take the lane.
+    _user(conn, "forged", scored="9 hours", read="1 minute", interacted="300 days")
+    _user(conn, "picker", scored="8 hours", read="1 minute")
+    _user(conn, "active", scored="7 hours", read="1 minute", interacted="1 day")
+    _user(conn, "idle", scored="20 hours", interacted="1 day")
+    interests("picker")
+
+    users = rd._fetch_personalised_users(conn, 4)
+
+    # Lane of two: the two readers that earn it, stalest first; then the rest of the
+    # rotation in its own order -- where the forged reader still competes as anyone does.
+    assert users[:2] == ["picker", "active"]
+    assert users[2:] == ["idle", "forged"]
+
+
+def test_with_the_activity_filter_off_the_lane_is_what_it_was(conn, monkeypatch):
+    monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
+    monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    monkeypatch.setattr(rd, "READER_ACTIVE_WITHIN_DAYS", 0)
+    _user(conn, "forged", scored="9 hours", read="1 minute", interacted="300 days")
+    _user(conn, "active", scored="7 hours", read="1 minute", interacted="1 day")
+
+    assert rd._fetch_personalised_users(conn, 4)[:2] == ["forged", "active"]
+
+
 def test_a_row_locked_by_another_writer_is_skipped_not_waited_for(conn, other):
     _user(conn, "busy", scored="2 hours")
     _user(conn, "free", scored="2 hours")
@@ -461,6 +544,16 @@ def test_the_reader_window_is_utc_on_a_server_that_is_not(tokyo, monkeypatch):
 
     # Compared as Tokyo time the read looks nine hours old, outside the hour's window.
     assert rd._fetch_personalised_users(tokyo, 2) == ["reader", "idle"]
+
+
+def test_the_activity_filter_is_utc_on_a_server_that_is_not(tokyo, monkeypatch):
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    monkeypatch.setattr(rd, "READER_ACTIVE_WITHIN_DAYS", 1)
+    _user(tokyo, "active", scored="1 hour", interacted="20 hours")
+
+    # Compared as Tokyo time the cutoff is nine hours later, and 20 hours ago looks
+    # older than a day.
+    assert rd._note_feed_reads(tokyo, {"active"}, 10) == {"active"}
 
 
 def test_the_lanes_minimum_age_is_utc_on_a_server_that_is_not(tokyo, monkeypatch):

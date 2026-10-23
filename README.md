@@ -711,6 +711,7 @@ start with a log line naming the variable. The others are held to their range.
 | `READER_WINDOW_SECONDS` | 86400 | How long one read keeps an account eligible for the reader lane. |
 | `READ_REFRESH_MIN_AGE_SECONDS` | 600 | A feed younger than this is not re-ranked on read, and does not take a lane slot. |
 | `READ_REFRESH_MAX_PER_CYCLE` | `MAX_USERS_PER_CYCLE` x `READER_CYCLE_SHARE`, at most 300 | Re-ranks on read per cycle period: between two scheduled cycles, and ahead of their turn during one (a cycle grows by at most this many accounts). 0 turns them off. Between cycles they run in the 300 s the ranker waits: keep this times seconds-per-account well under `CYCLE_SECONDS`, or they start delaying the cycle. |
+| `READER_ACTIVE_WITHIN_DAYS` | 0 | Off at 0. Otherwise a read earns a lane slot or an early re-rank only for an account active on chain within this many days, or with saved interests: a forged read for an account that does not use Hive then costs nothing. It narrows a flood, it does not stop one (tens of thousands of accounts are active on a full node). At 30 days it would have turned away about 1 real reader in 16 on testapi. |
 | `READ_REFRESH_BATCH_SECONDS` | 30 | After one read-triggered re-rank, the next waits this long and takes everyone who became due meanwhile. Each one fetches the candidates before ranking anyone (about 8 s on a full node), so they are grouped. 0 turns the grouping off. |
 
 What to expect, and what this does not do:

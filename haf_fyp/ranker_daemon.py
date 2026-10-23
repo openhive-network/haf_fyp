@@ -190,6 +190,24 @@ READ_REFRESH_MAX_PER_CYCLE = max(0, _tuning(
 # trickle of reads for different accounts keep the ranker fetching between cycles. The
 # first read after a quiet spell is not held back. 0 turns the grouping off.
 READ_REFRESH_BATCH_SECONDS = max(0, _tuning("READ_REFRESH_BATCH_SECONDS", "30", int))
+# Opt-in (#84): honour a read only from an account with on-chain activity in the last
+# this-many days, or with interests it saved (a signed request). 0, the default, honours
+# every read. A forged read for an account that does not use Hive then takes no lane slot
+# and no early re-rank. It does NOT stop a flood: on a full node tens of thousands of
+# accounts are active, far more than a lane holds. It keeps the lane to accounts worth
+# ranking anyway, at a cost measured on testapi of about 1 real reader in 16 at 30 days.
+#
+# Such a read is still stamped (last_read_at): the feed function notifies at most once
+# per ten minutes per account BECAUSE the read is stamped, so not stamping would let a
+# forger raise one notification per request instead.
+READER_ACTIVE_WITHIN_DAYS = _tuning("READER_ACTIVE_WITHIN_DAYS", "0", int, minimum=0)
+# Whether a read from active_users row `au` earns a slot: the condition, and its two
+# parameters (both READER_ACTIVE_WITHIN_DAYS). Shared by the early re-rank and the lane.
+_READ_EARNS_SQL = """(
+    %s = 0
+    OR au.last_interaction_at >= (NOW() AT TIME ZONE 'utc') - make_interval(days => %s)
+    OR EXISTS (SELECT 1 FROM haf_fyp_app.user_interests ui WHERE ui.username = au.username)
+)"""
 # Notifications held on the connection between drains. psycopg2 appends to
 # conn.notifies whenever it reads the socket, i.e. during every query of a cycle, and
 # nothing else bounds that list; the oldest are discarded past this. It is also the
@@ -473,27 +491,29 @@ def _note_feed_reads(conn, usernames: set[str], rerank_limit: int) -> set[str]:
         return set()
     with conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             WITH picked AS (
-                SELECT username, last_scored_at
-                  FROM haf_fyp_app.active_users
-                 WHERE username = ANY(%s)
-                   FOR UPDATE SKIP LOCKED
+                SELECT au.username, au.last_scored_at, {_READ_EARNS_SQL} AS earns
+                  FROM haf_fyp_app.active_users au
+                 WHERE au.username = ANY(%s)
+                   FOR UPDATE OF au SKIP LOCKED
             ), stamped AS (
                 UPDATE haf_fyp_app.active_users au
                    SET last_read_at = (NOW() AT TIME ZONE 'utc')
                   FROM picked
                  WHERE au.username = picked.username
-             RETURNING au.username, picked.last_scored_at
+             RETURNING au.username, picked.last_scored_at, picked.earns
             )
             SELECT username
               FROM stamped
-             WHERE last_scored_at IS NULL
-                OR last_scored_at < (NOW() AT TIME ZONE 'utc') - make_interval(secs => %s)
+             WHERE earns
+               AND (last_scored_at IS NULL
+                    OR last_scored_at < (NOW() AT TIME ZONE 'utc') - make_interval(secs => %s))
              ORDER BY last_scored_at ASC NULLS FIRST
              LIMIT %s
             """,
-            (sorted(usernames), READ_REFRESH_MIN_AGE_SECONDS, max(0, rerank_limit)),
+            (READER_ACTIVE_WITHIN_DAYS, READER_ACTIVE_WITHIN_DAYS, sorted(usernames),
+             READ_REFRESH_MIN_AGE_SECONDS, max(0, rerank_limit)),
         )
         stale = {r[0] for r in cur.fetchall()}
     conn.commit()
@@ -694,17 +714,19 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
             # speed, half at the default, for nothing. Such an account simply competes in
             # the remainder, where a fresh feed sorts last.
             cur.execute(
-                """
+                f"""
                 SELECT username
-                  FROM haf_fyp_app.active_users
+                  FROM haf_fyp_app.active_users au
                  WHERE last_read_at >= (NOW() AT TIME ZONE 'utc') - make_interval(secs => %s)
                    AND (last_scored_at IS NULL
                         OR last_scored_at < (NOW() AT TIME ZONE 'utc') - make_interval(secs => %s))
+                   AND {_READ_EARNS_SQL}
                  ORDER BY last_scored_at ASC NULLS FIRST,
                           last_read_at DESC
                  LIMIT %s
                 """,
-                (READER_WINDOW_SECONDS, READ_REFRESH_MIN_AGE_SECONDS, reader_slots),
+                (READER_WINDOW_SECONDS, READ_REFRESH_MIN_AGE_SECONDS,
+                 READER_ACTIVE_WITHIN_DAYS, READER_ACTIVE_WITHIN_DAYS, reader_slots),
             )
             readers = [r[0] for r in cur.fetchall()]
         _lane_taken, _lane_slots = len(readers), reader_slots
