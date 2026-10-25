@@ -1,0 +1,49 @@
+# How .aidev/compose_lane.py runs the CI compose lanes inside the AIDEV runtime
+# container (see its docstring and .aidev/README.md).
+#
+# lanes.<compose file>.external: the lane's long-running servers, which are services
+# of the AIDEV test stack (.aidev/test-stack.compose.yml) — lane service name -> stack
+# service name. A name that differs is rewritten wherever the lane addresses it
+# (`-h <name>`, `@<name>`, a `*HOST` variable equal to it).
+# lanes.<compose file>.after: a shell command run once the named lane service exits 0.
+# builds.<Dockerfile>: how a service built from that Dockerfile runs from the checkout
+# (`root`: the image path its COPY lines lay out, mapped to a scratch copy).
+lanes:
+  docker/docker-compose-ci.yml:
+    external:
+      postgres: postgres
+      haf-fyp-postgrest: haf-fyp-postgrest
+      haf-fyp-postgrest-rewriter: haf-fyp-postgrest-rewriter
+    # In CI, PostgREST starts after `setup` has created its schema. The stack's PostgREST
+    # is up before it, so it is told to reload its schema cache once setup is done, and
+    # the lane goes on when it serves the root spec.
+    after:
+      setup: >-
+        PGPASSWORD=postgres psql -h postgres -U postgres -d haf_block_log -v ON_ERROR_STOP=1
+        -c "NOTIFY pgrst, 'reload schema'" &&
+        for i in $(seq 1 60); do
+        curl -fsS -o /dev/null http://haf-fyp-postgrest:3000/ && exit 0; sleep 0.5;
+        done; echo "PostgREST did not serve / after the schema reload"; exit 1
+  # The install lane over a model of HAF: its `postgres` (pgvector:pg18) is the stack's
+  # `install-db`, because the stack's `postgres` is the PostgREST lane's pg14.
+  docker/docker-compose-ci-install.yml:
+    external:
+      postgres: install-db
+  docker/docker-compose-ci-install-haf.yml:
+    external:
+      haf-init: haf-init
+      haf: haf
+
+builds:
+  # Dockerfile.sql: its COPY lines lay db/, endpoints/, scripts/ (755) and the entrypoint
+  # out under /app (an env value under `root` is mapped into that copy, others are kept); the entrypoint runs from that copy and reads it through
+  # HAF_FYP_APP_DIR. Its GIT_HASH build arg becomes the image's GIT_HASH.
+  Dockerfile.sql:
+    root: /app
+    entrypoint: [/app/docker_entrypoint.sh]
+    env:
+      HAF_FYP_APP_DIR: /app
+      # The wrapper the image's base (common-ci-configuration/psql) carries at
+      # /usr/local/bin; the runtime image keeps its copy out of the unit tests' way.
+      HAF_FYP_INSTALL_LOCK_WRAPPER: /opt/psql-image/usr/local/bin/install_with_app_lock.py
+    args_to_env: true

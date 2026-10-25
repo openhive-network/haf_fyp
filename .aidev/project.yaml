@@ -1,0 +1,98 @@
+# Profile for hive/haf_fyp, written by `aidev project scaffold` (#13561).
+#
+# Schema reference: docs/architecture/project-profile.md
+# Onboarding procedure: the `onboard-external-project` skill.
+# Guide: docs/operations/onboarding-an-external-project.md
+#
+# The generator writes a starting point, not a governed answer: every
+# binding below is the command a maintainer said this project runs, and it
+# is reviewed and edited like any other declaration.
+version: 2
+project: haf-fyp
+
+gitlab:
+  host: "gitlab.syncad.com"
+  path: "hive/haf_fyp"
+  id: 603
+
+# AIDEV integrates into its own branch and hands it off to develop by merge
+# request (`aidev handoff`: it opens the MR gated by the project CI), as in
+# hive/nft_tracker, hive/reputation_tracker and hive/balance_tracker. `stable` is
+# omitted, so `aidev release` never moves develop or main; develop -> main stays
+# the project's own process.
+branches:
+  integration: "aidev/integration"
+  handoff: "develop"
+
+# How this project's suites execute (#13892): one kind, stated once.
+environment:
+  kind: "container"
+  # Built by .aidev/runtime/build.sh from .aidev/runtime/Dockerfile and requirements.txt.
+  image: "registry.gitlab.syncad.com/hive/haf_fyp/aidev-tests@sha256:f7fde1e02088a902023bca484f597db7b2c4794e34621db5adb9eee4ca910090"
+  inputs: [".aidev/runtime/Dockerfile", "requirements.txt"]
+
+issues:
+  intake_label: todo
+  taxonomy: ".aidev/labels.yaml"
+  decompose:
+    # `never` is where an external project starts: nothing marks work
+    # approved on this project's behalf until there is a track record.
+    auto_todo: never
+  # Reports about this project's work are filed against this project.
+  watcher_reports: self
+
+# The service stack the slots that run haf_fyp's database lanes start (aidev#9890):
+# the long-running servers of CI's fastapi-tests, postgrest-tests, install-test and
+# install-test-haf jobs, one set per lane — PostgreSQL 14 for the FastAPI tests,
+# pgvector 14 + PostgREST + the rewriter built from the candidate's
+# Dockerfile.rewriter, pgvector 18 as the model of HAF, and HAF itself (docker/.env's
+# HAF_INSTALL_LANE_VERSION, initialised with --exit-before-sync, nothing replayed).
+# The lanes' one-shot steps run in the runtime image, which joins the stack's
+# network. Slots that only lint and unit-test say `stack: false`. See
+# .aidev/README.md.
+sandbox:
+  compose: .aidev/test-stack.compose.yml
+  # Idle databases and one PostgREST; nothing replayed.
+  resource_class: light
+  services: [fastapi-db, postgres, haf-fyp-postgrest, haf-fyp-postgrest-rewriter, install-db, haf-init, haf]
+  readiness_timeout: 300
+
+# Verification slots. Each binding is what this project genuinely runs for
+# that slot — never one selection repeated under seven names, which makes
+# seven gates report on the same evidence while claiming to check seven
+# different things.
+#
+# Every step except stack-pins and aidev-scripts is a job of .gitlab-ci.yml, run
+# from that file (.aidev/ci_job.py): the lint jobs, python-tests (`unit`), and for
+# full, baseline and canary the four database lanes. Not bound: haf-shim-drift
+# (fetches hive/haf over the network; its offline half is in the unit tests), the
+# docker-build-* image smoke tests (they need a docker daemon) and the scheduled
+# jobs. See .aidev/README.md.
+verification:
+  quick:
+    adapter: command
+    args: [".aidev/run-checks.sh", "quick", "stack-pins", "aidev-scripts", "sql-lint", "shell-lint", "python-lint", "hadolint", "compose-validate", "openapi-drift", "unit"]
+    stack: false
+    artifacts: ["test-results/quick/"]
+  full:
+    adapter: command
+    args: [".aidev/run-checks.sh", "full", "stack-pins", "aidev-scripts", "sql-lint", "shell-lint", "python-lint", "hadolint", "compose-validate", "openapi-drift", "unit", "fastapi", "postgrest", "install", "install-haf"]
+    artifacts: ["test-results/full/"]
+  baseline:
+    adapter: command
+    args: [".aidev/run-checks.sh", "baseline", "unit", "fastapi", "postgrest", "install", "install-haf"]
+    artifacts: ["test-results/baseline/"]
+  canary:
+    adapter: command
+    args: [".aidev/run-checks.sh", "canary", "stack-pins", "aidev-scripts", "sql-lint", "shell-lint", "python-lint", "hadolint", "compose-validate", "openapi-drift", "unit", "fastapi", "postgrest", "install", "install-haf"]
+    artifacts: ["test-results/canary/"]
+  # python-tests with its pytest-cov run (coverage.xml beside the junit). `static`
+  # and `system` are left unbound: AIDEV runs neither for a project.
+  coverage:
+    adapter: command
+    args: [".aidev/run-checks.sh", "coverage", "unit"]
+    stack: false
+    artifacts: ["test-results/coverage/"]
+
+# Capability grants for target-side code. Empty until this project needs one.
+capabilities: []

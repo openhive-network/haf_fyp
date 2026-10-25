@@ -162,13 +162,16 @@ class Flavour:
         }
 
 
-# .standard-rules, as every other lane has them: merge requests and the default branch,
+# .standard-rules, as every other lane has them: merge requests, API- and web-started
+# pipelines on AIDEV's aidev/integration (`aidev handoff`'s), and the default branch,
 # never a schedule. Stated here because the jobs only ALIAS them -- weakening the anchor
 # (say, to `when: manual`) would weaken these jobs without touching them.
 STANDARD_RULES = [
     {"if": '$CI_PIPELINE_SOURCE == "schedule"', "when": "never"},
     {"if": '$RUN_REGISTRY_RESOLUTION == "true"', "when": "never"},
     {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'},
+    {"if": '$CI_COMMIT_BRANCH == "aidev/integration" && $CI_PIPELINE_SOURCE == "api"'},
+    {"if": '$CI_COMMIT_BRANCH == "aidev/integration" && $CI_PIPELINE_SOURCE == "web"'},
     {"if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"},
 ]
 
