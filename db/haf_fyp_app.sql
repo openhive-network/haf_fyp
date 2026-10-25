@@ -478,6 +478,193 @@ END;
 $$;
 
 -- ---------------------------------------------------------------------------
+-- Indexes and foreign keys deferred during the initial massive sync
+-- ---------------------------------------------------------------------------
+-- Every index and foreign key on a table block processing writes, classified. A
+-- processor statement reads or arbitrates on the first kind, so it stays live; nothing
+-- block processing runs reads the second kind, so HAF drops it before the first range and
+-- it is rebuilt once, when the context leaves MASSIVE_PROCESSING. EXPLAIN over a 5M-block
+-- clone with the second kind dropped shows each processor statement on the same index
+-- it used before.
+--
+-- Needed by block processing (stay live):
+--   post_candidates_pkey                  process_posts' insert, and what the restored
+--                                         foreign keys validate against
+--   post_candidates_author_permlink_key   process_posts: ON CONFLICT (author, permlink)
+--   idx_post_candidates_payout_window     process_payout_windows' UPDATE, every range
+--   idx_post_candidates_unresolved        resolve_hivemind_post_ids' UPDATE, every range
+--                                         on a node with hivemind
+--   post_lookup_pkey                      process_posts: ON CONFLICT (post_id)
+--   idx_post_lookup_ap                    the (author, permlink) join of process_comments,
+--                                         process_reblogs, process_votes and
+--                                         process_interactions; post_lookup has no other
+--                                         index on those columns, so it is not redundant
+--   post_commenters_pkey                  process_comments: ON CONFLICT
+--   engagement_metrics_pkey               process_posts' ON CONFLICT and the engagement
+--                                         UPDATEs' post_id lookup
+--   user_interactions_pkey                process_interactions: ON CONFLICT
+--   active_users_pkey                     process_interactions: ON CONFLICT
+--   user_communities_pkey                 process_subscribe's ON CONFLICT and
+--                                         process_unsubscribe's DELETE
+-- API and ranker only (deferred), the rows of deferred_during_massive_sync() below:
+--   idx_user_interactions_user_time       the ranker's per-user history read
+--   idx_active_users_last_read_at         the ranker's recent-readers pick
+--   idx_user_communities_user             API reads by username
+--   the foreign keys to post_candidates of post_lookup, post_commenters,
+--   engagement_metrics and post_bridge_cache: every post_id the processors write comes
+--   from process_posts' own insert or from post_lookup, and nothing deletes a
+--   post_candidates row, so the rebuild's validation finds what the checks would have
+--
+-- Tables block processing never writes (feed_cache, global_feed_cache, feed_events,
+-- user_profile_vectors, ...) cost the sync nothing and keep everything.
+--
+-- Only the INITIAL sync defers: the drop happens on the first range a context processes
+-- from block 0. A live node that falls behind re-enters MASSIVE_PROCESSING, and rebuilding
+-- the history indexes after every catch-up would cost more than the catch-up saves.
+CREATE OR REPLACE FUNCTION haf_fyp_app.deferred_during_massive_sync()
+RETURNS TABLE (table_name text, object_name text, is_foreign_key boolean)
+LANGUAGE sql
+IMMUTABLE
+AS $$
+    VALUES
+        ('user_interactions', 'idx_user_interactions_user_time', FALSE),
+        ('active_users', 'idx_active_users_last_read_at', FALSE),
+        ('user_communities', 'idx_user_communities_user', FALSE),
+        ('post_lookup', 'post_lookup_post_id_fkey', TRUE),
+        ('post_commenters', 'post_commenters_post_id_fkey', TRUE),
+        ('engagement_metrics', 'engagement_metrics_post_id_fkey', TRUE),
+        ('post_bridge_cache', 'post_bridge_cache_post_id_fkey', TRUE);
+$$;
+
+-- Registers the deferred indexes with HAF (hive.app_register_index_dependency), which
+-- records them as 'created'; foreign keys have no registration of their own in HAF and
+-- are recorded when hive.app_save_and_drop_foreign_keys drops them. Each command is the
+-- index's own pg_get_indexdef, so what HAF rebuilds is what db/create_tables.sql made.
+-- Re-registering is a no-op in HAF.
+--
+-- Then restores, when the context is past MASSIVE_PROCESSING: a node whose processor
+-- stopped between its last massive range and the first live one has its indexes back
+-- before anything else reads them.
+--
+-- A HAF without the index API (the CI model of HAF, tests/haf_stub.sql, has none)
+-- defers nothing: the tables keep every index and the sync runs as it always did.
+CREATE OR REPLACE FUNCTION haf_fyp_app.register_deferred_indexes()
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    _command text;
+BEGIN
+    IF to_regprocedure('hive.app_register_index_dependency(text,text)') IS NULL THEN
+        RAISE NOTICE 'This HAF has no hive.app_register_index_dependency: no index is deferred during massive sync.';
+        RETURN;
+    END IF;
+
+    FOR _command IN
+        SELECT regexp_replace(pg_get_indexdef(i.indexrelid), '^CREATE INDEX ', 'CREATE INDEX IF NOT EXISTS ')
+        FROM haf_fyp_app.deferred_during_massive_sync() AS d
+        INNER JOIN pg_class AS c ON c.relname = d.object_name
+        INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace AND n.nspname = 'haf_fyp_app'
+        INNER JOIN pg_index AS i ON i.indexrelid = c.oid
+        WHERE NOT d.is_foreign_key
+    LOOP
+        PERFORM hive.app_register_index_dependency('haf_fyp', _command);
+    END LOOP;
+
+    IF hive.get_current_stage_name('haf_fyp') IS DISTINCT FROM 'MASSIVE_PROCESSING' THEN
+        PERFORM haf_fyp_app.restore_deferred_indexes();
+    END IF;
+END;
+$$;
+
+-- Whether HAF holds any of this context's indexes or foreign keys as dropped. Asked of
+-- HAF's record rather than the catalog: what HAF did not drop, it cannot restore.
+CREATE OR REPLACE FUNCTION haf_fyp_app.deferred_indexes_dropped()
+RETURNS boolean
+LANGUAGE plpgsql
+STABLE
+AS $$
+BEGIN
+    IF to_regclass('hafd.indexes_constraints') IS NULL THEN
+        RETURN FALSE;
+    END IF;
+
+    RETURN EXISTS (
+        SELECT 1
+        FROM hafd.indexes_constraints AS ic
+        INNER JOIN hafd.contexts AS c ON c.id = ANY (ic.contexts)
+        WHERE c.name = 'haf_fyp' AND ic.status <> 'created'
+    );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION haf_fyp_app.drop_deferred_indexes()
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF to_regprocedure('hive.app_save_and_drop_indexes(text)') IS NULL THEN
+        RETURN;
+    END IF;
+    PERFORM hive.app_save_and_drop_indexes('haf_fyp');
+
+    -- Per table: HAF drops every foreign key of the tables named, and these have one each.
+    IF to_regprocedure('hive.app_save_and_drop_foreign_keys(text,text,text)') IS NOT NULL THEN
+        PERFORM hive.app_save_and_drop_foreign_keys('haf_fyp', 'haf_fyp_app', d.table_name)
+        FROM haf_fyp_app.deferred_during_massive_sync() AS d
+        WHERE d.is_foreign_key;
+    END IF;
+END;
+$$;
+
+-- Rebuilds whatever HAF dropped, indexes first so the foreign keys' validation has them,
+-- and ANALYZEs the tables (hive.app_restore_indexes). A no-op when nothing is dropped.
+-- Called by the first range past MASSIVE_PROCESSING, by register_deferred_indexes() at
+-- install, and by hand on a context stopped while still massive (the replay lane stops
+-- at a fixed block):
+--     SET ROLE haf_fyp_owner; SELECT haf_fyp_app.restore_deferred_indexes();
+CREATE OR REPLACE FUNCTION haf_fyp_app.restore_deferred_indexes()
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NOT haf_fyp_app.deferred_indexes_dropped() THEN
+        RETURN;
+    END IF;
+    PERFORM hive.app_restore_indexes('haf_fyp');
+
+    IF to_regprocedure('hive.app_restore_foreign_keys(text,text)') IS NOT NULL THEN
+        PERFORM hive.app_restore_foreign_keys('haf_fyp', 'haf_fyp_app.' || d.table_name)
+        FROM haf_fyp_app.deferred_during_massive_sync() AS d
+        WHERE d.is_foreign_key;
+    END IF;
+END;
+$$;
+
+-- Runs before each range, in its transaction, so a drop or a rebuild commits or rolls
+-- back with the range it was made for. last_processed_block = 0 is "this context has
+-- processed nothing": the range about to run is the initial sync's first.
+CREATE OR REPLACE FUNCTION haf_fyp_app.manage_deferred_indexes()
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF to_regprocedure('hive.get_current_stage_name(hafd.context_name)') IS NULL THEN
+        RETURN;
+    END IF;
+
+    IF hive.get_current_stage_name('haf_fyp') = 'MASSIVE_PROCESSING' THEN
+        IF NOT EXISTS (SELECT 1 FROM haf_fyp_app.app_status WHERE last_processed_block > 0) THEN
+            PERFORM haf_fyp_app.drop_deferred_indexes();
+        END IF;
+    ELSE
+        PERFORM haf_fyp_app.restore_deferred_indexes();
+    END IF;
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- Main block-processing loop (PROCEDURE so CALL works and transactions commit).
 -- Uses hive.app_next_iteration() which automatically advances the context block
 -- pointer — unlike the older hive.app_next_block() function which does not.
@@ -509,6 +696,7 @@ BEGIN
             CONTINUE;
         END IF;
 
+        PERFORM haf_fyp_app.manage_deferred_indexes();
         PERFORM haf_fyp_app.process_block_range(_block_range.first_block, _block_range.last_block);
         UPDATE haf_fyp_app.app_status SET last_processed_block = _block_range.last_block;
     END LOOP;
@@ -528,6 +716,7 @@ CREATE OR REPLACE PROCEDURE haf_fyp_app.process_blocks(
 LANGUAGE plpgsql
 AS $$
 BEGIN
+    PERFORM haf_fyp_app.manage_deferred_indexes();
     PERFORM haf_fyp_app.process_block_range(_block_range.first_block, _block_range.last_block);
     UPDATE haf_fyp_app.app_status SET last_processed_block = _block_range.last_block;
 END;

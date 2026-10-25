@@ -58,6 +58,24 @@ BEGIN
 END
 $$;
 
+-- HAF's records of the indexes it drops and restores for haf_fyp's tables: removing the
+-- context removes them (hive.app_remove_context). The snapshot below leaves them out,
+-- so they are asked for here. A HAF without the table (the model) has none to leave.
+DO $$
+DECLARE
+    _left TEXT;
+BEGIN
+    IF to_regclass('hafd.indexes_constraints') IS NULL THEN
+        RETURN;
+    END IF;
+    EXECUTE 'SELECT string_agg(i.table_name || ''.'' || i.index_constraint_name, '', '' ORDER BY i.table_name, i.index_constraint_name)'
+        ' FROM hafd.indexes_constraints AS i WHERE split_part(i.table_name, ''.'', 1) = ''haf_fyp_app''' INTO _left;
+    IF _left IS NOT NULL THEN
+        RAISE EXCEPTION 'the uninstall left HAF index records: %', _left;
+    END IF;
+END
+$$;
+
 -- Outside haf_fyp's schemas the database is, by the snapshot tests/ci_install_setup.sql
 -- defines (which says what it holds and what it does not), what it was before the
 -- first install -- and every grant the installer gave its roles is gone with them.

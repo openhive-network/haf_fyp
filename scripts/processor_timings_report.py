@@ -3,6 +3,7 @@
 
     processor_timings_report.py --log DRIVER_LOG --out REPORT.json
         --first-block N --last-block M --sync-seconds S [--uninstrumented-sync-seconds U]
+        [--index-restore-seconds R] [--uninstrumented-index-restore-seconds V]
 
 DRIVER_LOG is haf_app_driver.py's output for a run with haf_fyp.processor_timings = on
 (db/process_block_range.sql): one `haf_fyp_processor_timing {...}` line per processor
@@ -13,9 +14,11 @@ time, a missing or unknown processor, a gap or an overlap -- exits 1 naming the 
 and writes no report.
 
 The report holds each processor's wall time over the whole run and per 1,000,000 blocks
-(a batch counts towards the million its first block is in), the rows of each op type a
-processor read (stage_operations from hive.operations_view, the others as it staged them), the custom_json ids the reblog question turns on,
-and the run's wall time as measured by the caller.
+(a batch counts towards the million its first block is in), the rows each processor read
+from hive.operations_view by op type, the custom_json ids the reblog question turns on,
+and the run's wall time as measured by the caller. The indexes and foreign keys deferred
+during massive sync are rebuilt after the last batch, so their rebuild is not in the
+sync's wall time: the caller passes it separately, and the report adds the two.
 """
 
 from __future__ import annotations
@@ -198,15 +201,22 @@ def _rounded(seconds: float) -> float:
     return round(seconds, 3)
 
 
+def _plus(a: float | None, b: float | None) -> float | None:
+    return None if a is None or b is None else _rounded(a + b)
+
+
 def build_report(timings: list[_Timing], counts: list[_Counts], *, first_block: int, last_block: int,
-                 sync_seconds: float, uninstrumented_sync_seconds: float | None = None) -> dict[str, Any]:
+                 sync_seconds: float, uninstrumented_sync_seconds: float | None = None,
+                 index_restore_seconds: float | None = None,
+                 uninstrumented_index_restore_seconds: float | None = None) -> dict[str, Any]:
     """The report for one run: totals, the per-million split, rows read and the reblog ids.
 
     :raises TimingsError: the records do not tile ``first_block..last_block`` with every
-        processor timed and the operations counted once per batch.
+        processor timed and the operations counted once per batch, or a wall time is negative.
     """
-    if sync_seconds < 0 or (uninstrumented_sync_seconds is not None and uninstrumented_sync_seconds < 0):
-        raise TimingsError("a sync wall time is negative")
+    walls = (sync_seconds, uninstrumented_sync_seconds, index_restore_seconds, uninstrumented_index_restore_seconds)
+    if any(w is not None and w < 0 for w in walls):
+        raise TimingsError("a wall time is negative")
     batches = _batches(timings, counts, first_block, last_block)
     totals: dict[str, float] = dict.fromkeys(PROCESSORS, 0.0)
     rows_read: dict[str, dict[str, int]] = {p: defaultdict(int) for p in PROCESSORS}
@@ -256,6 +266,12 @@ def build_report(timings: list[_Timing], counts: list[_Counts], *, first_block: 
         "blocks_per_second": round(blocks / sync_seconds, 1) if sync_seconds > 0 else None,
         "uninstrumented_sync_wall_seconds": (
             None if uninstrumented_sync_seconds is None else _rounded(uninstrumented_sync_seconds)),
+        "index_restore_seconds": None if index_restore_seconds is None else _rounded(index_restore_seconds),
+        "uninstrumented_index_restore_seconds": (
+            None if uninstrumented_index_restore_seconds is None else _rounded(uninstrumented_index_restore_seconds)),
+        "sync_plus_restore_wall_seconds": _plus(sync_seconds, index_restore_seconds),
+        "uninstrumented_sync_plus_restore_wall_seconds": _plus(uninstrumented_sync_seconds,
+                                                               uninstrumented_index_restore_seconds),
         "processing_seconds": _rounded(processing),
         "instrumentation_seconds": _rounded(instrumentation),
         "processors": {
@@ -304,6 +320,12 @@ def summary_table(report: Mapping[str, Any]) -> str:
                  f" instrumentation {report['instrumentation_seconds']:.1f}s")
     if report["uninstrumented_sync_wall_seconds"] is not None:
         lines.append(f"uninstrumented sync wall {report['uninstrumented_sync_wall_seconds']:.1f}s")
+    if report["index_restore_seconds"] is not None:
+        lines.append(f"index restore {report['index_restore_seconds']:.1f}s,"
+                     f" sync plus restore {report['sync_plus_restore_wall_seconds']:.1f}s")
+    if report["uninstrumented_sync_plus_restore_wall_seconds"] is not None:
+        lines.append(f"uninstrumented index restore {report['uninstrumented_index_restore_seconds']:.1f}s,"
+                     f" sync plus restore {report['uninstrumented_sync_plus_restore_wall_seconds']:.1f}s")
     ids = report["reblog_ids"]
     lines.append(f"reblogs: id='reblog' {ids['custom_json_id_reblog']},"
                  f" id='follow' with [\"reblog\", ...] {ids['custom_json_id_follow_payload_reblog']}."
@@ -320,13 +342,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sync-seconds", required=True, type=float, help="the timed run's wall time")
     parser.add_argument("--uninstrumented-sync-seconds", type=float,
                         help="the same range's wall time with the timings off")
+    parser.add_argument("--index-restore-seconds", type=float,
+                        help="the timed run's rebuild of the indexes deferred during massive sync")
+    parser.add_argument("--uninstrumented-index-restore-seconds", type=float,
+                        help="the same rebuild in the run with the timings off")
     args = parser.parse_args(argv)
     try:
         with args.log.open(encoding="utf-8", errors="replace") as log:
             timings, counts = parse_log(log)
         report = build_report(timings, counts, first_block=args.first_block, last_block=args.last_block,
                               sync_seconds=args.sync_seconds,
-                              uninstrumented_sync_seconds=args.uninstrumented_sync_seconds)
+                              uninstrumented_sync_seconds=args.uninstrumented_sync_seconds,
+                              index_restore_seconds=args.index_restore_seconds,
+                              uninstrumented_index_restore_seconds=args.uninstrumented_index_restore_seconds)
     except (OSError, TimingsError) as exc:
         print(f"no report: {exc}", file=sys.stderr)
         return 1

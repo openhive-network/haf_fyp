@@ -99,7 +99,10 @@ $$;
 -- uninstall legitimately do. What the contexts and applications tables hold FOR THE
 -- OTHER APPLICATION is compared whole by bystander_now() below, and for haf_fyp by
 -- data_now(). HAF's log of context events may only grow: context_log_now() below.
--- So the sequences behind HAF's contexts tables are compared by nobody.
+-- So the sequences behind HAF's contexts tables are compared by nobody. Likewise HAF's
+-- records of the indexes it drops and restores for haf_fyp's tables
+-- (hafd.indexes_constraints rows on haf_fyp_app.*, which the install registers): they
+-- are compared by data_now(), and every other row of that table here.
 --
 -- Only ordinary, logged tables: not unlogged ones, not materialized views. And each
 -- table is read whole into one string, which is right for a HAF with no blocks and
@@ -127,6 +130,10 @@ BEGIN
     LOOP
         IF _rel.relkind = 'S' THEN
             EXECUTE format('SELECT ''sequence value %s last_value='' || last_value || '' is_called='' || is_called FROM %s',
+                           _rel.name, _rel.name) INTO _line;
+        ELSIF _rel.name = 'hafd.indexes_constraints' THEN
+            EXECUTE format('SELECT ''rows of %s count='' || count(*) || '' md5='' || md5(coalesce(string_agg(t::text, E''\n'' ORDER BY t::text), '''')) FROM %s AS t'
+                           ' WHERE split_part(t.table_name, ''.'', 1) <> ''haf_fyp_app''',
                            _rel.name, _rel.name) INTO _line;
         ELSE
             EXECUTE format('SELECT ''rows of %s count='' || count(*) || '' md5='' || md5(coalesce(string_agg(t::text, E''\n'' ORDER BY t::text), '''')) FROM %s AS t',
@@ -430,9 +437,10 @@ RETURNS TEXT LANGUAGE sql STABLE AS $$
 $$;
 
 -- Every row the app's tables hold, and where its sequences stand: one line per table.
--- And the two rows HAF holds FOR the app, whole: its context (the block pointer, the
--- irreversible block, the stages) and its registration. What a running node wrote is
--- not the installer's to touch.
+-- And the rows HAF holds FOR the app, whole: its context (the block pointer, the
+-- irreversible block, the stages), its registration, and, on HAF, its records of the
+-- indexes and foreign keys it drops and restores for the app's tables. What a running
+-- node wrote is not the installer's to touch.
 CREATE OR REPLACE FUNCTION ci_install_lane.data_now()
 RETURNS TEXT [] LANGUAGE plpgsql STABLE AS $$
 DECLARE
@@ -459,6 +467,11 @@ BEGIN
         (SELECT to_jsonb(c)::text FROM hafd.contexts AS c WHERE c.name = 'haf_fyp'), 'GONE'));
     _out := _out || ('HAF registration ' || coalesce(
         (SELECT to_jsonb(a)::text FROM hafd.applications AS a WHERE a.name = 'haf_fyp'), 'GONE'));
+    IF to_regclass('hafd.indexes_constraints') IS NOT NULL THEN
+        EXECUTE 'SELECT ''HAF index records '' || coalesce(string_agg(to_jsonb(i)::text, '' '' ORDER BY i.table_name, i.index_constraint_name), ''none'')'
+            ' FROM hafd.indexes_constraints AS i WHERE split_part(i.table_name, ''.'', 1) = ''haf_fyp_app''' INTO _line;
+        _out := _out || _line;
+    END IF;
     RETURN _out;
 END;
 $$;
