@@ -213,26 +213,97 @@ WHERE last_read_at IS NOT NULL;
 --
 -- ---------------------------------------------------------------------------
 -- Feed cache — precomputed ranked feeds (personalized)
+--
+-- One row per (account, rank), up to 200 per account, so the row is kept narrow
+-- (#98): scores are real, rank is smallint, and the two repeated strings,
+-- algorithm_version and boost_source, are smallint codes into feed_cache_labels,
+-- 0 meaning none (NULL). Columns are ordered widest-aligned first, so no row pays
+-- alignment padding and none needs a null bitmap. One index: rank is unique per
+-- account (write_feed_cache numbers each feed 1..n), and every reader looks rows
+-- up by account and rank; the explainer's (account, post) lookup scans one
+-- account's at most 200 entries. The key stays the account NAME: an account id
+-- would need a HAF or hivemind lookup in every writer, reader and eviction path.
 -- ---------------------------------------------------------------------------
 
-CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_cache (
-    username varchar(16) NOT NULL,
-    post_id bigint NOT NULL,
-    final_score float NOT NULL,
-    score_engagement float,
-    score_recency float,
-    score_credibility float,
-    score_relevance float,
-    community_boost_applied boolean NOT NULL DEFAULT FALSE,
-    boost_source varchar(16),
-    rank int NOT NULL,
-    algorithm_version varchar(16),
-    computed_at timestamp,
-    PRIMARY KEY (username, post_id)
+CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_cache_labels (
+    code smallint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    label varchar(16) NOT NULL UNIQUE
 );
 
-CREATE INDEX IF NOT EXISTS idx_feed_cache_user_rank
-ON haf_fyp_app.feed_cache (username, rank ASC);
+-- Upgrade from the wide row (float8 scores, int rank, text labels, a second index on
+-- (username, post_id)). Step 1 of 2: set the old table aside, so the CREATE below makes
+-- the compact one. The copy is step 2, after it. Split this way so an install that
+-- dies in between is finished by the next one: the set-aside table is still there.
+DO $feed_cache_set_aside$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = to_regclass('haf_fyp_app.feed_cache')
+          AND attname = 'rank' AND atttypid = 'int4'::regtype AND NOT attisdropped
+    ) THEN
+        DROP INDEX IF EXISTS haf_fyp_app.idx_feed_cache_user_rank;
+        ALTER TABLE haf_fyp_app.feed_cache RENAME CONSTRAINT feed_cache_pkey TO feed_cache_wide_pkey;
+        ALTER TABLE haf_fyp_app.feed_cache RENAME TO feed_cache_wide;
+    END IF;
+END
+$feed_cache_set_aside$;
+
+CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_cache (
+    post_id bigint NOT NULL,
+    computed_at timestamp,
+    final_score real NOT NULL,
+    score_engagement real,
+    score_recency real,
+    score_credibility real,
+    score_relevance real,
+    rank smallint NOT NULL,
+    algorithm_version smallint NOT NULL DEFAULT 0,   -- feed_cache_labels.code, 0 = none
+    boost_source smallint NOT NULL DEFAULT 0,        -- feed_cache_labels.code, 0 = none
+    community_boost_applied boolean NOT NULL DEFAULT FALSE,
+    username varchar(16) NOT NULL,
+    PRIMARY KEY (username, rank)
+);
+
+-- Step 2 of 2: copy the wide rows across, labels to codes, and drop the old table. A
+-- rank repeated within one account cannot come from write_feed_cache; were one there,
+-- the first copy wins rather than the install failing. Existing feeds are kept as
+-- they are: the hourly unread-feed pass (db/active_users_maintenance.sql) is what
+-- drops the ones nobody reads.
+DO $feed_cache_compact$
+BEGIN
+    IF to_regclass('haf_fyp_app.feed_cache_wide') IS NULL THEN
+        RETURN;
+    END IF;
+    INSERT INTO haf_fyp_app.feed_cache_labels (label)
+    SELECT DISTINCT w.label
+    FROM (
+        SELECT algorithm_version AS label FROM haf_fyp_app.feed_cache_wide
+        UNION
+        SELECT boost_source FROM haf_fyp_app.feed_cache_wide
+    ) AS w
+    WHERE w.label IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM haf_fyp_app.feed_cache_labels AS l WHERE l.label = w.label)
+    ON CONFLICT (label) DO NOTHING;
+
+    INSERT INTO haf_fyp_app.feed_cache (
+        post_id, computed_at, final_score, score_engagement, score_recency,
+        score_credibility, score_relevance, rank, algorithm_version, boost_source,
+        community_boost_applied, username
+    )
+    SELECT
+        w.post_id, w.computed_at, w.final_score, w.score_engagement, w.score_recency,
+        w.score_credibility, w.score_relevance, w.rank,
+        COALESCE(la.code, 0), COALESCE(lb.code, 0),
+        w.community_boost_applied, w.username
+    FROM haf_fyp_app.feed_cache_wide AS w
+    LEFT JOIN haf_fyp_app.feed_cache_labels AS la ON la.label = w.algorithm_version
+    LEFT JOIN haf_fyp_app.feed_cache_labels AS lb ON lb.label = w.boost_source
+    ORDER BY w.username, w.rank
+    ON CONFLICT (username, rank) DO NOTHING;
+
+    DROP TABLE haf_fyp_app.feed_cache_wide;
+END
+$feed_cache_compact$;
 
 -- ---------------------------------------------------------------------------
 -- Global feed cache — unauthenticated / cold-start feed

@@ -76,6 +76,7 @@ def test_the_report_carries_every_figure_and_the_settings_it_assumed():
         # The API cannot see the ranker's settings: it says which values it used.
         "window_seconds": 86400,
         "due_after_seconds": 600,
+        "retention_days": 30,
         "readers_in_window": 9,
         "readers_due": 2,
         "oldest_reader_feed_seconds": 431,
@@ -104,16 +105,18 @@ def test_the_assumed_settings_are_the_rankers_defaults():
 
     repo = os.path.join(os.path.dirname(__file__), "..", "..")
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("READER_", "READ_REFRESH_", "MAX_USERS_PER_CYCLE"))}
+           if not k.startswith(("READER_", "READ_REFRESH_", "MAX_USERS_PER_CYCLE", "FEED_CACHE_"))}
     out = subprocess.run(
         [sys.executable, "-c",
          "import json; from haf_fyp import ranker_daemon as r; "
-         "print(json.dumps([r.READER_WINDOW_SECONDS, r.READ_REFRESH_MIN_AGE_SECONDS]))"],
+         "print(json.dumps([r.READER_WINDOW_SECONDS, r.READ_REFRESH_MIN_AGE_SECONDS, "
+         "r.FEED_CACHE_UNREAD_RETENTION_DAYS]))"],
         cwd=repo, env={**env, "PYTHONPATH": repo}, capture_output=True, text=True, check=True,
     )
 
     assert json.loads(out.stdout.strip().splitlines()[-1]) == [
         metrics.READER_FIRST_WINDOW_SECONDS, metrics.READER_FIRST_DUE_AFTER_SECONDS,
+        metrics.READER_FIRST_RETENTION_DAYS,
     ]
 
 
@@ -222,7 +225,7 @@ def test_the_probe_passes_the_assumed_settings_to_the_query():
     cur = _Cursor()
     fetch_reader_first(_conn(cur))
 
-    assert cur.params[2] == {"window": 86400, "due": 600}
+    assert cur.params[2] == {"window": 86400, "due": 600, "retention": 30}
 
 
 def test_the_query_names_its_schema_and_uses_utc():

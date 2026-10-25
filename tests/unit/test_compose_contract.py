@@ -1987,6 +1987,7 @@ TUNING = {
     "EMBEDDING_COVERAGE_DAYS",
     "ACTIVE_USERS_MAX_EVICTIONS",
     "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS",
+    "FEED_CACHE_UNREAD_RETENTION_DAYS",
 }
 
 # Read by the ranker and deliberately NOT passed by docker-compose.yml: two connection
@@ -2189,7 +2190,7 @@ def _coded_minimums() -> dict:
 
 RETENTION = ("FEED_EVENTS_MAINT_SECONDS", "FEED_EVENTS_RETAIN_DAYS", "FEED_EVENTS_MAX_ROWS",
              "EMBEDDING_COVERAGE_DAYS", "ACTIVE_USERS_MAX_EVICTIONS",
-             "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS")
+             "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS", "FEED_CACHE_UNREAD_RETENTION_DAYS")
 
 
 def test_the_readme_retention_table_shows_the_daemons_defaults_and_minimums():

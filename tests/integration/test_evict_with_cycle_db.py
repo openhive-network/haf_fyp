@@ -355,7 +355,10 @@ def test_an_account_the_cycles_own_reconcile_evicts_is_not_ranked(conn, other, m
     """The same account with nobody naming it: what the top-of-cycle reconcile returns
     must be taken out of the queue. (#10, and older than #85: here so that the test
     above cannot be passing on this alone, or failing to notice it missing.)"""
-    _member(conn, "gone", scored="6 hours", interests=False)
+    # Read three days ago: outside the reader window, so it is in the queue as the
+    # rotation's stalest. (An opted-out account that never read is not in the queue at
+    # all since #98; the hourly sweep evicts it.)
+    _member(conn, "gone", scored="6 hours", interests=False, read="3 days")
     for name, scored in (("acct1", "5 hours"), ("acct2", "4 hours")):
         _member(conn, name, scored=scored)
 

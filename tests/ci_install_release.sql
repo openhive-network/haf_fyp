@@ -15,7 +15,7 @@ DROP FUNCTION haf_fyp_endpoints.get_health();
 --   a function with a setting it should not have (CREATE OR REPLACE resets it)
 ALTER FUNCTION haf_fyp_endpoints.get_version() SET search_path = pg_temp;
 --   an index that is gone
-DROP INDEX haf_fyp_app.idx_feed_cache_user_rank;
+DROP INDEX haf_fyp_app.idx_global_feed_rank;
 --   a grant that is gone
 REVOKE SELECT ON haf_fyp_app.feed_cache FROM haf_fyp_user;
 

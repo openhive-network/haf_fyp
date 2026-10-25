@@ -103,6 +103,11 @@ def _user(conn, name, *, scored=None, read=None, interacted=None):
     conn.commit()
 
 
+# A read older than any reader window these tests set, and inside the feed-retention
+# window: an account the rotation lane takes (#98) and the reader lane does not.
+_IN_ROTATION = "20 days"
+
+
 def _read_age_seconds(conn, name):
     with conn.cursor() as cur:
         cur.execute(
@@ -277,7 +282,7 @@ def test_with_the_activity_filter_the_lane_takes_only_active_or_opted_in_readers
     _user(conn, "forged", scored="9 hours", read="1 minute", interacted="300 days")
     _user(conn, "picker", scored="8 hours", read="1 minute")
     _user(conn, "active", scored="7 hours", read="1 minute", interacted="1 day")
-    _user(conn, "idle", scored="20 hours", interacted="1 day")
+    _user(conn, "idle", scored="20 hours", interacted="1 day", read=_IN_ROTATION)
     interests("picker")
 
     users = rd._fetch_personalised_users(conn, 4)
@@ -340,9 +345,9 @@ def test_recent_readers_are_ranked_ahead_of_a_staler_rotation(conn, monkeypatch)
     # LAST in the round-robin, behind accounts nobody has ever opened a feed for.
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
     _user(conn, "reader", scored="20 minutes", read="2 minutes")
-    _user(conn, "idle_a", scored="20 hours")
-    _user(conn, "idle_b", scored="10 hours")
-    _user(conn, "idle_c", scored="5 hours")
+    _user(conn, "idle_a", scored="20 hours", read=_IN_ROTATION)
+    _user(conn, "idle_b", scored="10 hours", read=_IN_ROTATION)
+    _user(conn, "idle_c", scored="5 hours", read=_IN_ROTATION)
 
     assert rd._fetch_personalised_users(conn, 2) == ["reader", "idle_a"]
 
@@ -351,7 +356,7 @@ def test_a_read_outside_the_window_earns_no_priority(conn, monkeypatch):
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 3600)
     _user(conn, "lapsed", scored="1 minute", read="2 hours")
-    _user(conn, "idle", scored="20 hours")
+    _user(conn, "idle", scored="20 hours", read=_IN_ROTATION)
 
     assert rd._fetch_personalised_users(conn, 2) == ["idle", "lapsed"]
 
@@ -362,8 +367,8 @@ def test_readers_are_capped_and_the_stalest_reader_goes_first(conn, monkeypatch)
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
     for name, scored in (("r_old", "50 minutes"), ("r_mid", "30 minutes"), ("r_new", "15 minutes")):
         _user(conn, name, scored=scored, read="1 minute")
-    _user(conn, "idle_a", scored="20 hours")
-    _user(conn, "idle_b", scored="10 hours")
+    _user(conn, "idle_a", scored="20 hours", read=_IN_ROTATION)
+    _user(conn, "idle_b", scored="10 hours", read=_IN_ROTATION)
 
     # Four slots, half for readers: the two stalest readers, then the remainder from
     # everyone not already taken. The third reader competes there on staleness like
@@ -376,7 +381,7 @@ def test_a_reader_is_returned_once_although_both_queries_could_take_it(conn, mon
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
     _user(conn, "reader", scored="20 minutes", read="1 minute")
-    _user(conn, "idle", scored="20 hours")
+    _user(conn, "idle", scored="20 hours", read=_IN_ROTATION)
 
     assert rd._fetch_personalised_users(conn, 10) == ["reader", "idle"]
 
@@ -388,8 +393,8 @@ def test_a_reader_ranked_a_moment_ago_does_not_take_a_lane_slot(conn, monkeypatc
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
     _user(conn, "just_ranked", scored="5 minutes", read="2 minutes")
-    _user(conn, "idle_a", scored="20 hours")
-    _user(conn, "idle_b", scored="10 hours")
+    _user(conn, "idle_a", scored="20 hours", read=_IN_ROTATION)
+    _user(conn, "idle_b", scored="10 hours", read=_IN_ROTATION)
 
     # One lane slot, and nobody qualifies for it: the cycle goes to the rotation.
     assert rd._fetch_personalised_users(conn, 2) == ["idle_a", "idle_b"]
@@ -401,7 +406,7 @@ def test_a_never_ranked_reader_takes_a_lane_slot_whatever_the_minimum_age(conn, 
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
     _user(conn, "new_reader", scored=None, read="2 minutes")
-    _user(conn, "idle", scored="20 hours")
+    _user(conn, "idle", scored="20 hours", read=_IN_ROTATION)
 
     assert rd._fetch_personalised_users(conn, 2) == ["new_reader", "idle"]
     assert (rd._lane_taken, rd._lane_slots) == (1, 1)
@@ -409,10 +414,10 @@ def test_a_never_ranked_reader_takes_a_lane_slot_whatever_the_minimum_age(conn, 
 
 def test_without_readers_the_rotation_is_exactly_what_it_was(conn, monkeypatch):
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
-    _user(conn, "never_scored")
-    _user(conn, "stale", scored="20 hours")
-    _user(conn, "tie_active", scored="5 hours", interacted="1 hour")
-    _user(conn, "fresh", scored="1 minute")
+    _user(conn, "never_scored", read=_IN_ROTATION)
+    _user(conn, "stale", scored="20 hours", read=_IN_ROTATION)
+    _user(conn, "tie_active", scored="5 hours", interacted="1 hour", read=_IN_ROTATION)
+    _user(conn, "fresh", scored="1 minute", read=_IN_ROTATION)
 
     assert rd._fetch_personalised_users(conn, 3) == ["never_scored", "stale", "tie_active"]
 
@@ -420,7 +425,7 @@ def test_without_readers_the_rotation_is_exactly_what_it_was(conn, monkeypatch):
 def test_a_share_of_zero_ignores_readers(conn, monkeypatch):
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.0)
     _user(conn, "reader", scored="1 minute", read="1 minute")
-    _user(conn, "idle", scored="20 hours")
+    _user(conn, "idle", scored="20 hours", read=_IN_ROTATION)
 
     assert rd._fetch_personalised_users(conn, 1) == ["idle"]
 
@@ -572,7 +577,7 @@ def test_the_reader_window_is_utc_on_a_server_that_is_not(tokyo, monkeypatch):
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 3600)
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
     _user(tokyo, "reader", scored="20 minutes", read="2 minutes")
-    _user(tokyo, "idle", scored="20 hours")
+    _user(tokyo, "idle", scored="20 hours", read=_IN_ROTATION)
 
     # Compared as Tokyo time the read looks nine hours old, outside the hour's window.
     assert rd._fetch_personalised_users(tokyo, 2) == ["reader", "idle"]
@@ -600,8 +605,8 @@ def test_the_lanes_minimum_age_is_utc_on_a_server_that_is_not(tokyo, monkeypatch
             "SET last_read_at = (NOW() AT TIME ZONE 'utc') WHERE username = 'just_ranked'"
         )
     tokyo.commit()
-    _user(tokyo, "idle_a", scored="20 hours")
-    _user(tokyo, "idle_b", scored="10 hours")
+    _user(tokyo, "idle_a", scored="20 hours", read=_IN_ROTATION)
+    _user(tokyo, "idle_b", scored="10 hours", read=_IN_ROTATION)
 
     # Compared as Tokyo time the five-minute-old feed looks nine hours old and takes
     # the slot.
@@ -692,14 +697,18 @@ def shipped_feed(other):
         cur.execute(
             f"""
             CREATE TABLE {s}.feed_cache (
-                username varchar(16), post_id bigint, rank int, final_score float,
-                score_relevance float, score_recency float, score_engagement float,
-                score_credibility float, community_boost_applied boolean,
-                boost_source text, algorithm_version text);
+                username varchar(16), post_id bigint, rank smallint, final_score real,
+                score_relevance real, score_recency real, score_engagement real,
+                score_credibility real, community_boost_applied boolean,
+                boost_source smallint NOT NULL DEFAULT 0,
+                algorithm_version smallint NOT NULL DEFAULT 0);
+            CREATE TABLE {s}.feed_cache_labels (code smallint, label varchar(16));
             CREATE TABLE {s}.active_users (
                 username varchar(16) PRIMARY KEY, last_scored_at timestamp,
                 last_read_at timestamp);
-            CREATE TABLE {s}.global_feed_cache (post_id bigint);
+            CREATE TABLE {s}.global_feed_cache (
+                post_id bigint, rank int, final_score float, score_recency float,
+                score_engagement float, score_credibility float, algorithm_version text);
             CREATE TABLE {s}.post_candidates (post_id bigint, hive_post_id int);
             CREATE TABLE {s}.post_bridge_cache (post_id bigint, bridge jsonb);
             CREATE TABLE {s}.hive_accounts (id int, name text);
@@ -774,6 +783,81 @@ def test_the_shipped_function_is_silent_on_a_scroll_and_for_an_account_without_a
     assert _get_feed(shipped_feed, "nobody", 1) == []  # no cached feed, no global one
 
     assert _silent_then_control(conn, shipped_feed)
+
+
+def test_an_account_ranked_only_once_it_reads_gets_the_global_feed_until_then(
+    conn, shipped_feed, monkeypatch
+):
+    """#98, end to end. A drive-by voter (a rotation row from its votes, no read, no
+    interests) gets no feed from the scheduled cycle. Its first read is served the
+    global feed and reaches the ranker, and the next cycle ranks it in the reader lane."""
+    import pandas as pd
+
+    monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    monkeypatch.setattr(rd, "MAX_USERS_PER_CYCLE", 4)
+    monkeypatch.setattr(rd, "POLL_SECONDS", 0)
+    _user(conn, "voter", interacted="1 hour")  # never scored: the old rotation's first
+    _user(conn, "regular", scored="5 hours", read=_IN_ROTATION)
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM haf_fyp_app.feed_cache WHERE username IN ('voter', 'regular')")
+    conn.commit()
+    with shipped_feed.cursor() as cur:  # the endpoint's side of the same rotation
+        cur.execute(
+            f"INSERT INTO {_FEED_SCHEMA}.active_users (username) VALUES ('voter');"
+            f"INSERT INTO {_FEED_SCHEMA}.global_feed_cache VALUES (1, 1, 0.5, 0.5, 0.5, 0.5, '1.1.0')"
+        )
+    shipped_feed.commit()
+    rd._listen_for_feed_reads(conn)
+
+    ranked_by_cycle = []
+
+    def _rank(c, username, *_a, **_k):
+        # What write_feed_cache writes, against the CI database's reduced feed_cache.
+        with c.cursor() as cur:
+            cur.execute(
+                "INSERT INTO haf_fyp_app.active_users (username, last_scored_at) "
+                "VALUES (%s, (NOW() AT TIME ZONE 'utc')) ON CONFLICT (username) "
+                "DO UPDATE SET last_scored_at = EXCLUDED.last_scored_at",
+                (username,),
+            )
+            cur.execute("DELETE FROM haf_fyp_app.feed_cache WHERE username = %s", (username,))
+            cur.execute(
+                "INSERT INTO haf_fyp_app.feed_cache (username, post_id) VALUES (%s, 1)",
+                (username,),
+            )
+        c.commit()
+        ranked_by_cycle.append(username)
+
+    monkeypatch.setattr(rd, "register_vector_type", lambda _c: None)
+    monkeypatch.setattr(rd, "_evict_unsubscribed", lambda _c, _u: set())
+    monkeypatch.setattr(rd, "_fetch_algorithm", lambda _c: ("1.0.0", {}))
+    monkeypatch.setattr(
+        rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
+    )
+    monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
+    monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
+    monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)
+    monkeypatch.setattr(rd, "compute_scores", lambda **k: pd.DataFrame())
+    monkeypatch.setattr(rd, "_rank_user", _rank)
+
+    rd.run_cycle(conn, lambda c: set())
+
+    assert ranked_by_cycle == ["regular"]
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM haf_fyp_app.feed_cache WHERE username = 'voter'")
+        assert cur.fetchone()[0] == 0
+    conn.commit()
+
+    # The first read: no cached feed, so the global one -- and the ranker hears it.
+    posts = _get_feed(shipped_feed, "voter", 1)
+    assert [p["fyp"]["source"] for p in posts] == ["global"]
+    heard = _drain_for(conn, 3, until={"voter"})
+    assert heard == {"voter"}
+    rd._note_feed_reads(conn, heard, 0)  # stamped; no early re-rank, to see the lane
+
+    assert rd._fetch_personalised_users(conn, 4)[0] == "voter"
+    assert rd._lane_taken == 1
 
 
 def test_the_shipped_function_does_not_notify_again_within_ten_minutes(conn, shipped_feed):
@@ -898,8 +982,8 @@ def test_a_read_during_a_cycle_is_recorded_and_ranked_before_the_cycle_ends(
     monkeypatch.setattr(rd, "MAX_USERS_PER_CYCLE", 3)
     monkeypatch.setattr(rd, "POLL_SECONDS", 0)  # ask after every account
     for name, scored in (("u1", "5 hours"), ("u2", "4 hours"), ("u3", "3 hours")):
-        _user(conn, name, scored=scored)
-    _user(conn, "zed", scored="1 hour")  # stale, but last in the rotation's order
+        _user(conn, name, scored=scored, read=_IN_ROTATION)
+    _user(conn, "zed", scored="1 hour", read=_IN_ROTATION)  # stale, but last in the rotation's order
     rd._listen_for_feed_reads(conn)
 
     order, zed_read_when_u2_ranked = [], []
@@ -967,9 +1051,9 @@ def test_a_fresh_feed_read_during_a_cycle_is_recorded_but_not_ranked_again(conn,
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
     monkeypatch.setattr(rd, "MAX_USERS_PER_CYCLE", 2)
     monkeypatch.setattr(rd, "POLL_SECONDS", 0)
-    _user(conn, "u1", scored="3 hours")
-    _user(conn, "u2", scored="2 hours")
-    _user(conn, "fresh", scored="1 minute")
+    _user(conn, "u1", scored="3 hours", read=_IN_ROTATION)
+    _user(conn, "u2", scored="2 hours", read=_IN_ROTATION)
+    _user(conn, "fresh", scored="1 minute", read=_IN_ROTATION)
     rd._listen_for_feed_reads(conn)
     order = []
 
@@ -1026,8 +1110,8 @@ def test_a_name_with_no_rotation_row_handed_to_a_cycle_is_not_ranked_into_one(
 
     monkeypatch.setattr(rd, "MAX_USERS_PER_CYCLE", 2)
     monkeypatch.setattr(rd, "POLL_SECONDS", 0)
-    _user(conn, "u1", scored="3 hours")
-    _user(conn, "u2", scored="2 hours")
+    _user(conn, "u1", scored="3 hours", read=_IN_ROTATION)
+    _user(conn, "u2", scored="2 hours", read=_IN_ROTATION)
     rd._listen_for_feed_reads(conn)
     order = []
 

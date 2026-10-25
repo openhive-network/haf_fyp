@@ -98,7 +98,8 @@ def _rotation(conn):
     _user(conn, "reader-fresh", scored="5 minutes", read="2 minutes")  # reader, not due
     _user(conn, "reader-new", scored=None, read="1 minute")            # reader, due, no feed yet
     _user(conn, "lapsed", scored="10 hours", read="2 days")            # read outside the window
-    _user(conn, "never", scored=None, read=None)
+    _user(conn, "never", scored=None, read=None)                       # a voter: not ranked (#98)
+    _user(conn, "month", scored="20 days", read="25 days")             # ranked: read in retention
 
 
 def test_an_empty_rotation_has_no_ages_at_all(conn):
@@ -116,13 +117,13 @@ def test_each_figure_counts_what_its_name_says(conn):
     _rotation(conn)
     probe = fetch_reader_first(conn)
 
-    assert probe["rotation_size"] == 5
-    assert probe["never_ranked"] == 2                      # reader-new, never
-    assert probe["readers_in_window"] == 3                 # not lapsed, not never
+    assert probe["rotation_size"] == 5                     # all but never
+    assert probe["never_ranked"] == 1                      # reader-new
+    assert probe["readers_in_window"] == 3                 # not lapsed, month or never
     assert probe["readers_due"] == 2                       # reader-stale, reader-new
-    # The stalest ranked feed is lapsed's, ten hours; among READERS it is three hours;
+    # The stalest ranked feed is month's, twenty days; among READERS it is three hours;
     # the newest is reader-fresh's, five minutes.
-    assert 36000 <= probe["rotation_age_seconds"] < 36060
+    assert 20 * 86400 <= probe["rotation_age_seconds"] < 20 * 86400 + 60
     assert 10800 <= probe["oldest_reader_feed_seconds"] < 10860
     assert 300 <= probe["newest_feed_seconds"] < 360
 
@@ -132,7 +133,7 @@ def test_the_ages_cover_readers_that_are_not_due_and_accounts_never_read(conn):
     # been read: an age taken only among DUE readers, or only among accounts ever read,
     # would pass it.
     _user(conn, "fresh-reader", scored="5 minutes", read="1 minute")  # a reader, not due
-    _user(conn, "unread-old", scored="12 hours", read=None)            # ranked, never read
+    _user(conn, "unread-old", scored="12 hours", read="3 days")        # ranked, read long ago
     probe = fetch_reader_first(conn)
 
     assert probe["readers_due"] == 0
@@ -144,12 +145,39 @@ def test_the_ages_cover_readers_that_are_not_due_and_accounts_never_read(conn):
 def test_the_newest_feed_is_the_liveness_figure_whatever_the_rotation_holds(conn):
     # One account that can never be ranked makes rotation_age grow for ever on a healthy
     # ranker. The newest feed's age does not care.
-    _user(conn, "poison", scored="9 days", read=None)
-    _user(conn, "just-ranked", scored="20 seconds", read=None)
+    _user(conn, "poison", scored="9 days", read="10 days")
+    _user(conn, "just-ranked", scored="20 seconds", read="10 days")
     probe = fetch_reader_first(conn)
 
     assert probe["rotation_age_seconds"] >= 9 * 86400
     assert 20 <= probe["newest_feed_seconds"] < 80
+
+
+def test_an_account_that_only_voted_is_not_counted_in_the_rotation(conn):
+    """#98: the ranker builds no feed for it until it reads. Counted, it would hold
+    never_ranked above 0 and rotation_age rising for ever on a healthy ranker."""
+    _user(conn, "m98-voter-new", scored=None, read=None)
+    _user(conn, "m98-voter-old", scored="90 days", read=None)
+    _user(conn, "m98-lapsed", scored="60 days", read="31 days")   # outside the retention
+    _user(conn, "m98-reader", scored="1 hour", read="1 hour")
+    probe = fetch_reader_first(conn)
+
+    assert probe["rotation_size"] == 1
+    assert probe["never_ranked"] == 0
+    assert 3600 <= probe["rotation_age_seconds"] < 3660
+    assert 3600 <= probe["newest_feed_seconds"] < 3660
+
+
+def test_an_opt_in_is_in_the_rotation_without_a_read(conn):
+    _user(conn, "m98-picker", scored=None, read=None)
+    with conn.cursor() as cur:  # rolled back with the rest by the fixture
+        cur.execute(
+            "INSERT INTO haf_fyp_app.user_interests (username, community_id, declared_at) "
+            "VALUES ('m98-picker', 1, NOW())"
+        )
+    probe = fetch_reader_first(conn)
+
+    assert (probe["rotation_size"], probe["never_ranked"]) == (1, 1)
 
 
 def test_a_feed_stamped_by_a_clock_ahead_of_the_servers_is_zero_seconds_old(conn):

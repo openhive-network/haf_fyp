@@ -221,10 +221,10 @@ def test_readers_come_first_and_the_rest_fills_the_cycle(monkeypatch):
     # (window, min age, the filter's days twice, slots)
     assert reader_call.args[1] == (3600, 77, 30, 30, 5), "readers may take at most the share"
     # The remainder excludes the readers already taken and fills what is left of the
-    # cycle, so two readers leave eight slots, not five.
-    assert rest_call.args[1] == (["r1", "r2"], 8)
+    # cycle, so two readers leave eight slots, not five; it reaches back over the
+    # feed-retention window (#98), not the reader window.
+    assert rest_call.args[1] == (["r1", "r2"], rd.FEED_CACHE_UNREAD_RETENTION_DAYS, 8)
     assert "last_read_at" in reader_call.args[0]
-    assert "last_read_at" not in rest_call.args[0]
 
 
 def test_a_share_of_zero_turns_the_reader_lane_off(monkeypatch):
@@ -234,7 +234,7 @@ def test_a_share_of_zero_turns_the_reader_lane_off(monkeypatch):
     assert rd._fetch_personalised_users(conn, 10) == ["s1"]
 
     (only_call,) = cur.execute.call_args_list
-    assert only_call.args[1] == ([], 10)
+    assert only_call.args[1] == ([], rd.FEED_CACHE_UNREAD_RETENTION_DAYS, 10)
 
 
 def test_a_schema_without_the_read_column_is_never_asked_for_readers(monkeypatch):
@@ -270,7 +270,7 @@ def test_a_cycle_of_one_goes_to_the_rotation_not_to_a_reader(monkeypatch):
     assert rd._fetch_personalised_users(conn, 1) == ["s1"]
 
     (only_call,) = cur.execute.call_args_list
-    assert only_call.args[1] == ([], 1)
+    assert only_call.args[1][-1] == 1
 
 
 def test_even_the_largest_share_leaves_the_rotation_a_slot(monkeypatch):
@@ -280,7 +280,7 @@ def test_even_the_largest_share_leaves_the_rotation_a_slot(monkeypatch):
 
     rd._fetch_personalised_users(conn, 10)
 
-    assert cur.execute.call_args_list[1].args[1][1] == 1
+    assert cur.execute.call_args_list[1].args[1][-1] == 1
 
 
 def test_the_lane_leaves_out_a_feed_that_was_ranked_a_moment_ago():
@@ -313,6 +313,22 @@ def test_the_remainder_keeps_the_rotation_order():
     assert (
         "ORDER BY last_scored_at ASC NULLS FIRST, last_interaction_at DESC NULLS LAST"
         in _sql(cur.execute.call_args_list[-1])
+    )
+
+
+def test_the_remainder_takes_only_accounts_that_read_or_opted_in():
+    # #98: an account that has only voted on a tracked post is not ranked until it
+    # reads; the retention window is the unread-feed pass's, so nothing the pass drops
+    # is rebuilt.
+    conn, cur = _mock_conn([[], []])
+
+    rd._fetch_personalised_users(conn, 10)
+
+    rest = _sql(cur.execute.call_args_list[-1])
+    assert (
+        "AND (au.last_read_at >= (NOW() AT TIME ZONE 'utc') - make_interval(days => %s) "
+        "OR EXISTS (SELECT 1 FROM haf_fyp_app.user_interests ui "
+        "WHERE ui.username = au.username))" in rest
     )
 
 
@@ -916,6 +932,7 @@ RETENTION = {
     "EMBEDDING_COVERAGE_DAYS": 14,
     "ACTIVE_USERS_MAX_EVICTIONS": 1000,
     "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS": 1000,
+    "FEED_CACHE_UNREAD_RETENTION_DAYS": 30,
 }
 
 _NAMES = (
@@ -939,7 +956,8 @@ import haf_fyp.ranker_daemon as rd
 for env in envs:
     for key in list(os.environ):
         if key.startswith(("READER_", "READ_REFRESH_", "MAX_USERS_PER_CYCLE",
-                           "FEED_EVENTS_", "EMBEDDING_COVERAGE_", "ACTIVE_USERS_")):
+                           "FEED_EVENTS_", "EMBEDDING_COVERAGE_", "ACTIVE_USERS_",
+                           "FEED_CACHE_")):
             del os.environ[key]
     os.environ.update(env)
     rd = importlib.reload(rd)
@@ -981,6 +999,7 @@ def settings():
             "EMBEDDING_COVERAGE_DAYS": "1",
             "ACTIVE_USERS_MAX_EVICTIONS": "1",
             "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS": "0",
+            "FEED_CACHE_UNREAD_RETENTION_DAYS": "1",
         },
         "cycle_only_rest_empty": {
             "MAX_USERS_PER_CYCLE": "3000",
@@ -1082,7 +1101,7 @@ def test_a_setting_at_its_minimum_is_taken(settings):
     assert got["FEED_EVENTS_MAINT_SECONDS"] == 60
     assert got["ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS"] == 0
     for name in ("FEED_EVENTS_RETAIN_DAYS", "FEED_EVENTS_MAX_ROWS", "EMBEDDING_COVERAGE_DAYS",
-                 "ACTIVE_USERS_MAX_EVICTIONS"):
+                 "ACTIVE_USERS_MAX_EVICTIONS", "FEED_CACHE_UNREAD_RETENTION_DAYS"):
         assert got[name] == 1, name
 
 
@@ -1101,11 +1120,13 @@ def test_a_setting_at_its_minimum_is_taken(settings):
     ("ACTIVE_USERS_MAX_EVICTIONS", "0"),
     ("ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS", "-1"),
     ("READER_ACTIVE_WITHIN_DAYS", "-1"),
+    # Every cached feed but an opt-in's dropped on each pass.
+    ("FEED_CACHE_UNREAD_RETENTION_DAYS", "0"),
 ])
 def test_a_setting_below_its_minimum_stops_the_ranker_and_says_which(name, value):
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("MAX_USERS_PER_CYCLE", "FEED_EVENTS_", "EMBEDDING_COVERAGE_",
-                                "ACTIVE_USERS_"))}
+                                "ACTIVE_USERS_", "FEED_CACHE_"))}
     out = subprocess.run(
         [sys.executable, "-c", "import haf_fyp.ranker_daemon"],
         cwd=REPO,
@@ -1342,13 +1363,19 @@ def test_the_feed_function_notifies_the_channel_the_ranker_listens_on():
     assert guard.rstrip().endswith("THEN")
 
 
-def test_the_notify_is_inside_the_branch_for_an_account_with_a_feed():
+def test_the_notify_comes_before_the_cached_feed_test():
     code, guard = _notify_guard()
 
-    # Between the EXISTS test on feed_cache and the first statement of that branch:
-    # a name with no cached feed is never broadcast.
-    opens = code.index("IF EXISTS ( SELECT 1 FROM haf_fyp_app.feed_cache fc")
-    assert opens < code.index(guard) < code.index("_observer_id :=")
+    # #98: the ranker builds no feed for an account until it reads, so the read of an
+    # account with no cached feed (served the global one) must reach it too. Both
+    # branches follow the notify; the active_users test in the guard is what keeps a
+    # name outside the rotation from being broadcast.
+    assert (
+        code.index("BEGIN")
+        < code.index(guard)
+        < code.index("IF EXISTS ( SELECT 1 FROM haf_fyp_app.feed_cache fc")
+        < code.index("IF EXISTS (SELECT 1 FROM haf_fyp_app.global_feed_cache)")
+    )
 
 
 @pytest.mark.parametrize(

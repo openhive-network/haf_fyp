@@ -438,6 +438,33 @@ class TestWriteFeedCacheColumnAlignment:
         captured = self._run(monkeypatch)
         assert self._columns_in_sql(captured["sql"]) == self.COLUMNS
 
+    def test_the_values_pass_through_to_the_column_of_the_same_name(self, monkeypatch):
+        # #98: the tuple lands in v(...), not in the column list, and each label goes
+        # through feed_cache_labels on its way. Every SELECT item must read v's column
+        # of the same name as the insert column it feeds, or the checks above, which
+        # map the tuple onto the column list, would be checking the wrong alignment.
+        captured = self._run(monkeypatch)
+        head = " ".join(captured["sql"].split())
+        aliases = head[head.index("AS v(") + len("AS v("):]
+        aliases = [c.strip() for c in aliases[: aliases.index(")")].split(",")]
+        assert aliases == self.COLUMNS
+        select = head[head.index("SELECT ") + len("SELECT "): head.index(" FROM (VALUES %s)")]
+        items, depth, start = [], 0, 0
+        for i, ch in enumerate(select):
+            depth += {"(": 1, ")": -1}.get(ch, 0)
+            if ch == "," and depth == 0:
+                items.append(select[start:i].strip())
+                start = i + 1
+        items.append(select[start:].strip())
+        select = items
+        fed = {
+            "boost_source": "COALESCE(lb.code, 0)",
+            "algorithm_version": "COALESCE(la.code, 0)",
+        }
+        assert select == [fed.get(c, f"v.{c}") for c in self.COLUMNS]
+        assert "ON lb.label = v.boost_source" in head
+        assert "ON la.label = v.algorithm_version" in head
+
     def test_every_column_receives_its_own_value(self, monkeypatch):
         # The core of #24: name -> value, so any transposition fails here even when
         # the tuple is still the right LENGTH and every value is still plausible.

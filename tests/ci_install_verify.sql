@@ -323,7 +323,7 @@ DO $$
 DECLARE
     _want_tables TEXT [] := ARRAY[
         'active_users', 'algorithm_versions', 'app_config', 'app_status', 'app_version',
-        'embedding_coverage_daily', 'engagement_metrics', 'feed_cache', 'feed_events',
+        'embedding_coverage_daily', 'engagement_metrics', 'feed_cache', 'feed_cache_labels', 'feed_events',
         'feed_events_rollup_state', 'feed_metrics_daily', 'global_feed_cache', 'haf_fyp',
         'post_bridge_cache', 'post_candidates', 'post_commenters', 'post_lookup',
         'user_communities', 'user_interactions', 'user_interests', 'user_profile_vectors'
@@ -339,6 +339,7 @@ DECLARE
         'haf_fyp_app.deferred_during_massive_sync()',
         'haf_fyp_app.deferred_indexes_dropped()',
         'haf_fyp_app.drop_deferred_indexes()',
+        'haf_fyp_app.drop_unread_feeds(integer,integer)',
         'haf_fyp_app.evict_unproductive_users(integer)',
         'haf_fyp_app.evict_unsubscribed_users(character varying[])',
         'haf_fyp_app.get_bridge_post(integer,integer,integer)',
@@ -389,13 +390,14 @@ DECLARE
         'index algorithm_versions_pkey on algorithm_versions (primary key)',
         'index embedding_coverage_daily_pkey on embedding_coverage_daily (primary key)',
         'index engagement_metrics_pkey on engagement_metrics (primary key)',
+        'index feed_cache_labels_label_key on feed_cache_labels (unique)',
+        'index feed_cache_labels_pkey on feed_cache_labels (primary key)',
         'index feed_cache_pkey on feed_cache (primary key)',
         'index feed_events_pkey on feed_events (primary key)',
         'index feed_events_rollup_state_pkey on feed_events_rollup_state (primary key)',
         'index feed_metrics_daily_pkey on feed_metrics_daily (primary key)',
         'index global_feed_cache_pkey on global_feed_cache (primary key)',
         'index idx_active_users_last_read_at on active_users',
-        'index idx_feed_cache_user_rank on feed_cache',
         'index idx_feed_events_algo_created on feed_events',
         'index idx_feed_events_created_at on feed_events',
         'index idx_global_feed_rank on global_feed_cache',
@@ -425,7 +427,9 @@ DECLARE
         'constraint embedding_coverage_daily_pkey on embedding_coverage_daily: PRIMARY KEY (day)',
         'constraint engagement_metrics_pkey on engagement_metrics: PRIMARY KEY (post_id)',
         'constraint engagement_metrics_post_id_fkey on engagement_metrics: FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates(post_id)',
-        'constraint feed_cache_pkey on feed_cache: PRIMARY KEY (username, post_id)',
+        'constraint feed_cache_labels_label_key on feed_cache_labels: UNIQUE (label)',
+        'constraint feed_cache_labels_pkey on feed_cache_labels: PRIMARY KEY (code)',
+        'constraint feed_cache_pkey on feed_cache: PRIMARY KEY (username, rank)',
         'constraint feed_events_event_type_check on feed_events: CHECK (((event_type)::text = ANY ((ARRAY[''impression''::character varying, ''open''::character varying, ''video''::character varying, ''action''::character varying])::text[])))',
         'constraint feed_events_pkey on feed_events: PRIMARY KEY (id)',
         'constraint feed_events_rollup_state_pkey on feed_events_rollup_state: PRIMARY KEY (only_row)',
@@ -462,7 +466,8 @@ DECLARE
         'app_version:4ae27d34fdb2e1b24d65982fd39401c3',
         'embedding_coverage_daily:a62045d4221bbc4aea03335c98a60744',
         'engagement_metrics:7cf3981f79d4040049de58bb745de0e5',
-        'feed_cache:f0a1086f4b6cc5be47e6bc56e7c3bd2e',
+        'feed_cache:d8b86cb29a26c895cf89e2bdbda961cd',
+        'feed_cache_labels:9d8b9c5dd0d0c2b6aa1ac886847f7de8',
         'feed_events:5b00275a46d51dfae529688ee0f0a532',
         'feed_events_rollup_state:ae22e3f207a74f0d4ee3b1c51a2d4c63',
         'feed_metrics_daily:192c4d0610eb7c746f28d43819490adc',
@@ -490,6 +495,7 @@ DECLARE
         'haf_fyp_app.deferred_during_massive_sync() = cb18f3ecd54ef36892bfb74f29700694',
         'haf_fyp_app.deferred_indexes_dropped() = 6f73dbb338760b867bb706e844a0b36a',
         'haf_fyp_app.drop_deferred_indexes() = a967f1b32caec08ccf85d72f4970fb78',
+        'haf_fyp_app.drop_unread_feeds(integer,integer) = 7217702d92800e65e54820e39b195970',
         'haf_fyp_app.evict_unproductive_users(integer) = 47a59ce29e99ecf7b6623381be5380e4',
         'haf_fyp_app.evict_unsubscribed_users(character varying[]) = 2bf9d3fbbbc50aa7d1720d2b754f57d2',
         'haf_fyp_app.get_bridge_post(integer,integer,integer) = 21367c62940e9d817140e64d80f9b769',
@@ -556,7 +562,8 @@ BEGIN
     -- table which no grant on the table shows.
     --   views: exactly the ones HAF makes for a context, which are the ones it made
     --          for the other application (HAF's business which; the same for both);
-    --   sequences: the one behind feed_events.id, and the context table's own;
+    --   sequences: the ones behind feed_events.id and feed_cache_labels.code, and the
+    --              context table's own;
     --   nothing else at all: no materialized view, foreign table, type or domain of
     --   ours, and no relation of any kind among the endpoints.
     SELECT string_agg(d, '; ' ORDER BY d) INTO _diff
@@ -573,7 +580,7 @@ BEGIN
         UNION ALL
         SELECT 'sequence ' || c.relname || ' belongs to no listed column'
         FROM pg_class AS c WHERE c.relnamespace = 'haf_fyp_app'::regnamespace AND c.relkind = 'S'
-          AND c.relname <> 'feed_events_id_seq'
+          AND c.relname NOT IN ('feed_events_id_seq', 'feed_cache_labels_code_seq')
           AND NOT EXISTS (SELECT 1 FROM pg_depend AS d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
                           AND d.refclassid = 'pg_class'::regclass AND d.refobjid = 'haf_fyp_app.haf_fyp'::regclass
                           AND d.deptype IN ('a', 'i'))

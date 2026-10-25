@@ -129,6 +129,41 @@ def test_active_users_maintenance_reraises_operational_error():
         rd._run_active_users_maintenance(conn)
 
 
+def test_the_unread_feed_pass_repeats_until_a_batch_comes_back_short(monkeypatch):
+    # #98: the first pass on an existing install has hundreds of thousands of unread
+    # feeds; each batch is its own transaction, and the pass goes on until it is done.
+    monkeypatch.setattr(rd, "FEED_CACHE_UNREAD_RETENTION_DAYS", 11)
+    monkeypatch.setattr(rd, "_UNREAD_FEED_BATCH_ACCOUNTS", 5)
+    conn, cur = _mock_conn()
+    cur.fetchone.side_effect = [(5,), (5,), (2,)]
+
+    rd._run_unread_feed_maintenance(conn)
+
+    assert [c.args for c in cur.execute.call_args_list] == [
+        ("SELECT haf_fyp_app.drop_unread_feeds(%s, %s)", (11, 5))
+    ] * 3
+    assert conn.commit.call_count == 3
+    conn.rollback.assert_not_called()
+
+
+def test_the_unread_feed_pass_is_best_effort():
+    conn, cur = _mock_conn()
+    cur.execute.side_effect = RuntimeError("boom")
+
+    rd._run_unread_feed_maintenance(conn)
+
+    conn.rollback.assert_called_once()
+    conn.commit.assert_not_called()
+
+
+def test_the_unread_feed_pass_reraises_operational_error():
+    conn, cur = _mock_conn()
+    cur.execute.side_effect = psycopg2.OperationalError("connection lost")
+
+    with pytest.raises(psycopg2.OperationalError):
+        rd._run_unread_feed_maintenance(conn)
+
+
 def test_sync_gate_measures_distance_to_the_chain_head_not_the_app_itself():
     """hive.app_get_current_block_num('haf_fyp') returns THIS APP CONTEXT'S OWN
     position — the same quantity app_status.last_processed_block tracks — so

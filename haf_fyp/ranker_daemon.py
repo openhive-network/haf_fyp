@@ -280,6 +280,22 @@ ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS = _tuning(
     "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS", "1000", int, minimum=0
 )
 
+# Feeds are built for accounts that use the app, not for every account that ever voted
+# on a tracked post (#98): the rotation lane takes an account that has read its feed
+# within this many days, or that holds interests, and the hourly pass drops the cached
+# feed of any other. A replay from block 0 enrols hundreds of thousands of drive-by
+# voters, and ranking each of them stored 200 rows nobody asked for. Such an account
+# keeps its rotation row and its interaction history; its first read is served the
+# global feed and puts it in the reader lane, so its own feed follows within a cycle.
+# At most 100 years: a cutoff further back leaves PostgreSQL's date range.
+FEED_CACHE_UNREAD_RETENTION_DAYS = _tuning(
+    "FEED_CACHE_UNREAD_RETENTION_DAYS", "30", int, minimum=1, maximum=36500
+)
+# Accounts whose feed one transaction of the unread-feed pass drops. The pass repeats
+# until a batch comes back short, so the first pass on an existing install drains every
+# unread feed; the batch only bounds how long each transaction holds its row locks.
+_UNREAD_FEED_BATCH_ACCOUNTS = 10000
+
 # Bounds the post-eviction top-up below. Each round either fills the cycle or
 # permanently removes rows, so a handful of rounds drains any realistic backlog
 # without letting one cycle spin on a pathological table.
@@ -727,9 +743,11 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
     engaged users at equal staleness — engagement signal should win ties.
 
     #81 puts recent readers ahead of that order, in at most READER_CYCLE_SHARE of the
-    cycle; the remainder is filled exactly as before, from everyone else. The round-
-    robin argument below therefore still holds for the remainder, at a rate reduced
-    by the share actually used.
+    cycle; the remainder is filled in that order from everyone else who uses the app
+    (#98): a read within FEED_CACHE_UNREAD_RETENTION_DAYS, or interests. An account
+    that has only voted is not ranked until it reads. The round-robin argument below
+    therefore holds for the remainder, over that set, at a rate reduced by the share
+    actually used.
 
     The remainder stays a single ORDER BY on purpose. #10 considered reserving a share of
     each cycle for never-interacted opt-ins, but the ordering above is ALREADY a
@@ -772,16 +790,37 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
             )
             readers = [r[0] for r in cur.fetchall()]
         _lane_taken, _lane_slots = len(readers), reader_slots
+        if not _reads_supported:
+            # No last_read_at, so no telling a reader from a drive-by voter: rank the
+            # whole rotation, as before #98, rather than only the opt-ins.
+            cur.execute(
+                """
+                SELECT username
+                  FROM haf_fyp_app.active_users
+                 WHERE NOT (username = ANY(%s))
+                 ORDER BY last_scored_at ASC NULLS FIRST,
+                          last_interaction_at DESC NULLS LAST
+                 LIMIT %s
+                """,
+                (readers, limit - len(readers)),
+            )
+            return readers + [r[0] for r in cur.fetchall()]
+        # #98: only accounts that use the app -- a read within the retention window, or
+        # interests. The same test as the unread-feed pass, so the rotation never
+        # rebuilds a feed that pass is about to drop.
         cur.execute(
             """
             SELECT username
-              FROM haf_fyp_app.active_users
+              FROM haf_fyp_app.active_users au
              WHERE NOT (username = ANY(%s))
+               AND (au.last_read_at >= (NOW() AT TIME ZONE 'utc') - make_interval(days => %s)
+                    OR EXISTS (SELECT 1 FROM haf_fyp_app.user_interests ui
+                                WHERE ui.username = au.username))
              ORDER BY last_scored_at ASC NULLS FIRST,
                       last_interaction_at DESC NULLS LAST
              LIMIT %s
             """,
-            (readers, limit - len(readers)),
+            (readers, FEED_CACHE_UNREAD_RETENTION_DAYS, limit - len(readers)),
         )
         return readers + [r[0] for r in cur.fetchall()]
 
@@ -1446,6 +1485,41 @@ def _run_active_users_maintenance(conn) -> None:
         log.exception("active_users maintenance failed — skipping")
 
 
+def _run_unread_feed_maintenance(conn) -> None:
+    """
+    Drop the cached feed of every account that has not read it within
+    FEED_CACHE_UNREAD_RETENTION_DAYS and holds no interests (#98), a batch of accounts
+    per transaction until a batch comes back short.
+
+    Not gated on block sync, unlike the eviction sweep: nothing it reads comes from the
+    chain. Best-effort: a maintenance failure must never take down ranking.
+    """
+    dropped = 0
+    try:
+        while True:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT haf_fyp_app.drop_unread_feeds(%s, %s)",
+                    (FEED_CACHE_UNREAD_RETENTION_DAYS, _UNREAD_FEED_BATCH_ACCOUNTS),
+                )
+                batch = cur.fetchone()[0]
+            conn.commit()
+            dropped += batch
+            if batch < _UNREAD_FEED_BATCH_ACCOUNTS:
+                break
+    except psycopg2.OperationalError:
+        raise
+    except Exception:
+        conn.rollback()
+        log.exception("unread-feed maintenance failed after %d account(s) — skipping", dropped)
+        return
+    log.info(
+        "feed_cache maintenance: dropped the unread feed of %d account(s) "
+        "(no read within %d days, no interests)",
+        dropped, FEED_CACHE_UNREAD_RETENTION_DAYS,
+    )
+
+
 def _safe_rollback(conn) -> None:
     """
     Clear a failed transaction so the shared connection stays usable.
@@ -1621,6 +1695,7 @@ def main() -> None:
         if time.monotonic() >= next_feed_maint:
             try:
                 _run_active_users_maintenance(conn)
+                _run_unread_feed_maintenance(conn)
                 _run_feed_events_maintenance(conn)
                 _run_embedding_coverage_maintenance(conn)
             except (psycopg2.OperationalError, psycopg2.InterfaceError):
