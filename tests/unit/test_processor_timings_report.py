@@ -101,6 +101,40 @@ def test_a_recorded_run_makes_the_report(tmp_path: Path, lines: list[str],
     assert len(report["limits"]) == 2
 
 
+def test_the_index_restore_is_reported_beside_the_sync_and_added_to_it(
+        tmp_path: Path, lines: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+    rc, out = _run(tmp_path, lines, "--uninstrumented-sync-seconds", "11.0",
+                   "--index-restore-seconds", "3.4", "--uninstrumented-index-restore-seconds", "2.5")
+    assert rc == 0, capsys.readouterr().err
+    report = json.loads(out.read_text(encoding="utf-8"))
+    assert report["sync_wall_seconds"] == 12.5
+    assert report["index_restore_seconds"] == 3.4
+    assert report["sync_plus_restore_wall_seconds"] == 15.9
+    assert report["uninstrumented_index_restore_seconds"] == 2.5
+    assert report["uninstrumented_sync_plus_restore_wall_seconds"] == 13.5
+    table = capsys.readouterr().out
+    assert "index restore 3.4s, sync plus restore 15.9s" in table
+    assert "uninstrumented index restore 2.5s, sync plus restore 13.5s" in table
+
+
+def test_without_a_restore_time_the_report_has_no_total(tmp_path: Path, lines: list[str],
+                                                        capsys: pytest.CaptureFixture[str]) -> None:
+    rc, out = _run(tmp_path, lines)
+    assert rc == 0
+    report = json.loads(out.read_text(encoding="utf-8"))
+    assert report["index_restore_seconds"] is None
+    assert report["sync_plus_restore_wall_seconds"] is None
+    assert "index restore" not in capsys.readouterr().out
+
+
+def test_a_negative_restore_time_writes_no_report(tmp_path: Path, lines: list[str],
+                                                  capsys: pytest.CaptureFixture[str]) -> None:
+    rc, out = _run(tmp_path, lines, "--index-restore-seconds", "-1")
+    assert rc == 1
+    assert not out.exists()
+    assert "negative" in capsys.readouterr().err
+
+
 def test_each_batch_counts_towards_the_million_its_first_block_is_in(tmp_path: Path, lines: list[str]) -> None:
     rc, out = _run(tmp_path, lines)
     assert rc == 0

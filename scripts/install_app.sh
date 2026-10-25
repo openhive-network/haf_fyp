@@ -414,6 +414,11 @@ psql_cmd -c "SET ROLE haf_fyp_owner; SELECT haf_fyp_app.create_context_if_not_ex
 #      hive.app_register verifies that entry procedure with to_regprocedure().
 #      Warns and skips on a HAF without the registry; see db/register_app.sql.
 psql_cmd -c "SET ROLE haf_fyp_owner;" -f "${SCRIPT_DIR}/../db/register_app.sql"
+# 10c. The indexes HAF drops for the initial massive sync and rebuilds when it ends
+#      (db/haf_fyp_app.sql, haf_fyp_app.deferred_during_massive_sync). Needs the context
+#      (step 10) and the tables (step 3). On a context already past massive sync this
+#      also rebuilds whatever is still dropped, which can take minutes on a full node.
+psql_cmd -c "SET ROLE haf_fyp_owner; SELECT haf_fyp_app.register_deferred_indexes(); RESET ROLE;"
 
 # 12. Cross-schema grants (hivesense_app, reptracker_app, btracker_app, hafd).
 #     Schemas that don't exist yet are skipped with a NOTICE — re-run

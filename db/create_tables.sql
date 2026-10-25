@@ -59,6 +59,9 @@ WHERE payout_window;
 -- ---------------------------------------------------------------------------
 -- Post lookup — indexed (author, permlink) for efficient joins in processors
 -- ---------------------------------------------------------------------------
+-- The foreign keys to post_candidates here and on post_commenters, engagement_metrics
+-- and post_bridge_cache are dropped for the initial massive sync and rebuilt when it
+-- ends: see haf_fyp_app.deferred_during_massive_sync() (db/haf_fyp_app.sql).
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.post_lookup (
     post_id bigint NOT NULL,
@@ -149,6 +152,8 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.user_interactions (
 );
 
 -- Lookup pattern: most-recent interactions for one user within a time window.
+-- Dropped for the initial massive sync and rebuilt when it ends: see
+-- haf_fyp_app.deferred_during_massive_sync() (db/haf_fyp_app.sql).
 CREATE INDEX IF NOT EXISTS idx_user_interactions_user_time
 ON haf_fyp_app.user_interactions (username, created_at DESC);
 
@@ -191,6 +196,8 @@ ALTER COLUMN last_block DROP NOT NULL;
 ALTER TABLE haf_fyp_app.active_users
 ADD COLUMN IF NOT EXISTS last_read_at timestamp;
 
+-- Dropped for the initial massive sync and rebuilt when it ends: see
+-- haf_fyp_app.deferred_during_massive_sync() (db/haf_fyp_app.sql).
 CREATE INDEX IF NOT EXISTS idx_active_users_last_read_at
 ON haf_fyp_app.active_users (last_read_at)
 WHERE last_read_at IS NOT NULL;
@@ -288,6 +295,8 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.user_communities (
     PRIMARY KEY (username, community_id)
 );
 
+-- Dropped for the initial massive sync and rebuilt when it ends: see
+-- haf_fyp_app.deferred_during_massive_sync() (db/haf_fyp_app.sql).
 CREATE INDEX IF NOT EXISTS idx_user_communities_user
 ON haf_fyp_app.user_communities (username);
 
