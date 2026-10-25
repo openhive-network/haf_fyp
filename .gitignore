@@ -20,3 +20,6 @@ tests/tavern/.pytest_cache/
 # not vendored here, same as haf_stats.
 scripts/process_openapi.py
 scripts/openapi_out/
+
+# AIDEV check reports (.aidev/run-checks.sh)
+/test-results/

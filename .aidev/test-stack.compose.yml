@@ -1,0 +1,98 @@
+# The service stack AIDEV starts for the slots that run haf_fyp's database lanes
+# (every suite in .aidev/project.yaml without `stack: false`): the long-running
+# servers of CI's test jobs, one set per lane so that no lane sees another's schema.
+# The lanes' one-shot steps run in the runtime image (.aidev/ci_job.py,
+# .aidev/compose_lane.py), which joins this stack's network.
+#
+#   fastapi-db         fastapi-tests' `postgres:14-alpine` service (alias `haf` in CI)
+#   postgres           postgrest-tests: docker/docker-compose-ci.yml's database,
+#   haf-fyp-postgrest    PostgREST
+#   haf-fyp-postgrest-rewriter  and the rewriter, built from the candidate's
+#                      Dockerfile.rewriter as CI builds it
+#   install-db         install-test: docker/docker-compose-ci-install.yml's `postgres`,
+#                      the model of HAF
+#   haf-init, haf      install-test-haf: docker/docker-compose-ci-install-haf.yml's HAF
+#                      at docker/.env's HAF_INSTALL_LANE_VERSION, initialised once
+#                      (--exit-before-sync) and served with --skip-hived; nothing is
+#                      replayed
+#
+# Where it can, a service extends the lane's own definition (environment, command,
+# healthcheck), so a change there reaches this stack, and only the image is pinned
+# here, by digest. `stack-pins` (.aidev/stack_pins.py) fails when a pin's tag stops
+# being the one the lane names, or a written-out service stops matching the lane's.
+# Re-pin as .aidev/README.md says.
+name: haf_fyp_aidev
+
+volumes:
+  haf_datadir:
+
+services:
+  fastapi-db:
+    image: postgres:14-alpine@sha256:50fce0c9c54c43d8b02ce16cb9daff75eb94c09c4ee3d41c157852ebd9700c80
+    # fastapi-tests' job variables, which CI hands to its services.
+    environment:
+      POSTGRES_DB: haf_block_log
+      POSTGRES_USER: haf_fyp_user
+      POSTGRES_HOST_AUTH_METHOD: trust
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U haf_fyp_user -d haf_block_log"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  postgres:
+    extends: {file: ../docker/docker-compose-ci.yml, service: postgres}
+    image: pgvector/pgvector:pg14@sha256:1091ea8f64f5ffe0954dc4c90f196e0cc6ab906566b884a9ff210f0d24b83d12
+
+  # Written out, not extended: CI's makes it depend on `setup`, a one-shot that runs in
+  # the runtime here. It starts before setup has made its schema, and the lane reloads
+  # its schema cache once setup is done (.aidev/compose-lanes.yaml). `stack-pins`
+  # checks its environment is still CI's.
+  haf-fyp-postgrest:
+    image: postgrest/postgrest:v12.2.3@sha256:729bf65c733b73f5b52777f0e4b853f22ed73aa67a22d38269d289779b0a8401
+    environment:
+      PGRST_DB_URI: "postgres://postgres:postgres@postgres/haf_block_log"
+      PGRST_DB_SCHEMA: "haf_fyp_endpoints"
+      PGRST_DB_ANON_ROLE: "haf_fyp_user"
+      PGRST_DB_ROOT_SPEC: "root"
+      PGRST_DB_POOL: "5"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  haf-fyp-postgrest-rewriter:
+    extends: {file: ../docker/docker-compose-ci.yml, service: haf-fyp-postgrest-rewriter}
+    depends_on:
+      - haf-fyp-postgrest
+
+  install-db:
+    extends: {file: ../docker/docker-compose-ci-install.yml, service: postgres}
+    image: pgvector/pgvector:pg18@sha256:2358fcba361ed2233a5ed81b5fe4ca779ccb304120ce531a3bf51c0ed7e2bc11
+
+  # Written out, not extended: the lane's image is `${HAF_REGISTRY}/haf:${...}` from
+  # docker/.env, which compose would interpolate (empty) from here. `stack-pins` checks
+  # command, environment and healthcheck are still the lane's.
+  haf-init:
+    image: registry.gitlab.syncad.com/hive/haf:1.28.8@sha256:666b4917b965e478ab34f714b17673e4450d8b770ab47adee6a3a17b186968ee
+    command: ["--exit-before-sync", "--shared-file-size=1G"]
+    environment:
+      HAF_CI_MODE: "1"
+    volumes:
+      - haf_datadir:/home/hived/datadir
+
+  haf:
+    image: registry.gitlab.syncad.com/hive/haf:1.28.8@sha256:666b4917b965e478ab34f714b17673e4450d8b770ab47adee6a3a17b186968ee
+    command: ["--skip-hived"]
+    environment:
+      HAF_CI_MODE: "1"
+      PG_ACCESS: "host all all all trust"
+    volumes:
+      - haf_datadir:/home/hived/datadir
+    depends_on:
+      haf-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f '[s]leep_infinity[.]sh' >/dev/null && psql -U haf_admin -d haf_block_log -Atc 'SELECT 1' | grep -qx 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 60

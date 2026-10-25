@@ -33,6 +33,12 @@ stages:
   - if: $RUN_REGISTRY_RESOLUTION == "true"
     when: never
   - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  # AIDEV's integration branch (.aidev/README.md): a push there runs nothing -- AIDEV has
+  # verified it already -- but `aidev handoff` starts an API pipeline on it for the merge
+  # request it opens into develop, and a pipeline started from the web UI runs too.
+  # Without this rule GitLab refuses that pipeline: no job would be in it.
+  - if: $CI_COMMIT_BRANCH == "aidev/integration" && $CI_PIPELINE_SOURCE == "api"
+  - if: $CI_COMMIT_BRANCH == "aidev/integration" && $CI_PIPELINE_SOURCE == "web"
   - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 sql-lint:
