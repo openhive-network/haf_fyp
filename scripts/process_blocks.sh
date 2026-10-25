@@ -11,6 +11,9 @@
 #   --schema=NAME  Accepted for haf_api_node module-file compatibility; ignored
 #                  with a warning unless it names haf_fyp_app
 #   --is_forking=  Accepted likewise; this app's context is always non-forking
+#   --stop-at-block=NUMBER  Exit once block NUMBER is processed, instead of
+#                  following the chain. haf_app_driver.py only: refused when
+#                  the legacy CALL main() loop would run
 #   --help,-h,-?   Show this and exit                           # --- help-end ---
 
 set -euo pipefail
@@ -29,6 +32,7 @@ print_help() {
 # entrypoint and then silently dropped by this script -- the same "looks like it
 # worked while doing nothing" failure that install_app.sh's fallthrough was added
 # to remove, and which a module file copied from an upstream app would hit.
+STOP_AT_BLOCK=""
 for arg in "$@"; do
     case "$arg" in
         --host=*) require_flag_value "$arg"; POSTGRES_HOST="${arg#*=}" ;;
@@ -111,6 +115,17 @@ for arg in "$@"; do
                 *)
                     log "WARNING: --is_forking=${arg#*=} is ignored; haf_fyp's HAF context"
                     log "         is registered NON-forking by design. Continuing."
+                    ;;
+            esac
+            ;;
+
+        --stop-at-block=*)
+            require_flag_value "$arg"
+            STOP_AT_BLOCK="${arg#*=}"
+            case "$STOP_AT_BLOCK" in
+                '' | *[!0-9]* | 0*)
+                    log "ERROR: --stop-at-block= takes a block number (a positive whole number), not '${STOP_AT_BLOCK}'."
+                    exit 2
                     ;;
             esac
             ;;
@@ -400,11 +415,20 @@ if command -v haf_app_driver.py >/dev/null 2>&1 \
         exec haf_app_driver.py --app=haf_fyp \
             --postgres-url="postgresql://${POSTGRES_USER}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}?application_name=haf_fyp_block_processing" \
             "${lock_flags[@]}" \
+            ${STOP_AT_BLOCK:+"--stop-at-block=${STOP_AT_BLOCK}"} \
             --startup-marker=
     fi
     log "WARNING: haf_app_driver.py is on PATH but haf_fyp is not in the HAF application registry"
     log "         (HAF older than haf#341, db/register_app.sql skipped it, or the probe failed --"
     log "         see above); falling back to the legacy CALL main() loop until the next restart"
+fi
+
+# CALL main() follows the chain until stopped; it has no block to stop at. Refused before the
+# ownership check, which may park: a caller asking for a bounded run wants an answer.
+if [ -n "${STOP_AT_BLOCK}" ]; then
+    log "ERROR: --stop-at-block needs haf_app_driver.py, and the legacy CALL main() loop would run"
+    log "       here (see above), which cannot stop at a block."
+    exit 2
 fi
 
 # Checked on every path into the legacy loop, including HAF_FYP_USE_LEGACY_LOOP=true: the

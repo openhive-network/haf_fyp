@@ -28,7 +28,7 @@ branches:
 environment:
   kind: "container"
   # Built by .aidev/runtime/build.sh from .aidev/runtime/Dockerfile and requirements.txt.
-  image: "registry.gitlab.syncad.com/hive/haf_fyp/aidev-tests@sha256:f7fde1e02088a902023bca484f597db7b2c4794e34621db5adb9eee4ca910090"
+  image: "registry.gitlab.syncad.com/hive/haf_fyp/aidev-tests@sha256:4a3ec24828cf2c126b663dd4ca07cc041573e50910b7a01d0832309d317a178c"
   inputs: [".aidev/runtime/Dockerfile", "requirements.txt"]
 
 issues:
@@ -56,15 +56,25 @@ sandbox:
   resource_class: light
   services: [fastapi-db, postgres, haf-fyp-postgrest, haf-fyp-postgrest-rewriter, install-db, haf-init, haf]
   readiness_timeout: 300
+  # The replay steps of full and canary reach the shared HAF the `haf` project hosts (a
+  # HAF replayed to block 5000000) as AIDEV_EXTERNAL_HAF_HOST/_PORT: .aidev/run-checks.sh
+  # takes two copy-on-write clones of it per run, installs the candidate into both as
+  # haf_shared_consumer, processes blocks 1 to 5000000 in each and drops them on exit.
+  # The consumer role is trusted from the fleet LAN: no secret. See .aidev/README.md.
+  external:
+    - name: haf
+      provider: "haf/haf"
 
 # Verification slots. Each binding is what this project genuinely runs for
 # that slot — never one selection repeated under seven names, which makes
 # seven gates report on the same evidence while claiming to check seven
 # different things.
 #
-# Every step except stack-pins and aidev-scripts is a job of .gitlab-ci.yml, run
-# from that file (.aidev/ci_job.py): the lint jobs, python-tests (`unit`), and for
-# full, baseline and canary the four database lanes. Not bound: haf-shim-drift
+# Every step except stack-pins, aidev-scripts and the replay-* steps is a job of
+# .gitlab-ci.yml, run from that file (.aidev/ci_job.py): the lint jobs, python-tests
+# (`unit`), and for full, baseline and canary the four database lanes. full and canary
+# also run the replay over clones of the shared HAF (replay-install, replay-sync,
+# replay-parity, replay-report), which no CI job does. Not bound: haf-shim-drift
 # (fetches hive/haf over the network; its offline half is in the unit tests), the
 # docker-build-* image smoke tests (they need a docker daemon) and the scheduled
 # jobs. See .aidev/README.md.
@@ -78,9 +88,11 @@ verification:
     artifacts: ["test-results/quick/"]
   full:
     adapter: command
-    # measured 9m11-9m17 locally plus the stack's boot (~30 s)
-    timeout: 1800
-    args: [".aidev/run-checks.sh", "full", "stack-pins", "aidev-scripts", "sql-lint", "shell-lint", "python-lint", "hadolint", "compose-validate", "openapi-drift", "unit", "fastapi", "postgrest", "install", "install-haf"]
+    # measured 9m11-9m17 locally plus the stack's boot (~30 s), and 7m39 for the replay
+    # steps by hand on 2026-10-25 (install 36 s, the two 5M-block syncs side by side
+    # 413 s, parity 7 s): about 17 min. 2100 s, the full ceiling, leaves 2x on that.
+    timeout: 2100
+    args: [".aidev/run-checks.sh", "full", "stack-pins", "aidev-scripts", "sql-lint", "shell-lint", "python-lint", "hadolint", "compose-validate", "openapi-drift", "unit", "fastapi", "postgrest", "install", "install-haf", "replay-install", "replay-sync", "replay-parity", "replay-report"]
     artifacts: ["test-results/full/"]
   baseline:
     adapter: command
@@ -90,9 +102,9 @@ verification:
     artifacts: ["test-results/baseline/"]
   canary:
     adapter: command
-    # as full; 1500 s is the canary cap
+    # as full, about 17 min; 1500 s is the canary cap, about 1.45x on that
     timeout: 1500
-    args: [".aidev/run-checks.sh", "canary", "stack-pins", "aidev-scripts", "sql-lint", "shell-lint", "python-lint", "hadolint", "compose-validate", "openapi-drift", "unit", "fastapi", "postgrest", "install", "install-haf"]
+    args: [".aidev/run-checks.sh", "canary", "stack-pins", "aidev-scripts", "sql-lint", "shell-lint", "python-lint", "hadolint", "compose-validate", "openapi-drift", "unit", "fastapi", "postgrest", "install", "install-haf", "replay-install", "replay-sync", "replay-parity", "replay-report"]
     artifacts: ["test-results/canary/"]
   # python-tests with its pytest-cov run (coverage.xml beside the junit). `static`
   # and `system` are left unbound: AIDEV runs neither for a project.

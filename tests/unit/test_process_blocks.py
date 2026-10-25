@@ -614,6 +614,43 @@ def test_the_marker_is_written_before_the_driver_runs(bash, tmp_path):
     assert (tmp_path / "marker_at_exec.log").read_text().strip() == STUB_NOW
 
 
+def test_the_driver_stops_at_the_block_it_is_given(bash: str, tmp_path: Path) -> None:
+    """--stop-at-block bounds a run (a replay to a known block) and is passed through as is."""
+    make_psql(tmp_path)
+    argv_log = make_driver_stub(tmp_path)
+    r = run_env(bash, tmp_path, "--stop-at-block=5000000", startup_file=tmp_path / "startup.txt")
+    assert r.returncode == 0, r.stdout + r.stderr
+    args = argv_log.read_text().split()
+    assert [a for a in args if a.startswith("--stop-at-block")] == ["--stop-at-block=5000000"], args
+
+
+def test_without_a_stop_block_the_driver_follows_the_chain(bash: str, tmp_path: Path) -> None:
+    make_psql(tmp_path)
+    argv_log = make_driver_stub(tmp_path)
+    run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    assert "--stop-at-block" not in argv_log.read_text()
+
+
+@pytest.mark.parametrize("value", ["", "0", "012", "-5", "5M", "1 2"])
+def test_a_stop_block_that_is_not_a_block_number_is_refused(bash: str, tmp_path: Path, value: str) -> None:
+    sql = make_psql(tmp_path)
+    argv_log = make_driver_stub(tmp_path)
+    r = run_env(bash, tmp_path, f"--stop-at-block={value}", startup_file=tmp_path / "startup.txt")
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert not argv_log.exists()
+    assert not sql.exists(), "refused only after reaching the database"
+
+
+def test_the_legacy_loop_refuses_a_stop_block(bash: str, tmp_path: Path) -> None:
+    """CALL main() follows the chain until stopped: it cannot honour the flag, so the run
+    fails rather than processing past the block it was asked to stop at."""
+    sql = make_psql(tmp_path, registry="f")
+    r = run_env(bash, tmp_path, "--stop-at-block=5000000", startup_file=tmp_path / "startup.txt")
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "--stop-at-block needs haf_app_driver.py" in r.stdout + r.stderr
+    assert "CALL haf_fyp_app.main" not in sql.read_text()
+
+
 def test_legacy_loop_can_be_forced(bash, tmp_path):
     """HAF_FYP_USE_LEGACY_LOOP=true keeps the eternal CALL main() loop even when
     the driver is available - the operator escape hatch while the driver path

@@ -68,6 +68,11 @@
 -- do. Note both roles are created WITHOUT a password, so under a hardened pg_hba
 -- (md5/scram) a deployment must set one; under a `trust` line none is used.
 
+-- Every change below is made only when the role set lacks it, so an installer without
+-- CREATEROLE -- the shared HAF's haf_shared_consumer, installing into a clone of a HAF
+-- that already provides these roles -- runs this file without touching a role. A
+-- superuser or haf_admin install still repairs whatever is missing.
+
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'hive_applications_group') THEN
@@ -76,22 +81,22 @@ BEGIN
 
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'haf_fyp_owner') THEN
         CREATE ROLE haf_fyp_owner LOGIN INHERIT;
-    ELSE
+    ELSIF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'haf_fyp_owner' AND rolcanlogin AND rolinherit) THEN
         -- Repair path for installs created by the previous NOLOGIN NOINHERIT
-        -- definition. Unconditional rather than guarded on the current flags so a
-        -- partially repaired role converges too.
+        -- definition. Both attributes at once, so a partially repaired role converges.
         ALTER ROLE haf_fyp_owner LOGIN INHERIT;
     END IF;
 
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'haf_fyp_user') THEN
         CREATE ROLE haf_fyp_user LOGIN INHERIT;
-    ELSE
+    ELSIF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'haf_fyp_user' AND rolcanlogin AND rolinherit) THEN
         ALTER ROLE haf_fyp_user LOGIN INHERIT;
     END IF;
 END
 $$;
 
--- REVOKE before GRANT on every membership, rather than a bare GRANT.
+-- REVOKE before GRANT on a membership that is missing or does not inherit, rather than
+-- a bare GRANT.
 --
 -- PostgreSQL 16+ freezes a membership's inherit flag at GRANT time from the
 -- member role's rolinherit attribute, and ALTER ROLE ... INHERIT does NOT
@@ -101,22 +106,47 @@ $$;
 -- is not hypothetical: on a live HAF instance haf_stats' own
 -- `GRANT haf_stats_user TO haf_stats_owner` is still recorded with
 -- inherit_option = false, because its repair only covered the group membership.
--- On a fresh install each REVOKE is a harmless no-op.
-REVOKE hive_applications_owner_group FROM haf_fyp_owner;
-GRANT hive_applications_owner_group TO haf_fyp_owner;
+--
+-- "Does not inherit" is asked through pg_has_role(..., 'USAGE'), which follows the
+-- inherit flags on every PostgreSQL version: per membership on 16+, per role before.
+-- A membership that is recorded AND inherits is left alone.
+DO $$
+BEGIN
+    IF NOT (pg_has_role('haf_fyp_owner', 'hive_applications_owner_group', 'USAGE')
+            AND EXISTS (SELECT FROM pg_auth_members
+                        WHERE roleid = 'hive_applications_owner_group'::regrole
+                          AND member = 'haf_fyp_owner'::regrole)) THEN
+        REVOKE hive_applications_owner_group FROM haf_fyp_owner;
+        GRANT hive_applications_owner_group TO haf_fyp_owner;
+    END IF;
 
--- Defensive: strip the group from the API role if an earlier build granted it.
--- This role must never be a member (see the header) -- the SECURITY DEFINER
--- function in db/sync_status.sql is what gives it its hafd read.
-REVOKE hive_applications_group FROM haf_fyp_user;
+    -- Defensive: strip the group from the API role if an earlier build granted it.
+    -- This role must never be a member (see the header) -- the SECURITY DEFINER
+    -- function in db/sync_status.sql is what gives it its hafd read.
+    IF EXISTS (SELECT FROM pg_auth_members
+               WHERE roleid = 'hive_applications_group'::regrole
+                 AND member = 'haf_fyp_user'::regrole) THEN
+        REVOKE hive_applications_group FROM haf_fyp_user;
+    END IF;
 
--- haf_fyp_user is readable by haf_fyp_owner.
-REVOKE haf_fyp_user FROM haf_fyp_owner;
-GRANT haf_fyp_user TO haf_fyp_owner;
+    -- haf_fyp_user is readable by haf_fyp_owner.
+    IF NOT (pg_has_role('haf_fyp_owner', 'haf_fyp_user', 'USAGE')
+            AND EXISTS (SELECT FROM pg_auth_members
+                        WHERE roleid = 'haf_fyp_user'::regrole
+                          AND member = 'haf_fyp_owner'::regrole)) THEN
+        REVOKE haf_fyp_user FROM haf_fyp_owner;
+        GRANT haf_fyp_user TO haf_fyp_owner;
+    END IF;
 
--- haf_admin (HAF superrole) owns haf_fyp_owner. A bare GRANT: this script runs
--- as haf_admin, and haf_admin is a superuser for whom the inherit flag is moot.
-GRANT haf_fyp_owner TO haf_admin;
+    -- haf_admin (HAF superrole) owns haf_fyp_owner. A plain GRANT: haf_admin is a
+    -- superuser for whom the inherit flag is moot. Asked of pg_auth_members rather
+    -- than pg_has_role, which answers true for any superuser whether granted or not.
+    IF NOT EXISTS (SELECT FROM pg_auth_members AS m JOIN pg_roles AS r ON r.oid = m.member
+                   WHERE m.roleid = 'haf_fyp_owner'::regrole AND r.rolname = 'haf_admin') THEN
+        GRANT haf_fyp_owner TO haf_admin;
+    END IF;
+END
+$$;
 
 -- Install-time assertion. The failure this guards against is silence -- zero rows
 -- rather than an error -- so it has to be caught here rather than by someone

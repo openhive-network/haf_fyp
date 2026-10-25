@@ -24,6 +24,9 @@
 #   check that it does. It is not at /usr/local/bin, where the unit tests (CI's
 #   python:3.11-slim has no wrapper) would find it; .aidev/compose-lanes.yaml points
 #   the lanes' Dockerfile.sql services at it. psycopg2 comes from requirements.txt.
+#   /opt/psql-image/usr/local/bin/haf_app_driver.py, from the same image: the HAF
+#   block-processing driver scripts/process_blocks.sh execs there. Off PATH for the
+#   same reason; the replay steps put that directory on PATH.
 #
 # Inputs: this file and requirements.txt (the only file in the build context). Every
 # FROM is digest-pinned. Build and pin it with .aidev/runtime/build.sh; see
@@ -54,6 +57,7 @@ COPY --from=docker /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=docker /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
 COPY --from=postgrest /bin/postgrest /usr/local/bin/postgrest
 COPY --from=psql /usr/local/bin/install_with_app_lock.py /opt/psql-image/usr/local/bin/install_with_app_lock.py
+COPY --from=psql /usr/local/bin/haf_app_driver.py /opt/psql-image/usr/local/bin/haf_app_driver.py
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -q -r /tmp/requirements.txt \

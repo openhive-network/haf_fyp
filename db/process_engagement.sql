@@ -209,10 +209,19 @@ CREATE OR REPLACE FUNCTION haf_fyp_app.process_engagement(
 RETURNS void
 LANGUAGE plpgsql
 AS $$
+DECLARE
+    -- Per-processor timings: see db/process_block_range.sql.
+    _timed boolean := current_setting('haf_fyp.processor_timings', TRUE) = 'on';
+    _t timestamptz;
 BEGIN
+    IF _timed THEN _t := clock_timestamp(); END IF;
     PERFORM haf_fyp_app.process_comments(_first_block, _last_block);
+    IF _timed THEN _t := haf_fyp_app.report_processor_timing('comments', _first_block, _last_block, _t, '{comment_operation}'); END IF;
     PERFORM haf_fyp_app.process_reblogs(_first_block, _last_block);
+    IF _timed THEN _t := haf_fyp_app.report_processor_timing('reblogs', _first_block, _last_block, _t, '{custom_json_operation}'); END IF;
     PERFORM haf_fyp_app.process_votes(_first_block, _last_block);
+    IF _timed THEN _t := haf_fyp_app.report_processor_timing('votes', _first_block, _last_block, _t, '{vote_operation,effective_comment_vote_operation}'); END IF;
     PERFORM haf_fyp_app.process_payout_windows(_last_block);
+    IF _timed THEN PERFORM haf_fyp_app.report_processor_timing('payout_windows', _first_block, _last_block, _t, '{}'); END IF;
 END;
 $$;
