@@ -24,12 +24,26 @@ includes:
   - !include common.yaml
 
 stages:
-  - name: GET /rpc/get_algorithm returns v1.0.0
+  - name: GET /rpc/get_algorithm returns the active row, 1.1.0, with its stored weights
     request:
       url: "{api_url}/rpc/get_algorithm"
       method: GET
     response:
       status_code: 200
+      # The body, not just the status: with the active filter inverted this endpoint
+      # answered 200 with an inactive version. db/seed_data.sql stores three versions
+      # and marks 1.1.0 active, so 1.0.0 or 1.2.0 here means the filter is wrong.
+      json:
+        - version: "1.1.0"
+          description: "Tiered community boost: full for subscribed/declared communities, smaller for engaged-only"
+          weights:
+            relevance: 0.40
+            recency: 0.30
+            engagement: 0.20
+            credibility: 0.10
+            community_boost: 0.20
+            community_boost_engaged: 0.10
+          deployed_at: !anything
 
 ---
 test_name: Personalized feed returns empty array before ranker runs
