@@ -27,8 +27,8 @@ FIXTURE = Path(__file__).resolve().parent / "data" / "processor_timings_driver_l
 FIRST, LAST = 990001, 1020000
 
 PROCESSORS = [
-    "process_posts", "comments", "reblogs", "votes", "payout_windows",
-    "unsubscribe", "subscribe", "process_interactions", "resolve_hivemind_post_ids",
+    "stage_operations", "process_posts", "comments", "reblogs", "votes", "engagement_metrics",
+    "payout_windows", "unsubscribe", "subscribe", "process_interactions", "resolve_hivemind_post_ids",
 ]
 
 

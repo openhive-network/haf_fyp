@@ -38,14 +38,15 @@ HERE = os.path.dirname(__file__)
 STUB_SQL = os.path.join(HERE, "..", "haf_stub.sql")
 POSTS_SQL = os.path.join(HERE, "..", "..", "db", "process_posts.sql")
 COMMUNITIES_SQL = os.path.join(HERE, "..", "..", "db", "process_communities.sql")
+DISPATCHER_SQL = os.path.join(HERE, "..", "..", "db", "process_block_range.sql")
 
 CUSTOM_JSON, COMMENT, VOTE = 18, 1, 0
 BLOCK = 36467091
 
 # What the processors read, and nothing else. hive.operations_view is a view over HAF's
-# own tables on a real node; a table with the same three columns the SQL selects (plus
-# the id, which process_posts uses as post_id and process_communities orders by) is
-# enough for the statements to run unchanged.
+# own tables on a real node; a table with the same three columns stage_operations
+# selects (plus the id, which process_posts uses as post_id and process_communities
+# orders by) is enough for the statements to run unchanged.
 # The haf_fyp_app tables are created IF NOT EXISTS and widened IF NOT EXISTS because the
 # fastapi lane (tests/ci_fastapi_setup.sql) already has a three-column post_candidates.
 SCAFFOLD = """
@@ -144,9 +145,11 @@ def conn():
             cur.execute(open(STUB_SQL).read())
             cur.execute(SCAFFOLD)
             # In the order scripts/install_app.sh loads them: process_communities.sql
-            # uses helpers process_posts.sql defines.
+            # uses helpers process_posts.sql defines, and process_block_range.sql holds
+            # stage_operations, which the processors read the batch from.
             cur.execute(open(POSTS_SQL).read())
             cur.execute(open(COMMUNITIES_SQL).read())
+            cur.execute(open(DISPATCHER_SQL).read())
         yield c
     finally:
         try:
@@ -196,6 +199,8 @@ def posts(cur) -> set:
 
 
 def run(cur, function, first=BLOCK, last=BLOCK):
+    """Stage the range as process_block_range does, then run one processor over it."""
+    cur.execute("SELECT haf_fyp_app.stage_operations(%s, %s)", (first, last))
     cur.execute(f"SELECT haf_fyp_app.{function}(%s, %s)", (first, last))
 
 
@@ -529,6 +534,8 @@ def test_the_range_gives_each_pair_exactly_one_row(conn):
         community_op(cur, "returns", "subscribe", "hive-123456", block=late)
         community_op(cur, "returns", "subscribe", "hive-777", block=late)
 
+        # It reads the range's custom_json as stage_operations staged it.
+        cur.execute("SELECT haf_fyp_app.stage_operations(%s, %s)", (early, late))
         cur.execute("SELECT username, community_id, left_in_range, joined_block "
                     "FROM haf_fyp_app.community_membership_changes(%s, %s) ORDER BY 1, 2, 4",
                     (early, late))

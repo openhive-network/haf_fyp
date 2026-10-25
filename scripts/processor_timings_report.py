@@ -13,8 +13,8 @@ time, a missing or unknown processor, a gap or an overlap -- exits 1 naming the 
 and writes no report.
 
 The report holds each processor's wall time over the whole run and per 1,000,000 blocks
-(a batch counts towards the million its first block is in), the rows each processor read
-from hive.operations_view by op type, the custom_json ids the reblog question turns on,
+(a batch counts towards the million its first block is in), the rows of each op type a
+processor read (stage_operations from hive.operations_view, the others as it staged them), the custom_json ids the reblog question turns on,
 and the run's wall time as measured by the caller.
 """
 
@@ -32,10 +32,12 @@ from typing import Any
 
 #: The processors db/process_block_range.sql dispatches, in dispatch order.
 PROCESSORS: tuple[str, ...] = (
+    "stage_operations",
     "process_posts",
     "comments",
     "reblogs",
     "votes",
+    "engagement_metrics",
     "payout_windows",
     "unsubscribe",
     "subscribe",

@@ -2,10 +2,8 @@
 -- Steps 1–3: ingest root posts into post_candidates, populate post_lookup,
 -- and initialise engagement_metrics — all in a single CTE pass per block range.
 --
--- HAF API used:
---   hive.operations_view    — confirmed correct read interface
---   hafd.operation_types    — op type id lookup (name includes hive::protocol:: prefix)
---   hafd.blocks             — block timestamps
+-- Reads the batch's comment operations as stage_operations (db/process_block_range.sql)
+-- staged them, with their block timestamps.
 --
 -- json_metadata is a user-supplied string field — may be empty, null, or
 -- malformed JSON. safe_parse_json() absorbs all such cases silently.
@@ -13,6 +11,13 @@
 -- ---------------------------------------------------------------------------
 -- Helper: safe JSON parser — returns NULL for empty, null, or malformed input
 -- ---------------------------------------------------------------------------
+-- Called once per staged custom_json and root post, so it must not open a
+-- subtransaction for each: an EXCEPTION block does, on entry. pg_input_is_valid
+-- (PostgreSQL 16 and later) reports malformed JSON without raising. It does raise
+-- "stack depth limit exceeded" for JSON nested some 15,000 deep (at the default
+-- max_stack_depth), and nesting is at most the count of [ and {, so an input with more
+-- than 1000 of them, or a server older than 16 (the stub lanes run 14), takes the
+-- EXCEPTION path, which absorbs that too.
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.safe_parse_json(_json_str text)
 RETURNS jsonb
@@ -22,9 +27,18 @@ BEGIN
     IF _json_str IS NULL OR _json_str = '' OR _json_str = 'null' THEN
         RETURN NULL;
     END IF;
-    RETURN _json_str::jsonb;
-EXCEPTION WHEN OTHERS THEN
-    RETURN NULL;
+    IF current_setting('server_version_num')::int >= 160000
+       AND length(_json_str) - length(translate(_json_str, '[{', '')) <= 1000 THEN
+        IF pg_input_is_valid(_json_str, 'jsonb') THEN
+            RETURN _json_str::jsonb;
+        END IF;
+        RETURN NULL;
+    END IF;
+    BEGIN
+        RETURN _json_str::jsonb;
+    EXCEPTION WHEN OTHERS THEN
+        RETURN NULL;
+    END;
 END;
 $$;
 
@@ -56,8 +70,6 @@ CREATE OR REPLACE FUNCTION haf_fyp_app.process_posts(
 RETURNS void
 LANGUAGE plpgsql
 AS $$
-DECLARE
-    _comment_op_id int := (SELECT id FROM hafd.operation_types WHERE name = 'hive::protocol::comment_operation' LIMIT 1);
 BEGIN
     -- Three-step CTE: RETURNING from step 1 feeds steps 2 and 3,
     -- so only genuinely new posts flow into post_lookup and engagement_metrics.
@@ -75,15 +87,15 @@ BEGIN
         )
         SELECT
             -- post_id: stable operation id from hive.operations_view
-            ov.id,
-            ov.body::jsonb -> 'value' ->> 'author',
-            ov.body::jsonb -> 'value' ->> 'permlink',
+            c.id,
+            c.author,
+            c.permlink,
             -- community_id: a post belongs to a community when the root post's
             -- parent_permlink is the community account 'hive-NNNNNN' (the number
             -- is the community id, matching user_communities). NULL otherwise
             -- (non-community posts, where parent_permlink is just the first tag).
-            haf_fyp_app.community_id_from_name(ov.body::jsonb -> 'value' ->> 'parent_permlink'),
-            ov.body::jsonb -> 'value' ->> 'title',
+            haf_fyp_app.community_id_from_name(c.parent_permlink),
+            c.title,
             -- tags: only extract if json_metadata.tags is a JSON array
             CASE
                 WHEN jsonb_typeof(meta.parsed -> 'tags') = 'array'
@@ -91,20 +103,21 @@ BEGIN
                 ELSE ARRAY[]::TEXT[]
             END,
             -- category = parent_permlink for root posts (tag or community slug)
-            ov.body::jsonb -> 'value' ->> 'parent_permlink',
-            b.created_at,
-            LENGTH(ov.body::jsonb -> 'value' ->> 'body')
-        FROM hive.operations_view ov
-        JOIN hafd.blocks b ON b.num = ov.block_num
-        -- Parse json_metadata once per row via a lateral subquery
+            c.parent_permlink,
+            c.created_at,
+            c.body_length
+        FROM pg_temp.haf_fyp_batch_comments c
+        -- Parse json_metadata once per row via a lateral subquery (OFFSET 0 keeps the
+        -- planner from inlining it into both uses)
         CROSS JOIN LATERAL (
-            SELECT haf_fyp_app.safe_parse_json(
-                ov.body::jsonb -> 'value' ->> 'json_metadata'
-            ) AS parsed
+            SELECT haf_fyp_app.safe_parse_json(c.json_metadata) AS parsed OFFSET 0
         ) meta
-        WHERE ov.block_num BETWEEN _first_block AND _last_block
-          AND ov.op_type_id = _comment_op_id
-          AND ov.body::jsonb -> 'value' ->> 'parent_author' = ''
+        WHERE c.block_num BETWEEN _first_block AND _last_block
+          AND c.parent_author = ''
+          AND c.created_at IS NOT NULL
+        -- Chain order, as the view's scan gave it: an edit repeats (author, permlink)
+        -- in the same batch, and the first one, the post itself, is what is kept.
+        ORDER BY c.id
         ON CONFLICT (author, permlink) DO NOTHING
         RETURNING post_id, author, permlink
     ),

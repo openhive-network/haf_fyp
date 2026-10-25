@@ -2,11 +2,11 @@
 -- Steps 4–7: process direct-reply comments, reblogs, votes/rshares, and
 -- payout window expiry — all keyed against post_lookup for efficient joins.
 --
--- HAF API used:
---   hive.operations_view          — non-virtual and virtual operations
---   hafd.operation_types          — op type id lookup (name includes hive::protocol:: prefix)
---   hafd.blocks                   — block timestamps (for payout window)
---   haf_fyp_app.safe_parse_json() — defined in process_posts.sql
+-- Reads the batch's operations as stage_operations (db/process_block_range.sql) staged
+-- them, and hafd.blocks for the payout window.
+--
+-- Steps 4–6 each add their deltas to pg_temp.haf_fyp_batch_engagement, and the
+-- dispatcher applies them to engagement_metrics in one UPDATE per batch.
 --
 -- Comment tracking covers direct replies only (parent in post_lookup).
 -- Multi-level comment trees are out of scope for Phase 3.
@@ -22,21 +22,18 @@ CREATE OR REPLACE FUNCTION haf_fyp_app.process_comments(
 RETURNS void
 LANGUAGE plpgsql
 AS $$
-DECLARE
-    _comment_op_id int := (SELECT id FROM hafd.operation_types WHERE name = 'hive::protocol::comment_operation' LIMIT 1);
 BEGIN
     WITH raw_comments AS (
         -- Replies whose immediate parent is a tracked root post
         SELECT
             pl.post_id,
-            ov.body::jsonb -> 'value' ->> 'author' AS commenter
-        FROM hive.operations_view ov
+            c.author AS commenter
+        FROM pg_temp.haf_fyp_batch_comments c
         JOIN haf_fyp_app.post_lookup pl
-            ON  pl.author    = ov.body::jsonb -> 'value' ->> 'parent_author'
-            AND pl.permlink  = ov.body::jsonb -> 'value' ->> 'parent_permlink'
-        WHERE ov.block_num BETWEEN _first_block AND _last_block
-          AND ov.op_type_id = _comment_op_id
-          AND ov.body::jsonb -> 'value' ->> 'parent_author' <> ''
+            ON  pl.author    = c.parent_author
+            AND pl.permlink  = c.parent_permlink
+        WHERE c.block_num BETWEEN _first_block AND _last_block
+          AND c.parent_author <> ''
     ),
     -- Total comment count per post (includes repeat commenters)
     comment_totals AS (
@@ -56,14 +53,10 @@ BEGIN
     new_commenter_totals AS (
         SELECT post_id, COUNT(*) AS cnt FROM new_commenters GROUP BY post_id
     )
-    UPDATE haf_fyp_app.engagement_metrics em
-    SET
-        comment_count     = em.comment_count + ct.cnt,
-        unique_commenters = em.unique_commenters + COALESCE(nc.cnt, 0),
-        updated_at        = NOW()
+    INSERT INTO pg_temp.haf_fyp_batch_engagement (post_id, comment_count, unique_commenters)
+    SELECT ct.post_id, ct.cnt, COALESCE(nc.cnt, 0)
     FROM comment_totals ct
-    LEFT JOIN new_commenter_totals nc USING (post_id)
-    WHERE em.post_id = ct.post_id;
+    LEFT JOIN new_commenter_totals nc USING (post_id);
 END;
 $$;
 
@@ -80,35 +73,17 @@ CREATE OR REPLACE FUNCTION haf_fyp_app.process_reblogs(
 RETURNS void
 LANGUAGE plpgsql
 AS $$
-DECLARE
-    _custom_json_op_id int := (SELECT id FROM hafd.operation_types WHERE name = 'hive::protocol::custom_json_operation' LIMIT 1);
 BEGIN
-    WITH reblogs AS (
-        SELECT pl.post_id
-        FROM hive.operations_view ov
-        -- Parse the double-encoded json field once per row
-        CROSS JOIN LATERAL (
-            SELECT haf_fyp_app.safe_parse_json(
-                ov.body::jsonb -> 'value' ->> 'json'
-            ) AS parsed
-        ) cj
-        JOIN haf_fyp_app.post_lookup pl
-            ON  pl.author    = cj.parsed -> 1 ->> 'author'
-            AND pl.permlink  = cj.parsed -> 1 ->> 'permlink'
-        WHERE ov.block_num BETWEEN _first_block AND _last_block
-          AND ov.op_type_id = _custom_json_op_id
-          AND ov.body::jsonb -> 'value' ->> 'id' = 'reblog'
-          AND cj.parsed ->> 0 = 'reblog'
-    ),
-    reblog_counts AS (
-        SELECT post_id, COUNT(*) AS cnt FROM reblogs GROUP BY post_id
-    )
-    UPDATE haf_fyp_app.engagement_metrics em
-    SET
-        reblog_count = em.reblog_count + rc.cnt,
-        updated_at   = NOW()
-    FROM reblog_counts rc
-    WHERE em.post_id = rc.post_id;
+    INSERT INTO pg_temp.haf_fyp_batch_engagement (post_id, reblog_count)
+    SELECT pl.post_id, COUNT(*)
+    FROM pg_temp.haf_fyp_batch_custom_json cj
+    JOIN haf_fyp_app.post_lookup pl
+        ON  pl.author    = cj.author
+        AND pl.permlink  = cj.permlink
+    WHERE cj.block_num BETWEEN _first_block AND _last_block
+      AND cj.custom_json_id = 'reblog'
+      AND cj.action = 'reblog'
+    GROUP BY pl.post_id;
 END;
 $$;
 
@@ -125,52 +100,26 @@ CREATE OR REPLACE FUNCTION haf_fyp_app.process_votes(
 RETURNS void
 LANGUAGE plpgsql
 AS $$
-DECLARE
-    _vote_op_id int := (SELECT id FROM hafd.operation_types WHERE name = 'hive::protocol::vote_operation' LIMIT 1);
-    _eff_vote_op_id int := (SELECT id FROM hafd.operation_types WHERE name = 'hive::protocol::effective_comment_vote_operation' LIMIT 1);
 BEGIN
-    -- 6a: increment vote_count from non-virtual vote_operation
-    WITH votes AS (
-        SELECT pl.post_id
-        FROM hive.operations_view ov
-        JOIN haf_fyp_app.post_lookup pl
-            ON  pl.author    = ov.body::jsonb -> 'value' ->> 'author'
-            AND pl.permlink  = ov.body::jsonb -> 'value' ->> 'permlink'
-        WHERE ov.block_num BETWEEN _first_block AND _last_block
-          AND ov.op_type_id = _vote_op_id
-    ),
-    vote_counts AS (
-        SELECT post_id, COUNT(*) AS cnt FROM votes GROUP BY post_id
-    )
-    UPDATE haf_fyp_app.engagement_metrics em
-    SET
-        vote_count = em.vote_count + vc.cnt,
-        updated_at = NOW()
-    FROM vote_counts vc
-    WHERE em.post_id = vc.post_id;
+    -- 6a: vote_count from non-virtual vote_operation
+    INSERT INTO pg_temp.haf_fyp_batch_engagement (post_id, vote_count)
+    SELECT pl.post_id, COUNT(*)
+    FROM pg_temp.haf_fyp_batch_votes v
+    JOIN haf_fyp_app.post_lookup pl
+        ON  pl.author    = v.author
+        AND pl.permlink  = v.permlink
+    WHERE v.block_num BETWEEN _first_block AND _last_block
+    GROUP BY pl.post_id;
 
-    -- 6b: accumulate net_rshares from virtual effective_comment_vote_operation
-    WITH rshare_deltas AS (
-        SELECT
-            pl.post_id,
-            SUM(COALESCE(
-                (ov.body::jsonb -> 'value' ->> 'rshares')::bigint,
-                0
-            )) AS total_rshares
-        FROM hive.operations_view ov
-        JOIN haf_fyp_app.post_lookup pl
-            ON  pl.author    = ov.body::jsonb -> 'value' ->> 'author'
-            AND pl.permlink  = ov.body::jsonb -> 'value' ->> 'permlink'
-        WHERE ov.block_num BETWEEN _first_block AND _last_block
-          AND ov.op_type_id = _eff_vote_op_id
-        GROUP BY pl.post_id
-    )
-    UPDATE haf_fyp_app.engagement_metrics em
-    SET
-        net_rshares = em.net_rshares + rd.total_rshares,
-        updated_at  = NOW()
-    FROM rshare_deltas rd
-    WHERE em.post_id = rd.post_id;
+    -- 6b: net_rshares from virtual effective_comment_vote_operation
+    INSERT INTO pg_temp.haf_fyp_batch_engagement (post_id, net_rshares)
+    SELECT pl.post_id, SUM(COALESCE(ev.rshares::bigint, 0))
+    FROM pg_temp.haf_fyp_batch_effective_votes ev
+    JOIN haf_fyp_app.post_lookup pl
+        ON  pl.author    = ev.author
+        AND pl.permlink  = ev.permlink
+    WHERE ev.block_num BETWEEN _first_block AND _last_block
+    GROUP BY pl.post_id;
 END;
 $$;
 
@@ -215,12 +164,49 @@ DECLARE
     _t timestamptz;
 BEGIN
     IF _timed THEN _t := clock_timestamp(); END IF;
+    -- Dropped first in case a transaction runs two batches; see stage_operations.
+    IF to_regclass('pg_temp.haf_fyp_batch_engagement') IS NOT NULL THEN
+        DROP TABLE pg_temp.haf_fyp_batch_engagement;
+    END IF;
+    -- One row per post and step that has something to add: bigint and numeric, the
+    -- types COUNT and SUM(bigint) give, so the sums below are what each step's own
+    -- UPDATE added.
+    CREATE TEMPORARY TABLE haf_fyp_batch_engagement (
+        post_id bigint NOT NULL,
+        comment_count bigint NOT NULL DEFAULT 0,
+        unique_commenters bigint NOT NULL DEFAULT 0,
+        reblog_count bigint NOT NULL DEFAULT 0,
+        vote_count bigint NOT NULL DEFAULT 0,
+        net_rshares numeric NOT NULL DEFAULT 0
+    ) ON COMMIT DROP;
     PERFORM haf_fyp_app.process_comments(_first_block, _last_block);
     IF _timed THEN _t := haf_fyp_app.report_processor_timing('comments', _first_block, _last_block, _t, '{comment_operation}'); END IF;
     PERFORM haf_fyp_app.process_reblogs(_first_block, _last_block);
     IF _timed THEN _t := haf_fyp_app.report_processor_timing('reblogs', _first_block, _last_block, _t, '{custom_json_operation}'); END IF;
     PERFORM haf_fyp_app.process_votes(_first_block, _last_block);
     IF _timed THEN _t := haf_fyp_app.report_processor_timing('votes', _first_block, _last_block, _t, '{vote_operation,effective_comment_vote_operation}'); END IF;
+    -- Every step's deltas in one statement: each post's row is written once per batch.
+    UPDATE haf_fyp_app.engagement_metrics em
+    SET
+        comment_count     = em.comment_count + d.comment_count,
+        unique_commenters = em.unique_commenters + d.unique_commenters,
+        reblog_count      = em.reblog_count + d.reblog_count,
+        vote_count        = em.vote_count + d.vote_count,
+        net_rshares       = em.net_rshares + d.net_rshares,
+        updated_at        = NOW()
+    FROM (
+        SELECT
+            post_id,
+            SUM(comment_count) AS comment_count,
+            SUM(unique_commenters) AS unique_commenters,
+            SUM(reblog_count) AS reblog_count,
+            SUM(vote_count) AS vote_count,
+            SUM(net_rshares) AS net_rshares
+        FROM pg_temp.haf_fyp_batch_engagement
+        GROUP BY post_id
+    ) d
+    WHERE em.post_id = d.post_id;
+    IF _timed THEN _t := haf_fyp_app.report_processor_timing('engagement_metrics', _first_block, _last_block, _t, '{}'); END IF;
     PERFORM haf_fyp_app.process_payout_windows(_last_block);
     IF _timed THEN PERFORM haf_fyp_app.report_processor_timing('payout_windows', _first_block, _last_block, _t, '{}'); END IF;
 END;

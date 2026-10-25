@@ -41,7 +41,7 @@ instead, and a pin the image does not carry fails the step (rebuild the image, b
 | `install-haf` | `install-test-haf` | the same chain over the stack's HAF |
 | `replay-install` | — | two copy-on-write clones of the shared 5M-block HAF, `scripts/install_app.sh` into each as `haf_shared_consumer` |
 | `replay-sync` | — | `scripts/process_blocks.sh --stop-at-block=5000000` over both clones at once, one with `haf_fyp.processor_timings` on |
-| `replay-parity` | — | `post_candidates`, `engagement_metrics` and `user_interactions` hold the same rows in both clones |
+| `replay-parity` | — | every table block processing writes (`post_candidates`, `post_lookup`, `post_commenters`, `engagement_metrics`, `user_interactions`, `active_users`, `user_communities`) holds the same rows in both clones |
 | `replay-report` | — | `scripts/processor_timings_report.py` over the timed run's driver log: `processor-timings.json` and a summary table |
 
 | Slot | Steps | Stack |

@@ -32,8 +32,8 @@
 #   - replay-sync       scripts/process_blocks.sh --stop-at-block=5000000 over both clones
 #                       at once, one with haf_fyp.processor_timings on; each run's wall
 #                       time, and the timed run's driver log, under test-results/<suite>/
-#   - replay-parity     row counts and checksums of post_candidates, engagement_metrics
-#                       and user_interactions agree between the two clones
+#   - replay-parity     row counts and checksums of every table block processing writes
+#                       agree between the two clones
 #   - replay-report     scripts/processor_timings_report.py over the timed run's log:
 #                       processor-timings.json and its summary table
 #
@@ -214,19 +214,22 @@ replay_sync() {
     replay_synced=yes
 }
 
-# Order-independent: a row count and the sum of the rows' hashes. engagement_metrics'
-# updated_at is NOW() at processing time, so it is left out.
+# Order-independent: a row count and the sum of the rows' hashes, for every table block
+# processing writes. engagement_metrics' updated_at is NOW() at processing time, so it is
+# left out. Two runs' outputs compare as text, whether they are the two clones here or
+# runs of two revisions.
 table_checksums() {
-    clone_q "$1" -Atc "
-        SELECT 'post_candidates ' || count(*) || ' ' || coalesce(sum(('x' || substr(md5(t::text), 1, 15))::bit(60)::bigint::numeric), 0)
-          FROM haf_fyp_app.post_candidates t
-        UNION ALL
-        SELECT 'engagement_metrics ' || count(*) || ' ' || coalesce(sum(('x' || substr(md5(row(t.post_id, t.comment_count,
-                  t.unique_commenters, t.reblog_count, t.vote_count, t.net_rshares)::text), 1, 15))::bit(60)::bigint::numeric), 0)
-          FROM haf_fyp_app.engagement_metrics t
-        UNION ALL
-        SELECT 'user_interactions ' || count(*) || ' ' || coalesce(sum(('x' || substr(md5(t::text), 1, 15))::bit(60)::bigint::numeric), 0)
-          FROM haf_fyp_app.user_interactions t"
+    local table sql="" row
+    for table in post_candidates post_lookup post_commenters engagement_metrics user_interactions \
+        active_users user_communities; do
+        row="t"
+        [ "$table" = engagement_metrics ] &&
+            row="row(t.post_id, t.comment_count, t.unique_commenters, t.reblog_count, t.vote_count, t.net_rshares)"
+        [ -n "$sql" ] && sql="$sql UNION ALL "
+        sql="$sql(SELECT '$table ' || count(*) || ' ' || coalesce(sum(('x' || substr(md5($row::text), 1, 15))::bit(60)::bigint::numeric), 0)
+          FROM haf_fyp_app.$table t)"
+    done
+    clone_q "$1" -Atc "$sql"
 }
 
 replay_parity() {
@@ -236,8 +239,9 @@ replay_parity() {
     echo "instrumentation on (table rows checksum):"; echo "$timed"
     echo "instrumentation off:"; echo "$plain"
     [ "$timed" = "$plain" ] || { echo "the two clones differ"; return 1; }
-    # Two empty tables agree as well as two full ones.
-    awk '$2 == 0 { print "no rows in " $1; bad = 1 } END { exit bad }' <<< "$timed"
+    # Two empty tables agree as well as two full ones. Communities came to the chain in
+    # 2019, near block 36,000,000, so user_communities is empty this early.
+    awk '$2 == 0 && $1 != "user_communities" { print "no rows in " $1; bad = 1 } END { exit bad }' <<< "$timed"
 }
 
 replay_report() {
