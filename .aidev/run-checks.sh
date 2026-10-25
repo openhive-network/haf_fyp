@@ -281,8 +281,9 @@ replay_parity() {
         fi
     done
     echo "indexes and constraints: as installed, all valid ($(wc -l < "$out/replay-schema-timed-synced.txt") of them)"
-    # Two empty tables agree as well as two full ones.
-    awk '$2 == 0 { print "no rows in " $1; bad = 1 } END { exit bad }' <<< "$timed"
+    # Two empty tables agree as well as two full ones. Communities came to the chain in
+    # 2019, near block 36,000,000, so user_communities is empty this early.
+    awk '$2 == 0 && $1 != "user_communities" { print "no rows in " $1; bad = 1 } END { exit bad }' <<< "$timed"
 }
 
 replay_report() {
