@@ -45,7 +45,7 @@ def bash():
     return require_bash()
 
 
-def make_psql(tmp_path, registry: str = "t", taken_by: str | None = None,
+def make_psql(tmp_path: Path, registry: str = "t", taken_by: str | None = None,
               ownership_failures: int = 0,
               ownership_error: str = "psql: stub ownership failure",
               varying_error: bool = False, blocking_main: bool = False,
@@ -180,7 +180,7 @@ def make_psql(tmp_path, registry: str = "t", taken_by: str | None = None,
     return logfile
 
 
-def sleeps(tmp_path) -> list[str]:
+def sleeps(tmp_path: Path) -> list[str]:
     """What the script asked `sleep` for, in order (the stub returns almost at once)."""
     f = tmp_path / "sleeps.log"
     return f.read_text().split() if f.exists() else []
@@ -213,12 +213,12 @@ def reason_in(path: Path, starts: str, contains: str = "", seconds: float = 5.0)
     raise AssertionError(f"reason never became {starts!r}...{contains!r}; last: {text!r}")
 
 
-def parked_file(tmp_path) -> Path:
+def parked_file(tmp_path: Path) -> Path:
     """Where these runs write "not processing, and why" (#76) -- never the host's /tmp."""
     return tmp_path / "parked.txt"
 
 
-def run(bash, tmp_path, *args: str, startup_file: Path | None = None):
+def run(bash, tmp_path: Path, *args: str, startup_file: Path | None = None):
     env = clean_env(stub_bin(tmp_path))
     env["HAF_FYP_PARKED_FILE"] = str(parked_file(tmp_path))
     if startup_file is not None:
@@ -228,7 +228,7 @@ def run(bash, tmp_path, *args: str, startup_file: Path | None = None):
 
 # --- the startup timestamp --------------------------------------------------------
 
-def test_writes_the_startup_timestamp(bash, tmp_path):
+def test_writes_the_startup_timestamp(bash, tmp_path: Path) -> None:
     """Without it the healthcheck reports "block processing hasn't started yet" for the
     life of the container."""
     make_psql(tmp_path)
@@ -238,7 +238,7 @@ def test_writes_the_startup_timestamp(bash, tmp_path):
     assert startup.read_text().strip() == STUB_NOW
 
 
-def test_the_timestamp_comes_from_the_database_not_the_container(bash, tmp_path):
+def test_the_timestamp_comes_from_the_database_not_the_container(bash, tmp_path: Path) -> None:
     """Two reasons, and the first is a correctness one.
 
     last_active_at is `timestamp without time zone`, written by HAF in the SERVER's
@@ -258,7 +258,7 @@ def test_the_timestamp_comes_from_the_database_not_the_container(bash, tmp_path)
     assert "SELECT now()::timestamp" in log.read_text()
 
 
-def test_no_gnu_only_date_invocation_survives_in_the_script(bash, tmp_path):
+def test_no_gnu_only_date_invocation_survives_in_the_script(bash, tmp_path: Path) -> None:
     """Pinned by name. The image is Alpine, so `date` is BusyBox: it has `-I[SPEC]` but
     no `--iso-8601`, and no `--utc`. Reintroducing either kills the container on line
     one, and no other test in this repo would notice."""
@@ -269,7 +269,7 @@ def test_no_gnu_only_date_invocation_survives_in_the_script(bash, tmp_path):
     assert not any("--utc" in line for line in code)
 
 
-def test_the_writer_and_the_reader_agree_on_the_default_path(bash, tmp_path):
+def test_the_writer_and_the_reader_agree_on_the_default_path(bash, tmp_path: Path) -> None:
     """They are two files that must name the same location. If they drift, the check
     reports "hasn't started yet" forever and nothing else fails."""
     default = "/tmp/block_processing_startup_time.txt"
@@ -279,7 +279,7 @@ def test_the_writer_and_the_reader_agree_on_the_default_path(bash, tmp_path):
     assert writer.group(1) == reader.group(1) == default
 
 
-def test_the_timestamp_is_written_after_the_database_is_reachable(bash, tmp_path):
+def test_the_timestamp_is_written_after_the_database_is_reachable(bash, tmp_path: Path) -> None:
     """It is read from the database now, so it cannot precede wait_for_postgres. That
     also sharpens what the file's absence means: not "the container started" but
     "block processing has not begun"."""
@@ -290,7 +290,7 @@ def test_the_timestamp_is_written_after_the_database_is_reachable(bash, tmp_path
 
 # --- the loop ---------------------------------------------------------------------
 
-def test_calls_main_with_the_context_name_not_the_schema_name(bash, tmp_path):
+def test_calls_main_with_the_context_name_not_the_schema_name(bash, tmp_path: Path) -> None:
     """haf_fyp is the context; haf_fyp_app is the schema. main() takes the context."""
     log = make_psql(tmp_path)
     run(bash, tmp_path, startup_file=tmp_path / "startup.txt")
@@ -299,7 +299,7 @@ def test_calls_main_with_the_context_name_not_the_schema_name(bash, tmp_path):
 
 # --- option handling --------------------------------------------------------------
 
-def test_host_flag_reaches_the_connection(bash, tmp_path):
+def test_host_flag_reaches_the_connection(bash, tmp_path: Path) -> None:
     """Asserted on psql's argv, not on wait_for_postgres's log line.
 
     The log line is built from the option loop's own variables, so it stays correct
@@ -314,7 +314,7 @@ def test_host_flag_reaches_the_connection(bash, tmp_path):
     assert "-p 6543" in argv
 
 
-def test_user_flag_reaches_the_connection(bash, tmp_path):
+def test_user_flag_reaches_the_connection(bash, tmp_path: Path) -> None:
     """--user could be parsed and then discarded with no test noticing, while --help
     still advertised it — the silent-discard failure this MR calls a bug elsewhere."""
     make_psql(tmp_path)
@@ -322,21 +322,21 @@ def test_user_flag_reaches_the_connection(bash, tmp_path):
     assert "-U someone_else" in (tmp_path / "argv.log").read_text()
 
 
-def test_an_unknown_option_is_rejected(bash, tmp_path):
+def test_an_unknown_option_is_rejected(bash, tmp_path: Path) -> None:
     make_psql(tmp_path)
     r = run(bash, tmp_path, "--nope", startup_file=tmp_path / "startup.txt")
     assert r.returncode == 2
     assert "is not a valid option" in r.stdout
 
 
-def test_help_exits_zero_and_lists_the_flags(bash, tmp_path):
+def test_help_exits_zero_and_lists_the_flags(bash, tmp_path: Path) -> None:
     r = run(bash, tmp_path, "--help")
     assert r.returncode == 0
     for flag in ("--host", "--port", "--user", "--help"):
         assert flag in r.stdout
 
 
-def test_the_startup_query_asks_for_a_bare_value(bash, tmp_path):
+def test_the_startup_query_asks_for_a_bare_value(bash, tmp_path: Path) -> None:
     """-At on the startup query. Without it real psql writes a header and "(1 row)" into
     the file, `:'startup_time'::timestamp` becomes a cast error, and the container is
     permanently unhealthy -- while a stub that ignores flags reports everything fine."""
@@ -346,7 +346,7 @@ def test_the_startup_query_asks_for_a_bare_value(bash, tmp_path):
     assert "-Atq" in argv or "-At" in argv
 
 
-def test_the_startup_file_is_written_before_the_loop_starts(bash, tmp_path):
+def test_the_startup_file_is_written_before_the_loop_starts(bash, tmp_path: Path) -> None:
     """main() never returns in production, so a write placed after the CALL would never
     happen and the healthcheck would report "hasn't started yet" for the life of the
     container. Ordering asserted against the SQL log, not against two log lines that
@@ -358,7 +358,7 @@ def test_the_startup_file_is_written_before_the_loop_starts(bash, tmp_path):
     assert sql.index("SELECT now()::timestamp") < sql.index("CALL haf_fyp_app.main")
 
 
-def test_the_startup_write_is_atomic(bash, tmp_path):
+def test_the_startup_write_is_atomic(bash, tmp_path: Path) -> None:
     """A plain `psql > file` truncates before psql runs, so a psql that fails after
     pg_isready succeeded leaves a zero-byte file that passes an existence check. The
     write goes to a temp file and is moved into place."""
@@ -377,7 +377,7 @@ def test_the_startup_write_is_atomic(bash, tmp_path):
 # it, so they exercise - deliberately - the legacy fallback that a driverless
 # environment (old image, this test host) gets.
 
-def make_driver_stub(tmp_path) -> Path:
+def make_driver_stub(tmp_path: Path) -> Path:
     """A stub haf_app_driver.py that records its argv and the startup file's
     content at exec time, then exits instead of looping forever."""
     argv_log = tmp_path / "driver_argv.log"
@@ -392,7 +392,7 @@ def make_driver_stub(tmp_path) -> Path:
     return argv_log
 
 
-def run_env(bash, tmp_path, *args: str, startup_file=None, extra_env=None):
+def run_env(bash, tmp_path: Path, *args: str, startup_file=None, extra_env=None):
     env = clean_env(stub_bin(tmp_path))
     env["HAF_FYP_PARKED_FILE"] = str(parked_file(tmp_path))
     if startup_file is not None:
@@ -402,7 +402,7 @@ def run_env(bash, tmp_path, *args: str, startup_file=None, extra_env=None):
     return _run_in_group([bash, str(SCRIPT), *args], env)
 
 
-def run_until_parked(bash, tmp_path, extra_env=None, seconds: int = 10,
+def run_until_parked(bash, tmp_path: Path, extra_env=None, seconds: int = 10,
                      marker: str = "belongs to application", min_ownership_calls: int = 0,
                      linger: float = 0.0, script: Path = SCRIPT,
                      parked_env: bool = True) -> str:
@@ -457,7 +457,7 @@ def run_until_parked(bash, tmp_path, extra_env=None, seconds: int = 10,
     raise AssertionError("unreachable")  # pragma: no cover
 
 
-def test_stopping_the_legacy_loop_cancels_its_statement(bash, tmp_path):
+def test_stopping_the_legacy_loop_cancels_its_statement(bash, tmp_path: Path) -> None:
     """#67: CALL main()'s session holds HAF's block-processor locks, and a server notices a
     vanished client only when a write to it fails -- so a stopped container used to leave
     that session, and the lock, behind, and an install started meanwhile skipped. The stop
@@ -491,7 +491,7 @@ def test_stopping_the_legacy_loop_cancels_its_statement(bash, tmp_path):
     assert proc.returncode != 0, "a cancelled loop must not report success"
 
 
-def test_the_legacy_session_checks_for_a_vanished_client(bash, tmp_path):
+def test_the_legacy_session_checks_for_a_vanished_client(bash, tmp_path: Path) -> None:
     """The backstop for a hard kill, where no signal handler runs: in the SAME session as
     CALL main(), or it guards nothing."""
     make_psql(tmp_path, registry="f")
@@ -502,7 +502,7 @@ def test_the_legacy_session_checks_for_a_vanished_client(bash, tmp_path):
     assert "SET client_connection_check_interval" in calls[0], calls
 
 
-def test_the_driver_is_used_when_available(bash, tmp_path):
+def test_the_driver_is_used_when_available(bash, tmp_path: Path) -> None:
     """With the driver on PATH the script execs it for the registered application
     (context name, matching db/register_app.sql) instead of CALL main()."""
     sql = make_psql(tmp_path)
@@ -514,7 +514,7 @@ def test_the_driver_is_used_when_available(bash, tmp_path):
     assert "CALL haf_fyp_app.main" not in sql.read_text()
 
 
-def test_the_driver_gets_the_connection_flags(bash, tmp_path):
+def test_the_driver_gets_the_connection_flags(bash, tmp_path: Path) -> None:
     """--host/--port/--user must reach the driver's connection URL, the same
     silent-discard concern the psql-argv tests above guard for the legacy path."""
     make_psql(tmp_path)
@@ -525,7 +525,7 @@ def test_the_driver_gets_the_connection_flags(bash, tmp_path):
     assert "postgresql://someone_else@elsewhere:6543/" in argv
 
 
-def test_the_driver_does_not_write_its_own_startup_marker(bash, tmp_path):
+def test_the_driver_does_not_write_its_own_startup_marker(bash, tmp_path: Path) -> None:
     """The healthcheck compares against the DATABASE clock; the script writes that
     marker itself before exec'ing the driver, and disables the driver's own
     container-clock marker with an empty --startup-marker."""
@@ -535,7 +535,7 @@ def test_the_driver_does_not_write_its_own_startup_marker(bash, tmp_path):
     assert "--startup-marker=" in argv_log.read_text().split()
 
 
-def test_the_driver_holds_haf_s_block_processor_locks(bash, tmp_path):
+def test_the_driver_holds_haf_s_block_processor_locks(bash, tmp_path: Path) -> None:
     """#67: the driver takes no lock unless told. Asserted on the argv it RECEIVED -- a
     --lock line left after the command's last argument reads fine and is never passed."""
     make_psql(tmp_path)
@@ -549,7 +549,7 @@ def test_the_driver_holds_haf_s_block_processor_locks(bash, tmp_path):
     assert "hivemind is not installed" not in out and "could not ask" not in out, out
 
 
-def test_the_driver_does_not_hold_hivemind_s_lock_before_hivemind_is_installed(bash, tmp_path):
+def test_the_driver_does_not_hold_hivemind_s_lock_before_hivemind_is_installed(bash, tmp_path: Path) -> None:
     """#79: on a fresh node this processor starts before hivemind was ever installed. Holding
     'hivemind' then makes hivemind's installer skip itself -- for good. The names come from
     the database; where hivemind is absent it answers haf_fyp alone."""
@@ -563,7 +563,7 @@ def test_the_driver_does_not_hold_hivemind_s_lock_before_hivemind_is_installed(b
 
 
 @pytest.mark.parametrize("answer", [None, "", "haf_fyp; DROP", "haf_fyp\nhivemind", "HAF_FYP"])
-def test_an_unusable_answer_holds_both_locks(bash, tmp_path, answer):
+def test_an_unusable_answer_holds_both_locks(bash, tmp_path: Path, answer) -> None:
     """If the names cannot be had -- the query fails, or what comes back is not plain names
     -- the driver gets both, the list before #79: one lock too many is safer than reading
     hivemind_app unlocked. Nothing from the answer reaches the driver's argv."""
@@ -579,7 +579,7 @@ def test_an_unusable_answer_holds_both_locks(bash, tmp_path, answer):
         assert "psql: stub lock-names failure" in out, "the WARNING must carry psql's own error"
 
 
-def test_the_question_is_asked_so_that_psql_answers_with_bare_names(bash, tmp_path):
+def test_the_question_is_asked_so_that_psql_answers_with_bare_names(bash, tmp_path: Path) -> None:
     """The stub answers as real psql does, so this fails if the script drops -A/-t or
     array_to_string: it would then read a header or `{haf_fyp}`, refuse it, and hold both
     locks -- on a node without hivemind, #79 again, with every other test still green."""
@@ -596,7 +596,7 @@ def test_the_question_is_asked_so_that_psql_answers_with_bare_names(bash, tmp_pa
     assert [a for a in argv_log.read_text().split() if a.startswith("--lock")] == ["--lock=haf_fyp"]
 
 
-def test_the_names_are_asked_of_the_database_not_written_twice(bash, tmp_path):
+def test_the_names_are_asked_of_the_database_not_written_twice(bash, tmp_path: Path) -> None:
     """One list: the script holds no --lock literal of its own, only the fallback pair."""
     script = SCRIPT.read_text(encoding="utf-8")
     code = [ln for ln in script.splitlines() if not ln.lstrip().startswith("#")]
@@ -604,7 +604,7 @@ def test_the_names_are_asked_of_the_database_not_written_twice(bash, tmp_path):
     assert sum("haf_fyp_app.block_processor_lock_names()" in ln for ln in code) == 1
 
 
-def test_the_marker_is_written_before_the_driver_runs(bash, tmp_path):
+def test_the_marker_is_written_before_the_driver_runs(bash, tmp_path: Path) -> None:
     """Same ordering contract as the legacy loop: the driver never returns in
     production, so a marker written after the exec would never exist. The stub
     snapshots the marker file at exec time."""
@@ -614,7 +614,44 @@ def test_the_marker_is_written_before_the_driver_runs(bash, tmp_path):
     assert (tmp_path / "marker_at_exec.log").read_text().strip() == STUB_NOW
 
 
-def test_legacy_loop_can_be_forced(bash, tmp_path):
+def test_the_driver_stops_at_the_block_it_is_given(bash: str, tmp_path: Path) -> None:
+    """--stop-at-block bounds a run (a replay to a known block) and is passed through as is."""
+    make_psql(tmp_path)
+    argv_log = make_driver_stub(tmp_path)
+    r = run_env(bash, tmp_path, "--stop-at-block=5000000", startup_file=tmp_path / "startup.txt")
+    assert r.returncode == 0, r.stdout + r.stderr
+    args = argv_log.read_text().split()
+    assert [a for a in args if a.startswith("--stop-at-block")] == ["--stop-at-block=5000000"], args
+
+
+def test_without_a_stop_block_the_driver_follows_the_chain(bash: str, tmp_path: Path) -> None:
+    make_psql(tmp_path)
+    argv_log = make_driver_stub(tmp_path)
+    run_env(bash, tmp_path, startup_file=tmp_path / "startup.txt")
+    assert "--stop-at-block" not in argv_log.read_text()
+
+
+@pytest.mark.parametrize("value", ["", "0", "012", "-5", "5M", "1 2"])
+def test_a_stop_block_that_is_not_a_block_number_is_refused(bash: str, tmp_path: Path, value: str) -> None:
+    sql = make_psql(tmp_path)
+    argv_log = make_driver_stub(tmp_path)
+    r = run_env(bash, tmp_path, f"--stop-at-block={value}", startup_file=tmp_path / "startup.txt")
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert not argv_log.exists()
+    assert not sql.exists(), "refused only after reaching the database"
+
+
+def test_the_legacy_loop_refuses_a_stop_block(bash: str, tmp_path: Path) -> None:
+    """CALL main() follows the chain until stopped: it cannot honour the flag, so the run
+    fails rather than processing past the block it was asked to stop at."""
+    sql = make_psql(tmp_path, registry="f")
+    r = run_env(bash, tmp_path, "--stop-at-block=5000000", startup_file=tmp_path / "startup.txt")
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "--stop-at-block needs haf_app_driver.py" in r.stdout + r.stderr
+    assert "CALL haf_fyp_app.main" not in sql.read_text()
+
+
+def test_legacy_loop_can_be_forced(bash, tmp_path: Path) -> None:
     """HAF_FYP_USE_LEGACY_LOOP=true keeps the eternal CALL main() loop even when
     the driver is available - the operator escape hatch while the driver path
     is new."""
@@ -628,7 +665,7 @@ def test_legacy_loop_can_be_forced(bash, tmp_path):
 
 # --- the registry probe: the driver must not be exec'd against a HAF that cannot run it
 
-def test_the_driver_needs_the_registry_not_just_the_binary(bash, tmp_path):
+def test_the_driver_needs_the_registry_not_just_the_binary(bash, tmp_path: Path) -> None:
     """The psql base image ships haf_app_driver.py since 14-3, so the binary is
     always present; what decides is whether THIS HAF has the application
     registry with haf_fyp in it. Against a pre-haf#341 HAF the driver would
@@ -645,7 +682,7 @@ def test_the_driver_needs_the_registry_not_just_the_binary(bash, tmp_path):
     assert "probe failed:" not in r.stdout + r.stderr, r.stdout + r.stderr
 
 
-def test_an_unregistered_app_falls_back_too(bash, tmp_path):
+def test_an_unregistered_app_falls_back_too(bash, tmp_path: Path) -> None:
     """Registry present but haf_fyp not in it (register_app.sql skipped, or an
     install that predates it): same fallback, for the same reason -- the driver
     raises SystemExit on an unregistered application."""
@@ -657,7 +694,7 @@ def test_an_unregistered_app_falls_back_too(bash, tmp_path):
     assert "probe failed:" not in r.stdout + r.stderr, "a probe that answered was reported as failed"
 
 
-def test_the_legacy_loop_is_refused_on_a_context_another_application_owns(bash, tmp_path):
+def test_the_legacy_loop_is_refused_on_a_context_another_application_owns(bash, tmp_path: Path) -> None:
     """The one state where the legacy loop is NOT the safe answer (#62).
 
     `CALL haf_fyp_app.main('haf_fyp')` calls hive.app_next_iteration on context haf_fyp.
@@ -681,7 +718,7 @@ def test_the_legacy_loop_is_refused_on_a_context_another_application_owns(bash, 
     assert "embedding_app" in out, f"the refusal does not name the owning application; {out}"
 
 
-def test_the_refusal_also_applies_when_the_legacy_loop_is_forced(bash, tmp_path):
+def test_the_refusal_also_applies_when_the_legacy_loop_is_forced(bash, tmp_path: Path) -> None:
     """HAF_FYP_USE_LEGACY_LOOP=true asks for the loop; the hazard is the loop itself.
 
     With the driver ON PATH, as it always is since psql 14-3 -- otherwise the flag is never
@@ -695,7 +732,7 @@ def test_the_refusal_also_applies_when_the_legacy_loop_is_forced(bash, tmp_path)
     assert "embedding_app" in out
 
 
-def test_a_failing_registry_probe_counts_as_not_registered(bash, tmp_path):
+def test_a_failing_registry_probe_counts_as_not_registered(bash, tmp_path: Path) -> None:
     """A psql failure on the REGISTRY probe (permissions, transient error) must not be
     fatal under `set -e`, and must not be read as "registered" either: the answer is the
     legacy loop -- safe only because the ownership probe, which fails closed (#74), still
@@ -713,7 +750,7 @@ def test_a_failing_registry_probe_counts_as_not_registered(bash, tmp_path):
 
 # --- the ownership probe fails CLOSED (#74) ------------------------------------------
 
-def test_an_ownership_probe_that_cannot_answer_does_not_start_the_loop(bash, tmp_path):
+def test_an_ownership_probe_that_cannot_answer_does_not_start_the_loop(bash, tmp_path: Path) -> None:
     """The bug. A failed query used to read as "nobody else owns it", and the script went
     on to CALL main() on a context another application's driver may be advancing.
 
@@ -732,7 +769,7 @@ def test_an_ownership_probe_that_cannot_answer_does_not_start_the_loop(bash, tmp
     assert "retrying in 1s" in out and "retrying in 2s" in out, f"no backoff; {out}"
 
 
-def test_an_owner_found_after_a_failure_is_still_refused(bash, tmp_path):
+def test_an_owner_found_after_a_failure_is_still_refused(bash, tmp_path: Path) -> None:
     """The probe fails once, then names an owner. A retry path that forgot the answer, or
     treated "answered after a failure" as "nobody", would start the second loop -- #74 by
     another route."""
@@ -743,14 +780,14 @@ def test_an_owner_found_after_a_failure_is_still_refused(bash, tmp_path):
     assert "embedding_app" in out, out
 
 
-def test_the_backoff_doubles_to_five_minutes(bash, tmp_path):
+def test_the_backoff_doubles_to_five_minutes(bash, tmp_path: Path) -> None:
     """10, 20, 40, 80, 160, then 300 and stays there."""
     make_psql(tmp_path, registry="f", ownership_failures=-1)
     run_until_parked(bash, tmp_path, marker="retrying in", min_ownership_calls=8)
     assert sleeps(tmp_path)[:7] == ["10", "20", "40", "80", "160", "300", "300"], sleeps(tmp_path)
 
 
-def test_a_changed_error_is_printed_in_full_again(bash, tmp_path):
+def test_a_changed_error_is_printed_in_full_again(bash, tmp_path: Path) -> None:
     """The full error prints when it CHANGES, not only the first time: a new failure is
     new information."""
     make_psql(tmp_path, registry="f", ownership_failures=-1, varying_error=True)
@@ -760,7 +797,7 @@ def test_a_changed_error_is_printed_in_full_again(bash, tmp_path):
     assert "same error" not in out, out
 
 
-def test_a_generic_failure_gets_no_reinstall_hint(bash, tmp_path):
+def test_a_generic_failure_gets_no_reinstall_hint(bash, tmp_path: Path) -> None:
     """The hint is for a missing helper only; a connection error is not fixed by
     reinstalling."""
     make_psql(tmp_path, registry="f", ownership_failures=-1,
@@ -769,7 +806,7 @@ def test_a_generic_failure_gets_no_reinstall_hint(bash, tmp_path):
     assert "Re-run the install" not in out, out
 
 
-def test_a_failing_registry_lookup_is_logged_too(bash, tmp_path):
+def test_a_failing_registry_lookup_is_logged_too(bash, tmp_path: Path) -> None:
     """to_regclass answers, then the lookup itself fails: logged, and the legacy loop is
     chosen only because the ownership probe then answers "nobody"."""
     sql = make_psql(tmp_path, registry="lookup_error")
@@ -779,7 +816,7 @@ def test_a_failing_registry_lookup_is_logged_too(bash, tmp_path):
     assert "CALL haf_fyp_app.main('haf_fyp');" in sql.read_text()
 
 
-def test_the_same_holds_when_the_legacy_loop_is_forced(bash, tmp_path):
+def test_the_same_holds_when_the_legacy_loop_is_forced(bash, tmp_path: Path) -> None:
     """With the driver on PATH, so HAF_FYP_USE_LEGACY_LOOP is actually read."""
     sql = make_psql(tmp_path, registry="t", ownership_failures=-1)
     argv_log = make_driver_stub(tmp_path)
@@ -790,7 +827,7 @@ def test_the_same_holds_when_the_legacy_loop_is_forced(bash, tmp_path):
     assert not argv_log.exists(), out
 
 
-def test_a_registered_app_runs_the_driver_without_asking(bash, tmp_path):
+def test_a_registered_app_runs_the_driver_without_asking(bash, tmp_path: Path) -> None:
     """The ownership check guards the LEGACY loop. A registered haf_fyp owns its context
     (hive.app_register refuses a context another application holds), so its driver must
     not wait on a probe that cannot answer."""
@@ -806,7 +843,7 @@ def test_a_registered_app_runs_the_driver_without_asking(bash, tmp_path):
     "ERROR:  function haf_fyp_app.context_claimed_by_other_app(unknown) does not exist",
     'ERROR:  schema "haf_fyp_app" does not exist',
 ])
-def test_a_missing_helper_says_to_rerun_the_install(bash, tmp_path, error):
+def test_a_missing_helper_says_to_rerun_the_install(bash, tmp_path: Path, error) -> None:
     """A container restarted on a new image against a database installed before the
     helper existed: the one permanent failure with a known fix, so name it -- and still
     do not start the loop."""
@@ -825,7 +862,7 @@ def test_a_missing_helper_says_to_rerun_the_install(bash, tmp_path, error):
     # CALL main() ran on a context another application owned.
     ("08", 8), ("010", 10), ("007", 7),
 ])
-def test_the_retry_interval_defaults_and_rejects_nonsense(bash, tmp_path, value, expected):
+def test_the_retry_interval_defaults_and_rejects_nonsense(bash, tmp_path: Path, value, expected) -> None:
     """Default 10s. A value `sleep` rejects would exit under `set -e` -- a crash loop --
     and 0 would query the database in a tight loop; both fall back to 10s."""
     make_psql(tmp_path, registry="f", ownership_failures=-1)
@@ -835,7 +872,7 @@ def test_the_retry_interval_defaults_and_rejects_nonsense(bash, tmp_path, value,
     assert "value too great for base" not in out, out
 
 
-def test_a_leading_zero_interval_does_not_skip_the_check(bash, tmp_path):
+def test_a_leading_zero_interval_does_not_skip_the_check(bash, tmp_path: Path) -> None:
     """The failure itself, end to end: another application owns the context, the interval
     is `08`, and the loop must still be refused rather than started."""
     sql = make_psql(tmp_path, registry="f", taken_by="embedding_app")
@@ -844,7 +881,7 @@ def test_a_leading_zero_interval_does_not_skip_the_check(bash, tmp_path):
     assert "CALL haf_fyp_app.main" not in sql.read_text(), out
 
 
-def test_an_empty_error_still_prints_in_full_the_first_time(bash, tmp_path):
+def test_an_empty_error_still_prints_in_full_the_first_time(bash, tmp_path: Path) -> None:
     """psql killed by a signal writes nothing to stderr; the first attempt must still get
     the full message, not "same error"."""
     make_psql(tmp_path, registry="f", ownership_failures=-1, ownership_error="")
@@ -853,7 +890,7 @@ def test_an_empty_error_still_prints_in_full_the_first_time(bash, tmp_path):
     assert "could not find out whether another application owns" in out, out
 
 
-def test_a_transient_ownership_failure_recovers(bash, tmp_path):
+def test_a_transient_ownership_failure_recovers(bash, tmp_path: Path) -> None:
     """Retrying, not parking for good: once the probe answers "nobody", the loop starts.
     A node must not stay down until someone restarts it because of one dropped query."""
     sql = make_psql(tmp_path, registry="f", ownership_failures=2)
@@ -864,7 +901,7 @@ def test_a_transient_ownership_failure_recovers(bash, tmp_path):
     assert (tmp_path / "ownership_calls").read_text().strip() == "3"
 
 
-def test_the_ownership_question_is_the_shared_helper(bash, tmp_path):
+def test_the_ownership_question_is_the_shared_helper(bash, tmp_path: Path) -> None:
     """One statement, through haf_fyp_app.context_claimed_by_other_app() (#65): the same
     predicate as the install's guard and register_app.sql, with the registry probe inside
     it and an ORDER BY -- not a second inline copy that can drift, and not the old
@@ -879,7 +916,7 @@ def test_the_ownership_question_is_the_shared_helper(bash, tmp_path):
     assert "LIMIT" not in sql.read_text()
 
 
-def test_the_probe_names_the_relation_in_a_statement_of_its_own(bash, tmp_path):
+def test_the_probe_names_the_relation_in_a_statement_of_its_own(bash, tmp_path: Path) -> None:
     """PostgreSQL resolves relations at plan time, so a single statement that
     mentions hafd.applications fails on a HAF without it regardless of any
     to_regclass() guard in the same query. The existence check and the row
@@ -901,20 +938,20 @@ def test_the_probe_names_the_relation_in_a_statement_of_its_own(bash, tmp_path):
 # reads first.
 
 
-def test_a_parked_processor_leaves_its_reason(bash, tmp_path):
+def test_a_parked_processor_leaves_its_reason(bash, tmp_path: Path) -> None:
     make_psql(tmp_path, registry="f", taken_by="embedding_app")
     run_until_parked(bash, tmp_path, linger=0.5)
     reason_in(parked_file(tmp_path), "parked:", "embedding_app")
 
 
-def test_a_forced_legacy_loop_that_parks_leaves_its_reason_too(bash, tmp_path):
+def test_a_forced_legacy_loop_that_parks_leaves_its_reason_too(bash, tmp_path: Path) -> None:
     make_psql(tmp_path, registry="t", taken_by="embedding_app")
     make_driver_stub(tmp_path)
     run_until_parked(bash, tmp_path, linger=0.5, extra_env={"HAF_FYP_USE_LEGACY_LOOP": "true"})
     reason_in(parked_file(tmp_path), "parked:", "embedding_app")
 
 
-def test_a_probe_that_cannot_answer_leaves_its_reason(bash, tmp_path):
+def test_a_probe_that_cannot_answer_leaves_its_reason(bash, tmp_path: Path) -> None:
     """#74's retry is a refusal too: nothing is processed while it lasts."""
     make_psql(tmp_path, registry="f", ownership_failures=-1)
     run_until_parked(bash, tmp_path, marker="retrying in", linger=1,
@@ -922,14 +959,14 @@ def test_a_probe_that_cannot_answer_leaves_its_reason(bash, tmp_path):
     reason_in(parked_file(tmp_path), "waiting:", "stub ownership failure")
 
 
-def test_an_owner_found_after_a_failure_replaces_the_waiting_reason(bash, tmp_path):
+def test_an_owner_found_after_a_failure_replaces_the_waiting_reason(bash, tmp_path: Path) -> None:
     make_psql(tmp_path, registry="f", taken_by="embedding_app", ownership_failures=1)
     run_until_parked(bash, tmp_path, linger=0.5,
                      extra_env={"HAF_FYP_OWNERSHIP_RETRY_SECONDS": "1"})
     reason_in(parked_file(tmp_path), "parked:", "embedding_app")
 
 
-def test_a_probe_that_recovers_clears_the_reason(bash, tmp_path):
+def test_a_probe_that_recovers_clears_the_reason(bash, tmp_path: Path) -> None:
     """Failed once, then answered "nobody": the loop starts, and the check must not go on
     reporting a wait that is over."""
     sql = make_psql(tmp_path, registry="f", ownership_failures=1)
@@ -939,7 +976,7 @@ def test_a_probe_that_recovers_clears_the_reason(bash, tmp_path):
     assert not parked_file(tmp_path).exists(), parked_file(tmp_path).read_text()
 
 
-def test_a_reason_left_by_the_previous_run_is_cleared(bash, tmp_path):
+def test_a_reason_left_by_the_previous_run_is_cleared(bash, tmp_path: Path) -> None:
     """`docker restart` keeps the container's /tmp. A reason from the last run must not
     make a processor that now runs look parked."""
     parked_file(tmp_path).write_text("parked: stale, from the previous run\n")
@@ -949,7 +986,7 @@ def test_a_reason_left_by_the_previous_run_is_cleared(bash, tmp_path):
     assert not parked_file(tmp_path).exists()
 
 
-def test_the_driver_path_clears_a_stale_reason_too(bash, tmp_path):
+def test_the_driver_path_clears_a_stale_reason_too(bash, tmp_path: Path) -> None:
     """The registered path execs the driver without the ownership probe; it must still
     start from a clean slate."""
     parked_file(tmp_path).write_text("parked: stale\n")
@@ -960,14 +997,14 @@ def test_the_driver_path_clears_a_stale_reason_too(bash, tmp_path):
     assert not parked_file(tmp_path).exists()
 
 
-def test_the_reason_is_written_atomically(bash, tmp_path):
+def test_the_reason_is_written_atomically(bash, tmp_path: Path) -> None:
     """The check reads it on its own schedule; it must never see a half-written file."""
     body = [line for line in SCRIPT.read_text().splitlines()
             if not line.lstrip().startswith("#")]
     assert any('mv "${tmp}" "${PARKED_FILE}"' in line for line in body)
 
 
-def test_the_writer_and_the_reader_agree_on_the_parked_path(bash, tmp_path):
+def test_the_writer_and_the_reader_agree_on_the_parked_path(bash, tmp_path: Path) -> None:
     default = "/tmp/block_processing_parked.txt"
     writer = re.search(r"HAF_FYP_PARKED_FILE:-([^}\"]+)", SCRIPT.read_text())
     reader = re.search(r"HAF_FYP_PARKED_FILE:-([^}\"]+)", HEALTHCHECK.read_text())
@@ -975,7 +1012,7 @@ def test_the_writer_and_the_reader_agree_on_the_parked_path(bash, tmp_path):
     assert writer.group(1) == reader.group(1) == default
 
 
-def test_the_reason_says_starting_until_ownership_is_known(bash, tmp_path):
+def test_the_reason_says_starting_until_ownership_is_known(bash, tmp_path: Path) -> None:
     """No window in which the heartbeat speaks for a container that is not processing yet:
     between start and the ownership answer -- which can hang -- the file says so."""
     make_psql(tmp_path, registry="f")
@@ -985,7 +1022,7 @@ def test_the_reason_says_starting_until_ownership_is_known(bash, tmp_path):
     assert not parked_file(tmp_path).exists()
 
 
-def test_the_driver_is_exec_d_without_a_reason_in_place(bash, tmp_path):
+def test_the_driver_is_exec_d_without_a_reason_in_place(bash, tmp_path: Path) -> None:
     """The driver never returns; a "starting" reason left at exec would report the
     processor unhealthy for as long as it runs."""
     make_psql(tmp_path, registry="t")
@@ -994,7 +1031,7 @@ def test_the_driver_is_exec_d_without_a_reason_in_place(bash, tmp_path):
     assert (tmp_path / "parked_at_exec.log").read_text().strip() == "absent"
 
 
-def test_a_reason_that_cannot_be_written_does_not_stop_the_park(bash, tmp_path):
+def test_a_reason_that_cannot_be_written_does_not_stop_the_park(bash, tmp_path: Path) -> None:
     """The write is best-effort. Failing it under set -e was an exit -- a crash loop under
     the restart policy -- and on the owner path it came before the explanation was logged."""
     make_psql(tmp_path, registry="f", taken_by="embedding_app")
@@ -1004,7 +1041,7 @@ def test_a_reason_that_cannot_be_written_does_not_stop_the_park(bash, tmp_path):
     assert "could not record" in out, out
 
 
-def test_the_waiting_reason_lasts_as_long_as_the_wait(bash, tmp_path):
+def test_the_waiting_reason_lasts_as_long_as_the_wait(bash, tmp_path: Path) -> None:
     """Still there after several failed attempts, not just the first: a reason that went
     away mid-wait would hand the verdict back to the owner's heartbeat."""
     make_psql(tmp_path, registry="f", ownership_failures=-1)
@@ -1013,7 +1050,7 @@ def test_the_waiting_reason_lasts_as_long_as_the_wait(bash, tmp_path):
     reason_in(parked_file(tmp_path), "waiting:", "stub ownership failure")
 
 
-def test_the_waiting_reason_follows_a_changed_error(bash, tmp_path):
+def test_the_waiting_reason_follows_a_changed_error(bash, tmp_path: Path) -> None:
     """The reason is rewritten when the error changes, as the log is."""
     make_psql(tmp_path, registry="f", ownership_failures=-1, varying_error=True)
     run_until_parked(bash, tmp_path, marker="retrying in", min_ownership_calls=3, linger=1,
@@ -1023,7 +1060,7 @@ def test_the_waiting_reason_follows_a_changed_error(bash, tmp_path):
     assert attempt > 1, f"the reason still names the first failure; {reason}"
 
 
-def test_the_default_path_is_used_when_nothing_is_set(bash, tmp_path):
+def test_the_default_path_is_used_when_nothing_is_set(bash, tmp_path: Path) -> None:
     """Production sets no HAF_FYP_PARKED_FILE. Every other run here does, so a script that
     wrote the reason only when the variable was set passed them all. This runs a copy whose
     DEFAULT points into tmp_path -- and the variable unset -- so the default path itself is

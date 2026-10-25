@@ -79,6 +79,23 @@ def git(*args: str) -> str:
         return ""
 
 
+def pin_gitlink(link: Path) -> None:
+    """Make a copied worktree's `gitdir:` link absolute.
+
+    A relative link (a worktree checkout's .git file can carry one) is resolved from
+    the directory holding it, so in the scratch copy it points nowhere and every git
+    command the job runs fails with "not a git repository".
+    """
+    if not link.is_file():
+        return
+    text = link.read_text(encoding="utf-8").strip()
+    if not text.startswith("gitdir:"):
+        return
+    target = Path(text[len("gitdir:"):].strip())
+    if not target.is_absolute():
+        link.write_text(f"gitdir: {(REPO / target).resolve()}\n", encoding="utf-8")
+
+
 def check_pip_line(line: str, env: dict[str, str]) -> list[str]:
     """The problems with a skipped `pip install` line: pins the job's python lacks."""
     problems = []
@@ -145,6 +162,7 @@ def main() -> int:
         scratch = Path(tempfile.mkdtemp(prefix=f"ci-{a.job}-"))
         workdir = scratch / "tree"
         shutil.copytree(REPO, workdir, symlinks=True, ignore=shutil.ignore_patterns("test-results"))
+        pin_gitlink(workdir / ".git")
     for pair in a.seed:
         src, _, dest = pair.partition("=")
         shutil.copyfile(src, workdir / dest)

@@ -159,8 +159,15 @@ CREATE OR REPLACE FUNCTION haf_fyp_app.process_communities(
 RETURNS void
 LANGUAGE plpgsql
 AS $$
+DECLARE
+    -- Per-processor timings: see db/process_block_range.sql.
+    _timed boolean := current_setting('haf_fyp.processor_timings', TRUE) = 'on';
+    _t timestamptz;
 BEGIN
+    IF _timed THEN _t := clock_timestamp(); END IF;
     PERFORM haf_fyp_app.process_unsubscribe(_first_block, _last_block);
+    IF _timed THEN _t := haf_fyp_app.report_processor_timing('unsubscribe', _first_block, _last_block, _t, '{custom_json_operation}'); END IF;
     PERFORM haf_fyp_app.process_subscribe(_first_block, _last_block);
+    IF _timed THEN PERFORM haf_fyp_app.report_processor_timing('subscribe', _first_block, _last_block, _t, '{custom_json_operation}'); END IF;
 END;
 $$;

@@ -6,8 +6,8 @@
 #
 #   .aidev/run-checks.sh <suite> <step>...
 #
-# Every step but stack-pins and aidev-scripts is a job of .gitlab-ci.yml, run from
-# that file by .aidev/ci_job.py, so what AIDEV runs moves with CI:
+# Every step but stack-pins, aidev-scripts and the replay-* steps is a job of
+# .gitlab-ci.yml, run from that file by .aidev/ci_job.py, so what AIDEV runs moves with CI:
 #
 #   - stack-pins        the test stack and the runtime image still run what CI runs
 #                       (.aidev/stack_pins.py)
@@ -26,10 +26,22 @@
 #   - install           install-test: docker/docker-compose-ci-install.yml's install /
 #                       locked install / reinstall / uninstall chain over the model of HAF
 #   - install-haf       install-test-haf: the same chain over the stack's HAF
+#   - replay-install    two copy-on-write clones of the shared 5M-block HAF for this run
+#                       (haf_shared.clone_run_database on AIDEV_EXTERNAL_HAF_HOST:_PORT,
+#                       as haf_shared_consumer), scripts/install_app.sh into each
+#   - replay-sync       scripts/process_blocks.sh --stop-at-block=5000000 over both clones
+#                       at once, one with haf_fyp.processor_timings on; each run's wall
+#                       time, and the timed run's driver log, under test-results/<suite>/
+#   - replay-parity     row counts and checksums of post_candidates, engagement_metrics
+#                       and user_interactions agree between the two clones
+#   - replay-report     scripts/processor_timings_report.py over the timed run's log:
+#                       processor-timings.json and its summary table
 #
-# The last four need the stack (.aidev/test-stack.compose.yml); the compose lanes run
-# through .aidev/compose_lane.py. Reports go to test-results/<suite>/: junit.xml (one
-# case per step) and the pytest/tavern junit files the jobs write.
+# fastapi to install-haf need the stack (.aidev/test-stack.compose.yml); the compose
+# lanes run through .aidev/compose_lane.py. The replay steps need the shared HAF
+# (sandbox.external haf, provider haf/haf), each needs the one before it, and the clones
+# are dropped when the script exits, pass or fail. Reports go to test-results/<suite>/:
+# junit.xml (one case per step) and the pytest/tavern junit files the jobs write.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
@@ -59,6 +71,187 @@ step() {
 
 job() { python3 .aidev/ci_job.py "$@" --out "$out"; }
 
+# --- the replay over clones of the shared HAF -----------------------------------------
+#
+# The two syncs run at the same time, on two clones: one after another they would not
+# fit the slot's wall. So each one's wall time is measured beside the other.
+STOP_AT_BLOCK=5000000
+# The shared HAF trusts haf_shared_consumer from the fleet LAN: no password.
+CONSUMER_URL="postgresql://haf_shared_consumer@${AIDEV_EXTERNAL_HAF_HOST:-}:${AIDEV_EXTERNAL_HAF_PORT:-5432}"
+declare -A clones=()
+declare -A clone_ids=()
+declare -A sync_seconds=()
+sync_pids=()
+replay_stage=""
+replay_installed=""
+replay_synced=""
+# The script's own stderr, which a step's redirected output does not reach: where the
+# clones' names and their drops are reported.
+exec 3>&2
+
+open_clone() {
+    local which="$1" run_id clone
+    run_id="haf-fyp-$suite-$which-$(date -u +%Y%m%d%H%M%S)-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+    clone="$(psql -X "$CONSUMER_URL/haf_shared" -v ON_ERROR_STOP=on -Atc "select haf_shared.clone_run_database('$run_id')")" || return 1
+    clones[$which]="$clone"
+    clone_ids[$which]="$run_id"
+    echo "== shared HAF clone $clone ($which)" | tee /dev/fd/3
+}
+
+drop_clones() {
+    local which
+    for which in "${!clones[@]}"; do
+        if psql -X "$CONSUMER_URL/haf_shared" -v ON_ERROR_STOP=on -qAtc "select haf_shared.drop_run_database('${clone_ids[$which]}')"; then
+            echo "== dropped shared HAF clone ${clones[$which]}" >&3
+        else
+            echo "== could not drop shared HAF clone ${clones[$which]}; the provider reaps it after its TTL" >&3
+        fi
+    done
+}
+
+cleanup() {
+    local pid
+    for pid in "${sync_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+    drop_clones
+    if [ -n "$replay_stage" ]; then rm -rf "$replay_stage"; fi
+}
+trap cleanup EXIT
+trap 'exit 143' TERM INT
+
+clone_q() { psql -X "$CONSUMER_URL/${clones[$1]}" -v ON_ERROR_STOP=on "${@:2}"; }
+
+# The install script is run from a scratch copy, executable as Dockerfile.sql makes it:
+# install_with_app_lock.py runs it again as its child. The shared HAF has no pgvector, and the
+# consumer is no superuser and cannot create it, so on such a HAF the copy declares
+# user_profile_vectors.interest_vector as real[] and skips the install's pgvector check.
+# Block processing never touches that column. Each edit must hit exactly once.
+stage_replay_sources() {
+    local has_vector="$1"
+    replay_stage="$(mktemp -d)"
+    cp -r db endpoints scripts "$replay_stage/"
+    chmod +x "$replay_stage"/scripts/*.sh
+    [ "$has_vector" = t ] && return 0
+    echo "the shared HAF has no pgvector: interest_vector is staged as real[]"
+    replace_once "$replay_stage/db/create_tables.sql" 'interest_vector vector(1024)' 'interest_vector real[]' &&
+        replace_once "$replay_stage/scripts/install_app.sh" "IF to_regtype('vector') IS NOT NULL THEN" 'IF TRUE THEN'
+}
+
+replace_once() {
+    local file="$1" from="$2" to="$3" n
+    n="$(grep -cF -- "$from" "$file")"
+    [ "$n" = 1 ] || { echo "$file: expected '$from' once, found it $n times"; return 1; }
+    python3 -c 'import sys; p, a, b = sys.argv[1:]; t = open(p).read(); open(p, "w").write(t.replace(a, b))' "$file" "$from" "$to"
+}
+
+replay_install() {
+    local which has_vector
+    if [ -z "${AIDEV_EXTERNAL_HAF_HOST:-}" ]; then
+        echo "AIDEV_EXTERNAL_HAF_HOST is unset: this step needs sandbox.external haf (provider haf/haf)"
+        return 1
+    fi
+    for which in timed plain; do open_clone "$which" || return 1; done
+    has_vector="$(clone_q timed -Atc "select to_regtype('vector') is not null")" || return 1
+    stage_replay_sources "$has_vector" || return 1
+    for which in timed plain; do
+        # The consumer owns the clone; the app's roles need to create its schemas in it.
+        clone_q "$which" -c "GRANT CREATE, CONNECT ON DATABASE \"${clones[$which]}\" TO haf_fyp_owner, haf_fyp_user" || return 1
+        echo "== install into ${clones[$which]}"
+        (cd "$replay_stage" && POSTGRES_HOST="$AIDEV_EXTERNAL_HAF_HOST" POSTGRES_PORT="${AIDEV_EXTERNAL_HAF_PORT:-5432}" \
+            POSTGRES_USER=haf_shared_consumer POSTGRES_DB="${clones[$which]}" \
+            GIT_HASH="$(git rev-parse HEAD 2>/dev/null || echo aidev)" \
+            HAF_FYP_INSTALL_LOCK_WRAPPER=/opt/psql-image/usr/local/bin/install_with_app_lock.py \
+            bash scripts/install_app.sh) || return 1
+    done
+    replay_installed=yes
+}
+
+# One sync, in the background: scripts/process_blocks.sh as production runs it, connected
+# as the consumer acting as haf_fyp_owner. Writes its wall time to <log>.seconds. A TERM
+# (cleanup) is passed on to the driver, which stops after its current batch.
+start_sync() {
+    local which="$1" options="-c role=haf_fyp_owner" log="$out/replay-sync-$1.log"
+    [ "$which" = timed ] && options="$options -c haf_fyp.processor_timings=on"
+    (
+        t0="$(date +%s.%N)"
+        PATH="/opt/psql-image/usr/local/bin:$PATH" PGOPTIONS="$options" \
+            POSTGRES_HOST="$AIDEV_EXTERNAL_HAF_HOST" POSTGRES_PORT="${AIDEV_EXTERNAL_HAF_PORT:-5432}" \
+            POSTGRES_USER=haf_shared_consumer POSTGRES_DB="${clones[$which]}" \
+            HAF_FYP_STARTUP_TIME_FILE="$(mktemp)" HAF_FYP_PARKED_FILE="$(mktemp -u)" \
+            bash scripts/process_blocks.sh --stop-at-block="$STOP_AT_BLOCK" > "$log" 2>&1 &
+        child=$!
+        trap 'kill -TERM "$child" 2>/dev/null' TERM
+        rc=0
+        wait "$child" || rc=$?
+        while kill -0 "$child" 2>/dev/null; do wait "$child" || rc=$?; done
+        echo "$t0 $(date +%s.%N)" | awk '{ printf "%.3f\n", $2 - $1 }' > "$log.seconds"
+        exit "$rc"
+    ) &
+    sync_pids+=("$!")
+}
+
+replay_sync() {
+    local i rc=0 which block
+    local order=(timed plain)
+    for which in "${order[@]}"; do start_sync "$which"; done
+    for i in "${!order[@]}"; do
+        which="${order[$i]}"
+        if wait "${sync_pids[$i]}"; then
+            echo "$which sync finished in $(cat "$out/replay-sync-$which.log.seconds")s"
+        else
+            echo "$which sync failed; the end of its log ($out/replay-sync-$which.log):"
+            tail -30 "$out/replay-sync-$which.log"
+            rc=1
+        fi
+    done
+    sync_pids=()
+    [ "$rc" -eq 0 ] || return 1
+    for which in "${order[@]}"; do
+        block="$(clone_q "$which" -Atc "select hive.app_get_current_block_num('haf_fyp')")" || return 1
+        echo "$which: processed up to block $block"
+        [ "$block" -ge "$STOP_AT_BLOCK" ] || { echo "expected block $STOP_AT_BLOCK"; return 1; }
+        sync_seconds[$which]="$(cat "$out/replay-sync-$which.log.seconds")"
+    done
+    replay_synced=yes
+}
+
+# Order-independent: a row count and the sum of the rows' hashes. engagement_metrics'
+# updated_at is NOW() at processing time, so it is left out.
+table_checksums() {
+    clone_q "$1" -Atc "
+        SELECT 'post_candidates ' || count(*) || ' ' || coalesce(sum(('x' || substr(md5(t::text), 1, 15))::bit(60)::bigint::numeric), 0)
+          FROM haf_fyp_app.post_candidates t
+        UNION ALL
+        SELECT 'engagement_metrics ' || count(*) || ' ' || coalesce(sum(('x' || substr(md5(row(t.post_id, t.comment_count,
+                  t.unique_commenters, t.reblog_count, t.vote_count, t.net_rshares)::text), 1, 15))::bit(60)::bigint::numeric), 0)
+          FROM haf_fyp_app.engagement_metrics t
+        UNION ALL
+        SELECT 'user_interactions ' || count(*) || ' ' || coalesce(sum(('x' || substr(md5(t::text), 1, 15))::bit(60)::bigint::numeric), 0)
+          FROM haf_fyp_app.user_interactions t"
+}
+
+replay_parity() {
+    local timed plain
+    timed="$(table_checksums timed)" || return 1
+    plain="$(table_checksums plain)" || return 1
+    echo "instrumentation on (table rows checksum):"; echo "$timed"
+    echo "instrumentation off:"; echo "$plain"
+    [ "$timed" = "$plain" ] || { echo "the two clones differ"; return 1; }
+    # Two empty tables agree as well as two full ones.
+    awk '$2 == 0 { print "no rows in " $1; bad = 1 } END { exit bad }' <<< "$timed"
+}
+
+replay_report() {
+    python3 scripts/processor_timings_report.py --log "$out/replay-sync-timed.log" \
+        --out "$out/processor-timings.json" --first-block 1 --last-block "$STOP_AT_BLOCK" \
+        --sync-seconds "${sync_seconds[timed]}" --uninstrumented-sync-seconds "${sync_seconds[plain]}"
+}
+
+needs() {
+    local state="$1" what="$2"; shift 2
+    [ -n "$state" ] || { echo "$what did not run or failed"; return 1; }
+    "$@"
+}
+
 aidev_scripts() {
     shellcheck -f gcc .aidev/*.sh .aidev/runtime/*.sh && python3 -m py_compile .aidev/*.py && echo "clean"
 }
@@ -79,6 +272,10 @@ for s in "$@"; do
                 --env "PYTEST_ADDOPTS=--junitxml=$PWD/$out/postgrest-tavern.xml" ;;
         install) step install job install-test --compose-lane ;;
         install-haf) step install-haf job install-test-haf --compose-lane ;;
+        replay-install) step replay-install replay_install ;;
+        replay-sync) step replay-sync needs "$replay_installed" replay-install replay_sync ;;
+        replay-parity) step replay-parity needs "$replay_synced" replay-sync replay_parity ;;
+        replay-report) step replay-report needs "$replay_synced" replay-sync replay_report ;;
         *) echo "unknown step: $s" >&2; exit 2 ;;
     esac
 done
