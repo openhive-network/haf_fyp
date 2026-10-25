@@ -5,11 +5,8 @@
 -- instead of re-scanning hive.account_operations_view every cycle — which is
 -- far too slow per user to run at scale.
 --
--- HAF API used:
---   hive.operations_view          — vote_operation + custom_json reblog
---   hafd.operation_types          — op type id lookup ('hive::protocol::' prefix)
---   hafd.blocks                   — block timestamps (interaction time)
---   haf_fyp_app.safe_parse_json() — defined in process_posts.sql
+-- Reads the batch's vote_operation and custom_json reblogs, with their block timestamps
+-- (the interaction time), as stage_operations (db/process_block_range.sql) staged them.
 --
 -- Only interactions whose target post is already tracked (post_lookup) are kept,
 -- so the table is bounded by tracked posts. Deduplicated to one row per
@@ -22,26 +19,22 @@ CREATE OR REPLACE FUNCTION haf_fyp_app.process_interactions(
 RETURNS void
 LANGUAGE plpgsql
 AS $$
-DECLARE
-    _vote_op_id int := (SELECT id FROM hafd.operation_types WHERE name = 'hive::protocol::vote_operation' LIMIT 1);
-    _custom_json_op_id int := (SELECT id FROM hafd.operation_types WHERE name = 'hive::protocol::custom_json_operation' LIMIT 1);
 BEGIN
     WITH interactions AS (
         -- Votes (weight 1.0) cast by the voter on a tracked post
         SELECT
-            ov.body::jsonb -> 'value' ->> 'voter' AS username,
+            v.voter AS username,
             pl.post_id,
             1.0::real AS action_weight,
-            b.created_at,
-            ov.block_num
-        FROM hive.operations_view ov
-        JOIN hafd.blocks b ON b.num = ov.block_num
+            v.created_at,
+            v.block_num
+        FROM pg_temp.haf_fyp_batch_votes v
         JOIN haf_fyp_app.post_lookup pl
-            ON  pl.author   = ov.body::jsonb -> 'value' ->> 'author'
-            AND pl.permlink = ov.body::jsonb -> 'value' ->> 'permlink'
-        WHERE ov.block_num BETWEEN _first_block AND _last_block
-          AND ov.op_type_id = _vote_op_id
-          AND length(ov.body::jsonb -> 'value' ->> 'voter') BETWEEN 3 AND 16
+            ON  pl.author   = v.author
+            AND pl.permlink = v.permlink
+        WHERE v.block_num BETWEEN _first_block AND _last_block
+          AND v.created_at IS NOT NULL
+          AND length(v.voter) BETWEEN 3 AND 16
 
         UNION ALL
 
@@ -49,26 +42,20 @@ BEGIN
         -- json field is a string-encoded array (T-0.7):
         --   ["reblog", {"account": "...", "author": "...", "permlink": "..."}]
         SELECT
-            cj.parsed -> 1 ->> 'account' AS username,
+            cj.account AS username,
             pl.post_id,
             1.5::real AS action_weight,
-            b.created_at,
-            ov.block_num
-        FROM hive.operations_view ov
-        JOIN hafd.blocks b ON b.num = ov.block_num
-        CROSS JOIN LATERAL (
-            SELECT haf_fyp_app.safe_parse_json(
-                ov.body::jsonb -> 'value' ->> 'json'
-            ) AS parsed
-        ) cj
+            cj.created_at,
+            cj.block_num
+        FROM pg_temp.haf_fyp_batch_custom_json cj
         JOIN haf_fyp_app.post_lookup pl
-            ON  pl.author   = cj.parsed -> 1 ->> 'author'
-            AND pl.permlink = cj.parsed -> 1 ->> 'permlink'
-        WHERE ov.block_num BETWEEN _first_block AND _last_block
-          AND ov.op_type_id = _custom_json_op_id
-          AND ov.body::jsonb -> 'value' ->> 'id' = 'reblog'
-          AND cj.parsed ->> 0 = 'reblog'
-          AND length(cj.parsed -> 1 ->> 'account') BETWEEN 3 AND 16
+            ON  pl.author   = cj.author
+            AND pl.permlink = cj.permlink
+        WHERE cj.block_num BETWEEN _first_block AND _last_block
+          AND cj.created_at IS NOT NULL
+          AND cj.custom_json_id = 'reblog'
+          AND cj.action = 'reblog'
+          AND length(cj.account) BETWEEN 3 AND 16
     ),
     -- One row per (username, post_id) for this block range: strongest action,
     -- latest block/time.

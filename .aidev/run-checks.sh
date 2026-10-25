@@ -31,9 +31,13 @@
 #                       as haf_shared_consumer), scripts/install_app.sh into each
 #   - replay-sync       scripts/process_blocks.sh --stop-at-block=5000000 over both clones
 #                       at once, one with haf_fyp.processor_timings on; each run's wall
-#                       time, and the timed run's driver log, under test-results/<suite>/
+#                       time, and the timed run's driver log, under test-results/<suite>/;
+#                       then haf_fyp_app.restore_deferred_indexes() in each, timed: the
+#                       lane stops at 5M while the context is still massive
 #   - replay-parity     row counts and checksums of post_candidates, engagement_metrics
-#                       and user_interactions agree between the two clones
+#                       and user_interactions agree between the two clones, and each
+#                       clone's indexes and constraints are the ones its install made,
+#                       all valid
 #   - replay-report     scripts/processor_timings_report.py over the timed run's log:
 #                       processor-timings.json and its summary table
 #
@@ -81,6 +85,7 @@ CONSUMER_URL="postgresql://haf_shared_consumer@${AIDEV_EXTERNAL_HAF_HOST:-}:${AI
 declare -A clones=()
 declare -A clone_ids=()
 declare -A sync_seconds=()
+declare -A restore_seconds=()
 sync_pids=()
 replay_stage=""
 replay_installed=""
@@ -161,6 +166,7 @@ replay_install() {
             GIT_HASH="$(git rev-parse HEAD 2>/dev/null || echo aidev)" \
             HAF_FYP_INSTALL_LOCK_WRAPPER=/opt/psql-image/usr/local/bin/install_with_app_lock.py \
             bash scripts/install_app.sh) || return 1
+        schema_shape "$which" > "$out/replay-schema-$which-installed.txt" || return 1
     done
     replay_installed=yes
 }
@@ -211,39 +217,80 @@ replay_sync() {
         [ "$block" -ge "$STOP_AT_BLOCK" ] || { echo "expected block $STOP_AT_BLOCK"; return 1; }
         sync_seconds[$which]="$(cat "$out/replay-sync-$which.log.seconds")"
     done
+    # The sync stops at a fixed block, still in MASSIVE_PROCESSING, so the first live
+    # range that would rebuild the deferred indexes never runs: rebuild them here.
+    for which in "${order[@]}"; do
+        restore_seconds[$which]="$(restore_deferred "$which")" || return 1
+        echo "$which: deferred indexes restored in ${restore_seconds[$which]}s"
+    done
     replay_synced=yes
+}
+
+restore_deferred() {
+    local t0
+    t0="$(date +%s.%N)"
+    clone_q "$1" -qAt -c "SET ROLE haf_fyp_owner" -c "SELECT haf_fyp_app.restore_deferred_indexes()" > /dev/null || return 1
+    echo "$t0 $(date +%s.%N)" | awk '{ printf "%.3f\n", $2 - $1 }'
+}
+
+# Every index and constraint of the app schema, with whether it is valid: what the
+# install made has to be what is there after the sync and the restore.
+schema_shape() {
+    clone_q "$1" -Atc "
+        SELECT 'index ' || x.indexrelid::regclass || ' ' || pg_get_indexdef(x.indexrelid) || ' valid=' || x.indisvalid
+          FROM pg_index x JOIN pg_class c ON c.oid = x.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'haf_fyp_app'
+        UNION ALL
+        SELECT 'constraint ' || k.conrelid::regclass || ' ' || k.conname || ' ' || pg_get_constraintdef(k.oid) || ' valid=' || k.convalidated
+          FROM pg_constraint k JOIN pg_namespace n ON n.oid = k.connamespace
+         WHERE n.nspname = 'haf_fyp_app'
+        ORDER BY 1"
 }
 
 # Order-independent: a row count and the sum of the rows' hashes. engagement_metrics'
 # updated_at is NOW() at processing time, so it is left out.
 table_checksums() {
-    clone_q "$1" -Atc "
-        SELECT 'post_candidates ' || count(*) || ' ' || coalesce(sum(('x' || substr(md5(t::text), 1, 15))::bit(60)::bigint::numeric), 0)
-          FROM haf_fyp_app.post_candidates t
-        UNION ALL
-        SELECT 'engagement_metrics ' || count(*) || ' ' || coalesce(sum(('x' || substr(md5(row(t.post_id, t.comment_count,
-                  t.unique_commenters, t.reblog_count, t.vote_count, t.net_rshares)::text), 1, 15))::bit(60)::bigint::numeric), 0)
-          FROM haf_fyp_app.engagement_metrics t
-        UNION ALL
-        SELECT 'user_interactions ' || count(*) || ' ' || coalesce(sum(('x' || substr(md5(t::text), 1, 15))::bit(60)::bigint::numeric), 0)
-          FROM haf_fyp_app.user_interactions t"
+    local table sql="" row
+    for table in post_candidates post_lookup post_commenters engagement_metrics user_interactions \
+        active_users user_communities; do
+        row="t"
+        [ "$table" = engagement_metrics ] &&
+            row="row(t.post_id, t.comment_count, t.unique_commenters, t.reblog_count, t.vote_count, t.net_rshares)"
+        [ -n "$sql" ] && sql="$sql UNION ALL "
+        sql="$sql(SELECT '$table ' || count(*) || ' ' || coalesce(sum(('x' || substr(md5($row::text), 1, 15))::bit(60)::bigint::numeric), 0)
+          FROM haf_fyp_app.$table t)"
+    done
+    clone_q "$1" -Atc "$sql"
 }
 
 replay_parity() {
-    local timed plain
+    local timed plain which
     timed="$(table_checksums timed)" || return 1
     plain="$(table_checksums plain)" || return 1
     echo "instrumentation on (table rows checksum):"; echo "$timed"
     echo "instrumentation off:"; echo "$plain"
     [ "$timed" = "$plain" ] || { echo "the two clones differ"; return 1; }
-    # Two empty tables agree as well as two full ones.
-    awk '$2 == 0 { print "no rows in " $1; bad = 1 } END { exit bad }' <<< "$timed"
+    for which in timed plain; do
+        schema_shape "$which" > "$out/replay-schema-$which-synced.txt" || return 1
+        if ! diff "$out/replay-schema-$which-installed.txt" "$out/replay-schema-$which-synced.txt"; then
+            echo "$which: the indexes and constraints after the sync are not the ones the install made"
+            return 1
+        fi
+        if grep -q 'valid=false' "$out/replay-schema-$which-synced.txt"; then
+            echo "$which: an index or constraint is not valid"; return 1
+        fi
+    done
+    echo "indexes and constraints: as installed, all valid ($(wc -l < "$out/replay-schema-timed-synced.txt") of them)"
+    # Two empty tables agree as well as two full ones. Communities came to the chain in
+    # 2019, near block 36,000,000, so user_communities is empty this early.
+    awk '$2 == 0 && $1 != "user_communities" { print "no rows in " $1; bad = 1 } END { exit bad }' <<< "$timed"
 }
 
 replay_report() {
     python3 scripts/processor_timings_report.py --log "$out/replay-sync-timed.log" \
         --out "$out/processor-timings.json" --first-block 1 --last-block "$STOP_AT_BLOCK" \
-        --sync-seconds "${sync_seconds[timed]}" --uninstrumented-sync-seconds "${sync_seconds[plain]}"
+        --sync-seconds "${sync_seconds[timed]}" --uninstrumented-sync-seconds "${sync_seconds[plain]}" \
+        --index-restore-seconds "${restore_seconds[timed]}" --uninstrumented-index-restore-seconds "${restore_seconds[plain]}"
 }
 
 needs() {

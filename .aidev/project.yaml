@@ -88,6 +88,7 @@ verification:
     artifacts: ["test-results/quick/"]
   full:
     adapter: command
+    reports: ["test-results/full/processor-timings.json"]
     # measured 9m11-9m17 locally plus the stack's boot (~30 s), and 7m39 for the replay
     # steps by hand on 2026-10-25 (install 36 s, the two 5M-block syncs side by side
     # 413 s, parity 7 s): about 17 min. 2100 s, the full ceiling, leaves 2x on that.
@@ -102,6 +103,7 @@ verification:
     artifacts: ["test-results/baseline/"]
   canary:
     adapter: command
+    reports: ["test-results/canary/processor-timings.json"]
     # as full, about 17 min; 1500 s is the canary cap, about 1.45x on that
     timeout: 1500
     args: [".aidev/run-checks.sh", "canary", "stack-pins", "aidev-scripts", "sql-lint", "shell-lint", "python-lint", "hadolint", "compose-validate", "openapi-drift", "unit", "fastapi", "postgrest", "install", "install-haf", "replay-install", "replay-sync", "replay-parity", "replay-report"]

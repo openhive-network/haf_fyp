@@ -241,7 +241,7 @@ def _load(flavour: Flavour) -> dict:
 
 
 @LANES
-def test_the_lane_is_exactly_the_one_stated_here(flavour):
+def test_the_lane_is_exactly_the_one_stated_here(flavour) -> None:
     services, want = _load(flavour)["services"], flavour.services()
     assert list(services) == list(want), "steps added, removed or reordered"
     for name, step in want.items():
@@ -249,7 +249,7 @@ def test_the_lane_is_exactly_the_one_stated_here(flavour):
 
 
 @LANES
-def test_the_compose_file_has_nothing_but_what_is_stated(flavour):
+def test_the_compose_file_has_nothing_but_what_is_stated(flavour) -> None:
     """No top-level `networks`, `include` or `secrets`, and no volume but the one HAF
     lane's datadir: each is a way for a lane to share something with another stack, or
     to pull in services its file does not show."""
@@ -263,7 +263,7 @@ def test_the_compose_file_has_nothing_but_what_is_stated(flavour):
 
 
 @LANES
-def test_the_chain_reaches_every_step_from_the_one_the_job_waits_on(flavour):
+def test_the_chain_reaches_every_step_from_the_one_the_job_waits_on(flavour) -> None:
     """Implied by the equality above for THIS chain. Kept as its own statement so that
     whoever edits the expected lane cannot add a step nothing waits for: a step outside
     the chain runs, or fails, with nobody reading its exit code."""
@@ -283,14 +283,14 @@ def test_the_chain_reaches_every_step_from_the_one_the_job_waits_on(flavour):
 
 
 @LANES
-def test_every_mounted_file_exists(flavour):
+def test_every_mounted_file_exists(flavour) -> None:
     for name, svc in _load(flavour)["services"].items():
         for vol in svc.get("volumes", []):
             if vol.startswith("../"):
                 assert (flavour.path.parent / vol.split(":")[0]).resolve().is_file(), (name, vol)
 
 
-def test_no_healthcheck_can_find_itself():
+def test_no_healthcheck_can_find_itself() -> None:
     """`pgrep -f X` inside `sh -c "... pgrep -f X ..."` always succeeds: the shell's own
     command line contains X. The first version of the HAF service's check did exactly
     that. A pattern is safe when it does not match its own text."""
@@ -302,7 +302,7 @@ def test_no_healthcheck_can_find_itself():
                 assert not re.search(pattern, check), f"{name}: `pgrep -f {pattern}` matches its own command line"
 
 
-def test_the_real_lane_loads_no_model_of_haf():
+def test_the_real_lane_loads_no_model_of_haf() -> None:
     """If it did, it would be testing the installer against the model again, with a
     HAF image idling beside it."""
     mounted = {vol for svc in _load(REAL)["services"].values() for vol in svc.get("volumes", [])}
@@ -311,7 +311,7 @@ def test_the_real_lane_loads_no_model_of_haf():
     assert "pgvector/pgvector" not in text
 
 
-def test_the_two_lanes_differ_only_in_where_the_database_is_and_who_connects():
+def test_the_two_lanes_differ_only_in_where_the_database_is_and_who_connects() -> None:
     """From `install` on, a step of one lane IS the step of the other once the host,
     the user and the two connection environments are taken out: same files, mounted
     the same way, same psql flags, same commands, same healthchecks, same order. The
@@ -355,7 +355,7 @@ def _neutral(flavour: Flavour, value):
     return value
 
 
-def test_the_two_compose_files_agree_from_install_on():
+def test_the_two_compose_files_agree_from_install_on() -> None:
     """The FILES, not this module's expectation of them: an edit that changes one lane
     here and in its compose file together passes every equality above. Environments
     are compared by VALUE (the installer connecting as `postgres` in one lane, or a
@@ -369,7 +369,7 @@ def test_the_two_compose_files_agree_from_install_on():
     assert list(steps(MODEL)) == list(steps(REAL))
 
 
-def test_the_two_jobs_agree(ci):
+def test_the_two_jobs_agree(ci) -> None:
     """One lane with its six log checks removed, or allowed to fail, is half the pair
     gone. Everything but the compose file's name and the database services' own log
     lines is the same in both jobs."""
@@ -381,7 +381,7 @@ def test_the_two_jobs_agree(ci):
     assert job(MODEL) == job(REAL)
 
 
-def test_the_haf_the_real_lane_runs_is_the_one_the_repository_pins(ci):
+def test_the_haf_the_real_lane_runs_is_the_one_the_repository_pins(ci) -> None:
     """`${HAF_REGISTRY}/haf:${HAF_INSTALL_LANE_VERSION}` is a pin only while nothing
     else can set those two. A CI-level `variables:` would: the shell's environment beats
     docker/.env in compose, silently, and the lane would be testing some other HAF. So
@@ -409,7 +409,7 @@ def test_the_haf_the_real_lane_runs_is_the_one_the_repository_pins(ci):
 
 
 @LANES
-def test_the_job_is_exactly_the_one_stated_here(ci, flavour):
+def test_the_job_is_exactly_the_one_stated_here(ci, flavour) -> None:
     """Key for key. `allow_failure`, `retry`, `when`, `needs`, `before_script`,
     `interruptible`, `timeout`, `parallel`, `extends`, `environment` -- none of them is
     in the expected job, so adding any one fails here."""
@@ -417,7 +417,7 @@ def test_the_job_is_exactly_the_one_stated_here(ci, flavour):
 
 
 @LANES
-def test_the_job_is_defined_once_and_nothing_global_runs_inside_it(ci, flavour):
+def test_the_job_is_defined_once_and_nothing_global_runs_inside_it(ci, flavour) -> None:
     text = CI.read_text(encoding="utf-8")
     # YAML keeps the LAST of two equal keys without a word, so a second definition
     # further down the file would replace the one a reader finds first.
@@ -426,19 +426,19 @@ def test_the_job_is_defined_once_and_nothing_global_runs_inside_it(ci, flavour):
     assert not {"default", "before_script", "after_script", "image", "services"} & set(ci), set(ci)
 
 
-def test_the_standard_rules_are_what_this_file_says_they_are(ci):
+def test_the_standard_rules_are_what_this_file_says_they_are(ci) -> None:
     assert ci[".standard-rules"] == STANDARD_RULES
 
 
 @LANES
-def test_both_blocking_commands_are_bounded(flavour):
+def test_both_blocking_commands_are_bounded(flavour) -> None:
     for line in flavour.ci_job()["script"][:2]:
         seconds = int(re.match(r"timeout (\d+) ", line).group(1))
         assert 60 <= seconds <= 1800, line
 
 
 @LANES
-def test_compose_validate_parses_the_lane(ci, flavour):
+def test_compose_validate_parses_the_lane(ci, flavour) -> None:
     assert f"{flavour.compose} config --quiet" in ci["compose-validate"]["script"]
 
 
@@ -447,7 +447,7 @@ def test_compose_validate_parses_the_lane(ci, flavour):
 # many could be deleted, or turned into notices, with every test and both lanes green.
 # Adding a check means changing its file's number; so does removing one, which is the
 # point.
-RAISES = {"ci_install_verify.sql": 92, "ci_uninstall_verify.sql": 18, "ci_install_lock_holder.sql": 12,
+RAISES = {"ci_install_verify.sql": 92, "ci_uninstall_verify.sql": 19, "ci_install_lock_holder.sql": 12,
           "ci_install_haf_model.sql": 9, "ci_install_age.sql": 1, "ci_install_setup.sql": 0, "ci_install_release.sql": 0}
 LANE_SQL = sorted({"ci_install_haf_model.sql", "ci_install_setup.sql", "ci_install_verify.sql",
                    "ci_install_age.sql", "ci_install_lock_holder.sql", "ci_install_release.sql",
@@ -455,7 +455,7 @@ LANE_SQL = sorted({"ci_install_haf_model.sql", "ci_install_setup.sql", "ci_insta
 
 
 @pytest.mark.parametrize("name", LANE_SQL)
-def test_the_sql_the_lanes_run_cannot_be_switched_off_from_inside(name):
+def test_the_sql_the_lanes_run_cannot_be_switched_off_from_inside(name) -> None:
     """The compose files pass ON_ERROR_STOP and mount these files; what is IN them is
     not their business. A psql meta-command can undo the first (a `set` of
     ON_ERROR_STOP, a quit on line one), and turning every RAISE EXCEPTION into a NOTICE
@@ -472,7 +472,7 @@ def test_the_sql_the_lanes_run_cannot_be_switched_off_from_inside(name):
     assert not re.search(r"WHEN\s+OTHERS", text, re.I), name
 
 
-def test_the_stub_the_model_lane_loads_cannot_switch_checking_off_either():
+def test_the_stub_the_model_lane_loads_cannot_switch_checking_off_either() -> None:
     """tests/haf_stub.sql is loaded by the model lane's db-setup, in the same psql
     conventions as the lane's own files, and is not one of them."""
     text = (ROOT / "tests" / "haf_stub.sql").read_text(encoding="utf-8")
@@ -480,14 +480,14 @@ def test_the_stub_the_model_lane_loads_cannot_switch_checking_off_either():
     assert "ON_ERROR_STOP" not in text
 
 
-def test_every_lane_sql_file_is_one_of_those():
+def test_every_lane_sql_file_is_one_of_those() -> None:
     mounted = {vol.split(":")[0].rsplit("/", 1)[1]
                for flavour in (MODEL, REAL) for svc in flavour.services().values()
                for vol in svc.get("volumes", []) if vol.startswith("../")}
     assert mounted - {"haf_stub.sql"} == set(LANE_SQL), mounted
 
 
-def test_the_sentences_the_jobs_grep_for_are_the_ones_the_files_print():
+def test_the_sentences_the_jobs_grep_for_are_the_ones_the_files_print() -> None:
     verify = (ROOT / "tests" / "ci_install_verify.sql").read_text(encoding="utf-8")
     assert "RAISE NOTICE 'first install: % items recorded'" in verify
     assert "RAISE NOTICE 'phase %: all % items identical to the first install'" in verify
@@ -496,14 +496,14 @@ def test_the_sentences_the_jobs_grep_for_are_the_ones_the_files_print():
     assert gone.rstrip().endswith("RAISE NOTICE 'haf_fyp is gone and nothing else was touched';\nEND\n$$;")
 
 
-def test_the_database_does_not_arrive_with_pgvector_created():
+def test_the_database_does_not_arrive_with_pgvector_created() -> None:
     """The installer creates it when it is missing; a setup file that did so first
     would leave that step, and the check that it ran, with nothing to do."""
     for name in ("haf_stub.sql", "ci_install_haf_model.sql", "ci_install_setup.sql"):
         assert "CREATE EXTENSION" not in (ROOT / "tests" / name).read_text(encoding="utf-8").upper(), name
 
 
-def test_the_shared_setup_uses_nothing_only_the_model_has():
+def test_the_shared_setup_uses_nothing_only_the_model_has() -> None:
     """tests/ci_install_setup.sql runs against HAF too. The stub's call log and its
     attachment table are the model's own."""
     text = (ROOT / "tests" / "ci_install_setup.sql").read_text(encoding="utf-8")
@@ -513,7 +513,7 @@ def test_the_shared_setup_uses_nothing_only_the_model_has():
     assert "ci_register_calls" not in text and "contexts_attachment" not in text
 
 
-def test_the_unit_tests_that_guard_these_lanes_are_themselves_run(ci):
+def test_the_unit_tests_that_guard_these_lanes_are_themselves_run(ci) -> None:
     """This file is only as good as the job that runs it. No `--ignore`, `-k` or
     `--deselect` on that job's pytest line, and no forgiveness on the job."""
     job = ci["python-tests"]

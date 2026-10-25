@@ -2,11 +2,8 @@
 -- Steps 8–9: sync unsubscribe and subscribe events from custom_json_operation
 -- into user_communities, which drives the community_boost signal in the ranker.
 --
--- HAF API used:
---   hive.operations_view          — non-virtual operations
---   hafd.operation_types          — op type id lookup (name includes hive::protocol:: prefix)
---   hafd.blocks                   — block timestamps for subscribed_at
---   haf_fyp_app.safe_parse_json() — defined in process_posts.sql
+-- Reads the batch's custom_json as stage_operations (db/process_block_range.sql) staged
+-- it, and hafd.blocks for subscribed_at.
 --   haf_fyp_app.community_id_from_name() — defined in process_posts.sql
 --
 -- T-0.7 confirmed: custom_json_operation community format:
@@ -36,6 +33,10 @@
 -- by process_subscribe, once per pair that has one, so the unsubscribe pass gains no
 -- join to hafd.blocks. (It does read both actions now and aggregate them per pair.)
 --
+-- stage_operations stages this function's result once per batch, as
+-- pg_temp.haf_fyp_batch_membership, and process_unsubscribe and process_subscribe both
+-- read that.
+--
 -- "Last" and "after" are by hive.operations_view.id, which rises along the chain: with
 -- the block, and with the position inside the block.
 --
@@ -55,29 +56,21 @@ RETURNS TABLE (
 LANGUAGE plpgsql
 STABLE
 AS $$
-DECLARE
-    _custom_json_op_id int := (SELECT id FROM hafd.operation_types WHERE name = 'hive::protocol::custom_json_operation' LIMIT 1);
 BEGIN
     -- Every column below is qualified or an alias: the RETURNS TABLE names are variables
     -- in here, and a bare `username` would be ambiguous.
     RETURN QUERY
     WITH events AS (
         SELECT
-            ov.id,
-            ov.body::jsonb -> 'value' -> 'required_posting_auths' ->> 0 AS username,
-            haf_fyp_app.community_id_from_name(cj.parsed -> 1 ->> 'community') AS community_id,
-            cj.parsed ->> 0 = 'subscribe' AS subscribes,
-            ov.block_num
-        FROM hive.operations_view ov
-        CROSS JOIN LATERAL (
-            SELECT haf_fyp_app.safe_parse_json(
-                ov.body::jsonb -> 'value' ->> 'json'
-            ) AS parsed
-        ) cj
-        WHERE ov.block_num BETWEEN _first_block AND _last_block
-          AND ov.op_type_id = _custom_json_op_id
-          AND ov.body::jsonb -> 'value' ->> 'id' = 'community'
-          AND cj.parsed ->> 0 IN ('subscribe', 'unsubscribe')
+            cj.id,
+            cj.posting_auth AS username,
+            haf_fyp_app.community_id_from_name(cj.community) AS community_id,
+            cj.action = 'subscribe' AS subscribes,
+            cj.block_num
+        FROM pg_temp.haf_fyp_batch_custom_json cj
+        WHERE cj.block_num BETWEEN _first_block AND _last_block
+          AND cj.custom_json_id = 'community'
+          AND cj.action IN ('subscribe', 'unsubscribe')
     ), marked AS (
         SELECT
             e.*,
@@ -115,7 +108,7 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
     DELETE FROM haf_fyp_app.user_communities uc
-    USING haf_fyp_app.community_membership_changes(_first_block, _last_block) c
+    USING pg_temp.haf_fyp_batch_membership c
     WHERE uc.username     = c.username
       AND uc.community_id = c.community_id
       AND c.left_in_range;
@@ -139,7 +132,7 @@ AS $$
 BEGIN
     INSERT INTO haf_fyp_app.user_communities (username, community_id, subscribed_at)
     SELECT c.username, c.community_id, b.created_at
-    FROM haf_fyp_app.community_membership_changes(_first_block, _last_block) c
+    FROM pg_temp.haf_fyp_batch_membership c
     JOIN hafd.blocks b ON b.num = c.joined_block
     ON CONFLICT (username, community_id) DO NOTHING;
 END;
@@ -150,7 +143,8 @@ $$;
 -- ---------------------------------------------------------------------------
 -- Unsubscribe, then subscribe: a pair that left and came back is removed by the first
 -- and written again by the second. The two never disagree about a pair, because both
--- read community_membership_changes() and it gives each pair one outcome.
+-- read the one community_membership_changes() result stage_operations staged, and it
+-- gives each pair one outcome.
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_communities(
     _first_block int,
