@@ -71,19 +71,27 @@ sandbox:
 verification:
   quick:
     adapter: command
+    # lints ~10 s + python-tests ~290 s (CI 302 s): above the 300 s base wall
+    timeout: 900
     args: [".aidev/run-checks.sh", "quick", "stack-pins", "aidev-scripts", "sql-lint", "shell-lint", "python-lint", "hadolint", "compose-validate", "openapi-drift", "unit"]
     stack: false
     artifacts: ["test-results/quick/"]
   full:
     adapter: command
+    # measured 9m11-9m17 locally plus the stack's boot (~30 s)
+    timeout: 1800
     args: [".aidev/run-checks.sh", "full", "stack-pins", "aidev-scripts", "sql-lint", "shell-lint", "python-lint", "hadolint", "compose-validate", "openapi-drift", "unit", "fastapi", "postgrest", "install", "install-haf"]
     artifacts: ["test-results/full/"]
   baseline:
     adapter: command
+    # python-tests + the four lanes, ~9 min locally
+    timeout: 1500
     args: [".aidev/run-checks.sh", "baseline", "unit", "fastapi", "postgrest", "install", "install-haf"]
     artifacts: ["test-results/baseline/"]
   canary:
     adapter: command
+    # as full; 1500 s is the canary cap
+    timeout: 1500
     args: [".aidev/run-checks.sh", "canary", "stack-pins", "aidev-scripts", "sql-lint", "shell-lint", "python-lint", "hadolint", "compose-validate", "openapi-drift", "unit", "fastapi", "postgrest", "install", "install-haf"]
     artifacts: ["test-results/canary/"]
   # python-tests with its pytest-cov run (coverage.xml beside the junit). `static`
