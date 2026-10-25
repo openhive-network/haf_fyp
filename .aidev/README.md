@@ -19,7 +19,7 @@ starts one for the merge request it opens, and GitLab refuses a pipeline no job 
 `test-results/<suite>/junit.xml`, one test case per step, with the step's log tail as the
 failure body, plus the junit of every pytest run inside a step (one case per test).
 
-Every step except `stack-pins` and `aidev-scripts` **is a job of `.gitlab-ci.yml`**, run
+Every step except `stack-pins`, `aidev-scripts` and the `replay-*` steps **is a job of `.gitlab-ci.yml`**, run
 from that file by `.aidev/ci_job.py`: its `before_script`/`script`/`after_script` under the
 runner's `set -eo pipefail`, its `variables:`, and `CI=true`, so the tests that fail rather
 than skip in CI do so here too. Change a job and AIDEV runs the changed job. What
@@ -39,19 +39,46 @@ instead, and a pin the image does not carry fails the step (rebuild the image, b
 | `postgrest` | `postgrest-tests` | `docker/docker-compose-ci.yml`'s `setup` and `tavern` against the stack's database, PostgREST and rewriter |
 | `install` | `install-test` | `docker/docker-compose-ci-install.yml`: install, install under a held lock, reinstall, uninstall, each verified, over the model of HAF |
 | `install-haf` | `install-test-haf` | the same chain over the stack's HAF |
+| `replay-install` | — | two copy-on-write clones of the shared 5M-block HAF, `scripts/install_app.sh` into each as `haf_shared_consumer` |
+| `replay-sync` | — | `scripts/process_blocks.sh --stop-at-block=5000000` over both clones at once, one with `haf_fyp.processor_timings` on |
+| `replay-parity` | — | `post_candidates`, `engagement_metrics` and `user_interactions` hold the same rows in both clones |
+| `replay-report` | — | `scripts/processor_timings_report.py` over the timed run's driver log: `processor-timings.json` and a summary table |
 
 | Slot | Steps | Stack |
 |---|---|---|
 | quick | stack-pins, aidev-scripts, the six lint jobs, unit | no |
 | coverage | unit | no |
-| full, canary | quick's plus fastapi, postgrest, install, install-haf | yes |
+| full, canary | quick's plus fastapi, postgrest, install, install-haf, and the four replay steps | yes, and the shared HAF |
 | baseline | unit, fastapi, postgrest, install, install-haf | yes |
 
 `static` and `system` are unbound: AIDEV runs neither for a project. Not run by AIDEV:
 `haf-shim-drift` (it fetches `hive/haf` over the network; the unit tests check the
 vendored copy offline), the `docker-build-*` jobs' image smoke tests (they need a docker
-daemon), and the scheduled `registry-resolution` / `haf-shim-drift-develop`. No suite
-needs synced or mock chain data: every lane builds its own database.
+daemon), and the scheduled `registry-resolution` / `haf-shim-drift-develop`. Only the
+replay steps need chain data, and they take it from the shared HAF (below); every other
+lane builds its own database.
+
+### The replay over the shared HAF
+
+`full` and `canary` reach the shared HAF the `haf` project hosts, a HAF replayed to block
+5,000,000 (`sandbox.external`, provider `haf/haf`), as `AIDEV_EXTERNAL_HAF_HOST`/`_PORT`.
+`replay-install` takes two clones of it with `haf_shared.clone_run_database`, grants each
+to `haf_fyp_owner` and `haf_fyp_user`, and installs the candidate into each as
+`haf_shared_consumer`, under HAF's install lock. That HAF provides haf_fyp's two roles, and
+the consumer may change none: `db/builtin_roles.sql` leaves a role set that is already
+right alone. It has no pgvector either, which the consumer cannot create, so the install
+runs from a scratch copy that declares `interest_vector` as `real[]` (block processing
+never touches it); the copy is the tree unchanged once the HAF has pgvector.
+
+`replay-sync` runs `scripts/process_blocks.sh --stop-at-block=5000000` over both clones at
+the same time, connected as the consumer with `role=haf_fyp_owner`: one after the other
+they would not fit the slot's wall. One run has `haf_fyp.processor_timings=on`
+(`db/process_block_range.sql`), so its driver log, `replay-sync-timed.log`, holds every
+processor's time for every batch; the other is the production path. `replay-parity`
+checks that both left the same rows, and `replay-report` turns the timed log into
+`processor-timings.json` (per-processor time in total and per 1M blocks, rows read per
+op type, both runs' wall times, the reblog custom_json ids) and prints its table. The
+clones are dropped when the script exits, pass or fail.
 
 ### The compose lanes
 
@@ -106,8 +133,8 @@ The checks run in a container with your uid, built from `runtime/Dockerfile` and
 tools in `/opt/lint` (requirements.txt deliberately not there, as in `python-lint`); the
 openapi generator and validator in `/opt/openapi`; tavern 3.6.3 in `/opt/tavern`; psql 18;
 ShellCheck 0.11.0, hadolint 2.12.0, the docker CLI with compose (for `config` only),
-PostgREST 12.2.3, and `install_with_app_lock.py` from `Dockerfile.sql`'s base image. Every
-base is pinned by digest.
+PostgREST 12.2.3, and `install_with_app_lock.py` and `haf_app_driver.py` from
+`Dockerfile.sql`'s base image. Every base is pinned by digest.
 
 When `requirements.txt`, a CI tool pin or `runtime/Dockerfile` changes, rebuild and
 re-pin in the same commit:
