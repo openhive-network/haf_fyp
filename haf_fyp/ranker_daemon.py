@@ -93,6 +93,11 @@ def _tuning(key: str, default: str, convert: Callable[[str], _Number],
     given, a smaller value deletes data, does no work or fails on every pass (every feed
     event pruned, maintenance on every poll, a negative LIMIT), so it is far more likely
     a mistake than a choice.
+
+    hive/haf_api_node's haf_fyp.yaml passes these settings with their defaults COPIED
+    (`NAME: ${HAF_FYP_NAME:-<default>}`, haf_api_node!273). Raising a minimum above a
+    copied default stops every ranker on those nodes once haf_api_node pins that release:
+    change the copy there in the same release.
     """
     raw = os.environ.get(key, "").strip()
     try:
