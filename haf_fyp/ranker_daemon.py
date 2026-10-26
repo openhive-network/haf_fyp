@@ -55,6 +55,8 @@ from haf_fyp import visibility
 from haf_fyp.credibility import credibility_failure_message, fetch_author_credibility
 from haf_fyp.embeddings import fetch_post_vectors_safe, register_vector_type
 from haf_fyp.scoring import (
+    FEED_CACHE_RANK_TYPE,
+    FEED_CACHE_SHAPE_SQL,
     bootstrap_vector_from_communities,
     build_user_profile_vector,
     compute_scores,
@@ -258,6 +260,16 @@ _lane_slots = 0
 _feed_read_failure_logged_at = 0.0
 _missing_column_warned_at: float | None = None
 
+# False until the installed feed_cache is the compact row write_feed_cache writes (#98).
+# The SQL and the ranker image are upgraded separately: on the old wide table every
+# write_feed_cache fails (no feed_cache_labels), once per account, and the log fills
+# with those. While False, main() ranks nothing and says why instead.
+_feed_cache_compact = False
+# What the last look found: the type of feed_cache.rank (None: no such column) and
+# whether feed_cache_labels exists. For the error, which names it.
+_feed_cache_installed: tuple[str | None, bool] = (None, False)
+_feed_cache_mismatch_logged_at: float | None = None
+
 
 # Rotation eviction + #9-invariant repair (#10), on the hourly maintenance cadence.
 # active_users means "users we rank" (#9) and nothing ever removed a row, so a cleared
@@ -426,6 +438,7 @@ def _connect() -> psycopg2.extensions.connection:
             _listen_for_feed_reads(conn)
             # Before the first cycle as well: main() handles reads before it runs one.
             _refresh_read_filter(conn)
+            _check_feed_cache_shape(conn)
             return conn
         except psycopg2.OperationalError as exc:
             log.warning("database not ready (%s) — retrying in 5s", exc)
@@ -453,6 +466,43 @@ def _warn_missing_read_column() -> None:
         "is older than this ranker. Ranking continues without the reader lane. "
         "Stop the block processor and this ranker (the install is skipped while "
         "either holds HAF's lock) and re-run the install to enable it."
+    )
+
+
+def _check_feed_cache_shape(conn) -> None:
+    """Decide whether the installed feed_cache is the one this ranker writes. On every
+    connection, and once per cycle period for as long as it is not."""
+    global _feed_cache_compact, _feed_cache_installed, _feed_cache_mismatch_logged_at
+    with conn.cursor() as cur:
+        cur.execute(FEED_CACHE_SHAPE_SQL)
+        row = cur.fetchone()
+    conn.commit()
+    _feed_cache_compact = bool(row[0])
+    if not _feed_cache_compact:
+        _feed_cache_installed = (row[1], bool(row[2]))
+    elif _feed_cache_mismatch_logged_at is not None:
+        log.info("haf_fyp_app.feed_cache is the compact row now: ranking resumes")
+        _feed_cache_mismatch_logged_at = None
+
+
+def _warn_feed_cache_mismatch() -> None:
+    """One error, not one failure per account; repeated hourly, as a ranker can sit
+    like this for weeks."""
+    global _feed_cache_mismatch_logged_at
+    now = time.monotonic()
+    if _feed_cache_mismatch_logged_at is not None and now - _feed_cache_mismatch_logged_at < 3600:
+        return
+    _feed_cache_mismatch_logged_at = now
+    rank_type, labels_present = _feed_cache_installed
+    log.error(
+        "the installed SQL does not match this ranker: it writes haf_fyp_app.feed_cache "
+        "with rank %s and label codes in haf_fyp_app.feed_cache_labels, and the installed "
+        "feed_cache has %s, %s feed_cache_labels. Ranking nothing until the SQL is "
+        "upgraded: stop the block processor and this ranker (the install is skipped "
+        "while either holds HAF's lock), re-run the install, and start them.",
+        FEED_CACHE_RANK_TYPE,
+        f"rank {rank_type}" if rank_type else "no rank column",
+        "with" if labels_present else "and no",
     )
 
 
@@ -1602,6 +1652,26 @@ def main() -> None:
         if conn.closed:
             log.warning("database connection is closed — reconnecting")
             conn = _reconnect(conn)
+
+        # Nothing below may run on a feed_cache this ranker cannot write: the cycle and
+        # every refresh would fail once per account, and the unread-feed pass calls a
+        # function the old SQL does not have. Looked at again once per cycle period.
+        if not _feed_cache_compact:
+            if time.monotonic() >= next_full_cycle:
+                next_full_cycle = time.monotonic() + CYCLE_SECONDS
+                try:
+                    _check_feed_cache_shape(conn)
+                except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                    log.warning("database connection lost (feed_cache check) — reconnecting")
+                    conn = _reconnect(conn)
+                except Exception:
+                    log.exception("could not check the schema for the compact feed_cache")
+                    _safe_rollback(conn)
+            if not _feed_cache_compact:
+                _warn_feed_cache_mismatch()
+                time.sleep(POLL_SECONDS)
+                continue
+            next_full_cycle = 0.0
 
         # Drain pending force-refresh requests
         pending: set[str] = set()

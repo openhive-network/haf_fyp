@@ -60,10 +60,12 @@ from .auth import KeyLookupUnavailable, verify_interests, verify_interests_delet
 from .metrics import (
     build_coverage_report,
     build_credibility_sources_report,
+    build_feed_cache_report,
     build_ranking_sources_report,
     build_reader_first_report,
     fetch_coverage_rows,
     fetch_credibility_sources,
+    fetch_feed_cache_shape,
     fetch_feed_servability,
     fetch_ranking_sources,
     fetch_reader_first,
@@ -528,7 +530,7 @@ class _Ceiling:
 
     __slots__ = ("limit", "error_message")
 
-    def __init__(self, item):
+    def __init__(self, item) -> None:
         self.limit = item
         self.error_message = None
 
@@ -593,7 +595,7 @@ class RateLimitBeforeValidationMiddleware:
     anyio task group and a streaming-response bridge in front of every request.
     """
 
-    def __init__(self, app, limiter=None, early=None):
+    def __init__(self, app, limiter=None, early=None) -> None:
         self.app = app
         # None = decide per request from TRUSTED_PROXY_IPS and the request's own
         # peer and X-Real-IP, so a test (or a reload) that changes the trust list is
@@ -720,7 +722,7 @@ class RateLimitBeforeValidationMiddleware:
         # after metering, so it still costs the sender its allowance; where it is not,
         # it costs nothing (see below). Content-Length is absent on a chunked
         # request, which this cannot pre-empt -- the per-IP limit is the bound there.
-        declared = self._declared_size(request.headers.get("content-length"))
+        declared: int = self._declared_size(request.headers.get("content-length"))
         too_large = declared is not None and declared > _MAX_BODY_BYTES
 
         if not self._early_charge_is_safe(request):
@@ -820,7 +822,7 @@ class RateLimitBeforeValidationMiddleware:
         return int(digits or "0") if len(digits) <= 18 else 10**18
 
     @staticmethod
-    async def _too_large(scope, receive, send, size: int):
+    async def _too_large(scope, receive, send, size: int) -> None:
         body = json.dumps({
             "detail": f"request body of {size} bytes exceeds the "
                       f"{_MAX_BODY_BYTES}-byte limit"
@@ -1301,7 +1303,7 @@ class _BoundedProbe:
     When it ends, the next caller starts a fresh one; a finished answer is never reused.
     """
 
-    def __init__(self, name: str, probe, no_answer: str = "unreachable"):
+    def __init__(self, name: str, probe, no_answer: str = "unreachable") -> None:
         self._name = name
         self._probe = probe
         self._no_answer = no_answer
@@ -1316,7 +1318,7 @@ class _BoundedProbe:
             if current is None or not current[0].is_alive():
                 answer: list[str] = []
 
-                def work():
+                def work() -> None:
                     try:
                         answer.append(self._probe())
                     except Exception:
@@ -1515,6 +1517,10 @@ def metrics(response: Response):
     `degraded`. See build_reader_first_report for what each figure means and what to
     watch.
 
+    feed_cache (#99): whether the installed feed_cache is the compact row the ranker
+    writes (#98). `outdated` means the SQL is older than the ranker, which then ranks
+    nobody until the install is re-run; the section names both shapes.
+
     A failed credibility probe reports state "unknown" (and degraded true, which fails
     safe for a monitor) rather than taking the coverage metric down with it. The
     reverse does not hold: the coverage read runs first and is not optional, so if the
@@ -1567,6 +1573,8 @@ def metrics(response: Response):
             # abort the transaction for anything added after it. If an earlier probe
             # already has, it reports unknown.
             reader_first = fetch_reader_first(conn)
+            # After it, so its SAVEPOINT has left the transaction usable.
+            feed_cache = fetch_feed_cache_shape(conn)
     except psycopg2.pool.PoolError as exc:
         # Monitors poll this route, so a persistently exhausted pool must not write a
         # traceback per scrape. Same treatment /sync-status gives the identical error,
@@ -1589,6 +1597,7 @@ def metrics(response: Response):
     report["credibility_sources"] = build_credibility_sources_report(probe)
     report["ranking_sources"] = build_ranking_sources_report(ranking_probe, servability)
     report["reader_first"] = build_reader_first_report(reader_first)
+    report["feed_cache"] = build_feed_cache_report(feed_cache)
     return report
 
 

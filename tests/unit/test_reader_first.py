@@ -546,6 +546,8 @@ def _drive_main(
     monkeypatch.setattr(rd.threading, "Thread", _Subscriber)
     monkeypatch.setattr(rd, "_connect", lambda: first)
     monkeypatch.setattr(rd, "_reconnect", _reconnect)
+    # What _connect, stubbed above, decides on a schema that matches this ranker.
+    monkeypatch.setattr(rd, "_feed_cache_compact", True)
     monkeypatch.setattr(rd, "_drain_feed_reads", lambda conn: _next(drain))
     monkeypatch.setattr(rd, "_note_feed_reads", _note_reads)
     monkeypatch.setattr(rd, "_safe_rollback", lambda conn: seen.rollback.append(conn))

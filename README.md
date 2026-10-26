@@ -487,7 +487,7 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Can this container serve: `503` when the database pool does not answer a query within 1.5 s. Redis is reported in the body (`redis`, `rate_limit_store`) and never fails it: the app serves without Redis. A probe slower than its deadline (1.5 s database, 1.0 s Redis) counts as no answer. Not sync-aware (#61) |
-| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), reader-first figures (#86, under `reader_first`: whether the ranker is ranking, readers in the last day, their stalest feed, rotation age; see "How fresh a feed is"), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why) — not feed analytics |
+| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), reader-first figures (#86, under `reader_first`: whether the ranker is ranking, readers in the last day, their stalest feed, rotation age; see "How fresh a feed is"), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why), whether the installed `feed_cache` is the one the ranker writes (#99, under `feed_cache`: `ok`, or `outdated` with both shapes) — not feed analytics |
 | GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
 | POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10/min per IP, 60/min total) |
 | DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5/min per IP, 30/min total) |
@@ -675,6 +675,16 @@ or saved interests, and the hourly maintenance pass drops the cached feed of eve
 other. Such an account keeps its rotation row and its votes; its first read is served
 the global feed, puts it in the reader lane below, and its own feed follows within a
 cycle.
+
+The SQL and the ranker image of this change go together: the ranker writes a compact
+`feed_cache` row (smallint `rank`, labels as codes into `feed_cache_labels`). A ranker
+started against SQL that predates it ranks nobody, logs one error naming the installed
+and the expected shape (repeated hourly), and `GET /metrics` reports
+`feed_cache.state: outdated`; it starts ranking once it sees the upgraded table. Stop the
+block processor and the ranker, run the install, start them. The install's upgrade of
+an existing table copies only the feeds of accounts that read within 30 days or hold
+interests, the ones the hourly pass would keep at the default retention, and drops the
+rest with the old table; its log names how many rows it copied and skipped.
 
 **Readers go first (#81).** Requesting the first page of a feed tells the ranker, which
 

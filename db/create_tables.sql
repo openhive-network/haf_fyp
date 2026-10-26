@@ -266,20 +266,41 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_cache (
 
 -- Step 2 of 2: copy the wide rows across, labels to codes, and drop the old table. A
 -- rank repeated within one account cannot come from write_feed_cache; were one there,
--- the first copy wins rather than the install failing. Existing feeds are kept as
--- they are: the hourly unread-feed pass (db/active_users_maintenance.sql) is what
--- drops the ones nobody reads.
+-- the first copy wins rather than the install failing.
+--
+-- Only the feeds drop_unread_feeds (db/active_users_maintenance.sql) would keep are
+-- copied: those of accounts that read within 30 days (the ranker's default
+-- FEED_CACHE_UNREAD_RETENTION_DAYS) or hold user_interests. On a full replay nearly
+-- every row belongs to a voter who never read, and copying it would cost the copy,
+-- its WAL and the doubled space only for the hourly pass to delete it straight after.
+-- A node running a longer retention re-ranks a reader dropped here on its next read.
+-- user_interests is created further down: on a fresh install this block returns
+-- before naming it, and every install that has a wide feed_cache already has it.
 DO $feed_cache_compact$
+DECLARE
+    _cutoff timestamp := (NOW() AT TIME ZONE 'utc') - INTERVAL '30 days';
+    _total bigint;
+    _copied bigint;
+    _kept varchar(16) [];
 BEGIN
     IF to_regclass('haf_fyp_app.feed_cache_wide') IS NULL THEN
         RETURN;
     END IF;
+    SELECT COALESCE(array_agg(k.username), '{}') INTO _kept
+    FROM (
+        SELECT au.username FROM haf_fyp_app.active_users AS au WHERE au.last_read_at >= _cutoff
+        UNION
+        SELECT ui.username FROM haf_fyp_app.user_interests AS ui
+    ) AS k;
+
     INSERT INTO haf_fyp_app.feed_cache_labels (label)
     SELECT DISTINCT w.label
     FROM (
-        SELECT algorithm_version AS label FROM haf_fyp_app.feed_cache_wide
+        SELECT fw.algorithm_version AS label
+        FROM haf_fyp_app.feed_cache_wide AS fw JOIN unnest(_kept) AS k (username) USING (username)
         UNION
-        SELECT boost_source FROM haf_fyp_app.feed_cache_wide
+        SELECT fw.boost_source
+        FROM haf_fyp_app.feed_cache_wide AS fw JOIN unnest(_kept) AS k (username) USING (username)
     ) AS w
     WHERE w.label IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM haf_fyp_app.feed_cache_labels AS l WHERE l.label = w.label)
@@ -296,12 +317,17 @@ BEGIN
         COALESCE(la.code, 0), COALESCE(lb.code, 0),
         w.community_boost_applied, w.username
     FROM haf_fyp_app.feed_cache_wide AS w
+    JOIN unnest(_kept) AS k (username) USING (username)
     LEFT JOIN haf_fyp_app.feed_cache_labels AS la ON la.label = w.algorithm_version
     LEFT JOIN haf_fyp_app.feed_cache_labels AS lb ON lb.label = w.boost_source
     ORDER BY w.username, w.rank
     ON CONFLICT (username, rank) DO NOTHING;
+    GET DIAGNOSTICS _copied = ROW_COUNT;
 
+    SELECT count(*) INTO _total FROM haf_fyp_app.feed_cache_wide;
     DROP TABLE haf_fyp_app.feed_cache_wide;
+    RAISE NOTICE 'feed_cache compacted: % row(s) copied for readers and opt-ins, % skipped',
+        _copied, _total - _copied;
 END
 $feed_cache_compact$;
 

@@ -30,6 +30,7 @@ from haf_fyp.metrics import (
     fetch_feed_servability,
     fetch_ranking_sources,
 )
+from pytest import LogCaptureFixture, MonkeyPatch
 
 HIVEMIND = ("hivemind_app", "hive_posts")
 HIVESENSE = ("hivesense_app", "posts_vectors")
@@ -50,12 +51,12 @@ def _conn(rows):
 # --------------------------------------------------------------------------
 
 
-def test_readable_base_table():
+def test_readable_base_table() -> None:
     conn = _conn([("hivemind_app", "hive_posts", True, "r")])
     assert probe_relations(conn, (HIVEMIND,)) == {"hivemind_app.hive_posts": STATE_READABLE}
 
 
-def test_present_but_not_selectable_is_unreadable_not_absent():
+def test_present_but_not_selectable_is_unreadable_not_absent() -> None:
     # The distinction the whole probe exists for: a lost grant is repairable and an
     # uninstalled app is not a fault, and they used to be indistinguishable.
     conn = _conn([("hivesense_app", "posts_vectors", False, "r")])
@@ -64,11 +65,11 @@ def test_present_but_not_selectable_is_unreadable_not_absent():
     }
 
 
-def test_row_missing_entirely_is_absent():
+def test_row_missing_entirely_is_absent() -> None:
     assert probe_relations(_conn([]), (HIVEMIND,)) == {"hivemind_app.hive_posts": STATE_ABSENT}
 
 
-def test_readable_view_is_reported_as_unverified():
+def test_readable_view_is_reported_as_unverified() -> None:
     # has_table_privilege on a VIEW stays true after the view's owner loses access to
     # what it reads, so "readable" would be a claim this module cannot support. The
     # report builder treats it as healthy; the probe must still say which it is, or
@@ -80,7 +81,7 @@ def test_readable_view_is_reported_as_unverified():
 
 
 @pytest.mark.parametrize("relkind", ["r", "p", "m"])
-def test_relkinds_whose_privilege_answer_is_the_whole_story(relkind):
+def test_relkinds_whose_privilege_answer_is_the_whole_story(relkind) -> None:
     # Base table, partitioned parent and matview are all plainly readable: a matview
     # holds its own data (a broken underlying grant degrades REFRESH, not SELECT), and
     # a query through a partitioned parent is privilege-checked on the parent.
@@ -89,7 +90,7 @@ def test_relkinds_whose_privilege_answer_is_the_whole_story(relkind):
 
 
 @pytest.mark.parametrize("relkind", ["v", "f"])
-def test_relkinds_whose_privilege_answer_is_not(relkind):
+def test_relkinds_whose_privilege_answer_is_not(relkind) -> None:
     # A view's privilege stays true after its owner loses access to what it reads; a
     # foreign table's is a purely local check while the read traverses an FDW.
     conn = _conn([("hivemind_app", "hive_posts", True, relkind)])
@@ -98,12 +99,12 @@ def test_relkinds_whose_privilege_answer_is_not(relkind):
     }
 
 
-def test_unreadable_view_is_unreadable_not_unverified():
+def test_unreadable_view_is_unreadable_not_unverified() -> None:
     conn = _conn([("hivemind_app", "hive_posts", False, "v")])
     assert probe_relations(conn, (HIVEMIND,)) == {"hivemind_app.hive_posts": STATE_UNREADABLE}
 
 
-def test_each_relation_is_keyed_by_what_was_ASKED_for():
+def test_each_relation_is_keyed_by_what_was_ASKED_for() -> None:
     # The SQL filters on two arrays, so it can return a cross-product row for a
     # schema/name pair nobody asked about. Keying the output by the requested tuples
     # is what stops that contaminating an answer.
@@ -118,7 +119,7 @@ def test_each_relation_is_keyed_by_what_was_ASKED_for():
     }
 
 
-def test_empty_relations_makes_no_query():
+def test_empty_relations_makes_no_query() -> None:
     conn = MagicMock()
     assert probe_relations(conn, ()) == {}
     conn.cursor.assert_not_called()
@@ -129,7 +130,7 @@ def test_empty_relations_makes_no_query():
 # --------------------------------------------------------------------------
 
 
-def test_fetch_returns_a_state_for_every_declared_source():
+def test_fetch_returns_a_state_for_every_declared_source() -> None:
     # The survivable mutation this kills: `return {}` here makes every relation read
     # unknown on a healthy node -- a permanent false fault, every other test green.
     conn = _conn([
@@ -147,7 +148,7 @@ def test_fetch_returns_a_state_for_every_declared_source():
     }
 
 
-def test_the_declared_sources_are_the_relations_the_code_actually_reads():
+def test_the_declared_sources_are_the_relations_the_code_actually_reads() -> None:
     # Not a white-box check on the SQL binding -- that only compared the constant
     # against itself. This pins the constant against the OTHER places the same two
     # relations are named, so a typo in _RANKING_SOURCES (which would report `absent`
@@ -169,7 +170,7 @@ def test_the_declared_sources_are_the_relations_the_code_actually_reads():
 
 
 @pytest.fixture
-def vectors(monkeypatch):
+def vectors(monkeypatch: MonkeyPatch):
     """Drive fetch_post_vectors_safe's underlying fetch."""
     calls = []
 
@@ -183,7 +184,7 @@ def vectors(monkeypatch):
     return calls
 
 
-def test_repeated_identical_failures_log_once(vectors, caplog):
+def test_repeated_identical_failures_log_once(vectors, caplog: LogCaptureFixture) -> None:
     err = RuntimeError("hivesense gone")
     vectors.extend([err, err, err])
     conn = MagicMock()
@@ -192,7 +193,7 @@ def test_repeated_identical_failures_log_once(vectors, caplog):
     assert sum("embedding fetch failed" in r.message for r in caplog.records) == 1
 
 
-def test_a_different_failure_kind_is_reported(vectors, caplog):
+def test_a_different_failure_kind_is_reported(vectors, caplog: LogCaptureFixture) -> None:
     vectors.extend([RuntimeError("a"), ValueError("b")])
     conn = MagicMock()
     embeddings.fetch_post_vectors_safe(conn, [1])
@@ -202,7 +203,7 @@ def test_a_different_failure_kind_is_reported(vectors, caplog):
 
 
 
-def test_a_standing_failure_is_re_reported_after_the_throttle_window(vectors, caplog, monkeypatch):
+def test_a_standing_failure_is_re_reported_after_the_throttle_window(vectors, caplog: LogCaptureFixture, monkeypatch: MonkeyPatch) -> None:
     # Throttled, not suppressed. An earlier revision went silent for the life of the
     # process on the reasoning that /metrics carries the standing state -- but
     # ranking_sources is a privilege probe, so a RUNTIME failure (a stale-model
@@ -222,7 +223,7 @@ def test_a_standing_failure_is_re_reported_after_the_throttle_window(vectors, ca
     embeddings.fetch_post_vectors_safe(conn, [1])
     assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
 
-def test_same_class_different_pgcode_is_a_different_kind(vectors, caplog):
+def test_same_class_different_pgcode_is_a_different_kind(vectors, caplog: LogCaptureFixture) -> None:
     # The operational case the class name alone cannot see: a lost grant (42501) and
     # a dropped relation (42P01) are BOTH psycopg2 ProgrammingError. Discriminating on
     # the class only -- which every other test here tolerates, since they use
@@ -237,7 +238,7 @@ def test_same_class_different_pgcode_is_a_different_kind(vectors, caplog):
     assert sum("embedding fetch failed" in r.message for r in caplog.records) == 2
 
 
-def test_recovery_is_logged_and_a_relapse_is_reported_again(vectors, caplog):
+def test_recovery_is_logged_and_a_relapse_is_reported_again(vectors, caplog: LogCaptureFixture) -> None:
     # The bug this pins: without clearing the memo on success, a grant lost, repaired
     # and lost again is SILENT the second time -- the opposite of transition logging,
     # and it shipped once with a docstring claiming otherwise.
@@ -252,7 +253,7 @@ def test_recovery_is_logged_and_a_relapse_is_reported_again(vectors, caplog):
     assert sum("embedding fetch recovered" in r.message for r in caplog.records) == 1
 
 
-def test_a_clean_run_says_nothing(vectors, caplog):
+def test_a_clean_run_says_nothing(vectors, caplog: LogCaptureFixture) -> None:
     # set_level is load-bearing: the only thing the success path can log is INFO, and
     # without it caplog sits at WARNING and this assertion is vacuous. A review caught
     # that -- with it vacuous, deleting the `if recovered is not None` guard reported
@@ -264,7 +265,7 @@ def test_a_clean_run_says_nothing(vectors, caplog):
     assert not [r for r in caplog.records if "embedding fetch" in r.message]
 
 
-def test_operational_error_propagates_untouched(vectors):
+def test_operational_error_propagates_untouched(vectors) -> None:
     # The main loop owns reconnection, so this path must not roll back a connection
     # it is about to discard, and must not record a "kind" that would then suppress
     # the first real failure after the reconnect.
@@ -276,7 +277,7 @@ def test_operational_error_propagates_untouched(vectors):
     assert not embeddings._last_embedding_failure
 
 
-def test_failure_rolls_back_so_the_cycle_can_continue(vectors):
+def test_failure_rolls_back_so_the_cycle_can_continue(vectors) -> None:
     vectors.append(RuntimeError("boom"))
     conn = MagicMock()
     embeddings.fetch_post_vectors_safe(conn, [1])
@@ -288,7 +289,7 @@ def test_failure_rolls_back_so_the_cycle_can_continue(vectors):
 # --------------------------------------------------------------------------
 
 
-def test_metrics_probes_ranking_before_credibility(monkeypatch):
+def test_metrics_probes_ranking_before_credibility(monkeypatch: MonkeyPatch) -> None:
     """
     Ranking must be probed FIRST, and this is not a style preference.
 
@@ -328,6 +329,7 @@ def test_metrics_probes_ranking_before_credibility(monkeypatch):
     # Stubbed, not left to run on the MagicMock connection: it would "work" only
     # because the real probe swallows every error into None.
     monkeypatch.setattr(api, "fetch_reader_first", lambda conn: order.append("reader_first"))
+    monkeypatch.setattr(api, "fetch_feed_cache_shape", lambda conn: None)
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
     monkeypatch.setattr(api, "build_credibility_sources_report", lambda probe: {})
     # Positional, no defaults: production dropping an argument must fail here rather
@@ -361,7 +363,7 @@ def test_metrics_probes_ranking_before_credibility(monkeypatch):
     assert conns[0] is not None
 
 
-def test_metrics_feeds_each_probe_to_its_own_builder(monkeypatch):
+def test_metrics_feeds_each_probe_to_its_own_builder(monkeypatch: MonkeyPatch) -> None:
     """
     Swapping the two builder arguments survives every other test in this suite.
 
@@ -384,6 +386,7 @@ def test_metrics_feeds_each_probe_to_its_own_builder(monkeypatch):
     monkeypatch.setattr(api, "fetch_ranking_sources", lambda conn: {"which": "ranking"})
     monkeypatch.setattr(api, "fetch_feed_servability", lambda conn: {"which": "servability"})
     monkeypatch.setattr(api, "fetch_reader_first", lambda conn: None)
+    monkeypatch.setattr(api, "fetch_feed_cache_shape", lambda conn: None)
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
     monkeypatch.setattr(
         api, "build_credibility_sources_report", lambda probe: {"got": probe["which"]}
@@ -415,14 +418,14 @@ def _servability_conn(row, boom=None):
     return conn
 
 
-def test_servability_reports_a_serving_node():
+def test_servability_reports_a_serving_node() -> None:
     assert fetch_feed_servability(_servability_conn((True, True))) == {
         "cached": True,
         "servable": True,
     }
 
 
-def test_servability_distinguishes_no_cycle_from_nothing_resolving():
+def test_servability_distinguishes_no_cycle_from_nothing_resolving() -> None:
     # The whole reason this returns two booleans rather than one: "empty because the
     # ranker has not run" and "empty because nothing resolves" need different
     # responses, and a single servable flag cannot tell them apart.
@@ -436,14 +439,14 @@ def test_servability_distinguishes_no_cycle_from_nothing_resolving():
     }
 
 
-def test_servability_coerces_to_real_bools():
+def test_servability_coerces_to_real_bools() -> None:
     # psycopg2 gives real bools, but the report's `is True` assertions and any JSON
     # consumer deserve them regardless of what a driver hands back.
     out = fetch_feed_servability(_servability_conn((1, 0)))
     assert out["cached"] is True and out["servable"] is False
 
 
-def test_servability_failure_returns_none_without_rolling_back():
+def test_servability_failure_returns_none_without_rolling_back() -> None:
     # Same contract as the two sibling probes: never take the rest of /metrics down,
     # and never roll back a connection that may have died inside this call.
     conn = _servability_conn(None, boom=RuntimeError("boom"))
@@ -451,7 +454,7 @@ def test_servability_failure_returns_none_without_rolling_back():
     conn.rollback.assert_not_called()
 
 
-def test_servability_query_names_the_relations_and_predicate_it_should():
+def test_servability_query_names_the_relations_and_predicate_it_should() -> None:
     """
     A spelling check, and labelled as one.
 
@@ -489,14 +492,14 @@ def _boom(msg="boom", cls=RuntimeError):
     return cls(msg)
 
 
-def test_one_cause_across_many_users_logs_once(caplog):
+def test_one_cause_across_many_users_logs_once(caplog: LogCaptureFixture) -> None:
     # The whole point: 200 users failing for ONE reason is one line, not 200.
     for i in range(200):
         ranker_daemon._log_user_failure(f"user{i}", _boom())
     assert sum("failed to rank user" in r.message for r in caplog.records) == 1
 
 
-def test_the_username_is_not_part_of_the_key(caplog):
+def test_the_username_is_not_part_of_the_key(caplog: LogCaptureFixture) -> None:
     # Keying on username would reinstate the flood, since one cause hits everyone.
     # Pinned explicitly because the comment claims it and nothing else would notice.
     ranker_daemon._log_user_failure("alice", _boom())
@@ -504,7 +507,7 @@ def test_the_username_is_not_part_of_the_key(caplog):
     assert sum("failed to rank user" in r.message for r in caplog.records) == 1
 
 
-def test_two_alternating_kinds_do_not_defeat_the_throttle(caplog):
+def test_two_alternating_kinds_do_not_defeat_the_throttle(caplog: LogCaptureFixture) -> None:
     # A single "last kind seen" is defeated by two coexisting causes: A,B,A,B differs
     # from its predecessor every time, so the full flood returned. Keyed per kind,
     # each is reported once.
@@ -514,7 +517,7 @@ def test_two_alternating_kinds_do_not_defeat_the_throttle(caplog):
     assert sum("failed to rank user" in r.message for r in caplog.records) == 2
 
 
-def test_a_standing_failure_is_re_reported_hourly(caplog, monkeypatch):
+def test_a_standing_failure_is_re_reported_hourly(caplog: LogCaptureFixture, monkeypatch: MonkeyPatch) -> None:
     clock = [1000.0]
     monkeypatch.setattr(ranker_daemon.time, "monotonic", lambda: clock[0])
     ranker_daemon._log_user_failure("a", _boom())
@@ -526,7 +529,7 @@ def test_a_standing_failure_is_re_reported_hourly(caplog, monkeypatch):
     assert sum("failed to rank user" in r.message for r in caplog.records) == 2
 
 
-def test_a_clean_cycle_announces_recovery_and_re_arms(caplog):
+def test_a_clean_cycle_announces_recovery_and_re_arms(caplog: LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="haf_fyp.ranker_daemon")
     ranker_daemon._log_user_failure("a", _boom())
     ranker_daemon._clear_user_failure_memo()
@@ -536,13 +539,13 @@ def test_a_clean_cycle_announces_recovery_and_re_arms(caplog):
     assert sum("failed to rank user" in r.message for r in caplog.records) == 2
 
 
-def test_clearing_an_empty_memo_says_nothing(caplog):
+def test_clearing_an_empty_memo_says_nothing(caplog: LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="haf_fyp.ranker_daemon")
     ranker_daemon._clear_user_failure_memo()
     assert not [r for r in caplog.records if "recovered" in r.message]
 
 
-def test_a_per_user_success_does_not_clear_the_bulk_fetch_memo(caplog):
+def test_a_per_user_success_does_not_clear_the_bulk_fetch_memo(caplog: LogCaptureFixture) -> None:
     """
     Scoped memo (#41 review): one memo shared by every call site THRASHED.
 
@@ -570,7 +573,7 @@ def test_a_per_user_success_does_not_clear_the_bulk_fetch_memo(caplog):
     assert sum("embedding fetch failed" in r.message for r in caplog.records) == 1
 
 
-def test_each_scope_reports_its_own_failure(caplog):
+def test_each_scope_reports_its_own_failure(caplog: LogCaptureFixture) -> None:
     # The flip side: two scopes failing are two distinct conditions and both deserve
     # a line, even when the exception kind is identical.
     conn = MagicMock()
