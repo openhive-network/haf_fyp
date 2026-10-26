@@ -35,7 +35,7 @@ CONTEXT_NAME = "haf_fyp"
 # rationale and db/builtin_roles.sql for the role split. The function owns the
 # massive-sync guard, the LEFT JOIN and the context name; this module owns only
 # the wire format.
-SYNC_STATUS_SQL = "SELECT last_block_num, last_block_time FROM haf_fyp_app.sync_status()"
+SYNC_STATUS_SQL = "SELECT last_block_num, last_block_time, history FROM haf_fyp_app.sync_status()"
 
 # SQLSTATE 55000 (object_not_in_prerequisite_state), raised by the function when
 # hive.is_instance_ready() is false — HAF is still in massive sync and
@@ -99,17 +99,23 @@ def format_block_time(created_at: datetime | None) -> str | None:
 
 
 def build_sync_status(row: tuple | None) -> dict:
-    """Build the GET /sync-status payload from (current_block_num, created_at)."""
+    """Build the GET /sync-status payload from (current_block_num, created_at, history).
+
+    history (#97) is the state of the copy of hivemind's history: waiting_for_hivemind
+    until block processing has backfilled the window, then following_hivemind. A key
+    added after the two the ecosystem shares; their names and format are unchanged.
+    """
     if row is None:
         raise ContextNotFound(
             f"HAF context {CONTEXT_NAME!r} not found: the app is not installed, "
             "or haf_fyp_owner (the sync_status() definer) does not inherit "
             "hive_applications_group"
         )
-    block_num, created_at = row
+    block_num, created_at, history = row
     return {
         "last_block_num": int(block_num),
         "last_block_time": format_block_time(created_at),
+        "history": history,
     }
 
 
@@ -123,7 +129,7 @@ def is_not_ready(exc: BaseException) -> bool:
 
 
 def fetch_sync_status_row(conn) -> tuple | None:
-    """Read (last_block_num, last_block_time) for the haf_fyp context.
+    """Read (last_block_num, last_block_time, history) for the haf_fyp context.
 
     Raises InstanceNotReady during massive sync, before hafd.blocks is touched.
     """

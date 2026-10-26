@@ -59,11 +59,18 @@ def _mock_conn(*fetchone_results):
 # ---------------------------------------------------------------------------
 
 
-def test_payload_is_exactly_the_two_documented_keys():
-    assert build_sync_status((5000000, BLOCK_TIME)) == {
+def test_payload_is_the_two_ecosystem_keys_and_the_history_state():
+    """The two keys every HAF app's /sync-status carries, and haf_fyp's own third
+    (#97): whether its history window has been copied from hivemind yet."""
+    assert build_sync_status((5000000, BLOCK_TIME, "following_hivemind")) == {
         "last_block_num": 5000000,
         "last_block_time": "2016-09-15T19:47:21",
+        "history": "following_hivemind",
     }
+
+
+def test_a_node_waiting_for_hivemind_says_so():
+    assert build_sync_status((0, None, "waiting_for_hivemind"))["history"] == "waiting_for_hivemind"
 
 
 def test_block_time_is_19_chars_with_a_literal_T_and_no_timezone_suffix():
@@ -94,13 +101,14 @@ def test_aware_timestamp_is_converted_to_utc_not_local():
 def test_null_block_time_when_no_block_row_matched():
     # LEFT JOIN miss: the context points at a block hafd.blocks does not have.
     # Must be a null time, not an error.
-    assert build_sync_status((0, None)) == {"last_block_num": 0, "last_block_time": None}
+    assert build_sync_status((0, None, "waiting_for_hivemind")) == {
+        "last_block_num": 0, "last_block_time": None, "history": "waiting_for_hivemind"}
 
 
 def test_block_zero_is_a_real_answer_not_a_missing_context():
     # Guards the `if not block_num` class of bug — 0 means "context registered,
     # nothing processed yet", which is exactly what a fresh install reports.
-    assert build_sync_status((0, BLOCK_TIME))["last_block_num"] == 0
+    assert build_sync_status((0, BLOCK_TIME, "waiting_for_hivemind"))["last_block_num"] == 0
 
 
 def test_context_name_is_the_context_not_the_schema():

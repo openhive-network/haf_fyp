@@ -87,10 +87,11 @@ _Row = tuple[int, float, float, float, float, float, bool, str | None]
 
 # Scores a real holds exactly as written: six significant digits or fewer, which is
 # what the feed shows for them before and after.
+# The post ids are hivemind's (#97): ints, the type get_bridge_post takes.
 _SHORT: list[_Row] = [
     # post_id, final, engagement, recency, credibility, relevance, boosted, source
-    (464943962277281802, 0.91, 0.52, 0.43, 0.34, 0.25, True, "subscribed"),
-    (464943962277281999, 0.81, 0.62, 0.73, 0.84, 0.95, True, "engaged"),
+    (146943962, 0.91, 0.52, 0.43, 0.34, 0.25, True, "subscribed"),
+    (146943999, 0.81, 0.62, 0.73, 0.84, 0.95, True, "engaged"),
     (17, 0.5, 0.125, 1.0, 0.0, 0.333333, False, None),
 ]
 
@@ -175,23 +176,18 @@ def db() -> Iterator[Connection]:
                 username varchar(16) PRIMARY KEY, last_scored_at timestamp,
                 last_read_at timestamp);
             CREATE TABLE {S}.global_feed_cache (post_id bigint, rank int);
-            CREATE TABLE {S}.post_candidates (
-                post_id bigint, hive_post_id int, author varchar(16),
-                permlink varchar(256), title text);
-            CREATE TABLE {S}.post_bridge_cache (post_id bigint, bridge jsonb);
             CREATE TABLE {S}.hive_accounts (id int, name text);
             CREATE TABLE {S}.algorithm_versions (version varchar(16), weights jsonb);
             INSERT INTO {S}.algorithm_versions VALUES ('1.1.0', '{{"recency": 0.3}}');
+            -- Every post is rendered from its hivemind id now (#97): a stand-in render,
+            -- and a stand-in for the identity the explainer reads from hivemind.
             CREATE FUNCTION {S}.get_bridge_post(int, int, int) RETURNS jsonb
-                LANGUAGE sql STABLE AS 'SELECT NULL::jsonb';
+                LANGUAGE sql STABLE AS $f$SELECT '{{"body": "x"}}'::jsonb$f$;
+            CREATE FUNCTION {S}.hivemind_post_identity(int)
+                RETURNS TABLE (author varchar(16), permlink varchar(256), title text)
+                LANGUAGE sql STABLE AS $f$SELECT 'author'::varchar(16), ('p' || $1)::varchar(256), 'title'::text$f$;
             """
         )
-        for post_id, *_ in _SHORT:
-            cur.execute(
-                f"INSERT INTO {S}.post_candidates VALUES (%s, %s, 'author', %s, 'title');"
-                f"INSERT INTO {S}.post_bridge_cache VALUES (%s, '{{\"body\": \"x\"}}')",
-                (post_id, post_id % 100000, f"p{post_id}", post_id),
-            )
         # get_score_explanation is LANGUAGE sql, so its body is checked as it is
         # created; each test makes the feed_cache it reads.
         cur.execute("SET LOCAL check_function_bodies = off")
@@ -293,7 +289,6 @@ def _write_compact(
     db: Connection, monkeypatch: pytest.MonkeyPatch, username: str, rows: list[_Row],
     algo: str = "1.1.0",
 ) -> None:
-    monkeypatch.setattr(scoring, "render_bridge_for_posts", lambda *a, **k: None)
     scoring.write_feed_cache(_RehomedSession(db), username, _scored(rows), algo)
 
 

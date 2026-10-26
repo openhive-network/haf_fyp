@@ -401,7 +401,6 @@ class TestWriteFeedCacheColumnAlignment:
         monkeypatch.setattr(
             scoring.psycopg2.extras, "execute_values", fake_execute_values
         )
-        monkeypatch.setattr(scoring, "render_bridge_for_posts", lambda *a, **k: None)
 
         # Every score distinct, and none equal to another column's value: an
         # alignment test whose sentinels collide cannot see a swap.
@@ -545,7 +544,6 @@ class TestWriteGlobalFeedCacheStampsAlgorithmVersion:
         monkeypatch.setattr(
             scoring.psycopg2.extras, "execute_values", fake_execute_values
         )
-        monkeypatch.setattr(scoring, "render_bridge_for_posts", lambda *a, **k: None)
 
         df = pd.DataFrame(
             [

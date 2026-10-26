@@ -6,20 +6,11 @@ Table source (hivesense_app schema):
                   multiple chunk rows (distinguished by chunk_number); we
                   average the chunks here to get one document-level vector.
 
-Key-space bridge (important):
-  hivesense_app.posts_vectors.post_id is the *hivemind* post id
-  (hivemind_app.hive_posts.id), NOT haf_fyp's own post_id. haf_fyp keys posts
-  by an encoded id in haf_fyp_app.post_lookup. The two id spaces do not overlap,
-  so embeddings must be joined through the natural key (author, permlink):
-
-      haf_fyp_app.post_lookup (author, permlink)
-        -> hivemind_app.hive_accounts.name / hive_permlink_data.permlink
-        -> hivemind_app.hive_posts.id
-        -> hivesense_app.posts_vectors.post_id
-
-  The returned dict is keyed by haf_fyp post_id so callers (compute_scores,
-  build_user_profile_vector, bootstrap_vector_from_communities) can look up
-  vectors by the same post_id they already hold.
+Keys: hivesense_app.posts_vectors.post_id is the hivemind post id
+(hivemind_app.hive_posts.id), and so is every post_id haf_fyp holds (#97), so an
+embedding is read by the id the caller already has. The returned dict is keyed by
+that post_id, for compute_scores, build_user_profile_vector and
+bootstrap_vector_from_communities alike.
 """
 
 from __future__ import annotations
@@ -75,15 +66,11 @@ def _to_numpy(v) -> np.ndarray:
 def fetch_post_vectors(conn, post_ids: list[int]) -> dict[int, np.ndarray]:
     """
     Batch-fetch 1024-dim document embeddings from hivesense_app for the given
-    haf_fyp post_ids.
+    post ids (hivemind post ids), averaging each post's chunk vectors. The halfvec
+    embeddings are cast to vector so avg() and the pgvector psycopg2 adapter return
+    them as numpy arrays.
 
-    Resolves each haf_fyp post_id to its (author, permlink), bridges to the
-    hivemind post id, then averages that post's chunk vectors from
-    hivesense_app.posts_vectors. The halfvec embeddings are cast to vector so
-    avg() and the pgvector psycopg2 adapter return them as numpy arrays.
-
-    Returns a dict keyed by haf_fyp post_id. Posts with no embedding (or no
-    matching hivemind row) are omitted.
+    Returns a dict keyed by post id. Posts with no embedding are omitted.
     """
     if not post_ids:
         return {}
@@ -93,18 +80,10 @@ def fetch_post_vectors(conn, post_ids: list[int]) -> dict[int, np.ndarray]:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT pl.post_id, avg(pv.embedding::vector) AS embedding
-              FROM haf_fyp_app.post_lookup pl
-              JOIN hivemind_app.hive_accounts ha
-                    ON ha.name = pl.author
-              JOIN hivemind_app.hive_permlink_data hpd
-                    ON hpd.permlink = pl.permlink
-              JOIN hivemind_app.hive_posts hp
-                    ON hp.author_id = ha.id AND hp.permlink_id = hpd.id
-              JOIN hivesense_app.posts_vectors pv
-                    ON pv.post_id = hp.id
-             WHERE pl.post_id = ANY(%s)
-             GROUP BY pl.post_id
+            SELECT pv.post_id, avg(pv.embedding::vector) AS embedding
+              FROM hivesense_app.posts_vectors pv
+             WHERE pv.post_id = ANY(%s::int[])
+             GROUP BY pv.post_id
             """,
             (post_ids,),
         )
@@ -115,6 +94,32 @@ def fetch_post_vectors(conn, post_ids: list[int]) -> dict[int, np.ndarray]:
     return vectors
 
 
+# The account's hivemind id and its latest interaction time, looked up once (the
+# MATERIALIZED CTE) and compared as scalar subqueries: the planner runs those as
+# InitPlans, and the main scan is then a plain range read of the (account_id, created_at
+# DESC) index, newest first, which LIMIT stops. JOINED to the account through a CTE, the
+# planner lost that order and the lookback took 1-32 ms on steem-19 against 0.05-0.26 ms
+# (#97); a join to a derived table loses it the same way.
+_LOOKBACK_SQL = """
+    WITH ref AS MATERIALIZED (
+        SELECT ha.id,
+               (SELECT max(x.created_at) FROM haf_fyp_app.user_interactions x
+                 WHERE x.account_id = ha.id) AS latest
+          FROM hivemind_app.hive_accounts ha
+         WHERE ha.name = %(username)s
+    )
+    SELECT
+        ui.post_id,
+        ui.action_weight,
+        EXTRACT(EPOCH FROM ((SELECT latest FROM ref) - ui.created_at)) / 86400.0 AS age_days
+    FROM haf_fyp_app.user_interactions ui
+    WHERE ui.account_id = (SELECT id FROM ref)
+      AND ui.created_at >= (SELECT latest FROM ref) - make_interval(days => %(days)s)
+    ORDER BY ui.created_at DESC
+    LIMIT %(limit)s
+"""
+
+
 def fetch_user_interactions(
     conn,
     username: str,
@@ -123,37 +128,21 @@ def fetch_user_interactions(
 ) -> list[tuple[int, float, float]]:
     """
     Return (post_id, action_weight, age_days) for the user's recent interactions
-    with tracked posts: votes = 1.0×, reblogs = 1.5×.
+    with root posts: votes = 1.0×, reblogs = 1.5×.
 
-    Reads the incremental haf_fyp_app.user_interactions table (populated by the
-    process_interactions block processor) via the (username, created_at) index —
-    a cheap per-user lookup rather than scanning raw operations. This is what
-    makes per-user scoring fast enough to run at scale.
+    Reads haf_fyp_app.user_interactions (copied from hivemind by block processing,
+    db/process_interactions.sql) through its (account_id, created_at) index -- a
+    cheap per-user lookup rather than a scan of hivemind's votes, which would visit
+    every vote of the account's window, comments included, before LIMIT applied.
 
     "Recent" is measured relative to the user's own latest recorded interaction,
-    not wall-clock now, so the signal still works while the app is backfilling
-    historical blocks (interaction times then trail real time by years). age_days
-    is likewise computed against that reference, so the user's most recent actions
-    decay from ~0.
+    not wall-clock now, so the signal still works on a node whose history trails
+    real time (a replay). age_days is likewise computed against that reference, so
+    the user's most recent actions decay from ~0.
     """
     with conn.cursor() as cur:
         cur.execute(
-            """
-            WITH ref AS (
-                SELECT MAX(created_at) AS now_ts
-                  FROM haf_fyp_app.user_interactions
-                 WHERE username = %(username)s
-            )
-            SELECT
-                ui.post_id,
-                ui.action_weight,
-                EXTRACT(EPOCH FROM ((SELECT now_ts FROM ref) - ui.created_at)) / 86400.0 AS age_days
-            FROM haf_fyp_app.user_interactions ui
-            WHERE ui.username = %(username)s
-              AND ui.created_at >= (SELECT now_ts FROM ref) - make_interval(days => %(days)s)
-            ORDER BY ui.created_at DESC
-            LIMIT %(limit)s
-            """,
+            _LOOKBACK_SQL,
             {"username": username, "days": lookback_days, "limit": limit},
         )
         return cur.fetchall()

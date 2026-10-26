@@ -20,6 +20,13 @@ import pytest
 MAINT_SQL = os.path.join(
     os.path.dirname(__file__), "..", "..", "db", "active_users_maintenance.sql"
 )
+# user_interactions is keyed by hivemind's account id (#97), and the eviction predicates
+# resolve a name through hivemind_app.hive_accounts. This lane has no hivemind: the
+# fixture makes the one table, and drops it again.
+HIVE_ACCOUNTS_SQL = """
+CREATE SCHEMA hivemind_app;
+CREATE TABLE hivemind_app.hive_accounts (id int PRIMARY KEY, name varchar(16) NOT NULL UNIQUE);
+"""
 
 
 def _connect():
@@ -41,14 +48,23 @@ def conn():
         pytest.skip("no postgres available")
     c.autocommit = True
     with c.cursor() as cur:
+        cur.execute("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'hivemind_app')")
+        if cur.fetchone()[0]:
+            c.close()
+            pytest.skip("this database has a real hivemind_app; the test builds its own")
         cur.execute(open(MAINT_SQL).read())  # load the maintenance functions
+        cur.execute(HIVE_ACCOUNTS_SQL)
         cur.execute(
             "TRUNCATE haf_fyp_app.active_users, haf_fyp_app.user_interests, "
             "haf_fyp_app.feed_cache, "
             "haf_fyp_app.user_interactions, haf_fyp_app.user_profile_vectors"
         )
-    yield c
-    c.close()
+    try:
+        yield c
+    finally:
+        with c.cursor() as cur:
+            cur.execute("DROP SCHEMA IF EXISTS hivemind_app CASCADE")
+        c.close()
 
 
 # --------------------------------------------------------------------------
@@ -211,7 +227,15 @@ def test_evict_rejects_a_null_ceiling(conn):
 
 def _interaction(cur, name, post_id=1):
     cur.execute(
-        "INSERT INTO haf_fyp_app.user_interactions VALUES (%s, %s)", (name, post_id)
+        "INSERT INTO hivemind_app.hive_accounts (id, name) "
+        "SELECT (SELECT coalesce(max(id), 0) + 1 FROM hivemind_app.hive_accounts), %s "
+        "WHERE NOT EXISTS (SELECT 1 FROM hivemind_app.hive_accounts WHERE name = %s)",
+        (name, name),
+    )
+    cur.execute(
+        "INSERT INTO haf_fyp_app.user_interactions (account_id, post_id) "
+        "SELECT id, %s FROM hivemind_app.hive_accounts WHERE name = %s",
+        (post_id, name),
     )
 
 

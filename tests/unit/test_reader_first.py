@@ -353,12 +353,14 @@ def test_every_connection_listens_after_taking_the_locks(monkeypatch: MonkeyPatc
     fake = MagicMock()
     monkeypatch.setattr(rd.psycopg2, "connect", lambda _dsn: fake)
     monkeypatch.setattr(rd, "_take_app_locks", lambda c: order.append("locks"))
+    monkeypatch.setattr(rd, "_refuse_older_schema", lambda c: order.append("schema"))
     monkeypatch.setattr(rd, "_listen_for_feed_reads", lambda c: order.append("listen"))
 
     assert rd._connect() is fake
     # LISTEN belongs to the session. _reconnect goes through _connect, so a ranker
-    # that reconnected keeps hearing reads.
-    assert order == ["locks", "listen"]
+    # that reconnected keeps hearing reads. The schema is checked once the lock is
+    # held: an install that held it has finished by then (#97).
+    assert order == ["locks", "schema", "listen"]
 
 
 def test_listen_names_the_channel_the_feed_notifies_and_commits(monkeypatch: MonkeyPatch) -> None:
@@ -454,6 +456,7 @@ def test_a_failure_to_listen_is_not_reported_as_a_lock_failure(monkeypatch: Monk
 
     monkeypatch.setattr(rd.psycopg2, "connect", _connect)
     monkeypatch.setattr(rd, "_take_app_locks", lambda c: None)
+    monkeypatch.setattr(rd, "_refuse_older_schema", lambda c: None)
     monkeypatch.setattr(rd, "_listen_for_feed_reads", _listen)
     monkeypatch.setattr(rd.time, "sleep", lambda _s: None)
 

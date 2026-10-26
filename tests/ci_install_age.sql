@@ -13,18 +13,22 @@ SELECT hive.app_set_current_block_num('haf_fyp', 1234);
 UPDATE haf_fyp_app.app_status SET last_processed_block = 1234;
 -- ...and what the processor and the ranker have written since: an interaction, and how
 -- far the telemetry rollup has got.
-INSERT INTO haf_fyp_app.user_interactions (username, post_id, action_weight, created_at, block_num)
-VALUES ('ci-aged-user', 42, 1.0, '2016-09-15 19:47:21', 1234);
+INSERT INTO haf_fyp_app.user_interactions (account_id, post_id, action_weight, created_at)
+VALUES (7, 42, 1.0, '2016-09-15 19:47:21');
 UPDATE haf_fyp_app.feed_events_rollup_state SET last_rolled_id = 7;
+-- ...and the copy of hivemind's history it has made (#97): a re-install that reset this
+-- would backfill again over a window it already has.
+UPDATE haf_fyp_app.hivemind_follow
+SET snapshot_communities = FALSE, hivemind_live_at = '2016-09-15 19:47:21+00',
+    backfill_started_at = '2016-09-15 19:47:21+00', backfilled_at = '2016-09-15 19:48:21+00',
+    backfill_block = 1234, followed_through_block = 1234;
 -- ...and a row in every table that would otherwise be empty. An install that emptied a
 -- table -- a TRUNCATE ... CASCADE left in from a migration, say -- changes nothing in
 -- one that is empty already, and on this database most of them were.
-INSERT INTO haf_fyp_app.post_candidates (post_id, author, permlink, created_at)
-VALUES (42, 'ci-aged-author', 'ci-aged-permlink', '2016-09-15 19:47:21');
-INSERT INTO haf_fyp_app.post_lookup (post_id, author, permlink) VALUES (42, 'ci-aged-author', 'ci-aged-permlink');
-INSERT INTO haf_fyp_app.post_commenters (post_id, commenter) VALUES (42, 'ci-aged-user');
+INSERT INTO haf_fyp_app.post_candidates (post_id, created_at)
+VALUES (42, '2016-09-15 19:47:21');
+INSERT INTO haf_fyp_app.post_commenters (post_id, commenter_id) VALUES (42, 7);
 INSERT INTO haf_fyp_app.engagement_metrics (post_id, updated_at) VALUES (42, '2016-09-15 19:47:21');
-INSERT INTO haf_fyp_app.post_bridge_cache (post_id, bridge, computed_at) VALUES (42, '{}', '2016-09-15 19:47:21');
 INSERT INTO haf_fyp_app.user_profile_vectors (username, updated_at) VALUES ('ci-aged-user', '2016-09-15 19:47:21');
 INSERT INTO haf_fyp_app.user_communities (username, community_id, subscribed_at)
 VALUES ('ci-aged-user', 1, '2016-09-15 19:47:21');

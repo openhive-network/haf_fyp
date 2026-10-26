@@ -273,7 +273,8 @@ def test_connection_flags_are_honoured_not_rejected(bash, tmp_path):
 # entrypoint forwards to the destructive script.
 
 
-def run_install_full_stub(bash, tmp_path, *args: str, fail_on: str = "@@never@@"):
+def run_install_full_stub(bash, tmp_path, *args: str, fail_on: str = "@@never@@",
+                          env: dict | None = None):
     """Run install_app.sh with a psql that succeeds at everything and records it all.
 
     argv.log has one line per call, its arguments joined by spaces. argv.exact.log has
@@ -303,7 +304,7 @@ def run_install_full_stub(bash, tmp_path, *args: str, fail_on: str = "@@never@@"
     )
     proc = subprocess.run(
         [bash, str(INSTALL), *args],
-        env=clean_env(bindir), capture_output=True, text=True, timeout=TIMEOUT,
+        env={**clean_env(bindir), **(env or {})}, capture_output=True, text=True, timeout=TIMEOUT,
     )
     return proc, sql_log, argv_log
 
@@ -492,6 +493,51 @@ def test_without_the_wrapper_the_install_runs_unlocked_and_says_so(bash, tmp_pat
 # value, is tested against a real PostgreSQL in tests/integration/test_swagger_base_url_db.py.
 
 SWAGGER_SQL = "/scripts/set_swagger_base_url.sql"
+HISTORY_SQL = "/scripts/set_history_config.sql"
+
+
+# --- the history window (#97): FYP_HISTORY_DAYS, FYP_HIVEMIND_MAX_LAG_BLOCKS ------------
+
+def _history_calls(argv_log) -> list:
+    return [c for c in argv_log.read_text().splitlines() if c.endswith(HISTORY_SQL)]
+
+
+def test_the_history_window_defaults_when_unset_or_empty(bash, tmp_path):
+    for env in ({}, {"FYP_HISTORY_DAYS": "", "FYP_HIVEMIND_MAX_LAG_BLOCKS": ""}):
+        argv_log = tmp_path / "argv.log"
+        if argv_log.exists():
+            argv_log.unlink()
+        proc, _, _ = run_install_full_stub(bash, tmp_path, env=env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        calls = _history_calls(argv_log)
+        assert len(calls) == 1, calls
+        assert " -v history_days=365 -v hivemind_max_lag_blocks=1000 -f " in calls[0], calls[0]
+
+
+def test_the_history_window_is_handed_to_psql_as_variables(bash, tmp_path):
+    proc, _, argv_log = run_install_full_stub(
+        bash, tmp_path, env={"FYP_HISTORY_DAYS": "90", "FYP_HIVEMIND_MAX_LAG_BLOCKS": "0"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    calls = _history_calls(argv_log)
+    assert len(calls) == 1 and " -v history_days=90 -v hivemind_max_lag_blocks=0 -f " in calls[0], calls
+
+
+@pytest.mark.parametrize("name, value", [
+    ("FYP_HISTORY_DAYS", "0"),
+    ("FYP_HISTORY_DAYS", "36501"),
+    ("FYP_HISTORY_DAYS", "1 year"),
+    ("FYP_HISTORY_DAYS", "365; DROP SCHEMA haf_fyp_app"),
+    ("FYP_HISTORY_DAYS", "-5"),
+    ("FYP_HIVEMIND_MAX_LAG_BLOCKS", "10000001"),
+    ("FYP_HIVEMIND_MAX_LAG_BLOCKS", "01"),
+    ("FYP_HIVEMIND_MAX_LAG_BLOCKS", "lots"),
+])
+def test_a_history_setting_that_cannot_be_meant_refuses_before_anything_is_installed(
+        bash, tmp_path, name, value):
+    proc, _, argv_log = run_install_full_stub(bash, tmp_path, env={name: value})
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert name in proc.stdout + proc.stderr
+    assert not argv_log.exists() or argv_log.read_text() == "", argv_log.read_text()
 
 
 def _swagger_calls(argv_log) -> list:

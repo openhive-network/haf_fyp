@@ -89,6 +89,19 @@ WHERE NOT EXISTS (SELECT 1 AS one FROM haf_fyp_app.app_config);
 -- root() runs as the anonymous role and reads this on every GET /.
 GRANT SELECT ON haf_fyp_app.app_config TO haf_fyp_user;
 
+-- The history window copied from hivemind (#97, db/hivemind_follow.sql), written by
+-- install_app.sh from FYP_HISTORY_DAYS and FYP_HIVEMIND_MAX_LAG_BLOCKS
+-- (scripts/set_history_config.sql):
+--   history_days              days of votes, reblogs and posts kept, counted back from
+--                             hivemind's head block, not from the wall clock
+--   hivemind_max_lag_blocks   how far behind the chain's irreversible head hivemind may
+--                             be for the backfill to start. Hivemind drops its indexes
+--                             while it is 2,000,000 or more blocks behind, and the backfill
+--                             also waits for the ones it reads, whatever this says.
+ALTER TABLE haf_fyp_app.app_config
+ADD COLUMN IF NOT EXISTS history_days int NOT NULL DEFAULT 365,
+ADD COLUMN IF NOT EXISTS hivemind_max_lag_blocks int NOT NULL DEFAULT 1000;
+
 -- app_version and its singleton machinery live in db/app_version.sql, loaded next by
 -- scripts/install_app.sh (step 2b). Split out so the postgrest CI lane -- which does not
 -- load this file -- can execute the shipped DDL instead of a copy of it. That lane could
@@ -402,10 +415,10 @@ $$;
 -- The names are the applications' own lock names -- free text, hashed; not their
 -- contexts or schemas:
 --   haf_fyp   -- ourselves.
---   hivemind  -- db/process_posts.sql reads hivemind_app while processing, and
---                db/register_app.sql declares hivemind_app a dependency. Hivemind's
---                installer and sync use the name 'hivemind', as hivesense's processor
---                does for the same reason.
+--   hivemind  -- block processing copies its history from hivemind_app
+--                (db/hivemind_follow.sql), and db/register_app.sql declares
+--                hivemind_app a dependency. Hivemind's installer and sync use the name
+--                'hivemind', as hivesense's processor does for the same reason.
 -- scripts/process_blocks.sh passes the SAME names to haf_app_driver.py as --lock flags: it
 -- asks block_processor_lock_names() below, so there is one list, not two.
 --
@@ -413,8 +426,8 @@ $$;
 -- does not exist yet protects nothing and blocks the one thing that would create it: on a
 -- fresh node this processor started first, held 'hivemind', and hivemind's installer
 -- skipped itself ("lock on hivemind held by haf_fyp_legacy_main"), so hivemind never
--- installed and `docker compose up` aborted. "Installed" is hivemind_app.hive_posts, the
--- relation db/process_posts.sql reads -- so until hivemind's tables exist (no schema, or
+-- installed and `docker compose up` aborted. "Installed" is hivemind_app.hive_posts, one of
+-- the relations block processing reads -- so until hivemind's tables exist (no schema, or
 -- the empty schema its failed first install left behind) its installer can run.
 --
 -- Asked of the CATALOG, not with to_regclass(). to_regclass resolves the schema, and that
@@ -488,33 +501,25 @@ $$;
 -- it used before.
 --
 -- Needed by block processing (stay live):
---   post_candidates_pkey                  process_posts' insert, and what the restored
---                                         foreign keys validate against
---   post_candidates_author_permlink_key   process_posts: ON CONFLICT (author, permlink)
+--   post_candidates_pkey                  the posts' ON CONFLICT, and the engagement and
+--                                         interaction statements' joins to the window
+--   idx_post_candidates_created_at        the retention pass, and the window's
+--                                         newest-first reads
 --   idx_post_candidates_payout_window     process_payout_windows' UPDATE, every range
---   idx_post_candidates_unresolved        resolve_hivemind_post_ids' UPDATE, every range
---                                         on a node with hivemind
---   post_lookup_pkey                      process_posts: ON CONFLICT (post_id)
---   idx_post_lookup_ap                    the (author, permlink) join of process_comments,
---                                         process_reblogs, process_votes and
---                                         process_interactions; post_lookup has no other
---                                         index on those columns, so it is not redundant
---   post_commenters_pkey                  process_comments: ON CONFLICT
---   engagement_metrics_pkey               process_posts' ON CONFLICT and the engagement
---                                         UPDATEs' post_id lookup
---   user_interactions_pkey                process_interactions: ON CONFLICT
---   active_users_pkey                     process_interactions: ON CONFLICT
+--   post_commenters_pkey                  the commenters' ON CONFLICT
+--   engagement_metrics_pkey               the engagement upsert's ON CONFLICT
+--   user_interactions_pkey                the interactions' ON CONFLICT
+--   idx_user_interactions_created_at      BRIN, a few pages to maintain
+--   active_users_pkey                     the interactions' active_users upsert
 --   user_communities_pkey                 process_subscribe's ON CONFLICT and
 --                                         process_unsubscribe's DELETE
 -- API and ranker only (deferred), the rows of deferred_during_massive_sync() below:
---   idx_user_interactions_user_time       the ranker's per-user history read
+--   idx_user_interactions_account_time    the ranker's per-account history read
 --   idx_active_users_last_read_at         the ranker's recent-readers pick
 --   idx_user_communities_user             API reads by username
---   the foreign keys to post_candidates of post_lookup, post_commenters,
---   engagement_metrics and post_bridge_cache: every post_id the processors write comes
---   from process_posts' own insert or from post_lookup, and nothing deletes a
---   post_candidates row, so the rebuild's validation finds what the checks would have
 --
+-- The backfill from hivemind (db/hivemind_follow.sql) is what a fresh install's massive
+-- sync writes, when it finds hivemind live; the deferred index is built once, after it.
 -- Tables block processing never writes (feed_cache, global_feed_cache, feed_events,
 -- user_profile_vectors, ...) cost the sync nothing and keep everything.
 --
@@ -527,13 +532,9 @@ LANGUAGE sql
 IMMUTABLE
 AS $$
     VALUES
-        ('user_interactions', 'idx_user_interactions_user_time', FALSE),
+        ('user_interactions', 'idx_user_interactions_account_time', FALSE),
         ('active_users', 'idx_active_users_last_read_at', FALSE),
-        ('user_communities', 'idx_user_communities_user', FALSE),
-        ('post_lookup', 'post_lookup_post_id_fkey', TRUE),
-        ('post_commenters', 'post_commenters_post_id_fkey', TRUE),
-        ('engagement_metrics', 'engagement_metrics_post_id_fkey', TRUE),
-        ('post_bridge_cache', 'post_bridge_cache_post_id_fkey', TRUE);
+        ('user_communities', 'idx_user_communities_user', FALSE);
 $$;
 
 -- Registers the deferred indexes with HAF (hive.app_register_index_dependency), which

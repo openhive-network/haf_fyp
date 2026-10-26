@@ -34,7 +34,8 @@ from haf_fyp.metrics import (
 HIVEMIND = ("hivemind_app", "hive_posts")
 HIVESENSE = ("hivesense_app", "posts_vectors")
 HIVE_ACCOUNTS = ("hivemind_app", "hive_accounts")
-HIVE_PERMLINKS = ("hivemind_app", "hive_permlink_data")
+HIVE_VOTES = ("hivemind_app", "hive_votes")
+HIVE_REBLOGS = ("hivemind_app", "hive_reblogs")
 
 
 def _conn(rows):
@@ -136,14 +137,16 @@ def test_fetch_returns_a_state_for_every_declared_source():
         ("hivemind_app", "hive_posts", True, "r"),
         ("hivesense_app", "posts_vectors", True, "r"),
         ("hivemind_app", "hive_accounts", True, "r"),
-        ("hivemind_app", "hive_permlink_data", True, "r"),
+        ("hivemind_app", "hive_votes", True, "r"),
+        ("hivemind_app", "hive_reblogs", True, "r"),
     ])
     probe = fetch_ranking_sources(conn)
     assert probe == {
         "hivemind_app.hive_posts": STATE_READABLE,
         "hivesense_app.posts_vectors": STATE_READABLE,
         "hivemind_app.hive_accounts": STATE_READABLE,
-        "hivemind_app.hive_permlink_data": STATE_READABLE,
+        "hivemind_app.hive_votes": STATE_READABLE,
+        "hivemind_app.hive_reblogs": STATE_READABLE,
     }
 
 
@@ -152,15 +155,15 @@ def test_the_declared_sources_are_the_relations_the_code_actually_reads():
     # against itself. This pins the constant against the OTHER places the same two
     # relations are named, so a typo in _RANKING_SOURCES (which would report `absent`
     # for a present relation, and page forever) cannot pass.
-    assert set(_RANKING_SOURCES) == {HIVEMIND, HIVESENSE, HIVE_ACCOUNTS, HIVE_PERMLINKS}
+    assert set(_RANKING_SOURCES) == {HIVEMIND, HIVESENSE, HIVE_ACCOUNTS, HIVE_VOTES, HIVE_REBLOGS}
     embeddings_sql = io.open("haf_fyp/embeddings.py", encoding="utf-8").read()
     assert "hivesense_app.posts_vectors" in embeddings_sql
-    # All three hivemind relations the resolver joins are probed -- #36 shipped with
-    # two of them invisible, so a grant lost on either read "hivemind: readable"
-    # while nothing resolved.
-    resolver_sql = io.open("db/process_posts.sql", encoding="utf-8").read()
-    for schema, name in (HIVEMIND, HIVE_ACCOUNTS, HIVE_PERMLINKS):
-        assert f"{schema}.{name}" in resolver_sql
+    # Every hivemind relation the copy of its history reads is probed (#97) -- #36
+    # shipped with the then-resolver's inputs invisible, so a grant lost on one read
+    # "hivemind: readable" while nothing was copied.
+    copy_sql = io.open("db/process_interactions.sql", encoding="utf-8").read()
+    for schema, name in (HIVEMIND, HIVE_ACCOUNTS, HIVE_VOTES, HIVE_REBLOGS):
+        assert f"{schema}.{name}" in copy_sql
 
 
 # --------------------------------------------------------------------------
@@ -328,6 +331,7 @@ def test_metrics_probes_ranking_before_credibility(monkeypatch):
     # Stubbed, not left to run on the MagicMock connection: it would "work" only
     # because the real probe swallows every error into None.
     monkeypatch.setattr(api, "fetch_reader_first", lambda conn: order.append("reader_first"))
+    monkeypatch.setattr(api, "fetch_history", lambda conn: order.append("history"))
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
     monkeypatch.setattr(api, "build_credibility_sources_report", lambda probe: {})
     # Positional, no defaults: production dropping an argument must fail here rather
@@ -384,6 +388,7 @@ def test_metrics_feeds_each_probe_to_its_own_builder(monkeypatch):
     monkeypatch.setattr(api, "fetch_ranking_sources", lambda conn: {"which": "ranking"})
     monkeypatch.setattr(api, "fetch_feed_servability", lambda conn: {"which": "servability"})
     monkeypatch.setattr(api, "fetch_reader_first", lambda conn: None)
+    monkeypatch.setattr(api, "fetch_history", lambda conn: None)
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
     monkeypatch.setattr(
         api, "build_credibility_sources_report", lambda probe: {"got": probe["which"]}
@@ -465,13 +470,13 @@ def test_servability_query_names_the_relations_and_predicate_it_should():
     """
     from haf_fyp.metrics import _SERVABILITY_SQL
 
-    assert "hive_post_id IS NOT NULL" in _SERVABILITY_SQL
     assert "haf_fyp_app.global_feed_cache" in _SERVABILITY_SQL
-    assert "haf_fyp_app.post_candidates" in _SERVABILITY_SQL
-    # The predicate must at least still exist on the endpoint side; if it is gone
-    # entirely the probe is answering a question nobody asks any more.
+    assert "JOIN haf_fyp_app.post_candidates p ON p.post_id = g.post_id" in _SERVABILITY_SQL
+    # There is no id to resolve any more (#97): the cache holds hivemind's ids, and
+    # the endpoints render them as they are.
+    assert "hive_post_id" not in _SERVABILITY_SQL
     endpoints = io.open("endpoints/endpoint_schema.sql", encoding="utf-8").read()
-    assert "hive_post_id IS NOT NULL" in endpoints
+    assert "hive_post_id" not in endpoints
 
 
 

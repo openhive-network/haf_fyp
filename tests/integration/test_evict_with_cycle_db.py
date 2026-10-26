@@ -54,6 +54,13 @@ TABLES = (
 # A lock mistake in this file should fail a test, not hang the job until GitLab's
 # timeout: nothing here legitimately waits for a lock at all.
 LOCK_DEADLINE = "15s"
+# user_interactions is keyed by hivemind's account id (#97), and the eviction predicates
+# resolve a name through hivemind_app.hive_accounts. This lane has no hivemind: the
+# fixture makes the one table, and drops it again.
+HIVE_ACCOUNTS_SQL = """
+CREATE SCHEMA hivemind_app;
+CREATE TABLE hivemind_app.hive_accounts (id int PRIMARY KEY, name varchar(16) NOT NULL UNIQUE);
+"""
 
 
 def _connect():
@@ -81,9 +88,16 @@ def conn():
     """The ranker's own kind of session: autocommit off, it commits for itself, and it
     is left as the ranker has it (no lock deadline of ours while a test runs)."""
     c = _session()
+    with c.cursor() as cur:
+        cur.execute("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'hivemind_app')")
+        if cur.fetchone()[0]:
+            c.close()
+            pytest.skip("this database has a real hivemind_app; the test builds its own")
+    c.rollback()
     try:
         with c.cursor() as cur:
             cur.execute(open(MAINT_SQL).read())  # the shipped functions, not a copy
+            cur.execute(HIVE_ACCOUNTS_SQL)
             cur.execute(f"TRUNCATE {TABLES}")
         c.commit()
         yield c
@@ -94,6 +108,7 @@ def conn():
         with c.cursor() as cur:
             cur.execute(f"SET lock_timeout = '{LOCK_DEADLINE}'")
             cur.execute(f"TRUNCATE {TABLES}")
+            cur.execute("DROP SCHEMA IF EXISTS hivemind_app CASCADE")
         c.commit()
         c.close()
 
@@ -160,7 +175,13 @@ def _member(conn, name, *, scored, interests=True, history=False, read=None, vec
             )
         if history in (True, "rows"):
             cur.execute(
-                "INSERT INTO haf_fyp_app.user_interactions (username, post_id) VALUES (%s, 1)",
+                "INSERT INTO hivemind_app.hive_accounts (id, name) "
+                "SELECT (SELECT coalesce(max(id), 0) + 1 FROM hivemind_app.hive_accounts), %s",
+                (name,),
+            )
+            cur.execute(
+                "INSERT INTO haf_fyp_app.user_interactions (account_id, post_id) "
+                "SELECT id, 1 FROM hivemind_app.hive_accounts WHERE name = %s",
                 (name,),
             )
         if vector:

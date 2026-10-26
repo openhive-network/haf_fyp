@@ -106,26 +106,16 @@ def test_an_account_hivemind_does_not_know_hides_nothing(conn):
 
 
 def test_only_posts_and_authors_their_community_muted_are_left_out(conn):
+    """Post ids are hivemind's (#97): the read is of hive_posts alone."""
     with conn.cursor() as cur:
-        cur.execute("SELECT to_regclass('haf_fyp_app.post_candidates') IS NOT NULL")
-        if not cur.fetchone()[0]:
-            pytest.skip("no haf_fyp_app.post_candidates in this database")
-        ids = "(900001, 900002, 900003, 900004, 900005)"
-        cur.execute(f"DELETE FROM haf_fyp_app.post_candidates WHERE post_id IN {ids}")
-        cur.execute(
-            "INSERT INTO haf_fyp_app.post_candidates (post_id, created_at, hive_post_id) VALUES "
-            "(900001, now(), 501), (900002, now(), 502), (900003, now(), 503), (900004, now(), 504), "
-            "(900005, now(), NULL)"
-        )
         # 501 ordinary; 502 muted by a moderator; 503 and 504 by author 20, who is muted
         # in community 7 and an ordinary member of community 8.
         cur.execute("INSERT INTO hivemind_app.hive_posts VALUES "
                     "(501, FALSE, 11, 7), (502, TRUE, 12, 7), (503, FALSE, 20, 7), (504, FALSE, 20, 8)")
         cur.execute("INSERT INTO hivemind_app.hive_roles VALUES (20, 7, -2), (20, 8, 2), (11, 7, 2)")
-    # 900005 has no hivemind post yet: it cannot be served either, so it is left alone.
-    assert visibility.community_muted_post_ids(
-        conn, [900001, 900002, 900003, 900004, 900005]) == {900002, 900003}
-    assert visibility.community_muted_post_ids(conn, [900001, 900004]) == set()
+    # 505 is no post hivemind has: nothing to filter.
+    assert visibility.community_muted_post_ids(conn, [501, 502, 503, 504, 505]) == {502, 503}
+    assert visibility.community_muted_post_ids(conn, [501, 504]) == set()
 
 
 def test_without_hivemind_the_reads_filter_nothing_and_the_session_carries_on(conn):

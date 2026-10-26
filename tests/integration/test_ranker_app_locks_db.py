@@ -22,6 +22,8 @@ import pytest
 
 from haf_fyp import ranker_daemon as rd
 
+from .shipped_schema import function
+
 
 def _connect_installer():
     return psycopg2.connect(
@@ -48,6 +50,10 @@ def installer():
                         "'hive.acquire_app_block_processor_locks(text[])') IS NOT NULL")
             if not cur.fetchone()[0]:
                 pytest.skip("HAF's lock functions are not loaded (tests/haf_stub.sql)")
+            # The ranker checks the installed schema version once it holds the lock
+            # (#97): the shipped definition, as an install leaves it.
+            cur.execute("CREATE SCHEMA IF NOT EXISTS haf_fyp_app")
+            cur.execute(function("schema_version"))
         yield c
     finally:
         c.close()

@@ -80,10 +80,10 @@ BEGIN
 END
 $$;
 
--- HiveSense keys embeddings by hivemind post id, while haf_fyp keys posts by its
--- own encoded id. The ranker bridges the two via (author, permlink) through
--- hivemind_app.hive_accounts / hive_permlink_data / hive_posts, so it needs read
--- access to those tables.
+-- haf_fyp copies its history from hivemind (#97): block processing (haf_fyp_owner)
+-- reads hive_posts, hive_votes, hive_reblogs, hive_accounts, hive_subscriptions and
+-- their kin, and the ranker reads authors through hive_posts / hive_accounts. Every
+-- post id haf_fyp holds is hivemind's, the key HiveSense stores embeddings under.
 --
 -- The feed endpoints additionally reuse Hivemind's own post builders
 -- (hivemind_app.get_full_post_view_by_id + hivemind_postgrest_utilities.
@@ -106,12 +106,9 @@ BEGIN
                 GRANT USAGE ON SCHEMA hivemind_app TO haf_fyp_user;
                 GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_app TO haf_fyp_user;
                 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_app TO haf_fyp_user;
-                -- The block processor (haf_fyp_owner) also resolves (author, permlink) ->
-                -- hive_posts.id via resolve_hivemind_post_ids() to precompute
-                -- post_candidates.hive_post_id, so it needs read access to the three bridge
-                -- tables (hive_accounts / hive_permlink_data / hive_posts). SELECT on ALL
-                -- TABLES covers them; the resolver is exception-guarded, so it degrades to a
-                -- no-op if this grant has not been applied yet.
+                -- The block processor (haf_fyp_owner) copies the history window from
+                -- hivemind's tables (db/hivemind_follow.sql); until this grant is applied
+                -- it finds hivemind unreadable and waits for it.
                 GRANT USAGE ON SCHEMA hivemind_app TO haf_fyp_owner;
                 GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_app TO haf_fyp_owner;
                 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_app TO haf_fyp_owner;
@@ -309,7 +306,7 @@ $$;
 -- hafd is HAF core — accessible to haf_fyp_owner by default but the Python
 -- ranker (haf_fyp_user) also needs hafd.accounts for name → id joins in the
 -- credibility query. The per-user interest signal now comes from the
--- haf_fyp_app.user_interactions table (populated by process_interactions), so
+-- haf_fyp_app.user_interactions table (copied from hivemind by block processing), so
 -- the ranker no longer reads hive.* or hafd operation_types/blocks directly —
 -- those are used only by the block processor, which runs as haf_fyp_owner.
 --

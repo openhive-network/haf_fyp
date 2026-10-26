@@ -8,8 +8,10 @@ import pytest
 from haf_fyp.metrics import (
     build_coverage_report,
     build_credibility_sources_report,
+    build_history_report,
     build_ranking_sources_report,
     fetch_credibility_sources,
+    fetch_history,
     fetch_ranking_sources,
 )
 
@@ -219,12 +221,13 @@ def test_fetch_does_not_roll_back_a_dead_connection():
 # --------------------------------------------------------------------------
 
 
-def _sources(hivemind="readable", hivesense="readable", resolver="readable"):
+def _sources(hivemind="readable", hivesense="readable", history="readable"):
     return {
         "hivemind_app.hive_posts": hivemind,
         "hivesense_app.posts_vectors": hivesense,
-        "hivemind_app.hive_accounts": resolver,
-        "hivemind_app.hive_permlink_data": resolver,
+        "hivemind_app.hive_accounts": history,
+        "hivemind_app.hive_votes": history,
+        "hivemind_app.hive_reblogs": history,
     }
 
 
@@ -248,7 +251,7 @@ def test_shape_and_healthy_node():
         "sources",
         "detail",
     }
-    assert set(report["sources"]) == {"hivemind", "hivesense", "resolver_inputs"}
+    assert set(report["sources"]) == {"hivemind", "hivesense", "history_inputs"}
     assert report["state"] == "ranking_full"
     assert report["degraded"] is False
 
@@ -264,12 +267,13 @@ def test_hivemind_absent_and_unreadable_are_different_verdicts():
     assert absent["degraded"] is True and unreadable["degraded"] is True
 
 
-def test_unreadable_hivemind_does_not_claim_a_visible_outage():
-    # Because it is not necessarily one: both endpoints serve pre-rendered JSON from
-    # post_bridge_cache, so a warm node keeps answering while resolution is dead.
-    # The old feeds_empty said "every feed returns []" here, which was false.
+def test_unreadable_hivemind_says_both_the_copy_and_rendering_have_stopped():
+    # Every post is rendered from hive_posts now (#97): there is no pre-rendered
+    # cache to keep a warm node answering, so the detail says the outage it is.
     report = _report(_sources(hivemind="unreadable"))
-    assert "post_bridge_cache" in report["detail"]
+    assert "history copy has stopped" in report["detail"]
+    assert "cannot be rendered" in report["detail"]
+    assert "post_bridge_cache" not in report["detail"]
 
 
 def test_a_cache_with_nothing_servable_is_degraded():
@@ -286,6 +290,7 @@ def test_a_fresh_node_is_empty_but_not_degraded():
     assert report["state"] == "ranking_no_feed"
     assert report["degraded"] is False
     assert "has not completed a cycle" in report["detail"]
+    assert "waiting for hivemind" in report["detail"]
 
 
 def test_a_fresh_node_with_a_lost_grant_still_degrades():
@@ -304,13 +309,14 @@ def test_unreadable_hivesense_is_a_fault():
     assert _report(_sources(hivesense="unreadable"))["degraded"] is True
 
 
-def test_resolver_inputs_are_reported_and_degrade():
-    # #36 shipped these two invisible, so an operator saw "hivemind: readable" while
-    # resolution was dead.
-    report = _report(_sources(resolver="unreadable"))
-    assert report["sources"]["resolver_inputs"] == {
+def test_history_inputs_are_reported_and_degrade():
+    # #36 shipped the then-resolver's inputs invisible, so an operator saw "hivemind:
+    # readable" while nothing resolved. The copy of hivemind's history (#97) reads these.
+    report = _report(_sources(history="unreadable"))
+    assert report["sources"]["history_inputs"] == {
         "hivemind_app.hive_accounts": "unreadable",
-        "hivemind_app.hive_permlink_data": "unreadable",
+        "hivemind_app.hive_votes": "unreadable",
+        "hivemind_app.hive_reblogs": "unreadable",
     }
     assert report["degraded"] is True
 
@@ -346,7 +352,7 @@ def test_a_failed_probe_names_itself_and_fails_safe(probe, servability, missing)
 def test_a_failed_sources_probe_reports_unknown_states_not_absent():
     report = build_ranking_sources_report(None, SERVING)
     assert report["sources"]["hivemind"] == "unknown"
-    assert all(v == "unknown" for v in report["sources"]["resolver_inputs"].values())
+    assert all(v == "unknown" for v in report["sources"]["history_inputs"].values())
     assert report["degraded"] is True
 
 
@@ -359,7 +365,7 @@ def test_readable_unverified_counts_as_readable():
     assert report["sources"]["hivemind"] == "readable_unverified"
 
 
-def test_an_unreadable_resolver_input_gets_its_own_verdict():
+def test_an_unreadable_history_input_gets_its_own_verdict():
     """
     Pins the branch that stops `state: ranking_full` being reported alongside
     `degraded: true`.
@@ -370,34 +376,33 @@ def test_an_unreadable_resolver_input_gets_its_own_verdict():
     so in this state every authenticated feed request is already raising, and
     reporting "global feed servable" was the worst possible answer.
     """
-    report = _report(_sources(resolver="unreadable"))
+    report = _report(_sources(history="unreadable"))
     assert report["state"] == "ranking_no_feed"
     assert report["degraded"] is True
     assert "hivemind_app.hive_accounts" in report["detail"]
     assert "grant_cross_schema.sh" in report["detail"]
 
 
-def test_a_revoked_resolver_grant_outranks_the_unservable_cache_it_causes():
-    # Ordering, pinned deliberately: a revoked resolver grant is WHY the cache went
-    # unservable, so naming the cache would send the operator to the ranker instead
-    # of to the grant. Cause before symptom.
-    report = _report(_sources(resolver="unreadable"), servability=NOTHING_RESOLVES)
+def test_a_revoked_history_grant_outranks_the_unservable_cache_it_causes():
+    # Ordering, pinned deliberately: a revoked grant is WHY the cache went stale, so
+    # naming the cache would send the operator to the ranker instead of to the grant.
+    # Cause before symptom.
+    report = _report(_sources(history="unreadable"), servability=NOTHING_RESOLVES)
     assert report["state"] == "ranking_no_feed"
     assert "grant_cross_schema.sh" in report["detail"]
-    assert "none resolve" not in report["detail"]
+    assert "history window" not in report["detail"]
 
 
-def test_an_absent_resolver_input_is_a_fault_not_a_choice():
+def test_an_absent_history_input_is_a_fault_not_a_choice():
     """
-    A renamed or dropped resolver relation stops resolution exactly as dead as a
-    revoked grant.
+    A renamed or dropped relation stops the copy exactly as dead as a revoked grant.
 
     An earlier revision collected only `== unreadable`, so this state reported
     `ranking_full` / `degraded: false` while get_personalized_feed -- which reads
     hive_accounts UNGUARDED -- was raising on every authenticated request. The
     severity is the same as the unreadable case; only the remedy differs.
     """
-    report = _report(_sources(resolver="absent"))
+    report = _report(_sources(history="absent"))
     assert report["state"] == "ranking_no_feed"
     assert report["degraded"] is True
     assert "hivemind install" in report["detail"]
@@ -448,3 +453,88 @@ def test_full_state_detail_names_both_sources():
     report = _report()
     assert "hivemind" in report["detail"] and "hivesense" in report["detail"]
     assert "servable" in report["detail"]
+
+
+# --------------------------------------------------------------------------
+# history (#97) -- the copy of hivemind's votes, reblogs and posts
+# --------------------------------------------------------------------------
+
+LIVE = datetime(2026, 10, 25, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _history(**overrides):
+    probe = {
+        "state": "following_hivemind",
+        "history_days": 365,
+        "hivemind_block": 111_000_100,
+        "hivemind_behind_head": 2,
+        "followed_through_block": 111_000_000,
+        "hivemind_live_at": LIVE,
+        "backfill_started_at": LIVE,
+        "backfilled_at": LIVE.replace(minute=2, second=5),
+    }
+    probe.update(overrides)
+    return probe
+
+
+def test_a_following_node_reports_how_long_the_backfill_took_and_how_far_it_trails():
+    report = build_history_report(_history())
+    assert report["state"] == "following_hivemind"
+    assert report["backfill_seconds"] == 125.0
+    assert report["live_to_backfilled_seconds"] == 125.0
+    assert report["behind_hivemind_blocks"] == 100
+    assert report["backfilled_at"] == "2026-10-25T12:02:05+00:00"
+    assert report["history_days"] == 365
+    assert "degraded" not in report
+
+
+def test_a_waiting_node_says_what_it_waits_for():
+    report = build_history_report(_history(
+        state="waiting_for_hivemind", followed_through_block=None, backfill_started_at=None,
+        backfilled_at=None, hivemind_behind_head=1_500_000))
+    assert report["state"] == "waiting_for_hivemind"
+    assert report["backfill_seconds"] is None and report["live_to_backfilled_seconds"] is None
+    assert report["behind_hivemind_blocks"] is None
+    assert "FYP_HIVEMIND_MAX_LAG_BLOCKS" in report["detail"]
+
+
+def test_a_node_without_hivemind_is_told_to_install_or_grant():
+    report = build_history_report(_history(
+        state="waiting_for_hivemind", hivemind_block=None, hivemind_behind_head=None,
+        followed_through_block=None, hivemind_live_at=None, backfill_started_at=None,
+        backfilled_at=None))
+    assert "not installed" in report["detail"] and "grant_cross_schema.sh" in report["detail"]
+
+
+def test_sql_without_the_state_row_is_told_to_reinstall():
+    report = build_history_report(_history(state="unknown"))
+    assert "Re-run the install" in report["detail"]
+
+
+def test_a_history_read_that_fails_reports_unknown_and_releases_its_savepoint():
+    cur = MagicMock()
+    cur.execute.side_effect = [None, RuntimeError("boom"), None]
+    cm = MagicMock()
+    cm.__enter__.return_value = cur
+    cm.__exit__.return_value = False
+    conn = MagicMock()
+    conn.cursor.return_value = cm
+    assert fetch_history(conn) is None
+    statements = [c.args[0] for c in cur.execute.call_args_list]
+    assert statements[0].startswith("SAVEPOINT") and statements[2].startswith("ROLLBACK TO SAVEPOINT")
+    assert build_history_report(None)["state"] == "unknown"
+    conn.rollback.assert_not_called()
+
+
+def test_a_history_read_returns_the_function_s_row_by_name():
+    row = ("following_hivemind", 365, 10, 0, 9, LIVE, LIVE, LIVE)
+    cur = MagicMock()
+    cur.fetchone.return_value = row
+    cm = MagicMock()
+    cm.__enter__.return_value = cur
+    cm.__exit__.return_value = False
+    conn = MagicMock()
+    conn.cursor.return_value = cm
+    probe = fetch_history(conn)
+    assert probe["state"] == "following_hivemind" and probe["followed_through_block"] == 9
+    assert any("haf_fyp_app.history_status()" in c.args[0] for c in cur.execute.call_args_list)

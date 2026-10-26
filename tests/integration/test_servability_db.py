@@ -64,19 +64,21 @@ def conn():
     c.close()
 
 
-def _cache(cur, post_id, *, hive_post_id):
+def _cache(cur, post_id, *, in_window):
     # rank is deliberately NOT equal to post_id. An earlier version of this helper
     # used the post_id for both, which made `ON p.post_id = g.rank` -- a plausible
     # copy-paste error, and one this file's docstring claims to catch -- survive all
     # seven tests unchanged. Two columns that always hold the same value cannot
     # distinguish which one the query joins on.
-    cur.execute(
-        """
-        INSERT INTO haf_fyp_app.post_candidates (post_id, created_at, hive_post_id)
-        VALUES (%s, now(), %s)
-        """,
-        (post_id, hive_post_id),
-    )
+    #
+    # in_window: the post is still a candidate. global_feed_cache holds hivemind's post
+    # ids (#97), so there is nothing to resolve; what can go wrong is a cache whose
+    # posts have all left the window (prune_history) while nothing rewrote it.
+    if in_window:
+        cur.execute(
+            "INSERT INTO haf_fyp_app.post_candidates (post_id, created_at) VALUES (%s, now())",
+            (post_id,),
+        )
     cur.execute(
         """
         INSERT INTO haf_fyp_app.global_feed_cache (post_id, final_score, rank)
@@ -92,51 +94,48 @@ def test_empty_cache_is_neither_cached_nor_servable(conn):
     assert fetch_feed_servability(conn) == {"cached": False, "servable": False}
 
 
-def test_a_resolvable_post_is_servable(conn):
+def test_a_post_in_the_window_is_servable(conn):
     with conn.cursor() as cur:
-        _cache(cur, 1, hive_post_id=12345)
+        _cache(cur, 1, in_window=True)
     assert fetch_feed_servability(conn) == {"cached": True, "servable": True}
 
 
-def test_cached_but_unresolvable_is_the_failure_case(conn):
+def test_cached_but_all_out_of_the_window_is_the_failure_case(conn):
     # THE case #43 exists for, and the one no privilege probe can see: the rows are
-    # there, every relation is readable, and not one post can be served.
+    # there, every relation is readable, and not one is a post the node still has.
     with conn.cursor() as cur:
-        _cache(cur, 1, hive_post_id=None)
-        _cache(cur, 2, hive_post_id=None)
+        _cache(cur, 1, in_window=False)
+        _cache(cur, 2, in_window=False)
     assert fetch_feed_servability(conn) == {"cached": True, "servable": False}
 
 
-def test_one_resolvable_post_among_unresolvable_ones_is_enough(conn):
+def test_one_post_in_the_window_among_stale_ones_is_enough(conn):
     # servable is EXISTS, not a ratio: the feed is degraded but not empty, and the
     # check must not escalate "mostly broken" to "serving nothing".
     with conn.cursor() as cur:
-        _cache(cur, 1, hive_post_id=None)
-        _cache(cur, 2, hive_post_id=None)
-        _cache(cur, 3, hive_post_id=999)
+        _cache(cur, 1, in_window=False)
+        _cache(cur, 2, in_window=False)
+        _cache(cur, 3, in_window=True)
     assert fetch_feed_servability(conn) == {"cached": True, "servable": True}
 
 
 def test_the_two_columns_are_not_transposed(conn):
     # Pins column ORDER, which no mocked test can: transposing them in the SELECT
-    # list makes a cached-but-unresolvable node report cached=false/servable=true,
-    # which the report reads as `serving`. A total outage would read healthy.
+    # list makes a cached-but-stale node report cached=false/servable=true, which the
+    # report reads as `serving`. A total outage would read healthy.
     with conn.cursor() as cur:
-        _cache(cur, 1, hive_post_id=None)
+        _cache(cur, 1, in_window=False)
     out = fetch_feed_servability(conn)
     assert out["cached"] is True, "first column must be `cached`"
     assert out["servable"] is False, "second column must be `servable`"
 
 
 def test_a_candidate_with_no_cache_row_does_not_make_the_node_servable(conn):
-    # Pins the join direction. Resolvable candidates that are not in the global
-    # feed cache are irrelevant to whether the cache can serve anything.
+    # Pins the join direction. Candidates that are not in the global feed cache are
+    # irrelevant to whether the cache can serve anything.
     with conn.cursor() as cur:
         cur.execute(
-            """
-            INSERT INTO haf_fyp_app.post_candidates (post_id, created_at, hive_post_id)
-            VALUES (77, now(), 12345)
-            """
+            "INSERT INTO haf_fyp_app.post_candidates (post_id, created_at) VALUES (77, now())"
         )
     assert fetch_feed_servability(conn) == {"cached": False, "servable": False}
 
@@ -149,7 +148,7 @@ def test_the_query_does_not_depend_on_search_path(conn):
         cur.execute("SHOW search_path")
         original = cur.fetchone()[0]
         cur.execute("SET search_path TO pg_catalog")
-        _cache(cur, 1, hive_post_id=12345)
+        _cache(cur, 1, in_window=True)
     try:
         assert fetch_feed_servability(conn) == {"cached": True, "servable": True}
     finally:

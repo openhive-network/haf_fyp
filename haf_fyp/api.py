@@ -60,11 +60,13 @@ from .auth import KeyLookupUnavailable, verify_interests, verify_interests_delet
 from .metrics import (
     build_coverage_report,
     build_credibility_sources_report,
+    build_history_report,
     build_ranking_sources_report,
     build_reader_first_report,
     fetch_coverage_rows,
     fetch_credibility_sources,
     fetch_feed_servability,
+    fetch_history,
     fetch_ranking_sources,
     fetch_reader_first,
 )
@@ -1194,6 +1196,17 @@ class SyncStatusResponse(BaseModel):
             examples=["2016-09-15T19:47:21"],
         ),
     ] = None
+    history: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Whether haf_fyp has copied its history window from hivemind yet: "
+                "'waiting_for_hivemind' until the backfill has run, then "
+                "'following_hivemind'; 'unknown' where the installed SQL predates it."
+            ),
+            examples=["following_hivemind"],
+        ),
+    ] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1479,24 +1492,28 @@ def metrics(response: Response):
     whether anything is standing between this node and a served feed.
 
     It exists because these failures are otherwise INVISIBLE. Hivemind is a hard
-    dependency -- post_candidates.hive_post_id is resolved from it and both feed
-    endpoints filter on that column -- but the resolver is exception-guarded so a
-    missing schema cannot stall block processing. A node without it syncs happily,
-    raises nothing, and serves an empty feed forever.
+    dependency -- every post haf_fyp ranks is copied from it and rendered from it
+    (#97) -- yet a node without it syncs happily, waiting for it, raises nothing, and
+    serves an empty feed forever.
 
     ALERT ON `degraded`, not on any single field. That is a correction, not a
     style preference: #36 shipped a `feeds_empty` boolean and #43 tried to make it
     authoritative, and it was wrong in BOTH directions -- true on a node that was
-    serving (post_bridge_cache answers without touching hivemind), and false on a
-    node that was not (the global cache is the recency-weighted top 200, so the
-    backfill case leaves it green while per-user feeds are empty). Two separate
-    observations are reported instead, and neither is a proxy for the others:
+    serving (pre-rendered posts answered without touching hivemind), and false on a
+    node that was not (the global cache is the recency-weighted top 200, so it can
+    stay green while per-user feeds are empty). Two separate observations are
+    reported instead, and neither is a proxy for the others:
 
       global_feed -- whether the global feed cache holds anything, and whether any
-          of it is servable. `cached and not servable` is the failure no privilege
-          probe can see.
-      sources -- per-relation privilege states, including the two extra relations
-          the resolver joins. Diagnosis of WHY, not detection.
+          of it is still in the history window. `cached and not servable` is the
+          failure no privilege probe can see.
+      sources -- per-relation privilege states, including the relations the copy of
+          hivemind's history reads. Diagnosis of WHY, not detection.
+
+    history (#97): whether block processing has copied the history window from
+    hivemind yet (waiting_for_hivemind / following_hivemind), how long the backfill
+    took and how long after hivemind was live it ended, and how far the copy trails
+    hivemind. Informational; see build_history_report.
 
     detail names which probe failed when one does, rather than blaming a fixed one.
 
@@ -1567,6 +1584,8 @@ def metrics(response: Response):
             # abort the transaction for anything added after it. If an earlier probe
             # already has, it reports unknown.
             reader_first = fetch_reader_first(conn)
+            # Its own SAVEPOINT too (#97), after the reader-first read.
+            history = fetch_history(conn)
     except psycopg2.pool.PoolError as exc:
         # Monitors poll this route, so a persistently exhausted pool must not write a
         # traceback per scrape. Same treatment /sync-status gives the identical error,
@@ -1589,6 +1608,7 @@ def metrics(response: Response):
     report["credibility_sources"] = build_credibility_sources_report(probe)
     report["ranking_sources"] = build_ranking_sources_report(ranking_probe, servability)
     report["reader_first"] = build_reader_first_report(reader_first)
+    report["history"] = build_history_report(history)
     return report
 
 

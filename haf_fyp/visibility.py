@@ -4,10 +4,8 @@ their community has muted, and posts by authors the reader has muted.
 
 Applied when the ranker WRITES a feed, not when it is served. Dropping posts from a served
 page would make it shorter than its page-size, and front ends read a short page as the end
-of the feed. The serving side could not do it either: most posts are served from
-post_bridge_cache, rendered with observer 0 (#3), so a reader's own mute state is not in
-the response at all. So a feed is filtered from the next time its account is ranked; a
-mute made after that shows until the one after. An account with no feed of its own yet is
+of the feed. So a feed is filtered from the next time its account is ranked; a mute made
+after that shows until the one after. An account with no feed of its own yet is
 served the global feed, which carries the community filters and not the reader's.
 
 Read from hivemind (the same sources its bridge API uses for an observer):
@@ -46,10 +44,9 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 COMMUNITY_MUTED_SQL = """
-    SELECT pc.post_id
-    FROM haf_fyp_app.post_candidates AS pc
-    JOIN hivemind_app.hive_posts AS hp ON hp.id = pc.hive_post_id
-    WHERE pc.post_id = ANY(%(post_ids)s)
+    SELECT hp.id
+    FROM hivemind_app.hive_posts AS hp
+    WHERE hp.id = ANY(%(post_ids)s::int[])
       AND (hp.is_muted
            OR EXISTS (SELECT 1 FROM hivemind_app.hive_roles AS role
                       WHERE role.account_id = hp.author_id
@@ -115,8 +112,8 @@ def _read(conn, what: str, query: str, params: dict) -> set:
 
 
 def community_muted_post_ids(conn, post_ids: list[int]) -> set[int]:
-    """haf_fyp post ids, among `post_ids`, that the post's community muted, or whose
-    author it muted."""
+    """Post ids (hivemind's, as every haf_fyp post id is) among `post_ids` that the
+    post's community muted, or whose author it muted."""
     if not post_ids:
         return set()
     return _read(conn, "community mutes", COMMUNITY_MUTED_SQL, {"post_ids": list(post_ids)})

@@ -91,6 +91,7 @@ def test_a_lock_that_cannot_be_taken_is_retried_on_a_new_connection(monkeypatch,
     conns = iter([bad, good])
     monkeypatch.setattr(rd, "_current_conn", None)   # _connect() sets it; keep it local
     monkeypatch.setattr(rd.psycopg2, "connect", lambda dsn: next(conns))
+    monkeypatch.setattr(rd, "_refuse_older_schema", lambda c: None)
     sleeps = []
     monkeypatch.setattr(rd.time, "sleep", sleeps.append)
 
@@ -106,6 +107,7 @@ def test_every_connection_takes_the_lock(monkeypatch):
     conn, cur = _mock_conn()
     monkeypatch.setattr(rd, "_current_conn", None)
     monkeypatch.setattr(rd.psycopg2, "connect", lambda dsn: conn)
+    monkeypatch.setattr(rd, "_refuse_older_schema", lambda c: None)
     assert rd._connect() is conn
     assert conn.autocommit is False
     assert any("acquire_app_block_processor_locks(%s)" in s for s in _sql(cur))
@@ -117,6 +119,7 @@ def test_every_connection_sets_the_read_filter_before_any_read_is_handled(monkey
     order = []
     monkeypatch.setattr(rd, "_current_conn", None)
     monkeypatch.setattr(rd.psycopg2, "connect", lambda dsn: conn)
+    monkeypatch.setattr(rd, "_refuse_older_schema", lambda c: None)
     monkeypatch.setattr(rd, "_listen_for_feed_reads", lambda c: order.append("listen"))
     monkeypatch.setattr(rd, "_refresh_read_filter", lambda c: order.append(("filter", c)))
     assert rd._connect() is conn
@@ -212,6 +215,7 @@ def test_connect_records_the_session_before_taking_the_lock(monkeypatch):
     cur.execute.side_effect = lambda *a: seen.append(rd._current_conn)
     monkeypatch.setattr(rd.psycopg2, "connect", lambda dsn: conn)
     monkeypatch.setattr(rd, "_current_conn", None)
+    monkeypatch.setattr(rd, "_refuse_older_schema", lambda c: None)
     rd._connect()
     assert seen and all(c is conn for c in seen)
 
@@ -254,3 +258,38 @@ def test_main_can_be_stopped_before_it_first_connects():
 
     lines = [ln.strip() for ln in inspect.getsource(rd.main).splitlines()]
     assert lines.index("_install_stop_handler()") < lines.index("conn = _connect()")
+
+
+# --- the schema version (#97) -------------------------------------------------------
+
+
+def test_a_ranker_on_older_sql_exits_with_one_error_and_does_not_retry(monkeypatch, caplog):
+    """Retrying cannot make the schema newer: the ranker exits, with one ERROR naming the
+    versions and what to do, and closes the session that holds the lock."""
+    conn, _ = _mock_conn()
+    monkeypatch.setattr(rd, "_current_conn", None)
+    monkeypatch.setattr(rd.psycopg2, "connect", lambda dsn: conn)
+    monkeypatch.setattr(rd, "check_schema_version", lambda c: (_ for _ in ()).throw(
+        rd.IncompatibleSchemaError("haf_fyp's installed SQL has version 1; this ranker needs 2")))
+    monkeypatch.setattr(rd.time, "sleep", lambda s: pytest.fail("retried"))
+    with caplog.at_level(logging.ERROR, logger=rd.log.name), pytest.raises(SystemExit) as exited:
+        rd._connect()
+    assert exited.value.code == 2
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert [r.getMessage() for r in errors] == ["haf_fyp's installed SQL has version 1; this ranker needs 2"]
+    conn.close.assert_called_once()
+
+
+def test_the_schema_is_checked_after_the_lock(monkeypatch):
+    """An install that holds HAF's lock has finished by the time the ranker has it, so
+    what the check reads is what that install left."""
+    conn, _ = _mock_conn()
+    order = []
+    monkeypatch.setattr(rd, "_current_conn", None)
+    monkeypatch.setattr(rd.psycopg2, "connect", lambda dsn: conn)
+    monkeypatch.setattr(rd, "_take_app_locks", lambda c: order.append("locks"))
+    monkeypatch.setattr(rd, "check_schema_version", lambda c: order.append("schema") or 2)
+    monkeypatch.setattr(rd, "_listen_for_feed_reads", lambda c: order.append("listen"))
+    monkeypatch.setattr(rd, "_refresh_read_filter", lambda c: None)
+    assert rd._connect() is conn
+    assert order == ["locks", "schema", "listen"]
