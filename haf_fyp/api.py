@@ -60,10 +60,12 @@ from .auth import KeyLookupUnavailable, verify_interests, verify_interests_delet
 from .metrics import (
     build_coverage_report,
     build_credibility_sources_report,
+    build_feed_cache_report,
     build_ranking_sources_report,
     build_reader_first_report,
     fetch_coverage_rows,
     fetch_credibility_sources,
+    fetch_feed_cache_shape,
     fetch_feed_servability,
     fetch_ranking_sources,
     fetch_reader_first,
@@ -1515,6 +1517,10 @@ def metrics(response: Response):
     `degraded`. See build_reader_first_report for what each figure means and what to
     watch.
 
+    feed_cache (#99): whether the installed feed_cache is the compact row the ranker
+    writes (#98). `outdated` means the SQL is older than the ranker, which then ranks
+    nobody until the install is re-run; the section names both shapes.
+
     A failed credibility probe reports state "unknown" (and degraded true, which fails
     safe for a monitor) rather than taking the coverage metric down with it. The
     reverse does not hold: the coverage read runs first and is not optional, so if the
@@ -1567,6 +1573,8 @@ def metrics(response: Response):
             # abort the transaction for anything added after it. If an earlier probe
             # already has, it reports unknown.
             reader_first = fetch_reader_first(conn)
+            # After it, so its SAVEPOINT has left the transaction usable.
+            feed_cache = fetch_feed_cache_shape(conn)
     except psycopg2.pool.PoolError as exc:
         # Monitors poll this route, so a persistently exhausted pool must not write a
         # traceback per scrape. Same treatment /sync-status gives the identical error,
@@ -1589,6 +1597,7 @@ def metrics(response: Response):
     report["credibility_sources"] = build_credibility_sources_report(probe)
     report["ranking_sources"] = build_ranking_sources_report(ranking_probe, servability)
     report["reader_first"] = build_reader_first_report(reader_first)
+    report["feed_cache"] = build_feed_cache_report(feed_cache)
     return report
 
 

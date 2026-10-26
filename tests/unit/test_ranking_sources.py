@@ -328,6 +328,7 @@ def test_metrics_probes_ranking_before_credibility(monkeypatch):
     # Stubbed, not left to run on the MagicMock connection: it would "work" only
     # because the real probe swallows every error into None.
     monkeypatch.setattr(api, "fetch_reader_first", lambda conn: order.append("reader_first"))
+    monkeypatch.setattr(api, "fetch_feed_cache_shape", lambda conn: None)
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
     monkeypatch.setattr(api, "build_credibility_sources_report", lambda probe: {})
     # Positional, no defaults: production dropping an argument must fail here rather
@@ -384,6 +385,7 @@ def test_metrics_feeds_each_probe_to_its_own_builder(monkeypatch):
     monkeypatch.setattr(api, "fetch_ranking_sources", lambda conn: {"which": "ranking"})
     monkeypatch.setattr(api, "fetch_feed_servability", lambda conn: {"which": "servability"})
     monkeypatch.setattr(api, "fetch_reader_first", lambda conn: None)
+    monkeypatch.setattr(api, "fetch_feed_cache_shape", lambda conn: None)
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
     monkeypatch.setattr(
         api, "build_credibility_sources_report", lambda probe: {"got": probe["which"]}
