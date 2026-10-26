@@ -25,14 +25,14 @@ def ddl(*tables: str) -> str:
     statements = []
     for table in tables:
         create = re.search(
-            rf"^CREATE TABLE IF NOT EXISTS haf_fyp_app\.{table} \(.*?^\);", text, re.S | re.M)
+            rf"^CREATE TABLE IF NOT EXISTS haf_fyp_app\.{table} \(.*?^\);", text, re.DOTALL | re.MULTILINE)
         if create is None:
             raise LookupError(f"db/create_tables.sql creates no haf_fyp_app.{table}")
         statements.append(f"DROP TABLE IF EXISTS haf_fyp_app.{table} CASCADE;")
         statements.append(create.group(0))
         statements += re.findall(
             rf"^CREATE (?:UNIQUE )?INDEX IF NOT EXISTS \w+\s+ON haf_fyp_app\.{table}\b[^;]*;",
-            text, re.M)
+            text, re.MULTILINE)
     return "\n".join(statements)
 
 
@@ -44,7 +44,7 @@ def function(name: str) -> str:
     with open(CREATE_TABLES, encoding="utf-8") as f:
         text = f.read()
     found = re.search(
-        rf"^CREATE OR REPLACE FUNCTION haf_fyp_app\.{name}\(.*?^\$\$;", text, re.S | re.M)
+        rf"^CREATE OR REPLACE FUNCTION haf_fyp_app\.{name}\(.*?^\$\$;", text, re.DOTALL | re.MULTILINE)
     if found is None:
         raise LookupError(f"db/create_tables.sql defines no haf_fyp_app.{name}")
     return found.group(0)

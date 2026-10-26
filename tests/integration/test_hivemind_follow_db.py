@@ -224,7 +224,7 @@ def state(cur: cursor) -> dict[str, Any]:
     cur.execute("SELECT snapshot_communities, backfilled_at IS NOT NULL, backfill_block, "
                 "followed_through_block, hivemind_live_at IS NOT NULL FROM haf_fyp_app.hivemind_follow")
     keys = ("snapshot", "backfilled", "backfill_block", "through", "live_seen")
-    return dict(zip(keys, cur.fetchone()))
+    return dict(zip(keys, cur.fetchone(), strict=True))
 
 
 def snapshot(cur: cursor) -> dict[str, list[tuple[Any, ...]]]:
@@ -604,7 +604,7 @@ def test_every_batch_times_every_processor_the_report_expects(conn: connection) 
 def _upgrade_block() -> str:
     with open(CREATE_TABLES, encoding="utf-8") as f:
         text = f.read()
-    block = re.search(r"^DO \$history_from_hivemind\$.*?^\$history_from_hivemind\$;", text, re.S | re.M)
+    block = re.search(r"^DO \$history_from_hivemind\$.*?^\$history_from_hivemind\$;", text, re.DOTALL | re.MULTILINE)
     assert block is not None
     return block.group(0)
 

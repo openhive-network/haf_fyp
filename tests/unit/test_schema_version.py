@@ -70,6 +70,6 @@ def test_the_ranker_requires_the_version_the_sql_installs() -> None:
     """The two numbers move together: db/create_tables.sql's function and the ranker's
     requirement. A bump of one alone either refuses every install or checks nothing."""
     sql = (Path(__file__).resolve().parents[2] / "db" / "create_tables.sql").read_text(encoding="utf-8")
-    body = re.search(r"FUNCTION haf_fyp_app\.schema_version\(\).*?SELECT (\d+);", sql, re.S)
+    body = re.search(r"FUNCTION haf_fyp_app\.schema_version\(\).*?SELECT (\d+);", sql, re.DOTALL)
     assert body is not None
     assert int(body.group(1)) == REQUIRED_SCHEMA_VERSION
