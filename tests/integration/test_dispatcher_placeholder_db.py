@@ -269,7 +269,7 @@ def test_the_shipped_dispatcher_takes_the_placeholders_place(conn) -> None:
         body = installed[0][0]
         assert "install placeholder" not in body
         # Read, not run: the processors it calls are not loaded in this lane.
-        for call in ("stage_operations(_first_block, _last_block)",
+        for call in ("stage_operations(_apply_from, _last_block)",
                      "process_communities(_first_block, _last_block, _apply_operations)",
                      "follow_hivemind(_first_block, _last_block)",
                      "process_payout_windows(_last_block)"):

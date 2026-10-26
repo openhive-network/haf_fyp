@@ -172,8 +172,11 @@ $$;
 
 -- An install whose context has not applied community operations from genesis takes
 -- user_communities from hivemind at its backfill (hivemind_follow.snapshot_communities),
--- and until then has nothing to apply them to: its batches skip them. From the backfill
--- on, every batch applies its own.
+-- and until then has nothing to apply them to: its batches skip them. The snapshot holds
+-- every operation up to the block it was taken at (communities_snapshot_block), so from
+-- the backfill on a batch applies only its operations above that block: a batch wholly
+-- at or below it reads none. An install that never took the snapshot applies every
+-- batch's own.
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_block_range(
     _first_block int,
     _last_block int
@@ -184,14 +187,21 @@ AS $$
 DECLARE
     _timed boolean := current_setting('haf_fyp.processor_timings', TRUE) = 'on';
     _t timestamptz;
-    _apply_operations boolean := NOT coalesce(
-        (SELECT f.snapshot_communities FROM haf_fyp_app.hivemind_follow AS f), FALSE
-    );
+    _snapshot_pending boolean;
+    _snapshot_block int;
+    _apply_from int;
+    _apply_operations boolean;
 BEGIN
+    SELECT f.snapshot_communities, f.communities_snapshot_block
+    INTO _snapshot_pending, _snapshot_block
+    FROM haf_fyp_app.hivemind_follow AS f;
+    _apply_from := greatest(_first_block, _snapshot_block + 1);
+    _apply_operations := NOT coalesce(_snapshot_pending, FALSE) AND _apply_from <= _last_block;
+
     -- process_communities and follow_hivemind time their own steps.
     IF _timed THEN _t := clock_timestamp(); END IF;
     IF _apply_operations THEN
-        PERFORM haf_fyp_app.stage_operations(_first_block, _last_block);
+        PERFORM haf_fyp_app.stage_operations(_apply_from, _last_block);
     END IF;
     IF _timed THEN PERFORM haf_fyp_app.report_processor_timing('stage_operations', _first_block, _last_block, _t, '{custom_json_operation}'); END IF;
     PERFORM haf_fyp_app.process_communities(_first_block, _last_block, _apply_operations);

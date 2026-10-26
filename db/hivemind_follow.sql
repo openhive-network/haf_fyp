@@ -82,7 +82,8 @@ DECLARE
 BEGIN
     IF _copy AND _backfill AND (SELECT f.snapshot_communities FROM haf_fyp_app.hivemind_follow AS f) THEN
         PERFORM haf_fyp_app.copy_hivemind_subscriptions();
-        UPDATE haf_fyp_app.hivemind_follow SET snapshot_communities = FALSE;
+        UPDATE haf_fyp_app.hivemind_follow
+        SET snapshot_communities = FALSE, communities_snapshot_block = _to;
     END IF;
     IF _timed THEN _t := haf_fyp_app.report_processor_timing('hivemind_subscriptions', _first_block, _last_block, _t, '{}'); END IF;
 

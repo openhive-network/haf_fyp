@@ -12,7 +12,8 @@ hivemind tables haf_fyp reads (tests/hivemind_stub.sql) and check:
     category, subscriptions taken from hivemind on a fresh install;
   - that following block by block ends where a backfill at the same block does, and that
     reading a range twice changes nothing;
-  - community operations: skipped until the backfill on a fresh install, applied from it;
+  - community operations: skipped until the backfill on a fresh install, then applied
+    only above the block its subscriptions were taken at;
   - retention, the status the endpoints report, and that every batch times every
     processor scripts/processor_timings_report.py expects;
   - the upgrade from the replayed shape (the DO block of db/create_tables.sql): cached
@@ -222,8 +223,9 @@ def batch(cur: cursor, first: int, last: int) -> None:
 
 def state(cur: cursor) -> dict[str, Any]:
     cur.execute("SELECT snapshot_communities, backfilled_at IS NOT NULL, backfill_block, "
-                "followed_through_block, hivemind_live_at IS NOT NULL FROM haf_fyp_app.hivemind_follow")
-    keys = ("snapshot", "backfilled", "backfill_block", "through", "live_seen")
+                "followed_through_block, hivemind_live_at IS NOT NULL, communities_snapshot_block "
+                "FROM haf_fyp_app.hivemind_follow")
+    keys = ("snapshot", "backfilled", "backfill_block", "through", "live_seen", "snapshot_block")
     return dict(zip(keys, cur.fetchone(), strict=True))
 
 
@@ -272,7 +274,7 @@ def test_without_hivemind_a_batch_copies_nothing_and_waits(conn: connection) -> 
         cur.execute("DROP TABLE hivemind_app.hive_state")
         batch(cur, 1, 100)
         assert state(cur) == {"snapshot": True, "backfilled": False, "backfill_block": None,
-                              "through": None, "live_seen": False}
+                              "through": None, "live_seen": False, "snapshot_block": None}
         cur.execute("SELECT state, hivemind_block FROM haf_fyp_app.history_status()")
         assert cur.fetchone() == ("waiting_for_hivemind", None)
 
@@ -344,7 +346,7 @@ def test_the_backfill_copies_the_window(conn: connection) -> None:
         # A fresh install takes the subscriptions from hivemind.
         assert rows["user_communities"] == [("alice", 123456, t(500)), ("bob", 777, t(510))]
         assert state(cur) == {"snapshot": False, "backfilled": True, "backfill_block": 1000,
-                              "through": 1000, "live_seen": True}
+                              "through": 1000, "live_seen": True, "snapshot_block": 1000}
 
 
 def test_the_window_is_counted_back_from_hivemind_s_block(conn: connection) -> None:
@@ -488,6 +490,79 @@ def test_a_fresh_install_skips_community_operations_until_it_has_hivemind_s(conn
         assert cur.fetchone() == (0,)
 
 
+def operation_scans(cur: cursor) -> int:
+    """How many times this transaction has read hive.operations_view (a table here)."""
+    cur.execute("SELECT coalesce(seq_scan, 0) + coalesce(idx_scan, 0) FROM pg_stat_xact_user_tables "
+                "WHERE schemaname = 'hive' AND relname = 'operations_view'")
+    return int(cur.fetchone()[0])
+
+
+def communities(cur: cursor) -> list[tuple[Any, ...]]:
+    cur.execute("SELECT username, community_id, subscribed_at FROM haf_fyp_app.user_communities ORDER BY 1, 2")
+    rows: list[tuple[Any, ...]] = cur.fetchall()
+    return rows
+
+
+def test_after_the_snapshot_only_the_community_operations_above_its_block_are_applied(
+        conn: connection) -> None:
+    """The backfill of the first batch takes the subscriptions at hivemind's block 1000. A
+    later batch at or below 1000 reads no operations; one across it applies only the
+    operations above 1000."""
+    with conn.cursor() as cur:
+        seed_window(Hivemind(cur))
+        batch(cur, 1, 100)
+        assert state(cur)["snapshot_block"] == 1000
+        taken = communities(cur)
+        # Not in hivemind's subscriptions at 1000, so it would show if it were applied.
+        community_op(cur, "zed", "subscribe", "hive-1", 500)
+        community_op(cur, "bob", "unsubscribe", "hive-777", 950)
+        community_op(cur, "yara", "subscribe", "hive-2", 1050)
+        community_op(cur, "alice", "unsubscribe", "hive-123456", 1060)
+
+        scans = operation_scans(cur)
+        batch(cur, 101, 1000)
+        assert operation_scans(cur) == scans
+        assert communities(cur) == taken
+
+        batch(cur, 901, 1100)
+        assert operation_scans(cur) > scans          # the counter does see a read
+        assert communities(cur) == [("bob", 777, t(510)), ("yara", 2, t(1050))]
+
+
+def test_a_fresh_install_followed_past_its_snapshot_ends_where_applying_from_genesis_does(
+        conn: connection) -> None:
+    with conn.cursor() as cur:
+        hm = Hivemind(cur)
+        # Up to 1000, the operations and hivemind's subscriptions after them agree.
+        community_op(cur, "carol", "subscribe", "hive-777", 300)
+        community_op(cur, "carol", "unsubscribe", "hive-777", 400)
+        community_op(cur, "alice", "subscribe", "hive-123456", 500)
+        community_op(cur, "bob", "subscribe", "hive-777", 510)
+        community_op(cur, "dave", "subscribe", "hive-777", 950)
+        hm.subscribe("alice", "hive-123456", 500)
+        hm.subscribe("bob", "hive-777", 510)
+        hm.subscribe("dave", "hive-777", 950)
+        hm.at(1000)
+        community_op(cur, "alice", "unsubscribe", "hive-123456", 1050)
+        community_op(cur, "carol", "subscribe", "hive-123456", 1100)
+        community_op(cur, "dave", "unsubscribe", "hive-777", 1150)
+        community_op(cur, "dave", "subscribe", "hive-777", 1160)
+
+        batch(cur, 1, 100)
+        batch(cur, 101, 1000)
+        hm.at(1200)
+        cur.execute("UPDATE hive.ci_head SET block = 1200")
+        batch(cur, 1001, 1200)
+        from_snapshot = communities(cur)
+
+        cur.execute("DELETE FROM haf_fyp_app.user_communities")
+        cur.execute("UPDATE haf_fyp_app.hivemind_follow SET communities_snapshot_block = NULL")
+        batch(cur, 1, 1000)
+        batch(cur, 1001, 1200)
+        assert communities(cur) == from_snapshot == [
+            ("bob", 777, t(510)), ("carol", 123456, t(1100)), ("dave", 777, t(1160))]
+
+
 def test_after_the_backfill_each_batch_applies_its_community_operations(conn: connection) -> None:
     with conn.cursor() as cur:
         hm = Hivemind(cur)
@@ -511,6 +586,12 @@ def test_an_install_that_has_applied_the_operations_keeps_its_subscriptions(conn
         batch(cur, 1, 100)
         cur.execute("SELECT username, community_id FROM haf_fyp_app.user_communities ORDER BY 1")
         assert cur.fetchall() == [("kept", 5), ("zed", 1)]
+        # Below the backfill's block 1000, and applied all the same.
+        community_op(cur, "zed", "unsubscribe", "hive-1", 150)
+        batch(cur, 101, 200)
+        cur.execute("SELECT username, community_id FROM haf_fyp_app.user_communities ORDER BY 1")
+        assert cur.fetchall() == [("kept", 5)]
+        assert state(cur)["snapshot_block"] is None
 
 
 # --- retention ---------------------------------------------------------------------

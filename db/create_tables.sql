@@ -225,6 +225,10 @@ ON haf_fyp_app.user_interactions USING brin (created_at);
 --                          run. backfilled_at - hivemind_live_at is the time from
 --                          hivemind being live to haf_fyp having a window to rank.
 --   backfill_block         hivemind's block when the backfill read it.
+--   communities_snapshot_block
+--                          hivemind's block when the backfill took user_communities
+--                          from it; NULL where it did not. Block processing applies
+--                          community operations only above it (process_block_range).
 --   followed_through_block hivemind's block the copy is current to.
 -- ---------------------------------------------------------------------------
 
@@ -236,8 +240,13 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.hivemind_follow (
     backfilled_at timestamptz,
     backfill_block int,
     followed_through_block int,
+    communities_snapshot_block int,
     CONSTRAINT hivemind_follow_singleton CHECK (only_row)
 );
+
+-- A node past its backfill without the column keeps applying every batch's operations.
+ALTER TABLE haf_fyp_app.hivemind_follow
+ADD COLUMN IF NOT EXISTS communities_snapshot_block int;
 
 DO $hivemind_follow_seed$
 BEGIN

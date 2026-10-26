@@ -153,8 +153,8 @@ $$;
 -- gives each pair one outcome.
 --
 -- _apply false: the batch has staged nothing, because user_communities is still to be
--- taken from hivemind (process_block_range). The steps are timed all the same, so every
--- batch reports every processor.
+-- taken from hivemind or already holds the batch's blocks (process_block_range). The
+-- steps are timed all the same, so every batch reports every processor.
 
 DROP FUNCTION IF EXISTS haf_fyp_app.process_communities(int, int);
 
@@ -189,9 +189,11 @@ $$;
 -- Run once, by the backfill of an install that has not applied community operations
 -- from genesis (hivemind_follow.snapshot_communities). Replaces the table: hivemind's
 -- hive_subscriptions is the state after every operation up to its head, unsubscribes
--- included. The batches that follow apply the operations of blocks hivemind had
--- already read, which changes nothing: a range's last operation per pair decides the
--- pair, and hivemind applied the same one.
+-- included. The backfill records the block it was taken at
+-- (hivemind_follow.communities_snapshot_block), and block processing applies only the
+-- operations above it: re-applying the ones hivemind had already read would change
+-- nothing but a subscription to a community hivemind does not know, and reading them
+-- was the whole cost of a fresh install's sync to hivemind's block.
 --
 -- Hivemind keeps a subscription only to a community it knows, where the operations
 -- alone accept any well-formed hive-N; and its hive_communities.id is its own key, so
