@@ -1768,9 +1768,10 @@ BEGIN
                 LIMIT _limit
                 OFFSET _offset
             ) AS page
-            -- Planner barrier: without it s is pulled up into the aggregate, and
-            -- "post" is evaluated twice per row (once for jsonb_agg, once for its
-            -- FILTER), rendering every uncached post twice.
+            -- OFFSET 0 is an optimization fence: without it the planner pulls "s"
+            -- up into the aggregate and evaluates s.post twice per row (once in
+            -- jsonb_agg's argument, once in its FILTER), so every cache miss ran
+            -- get_bridge_post twice. The fence computes s.post once per row.
             OFFSET 0
         ) AS s;
         RETURN _result;
@@ -1840,9 +1841,7 @@ BEGIN
                 LIMIT _limit
                 OFFSET _offset
             ) AS page
-            -- Planner barrier: without it s is pulled up into the aggregate, and
-            -- "post" is evaluated twice per row (once for jsonb_agg, once for its
-            -- FILTER), rendering every uncached post twice.
+            -- Fence: s.post once per row, not twice (see get_personalized_feed).
             OFFSET 0
         ) AS s;
         RETURN _result;
@@ -1995,9 +1994,7 @@ BEGIN
                 LIMIT _limit
                 OFFSET _offset
             ) AS page
-            -- Planner barrier: without it s is pulled up into the aggregate, and
-            -- "post" is evaluated twice per row (once for jsonb_agg, once for its
-            -- FILTER), rendering every uncached post twice.
+            -- Fence: s.post once per row, not twice (see get_personalized_feed).
             OFFSET 0
         ) AS s;
         RETURN _result;
