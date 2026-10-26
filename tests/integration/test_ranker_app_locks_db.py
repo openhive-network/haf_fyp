@@ -23,6 +23,7 @@ import pytest
 from haf_fyp import ranker_daemon as rd
 
 from .shipped_schema import function
+from pytest import MonkeyPatch
 
 
 def _connect_installer():
@@ -60,7 +61,7 @@ def installer():
 
 
 @pytest.fixture()
-def ranker(installer, monkeypatch):
+def ranker(installer, monkeypatch: MonkeyPatch):
     """The ranker's session, as main() opens it. Its _dsn() reads the same POSTGRES_*
     variables as the installer. A failure inside _connect() would retry forever, so the
     retry sleep is made to fail the test instead."""
@@ -107,7 +108,7 @@ def eventually_free(installer, name, seconds=3.0) -> bool:
         time.sleep(0.05)
 
 
-def test_an_install_cannot_run_under_the_ranker(ranker, installer):
+def test_an_install_cannot_run_under_the_ranker(ranker, installer) -> None:
     assert eventually_free(installer, "haf_fyp")
     ranker()
     del installer.notices[:]
@@ -116,13 +117,13 @@ def test_an_install_cannot_run_under_the_ranker(ranker, installer):
     assert any("held by haf_fyp_ranker (pid=" in n for n in installer.notices), installer.notices
 
 
-def test_nor_blocks_installs_of_the_apps_it_only_reads(ranker, installer):
+def test_nor_blocks_installs_of_the_apps_it_only_reads(ranker, installer) -> None:
     ranker()
     for name in ("hivesense", "reputation_tracker", "hivemind", "balance_tracker"):
         assert install_lock_free(installer, name), name
 
 
-def test_the_lock_outlives_rollbacks_and_ends_with_the_session(ranker, installer):
+def test_the_lock_outlives_rollbacks_and_ends_with_the_session(ranker, installer) -> None:
     """main()'s error paths roll back (_safe_rollback); that must not release it."""
     conn = ranker()
     with conn.cursor() as cur:
@@ -133,13 +134,13 @@ def test_the_lock_outlives_rollbacks_and_ends_with_the_session(ranker, installer
     assert eventually_free(installer, "haf_fyp")
 
 
-def test_the_session_checks_for_a_vanished_client(ranker):
+def test_the_session_checks_for_a_vanished_client(ranker) -> None:
     with ranker().cursor() as cur:
         cur.execute("SHOW client_connection_check_interval")
         assert cur.fetchone()[0] == "5s"
 
 
-def test_a_ranker_started_mid_install_waits_for_it(ranker, installer):
+def test_a_ranker_started_mid_install_waits_for_it(ranker, installer) -> None:
     """Started while an install holds the lock, _connect() must not return -- and must
     return once the install lets go."""
     # Polled: the previous test's session may not have been released yet.
@@ -153,7 +154,7 @@ def test_a_ranker_started_mid_install_waits_for_it(ranker, installer):
         time.sleep(0.05)
     result = {}
 
-    def start():
+    def start() -> None:
         try:
             result["conn"] = ranker()
         except BaseException as exc:  # noqa: BLE001 - reported by the assertions below
@@ -188,7 +189,7 @@ with conn.cursor() as cur:
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX signals")
-def test_a_stopped_ranker_releases_the_lock_at_once(installer):
+def test_a_stopped_ranker_releases_the_lock_at_once(installer) -> None:
     """`docker stop` mid-statement: the handler cancels the statement and exits, so the
     lock is gone within a moment -- not after client_connection_check_interval (5s),
     which is all a plain kill gets. An install started right after the stop, as

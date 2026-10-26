@@ -10,6 +10,7 @@ import psycopg2
 import pytest
 
 from haf_fyp import ranker_daemon as rd
+from pytest import LogCaptureFixture, MonkeyPatch
 
 
 def _mock_conn(has_lock_functions=True):
@@ -27,7 +28,7 @@ def _sql(cur):
     return [c.args[0] for c in cur.execute.call_args_list]
 
 
-def test_takes_the_shared_lock_on_haf_fyp_and_commits():
+def test_takes_the_shared_lock_on_haf_fyp_and_commits() -> None:
     conn, cur = _mock_conn()
     rd._take_app_locks(conn)
     acquire = [c for c in cur.execute.call_args_list
@@ -37,13 +38,13 @@ def test_takes_the_shared_lock_on_haf_fyp_and_commits():
     conn.commit.assert_called_once()
 
 
-def test_only_haf_fyp():
+def test_only_haf_fyp() -> None:
     """hivesense_app and reptracker_app are optional signals: locking them would make
     their installs skip while haf_fyp's ranker runs, for nothing."""
     assert rd.APP_LOCKS == ["haf_fyp"]
 
 
-def test_the_session_notices_a_vanished_client():
+def test_the_session_notices_a_vanished_client() -> None:
     """Set BEFORE the lock is asked for: a ranker killed while waiting for an install
     must not leave a session that goes on to take the lock and keep it."""
     conn, cur = _mock_conn()
@@ -54,7 +55,7 @@ def test_the_session_notices_a_vanished_client():
     assert interval < locked
 
 
-def test_the_session_is_named_before_the_lock_is_taken():
+def test_the_session_is_named_before_the_lock_is_taken() -> None:
     """HAF's refusal names holders by application_name; set after the lock, a refusal in
     between would name a blank."""
     conn, cur = _mock_conn()
@@ -67,7 +68,7 @@ def test_the_session_is_named_before_the_lock_is_taken():
     assert named < locked
 
 
-def test_a_haf_without_the_lock_functions_runs_unlocked_with_a_warning(caplog):
+def test_a_haf_without_the_lock_functions_runs_unlocked_with_a_warning(caplog: LogCaptureFixture) -> None:
     """HAF 1.28.7 has no app_locks.sql: nothing to take and nobody to respect it."""
     conn, cur = _mock_conn(has_lock_functions=False)
     with caplog.at_level(logging.WARNING, logger=rd.log.name):
@@ -82,7 +83,7 @@ def test_a_haf_without_the_lock_functions_runs_unlocked_with_a_warning(caplog):
     psycopg2.errors.RaiseException("an error HAF's function raised"),
     psycopg2.OperationalError("server closed the connection unexpectedly"),
 ])
-def test_a_lock_that_cannot_be_taken_is_retried_on_a_new_connection(monkeypatch, error):
+def test_a_lock_that_cannot_be_taken_is_retried_on_a_new_connection(monkeypatch: MonkeyPatch, error) -> None:
     """Fail closed: never return a connection that does not hold the lock. The failed one
     is closed, so a half-set-up session does not linger."""
     bad, bad_cur = _mock_conn()
@@ -102,7 +103,7 @@ def test_a_lock_that_cannot_be_taken_is_retried_on_a_new_connection(monkeypatch,
     assert any("acquire_app_block_processor_locks(%s)" in s for s in _sql(good_cur))
 
 
-def test_every_connection_takes_the_lock(monkeypatch):
+def test_every_connection_takes_the_lock(monkeypatch: MonkeyPatch) -> None:
     """main() reconnects through _connect(); a new session holds nothing until it asks."""
     conn, cur = _mock_conn()
     monkeypatch.setattr(rd, "_current_conn", None)
@@ -113,7 +114,7 @@ def test_every_connection_takes_the_lock(monkeypatch):
     assert any("acquire_app_block_processor_locks(%s)" in s for s in _sql(cur))
 
 
-def test_every_connection_sets_the_read_filter_before_any_read_is_handled(monkeypatch):
+def test_every_connection_sets_the_read_filter_before_any_read_is_handled(monkeypatch: MonkeyPatch) -> None:
     """main() handles reads before its first cycle: the filter must be set by then (#84)."""
     conn, _cur = _mock_conn()
     order = []
@@ -133,7 +134,7 @@ class _Exited(Exception):
     pass
 
 
-def _no_exit(monkeypatch):
+def _no_exit(monkeypatch: MonkeyPatch):
     codes = []
 
     def fake_exit(code):
@@ -144,7 +145,7 @@ def _no_exit(monkeypatch):
     return codes
 
 
-def test_sigterm_cancels_the_running_statement_then_exits(monkeypatch):
+def test_sigterm_cancels_the_running_statement_then_exits(monkeypatch: MonkeyPatch) -> None:
     conn, _ = _mock_conn()
     conn.closed = 0
     monkeypatch.setattr(rd, "_current_conn", conn)
@@ -155,7 +156,7 @@ def test_sigterm_cancels_the_running_statement_then_exits(monkeypatch):
     assert codes == [0]
 
 
-def test_sigterm_exits_even_when_the_cancel_fails(monkeypatch):
+def test_sigterm_exits_even_when_the_cancel_fails(monkeypatch: MonkeyPatch) -> None:
     conn, _ = _mock_conn()
     conn.closed = 0
     conn.cancel.side_effect = psycopg2.OperationalError("socket gone")
@@ -166,7 +167,7 @@ def test_sigterm_exits_even_when_the_cancel_fails(monkeypatch):
     assert codes == [0]
 
 
-def test_sigterm_exits_even_when_logging_fails(monkeypatch):
+def test_sigterm_exits_even_when_logging_fails(monkeypatch: MonkeyPatch) -> None:
     conn, _ = _mock_conn()
     conn.closed = 0
     monkeypatch.setattr(rd, "_current_conn", conn)
@@ -177,7 +178,7 @@ def test_sigterm_exits_even_when_logging_fails(monkeypatch):
     assert codes == [0]
 
 
-def test_sigterm_before_any_connection_just_exits(monkeypatch):
+def test_sigterm_before_any_connection_just_exits(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "_current_conn", None)
     codes = _no_exit(monkeypatch)
     with pytest.raises(_Exited):
@@ -185,7 +186,7 @@ def test_sigterm_before_any_connection_just_exits(monkeypatch):
     assert codes == [0]
 
 
-def test_the_stop_handler_can_run_mid_statement():
+def test_the_stop_handler_can_run_mid_statement() -> None:
     """Installed for SIGTERM, and psycopg2 waits in Python (select) rather than inside
     libpq -- otherwise the handler would not run until the statement had finished."""
     import signal
@@ -208,7 +209,7 @@ def test_the_stop_handler_can_run_mid_statement():
         psycopg2.extensions.set_wait_callback(old_wait)
 
 
-def test_connect_records_the_session_before_taking_the_lock(monkeypatch):
+def test_connect_records_the_session_before_taking_the_lock(monkeypatch: MonkeyPatch) -> None:
     """So a stop during the wait for an install cancels that wait."""
     conn, cur = _mock_conn()
     seen = []
@@ -220,7 +221,7 @@ def test_connect_records_the_session_before_taking_the_lock(monkeypatch):
     assert seen and all(c is conn for c in seen)
 
 
-def test_reconnect_closes_the_old_session_first(monkeypatch):
+def test_reconnect_closes_the_old_session_first(monkeypatch: MonkeyPatch) -> None:
     """A cancelled statement or a deadlock raises OperationalError on a session that is
     still up -- and still holds the lock."""
     old, _ = _mock_conn()
@@ -232,7 +233,7 @@ def test_reconnect_closes_the_old_session_first(monkeypatch):
     assert order == ["close", "connect"]
 
 
-def test_reconnect_survives_an_old_session_that_will_not_close(monkeypatch):
+def test_reconnect_survives_an_old_session_that_will_not_close(monkeypatch: MonkeyPatch) -> None:
     old, _ = _mock_conn()
     old.close.side_effect = psycopg2.InterfaceError("already closed")
     new, _ = _mock_conn()
@@ -240,7 +241,7 @@ def test_reconnect_survives_an_old_session_that_will_not_close(monkeypatch):
     assert rd._reconnect(old) is new
 
 
-def test_main_reconnects_only_through_reconnect():
+def test_main_reconnects_only_through_reconnect() -> None:
     """Every `conn = ...` in main() after the first goes through _reconnect(), so none
     replaces a live session without closing it."""
     import inspect
@@ -251,7 +252,7 @@ def test_main_reconnects_only_through_reconnect():
     assert assigns[1:] and all(a == "conn = _reconnect(conn)" for a in assigns[1:]), assigns
 
 
-def test_main_can_be_stopped_before_it_first_connects():
+def test_main_can_be_stopped_before_it_first_connects() -> None:
     """The first _connect() can wait out an install for minutes; the handler must already
     be in place, or Python as PID 1 ignores `docker stop` until the 10s kill."""
     import inspect
@@ -263,7 +264,7 @@ def test_main_can_be_stopped_before_it_first_connects():
 # --- the schema version (#97) -------------------------------------------------------
 
 
-def test_a_ranker_on_older_sql_exits_with_one_error_and_does_not_retry(monkeypatch, caplog):
+def test_a_ranker_on_older_sql_exits_with_one_error_and_does_not_retry(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     """Retrying cannot make the schema newer: the ranker exits, with one ERROR naming the
     versions and what to do, and closes the session that holds the lock."""
     conn, _ = _mock_conn()
@@ -280,7 +281,7 @@ def test_a_ranker_on_older_sql_exits_with_one_error_and_does_not_retry(monkeypat
     conn.close.assert_called_once()
 
 
-def test_the_schema_is_checked_after_the_lock(monkeypatch):
+def test_the_schema_is_checked_after_the_lock(monkeypatch: MonkeyPatch) -> None:
     """An install that holds HAF's lock has finished by the time the ranker has it, so
     what the check reads is what that install left."""
     conn, _ = _mock_conn()

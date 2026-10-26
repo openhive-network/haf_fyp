@@ -64,7 +64,7 @@ def conn():
     c.close()
 
 
-def _cache(cur, post_id, *, in_window):
+def _cache(cur, post_id, *, in_window) -> None:
     # rank is deliberately NOT equal to post_id. An earlier version of this helper
     # used the post_id for both, which made `ON p.post_id = g.rank` -- a plausible
     # copy-paste error, and one this file's docstring claims to catch -- survive all
@@ -88,19 +88,19 @@ def _cache(cur, post_id, *, in_window):
     )
 
 
-def test_empty_cache_is_neither_cached_nor_servable(conn):
+def test_empty_cache_is_neither_cached_nor_servable(conn) -> None:
     # A node whose ranker has not completed a cycle. Empty, but not faulty -- the
     # report turns this pair into the one feeds_empty state that does not page.
     assert fetch_feed_servability(conn) == {"cached": False, "servable": False}
 
 
-def test_a_post_in_the_window_is_servable(conn):
+def test_a_post_in_the_window_is_servable(conn) -> None:
     with conn.cursor() as cur:
         _cache(cur, 1, in_window=True)
     assert fetch_feed_servability(conn) == {"cached": True, "servable": True}
 
 
-def test_cached_but_all_out_of_the_window_is_the_failure_case(conn):
+def test_cached_but_all_out_of_the_window_is_the_failure_case(conn) -> None:
     # THE case #43 exists for, and the one no privilege probe can see: the rows are
     # there, every relation is readable, and not one is a post the node still has.
     with conn.cursor() as cur:
@@ -109,7 +109,7 @@ def test_cached_but_all_out_of_the_window_is_the_failure_case(conn):
     assert fetch_feed_servability(conn) == {"cached": True, "servable": False}
 
 
-def test_one_post_in_the_window_among_stale_ones_is_enough(conn):
+def test_one_post_in_the_window_among_stale_ones_is_enough(conn) -> None:
     # servable is EXISTS, not a ratio: the feed is degraded but not empty, and the
     # check must not escalate "mostly broken" to "serving nothing".
     with conn.cursor() as cur:
@@ -119,7 +119,7 @@ def test_one_post_in_the_window_among_stale_ones_is_enough(conn):
     assert fetch_feed_servability(conn) == {"cached": True, "servable": True}
 
 
-def test_the_two_columns_are_not_transposed(conn):
+def test_the_two_columns_are_not_transposed(conn) -> None:
     # Pins column ORDER, which no mocked test can: transposing them in the SELECT
     # list makes a cached-but-stale node report cached=false/servable=true, which the
     # report reads as `serving`. A total outage would read healthy.
@@ -130,7 +130,7 @@ def test_the_two_columns_are_not_transposed(conn):
     assert out["servable"] is False, "second column must be `servable`"
 
 
-def test_a_candidate_with_no_cache_row_does_not_make_the_node_servable(conn):
+def test_a_candidate_with_no_cache_row_does_not_make_the_node_servable(conn) -> None:
     # Pins the join direction. Candidates that are not in the global feed cache are
     # irrelevant to whether the cache can serve anything.
     with conn.cursor() as cur:
@@ -140,7 +140,7 @@ def test_a_candidate_with_no_cache_row_does_not_make_the_node_servable(conn):
     assert fetch_feed_servability(conn) == {"cached": False, "servable": False}
 
 
-def test_the_query_does_not_depend_on_search_path(conn):
+def test_the_query_does_not_depend_on_search_path(conn) -> None:
     # /metrics runs on a pooled connection whose search_path is whatever the app or
     # a previous borrower left. Both relations are schema-qualified; this proves it
     # rather than assuming, by running under a search_path that contains neither.

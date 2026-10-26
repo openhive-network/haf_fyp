@@ -49,7 +49,7 @@ def conn():
     c.close()
 
 
-def _candidate(cur, post_id, *, days_ago):
+def _candidate(cur, post_id, *, days_ago) -> None:
     """A candidate's post_id is hivemind's (#97), the id HiveSense stores embeddings under."""
     cur.execute(
         """
@@ -60,7 +60,7 @@ def _candidate(cur, post_id, *, days_ago):
     )
 
 
-def _embed(cur, post_id, chunks=1):
+def _embed(cur, post_id, chunks=1) -> None:
     for ch in range(chunks):
         cur.execute(
             "INSERT INTO hivesense_app.posts_vectors (post_id, chunk_number) VALUES (%s, %s)",
@@ -80,7 +80,7 @@ def _coverage(cur, days_ago):
     return cur.fetchone()
 
 
-def test_counts_candidates_and_embedded(conn):
+def test_counts_candidates_and_embedded(conn) -> None:
     with conn.cursor() as cur:
         # Day 3d ago: 3 candidates, 2 embedded (one of them multi-chunk → counts once).
         _candidate(cur, 101, days_ago=3)
@@ -95,7 +95,7 @@ def test_counts_candidates_and_embedded(conn):
         assert _coverage(cur, 3) == (3, 2), "3 candidates, 2 embedded (chunks folded)"
 
 
-def test_window_bound_excludes_old_days(conn):
+def test_window_bound_excludes_old_days(conn) -> None:
     with conn.cursor() as cur:
         _candidate(cur, 201, days_ago=2)
         _candidate(cur, 202, days_ago=40)  # outside a 14-day window
@@ -107,7 +107,7 @@ def test_window_bound_excludes_old_days(conn):
         assert _coverage(cur, 40) is None, "days older than the window are not rolled up"
 
 
-def test_idempotent_upsert(conn):
+def test_idempotent_upsert(conn) -> None:
     with conn.cursor() as cur:
         _candidate(cur, 301, days_ago=1)
         cur.execute("SELECT haf_fyp_app.refresh_embedding_coverage(14)")

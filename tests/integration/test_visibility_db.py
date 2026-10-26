@@ -86,26 +86,26 @@ def _hivemind_exists(cur):
     return cur.fetchone()[0]
 
 
-def test_the_reader_hides_its_own_mutes_and_those_of_the_lists_it_follows(conn):
+def test_the_reader_hides_its_own_mutes_and_those_of_the_lists_it_follows(conn) -> None:
     assert visibility.muted_authors(conn, "reader") == {"mutedbyreader", "mutedbylist", "listkeeperalso"}
 
 
-def test_a_list_is_followed_one_way(conn):
+def test_a_list_is_followed_one_way(conn) -> None:
     # The stranger follows the reader's list, so the stranger hides the reader's mute
     # as well as its own; the reader hides nothing of the stranger's.
     assert visibility.muted_authors(conn, "stranger") == {"mutedbystranger", "mutedbyreader"}
     assert "mutedbystranger" not in visibility.muted_authors(conn, "reader")
 
 
-def test_a_blacklist_is_not_a_mute(conn):
+def test_a_blacklist_is_not_a_mute(conn) -> None:
     assert "blacklisted.one" not in visibility.muted_authors(conn, "reader")
 
 
-def test_an_account_hivemind_does_not_know_hides_nothing(conn):
+def test_an_account_hivemind_does_not_know_hides_nothing(conn) -> None:
     assert visibility.muted_authors(conn, "nobody") == set()
 
 
-def test_only_posts_and_authors_their_community_muted_are_left_out(conn):
+def test_only_posts_and_authors_their_community_muted_are_left_out(conn) -> None:
     """Post ids are hivemind's (#97): the read is of hive_posts alone."""
     with conn.cursor() as cur:
         # 501 ordinary; 502 muted by a moderator; 503 and 504 by author 20, who is muted
@@ -118,7 +118,7 @@ def test_only_posts_and_authors_their_community_muted_are_left_out(conn):
     assert visibility.community_muted_post_ids(conn, [501, 504]) == set()
 
 
-def test_without_hivemind_the_reads_filter_nothing_and_the_session_carries_on(conn):
+def test_without_hivemind_the_reads_filter_nothing_and_the_session_carries_on(conn) -> None:
     with conn.cursor() as cur:
         cur.execute("DROP TABLE hivemind_app.muted")
     visibility._warned.clear()

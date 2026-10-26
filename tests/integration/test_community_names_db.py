@@ -138,7 +138,7 @@ _next_id = iter(range(1, 100_000))
 
 
 def custom_json(cur, payload, *, posting=("mallory",), active=(), json_id="community",
-                block=BLOCK, op_type=CUSTOM_JSON, op_id=None):
+                block=BLOCK, op_type=CUSTOM_JSON, op_id=None) -> None:
     """A custom_json as the chain stores it: `json` is a STRING holding the payload.
 
     Ids rise in the order the helpers are called, as HAF's rise along the chain; op_id
@@ -150,7 +150,7 @@ def custom_json(cur, payload, *, posting=("mallory",), active=(), json_id="commu
                 (next(_next_id) if op_id is None else op_id, block, op_type, json.dumps(body)))
 
 
-def community_op(cur, user, action, community, **kwargs):
+def community_op(cur, user, action, community, **kwargs) -> None:
     custom_json(cur, json.dumps([action, {"community": community}]), posting=(user,), **kwargs)
 
 
@@ -159,7 +159,7 @@ def subscriptions(cur) -> set:
     return set(cur.fetchall())
 
 
-def run(cur, function, first=BLOCK, last=BLOCK):
+def run(cur, function, first=BLOCK, last=BLOCK) -> None:
     """Stage the range as process_block_range does, then run one processor over it."""
     cur.execute("SELECT haf_fyp_app.stage_operations(%s, %s)", (first, last))
     cur.execute(f"SELECT haf_fyp_app.{function}(%s, %s)", (first, last))
@@ -198,7 +198,7 @@ LENIENT_READINGS = [0, 12, 95, 12345, 123456, 1234567890]
     ("hive-123456", 123456),
     ("hive-999999999", 999999999),         # nine digits: the widest that always fits
 ])
-def test_a_well_formed_name_maps_to_its_number(conn, name, expected):
+def test_a_well_formed_name_maps_to_its_number(conn, name, expected) -> None:
     with conn.cursor() as cur:
         cur.execute("SELECT haf_fyp_app.community_id_from_name(%s)", (name,))
         assert cur.fetchone()[0] == expected
@@ -206,7 +206,7 @@ def test_a_well_formed_name_maps_to_its_number(conn, name, expected):
 
 @pytest.mark.parametrize(
     "value", [v for v in NOT_A_COMMUNITY_NAME if v is None or isinstance(v, str)], ids=repr)
-def test_anything_else_maps_to_null_and_never_raises(conn, value):
+def test_anything_else_maps_to_null_and_never_raises(conn, value) -> None:
     with conn.cursor() as cur:
         cur.execute("SELECT haf_fyp_app.community_id_from_name(%s)", (value,))
         assert cur.fetchone()[0] is None
@@ -214,7 +214,7 @@ def test_anything_else_maps_to_null_and_never_raises(conn, value):
 
 # --- subscribe ---------------------------------------------------------------------
 
-def test_subscribe_skips_malformed_names_and_keeps_the_rest_of_the_batch(conn):
+def test_subscribe_skips_malformed_names_and_keeps_the_rest_of_the_batch(conn) -> None:
     """One bad op must not cost the batch its good ones, and must not raise: a raise is
     what stalled the sync."""
     with conn.cursor() as cur:
@@ -228,7 +228,7 @@ def test_subscribe_skips_malformed_names_and_keeps_the_rest_of_the_batch(conn):
         assert subscriptions(cur) == {("alice", 123456), ("bob", 999999999)}
 
 
-def test_subscribing_again_is_not_an_error(conn):
+def test_subscribing_again_is_not_an_error(conn) -> None:
     """Twice in one range, and once more for a row an earlier range already wrote. A
     unique violation here stalls the sync exactly as the cast did."""
     with conn.cursor() as cur:
@@ -246,7 +246,7 @@ def test_subscribing_again_is_not_an_error(conn):
         assert dict(cur.fetchall()) == {"alice": True, "carol": False}
 
 
-def test_a_community_op_signed_with_the_active_key_is_skipped(conn):
+def test_a_community_op_signed_with_the_active_key_is_skipped(conn) -> None:
     """No posting auth, so no username: skipped, not inserted as NULL."""
     with conn.cursor() as cur:
         custom_json(cur, json.dumps(["subscribe", {"community": "hive-123456"}]),
@@ -258,7 +258,7 @@ def test_a_community_op_signed_with_the_active_key_is_skipped(conn):
         assert subscriptions(cur) == {("bob", 123456)}
 
 
-def test_only_subscribe_ops_of_the_community_protocol_in_range_subscribe(conn):
+def test_only_subscribe_ops_of_the_community_protocol_in_range_subscribe(conn) -> None:
     with conn.cursor() as cur:
         name = {"community": "hive-123456"}
         community_op(cur, "wrongid", "subscribe", "hive-123456", json_id="follow")
@@ -277,7 +277,7 @@ def test_only_subscribe_ops_of_the_community_protocol_in_range_subscribe(conn):
         assert subscriptions(cur) == {("alice", 123456)}
 
 
-def test_a_range_of_several_blocks_is_processed_whole(conn):
+def test_a_range_of_several_blocks_is_processed_whole(conn) -> None:
     with conn.cursor() as cur:
         cur.execute("INSERT INTO haf_fyp_app.user_communities VALUES "
                     "('x', 777, now()), ('y', 777, now()), ('z', 777, now())")
@@ -293,7 +293,7 @@ def test_a_range_of_several_blocks_is_processed_whole(conn):
 
 # --- unsubscribe -------------------------------------------------------------------
 
-def test_unsubscribe_removes_only_what_a_well_formed_name_names(conn):
+def test_unsubscribe_removes_only_what_a_well_formed_name_names(conn) -> None:
     """mallory holds every community a lenient reading of the junk would arrive at. The
     junk must remove none of them; the one well-formed op removes exactly its own."""
     with conn.cursor() as cur:
@@ -310,7 +310,7 @@ def test_unsubscribe_removes_only_what_a_well_formed_name_names(conn):
         assert subscriptions(cur) == {("mallory", c) for c in LENIENT_READINGS} | {("bob", 777)}
 
 
-def test_only_unsubscribe_ops_of_the_community_protocol_in_range_unsubscribe(conn):
+def test_only_unsubscribe_ops_of_the_community_protocol_in_range_unsubscribe(conn) -> None:
     with conn.cursor() as cur:
         users = ("wrongid", "wrongop", "before", "after", "joining", "alice")
         for user in users:
@@ -335,7 +335,7 @@ def test_only_unsubscribe_ops_of_the_community_protocol_in_range_unsubscribe(con
 
 # --- the dispatcher process_block_range calls --------------------------------------
 
-def test_the_dispatcher_runs_both(conn):
+def test_the_dispatcher_runs_both(conn) -> None:
     with conn.cursor() as cur:
         cur.execute("INSERT INTO haf_fyp_app.user_communities VALUES ('bob', 123456, now())")
         community_op(cur, "alice", "subscribe", "hive-123456")
@@ -377,7 +377,7 @@ SEQUENCES = [
 
 @pytest.mark.parametrize("spread", ["one block", "several blocks"])
 @pytest.mark.parametrize("before, ops, after", SEQUENCES, ids=lambda v: str(v))
-def test_the_last_operation_in_the_range_decides(conn, before, ops, after, spread):
+def test_the_last_operation_in_the_range_decides(conn, before, ops, after, spread) -> None:
     """Until #82 every subscribe was applied and then every unsubscribe, so 'US' ended
     unsubscribed. One block or several: the range is one batch either way."""
     with conn.cursor() as cur:
@@ -407,7 +407,7 @@ def test_the_last_operation_in_the_range_decides(conn, before, ops, after, sprea
             assert rows == [BLOCK_TIMES[blocks[first]]]
 
 
-def test_last_means_last_on_the_chain_not_last_in_the_table(conn):
+def test_last_means_last_on_the_chain_not_last_in_the_table(conn) -> None:
     """The order is the operation id's. Rows are written here newest first, so a
     processor that took the order the table happens to return would get both wrong.
     (All four are in one block: that the id, not the block, breaks a tie is the 'USUS'
@@ -426,7 +426,7 @@ def test_last_means_last_on_the_chain_not_last_in_the_table(conn):
         assert subscriptions(cur) == {("alice", 123456)}
 
 
-def test_only_the_same_user_and_community_can_have_the_last_word(conn):
+def test_only_the_same_user_and_community_can_have_the_last_word(conn) -> None:
     """alice's final subscribe to 123456 is followed by things that are not about that
     pair: another user, another community, a name that is not one, an op with no posting
     auth, another protocol. None of them is her last operation on 123456."""
@@ -453,7 +453,7 @@ def joined(cur) -> dict:
     return {(u, c): at for u, c, at in cur.fetchall()}
 
 
-def test_each_pair_is_dated_by_its_own_operations(conn):
+def test_each_pair_is_dated_by_its_own_operations(conn) -> None:
     """Two users on one community and one user on two, interleaved across three blocks.
     Each row's time comes from that pair's own first subscribe after its own last
     unsubscribe, not from a neighbour's."""
@@ -478,7 +478,7 @@ def test_each_pair_is_dated_by_its_own_operations(conn):
         }
 
 
-def test_the_range_gives_each_pair_exactly_one_row(conn):
+def test_the_range_gives_each_pair_exactly_one_row(conn) -> None:
     """What both steps read: one row per pair is the function's contract. Compared as a
     list, not a set, so a second row for a pair shows."""
     with conn.cursor() as cur:
@@ -505,7 +505,7 @@ def test_the_range_gives_each_pair_exactly_one_row(conn):
         ]
 
 
-def test_the_account_is_the_first_posting_auth(conn):
+def test_the_account_is_the_first_posting_auth(conn) -> None:
     with conn.cursor() as cur:
         # First by position, not by name: "zed" sorts after "alice".
         custom_json(cur, json.dumps(["subscribe", {"community": "hive-123456"}]),
@@ -522,7 +522,7 @@ def test_the_account_is_the_first_posting_auth(conn):
     # removed. That is why the dispatcher's order is fixed, and what this pins.
     (("process_subscribe", "process_unsubscribe"), {("joiner", 123456)}),
 ], ids=["as the dispatcher calls them", "the other way round"])
-def test_the_two_steps_agree_on_every_pair_but_their_order_matters(conn, order, expected):
+def test_the_two_steps_agree_on_every_pair_but_their_order_matters(conn, order, expected) -> None:
     """Both steps read the pair's ONE outcome: leaver and passer end unsubscribed and
     only the unsubscribe step touches them, joiner ends subscribed and only the
     subscribe step does. The returning user needs both, in the dispatcher's order. The
@@ -560,7 +560,7 @@ def test_the_two_steps_agree_on_every_pair_but_their_order_matters(conn, order, 
     '{action} hive-123456',                 # not JSON at all
     '',
 ], ids=repr)
-def test_a_payload_of_the_wrong_shape_changes_nothing(conn, action, payload):
+def test_a_payload_of_the_wrong_shape_changes_nothing(conn, action, payload) -> None:
     """eve holds 777 and sends the junk. A lenient subscribe would add (eve, 123456); a
     lenient unsubscribe is tried against a row she does hold, below."""
     with conn.cursor() as cur:

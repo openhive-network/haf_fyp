@@ -73,7 +73,7 @@ def conn():
 # --------------------------------------------------------------------------
 
 
-def _active_user(cur, name, *, interacted=None, scored=None):
+def _active_user(cur, name, *, interacted=None, scored=None) -> None:
     def ago(v):
         return "NULL" if v is None else f"now() - INTERVAL '{v}'"
 
@@ -87,7 +87,7 @@ def _active_user(cur, name, *, interacted=None, scored=None):
     )
 
 
-def _interest(cur, name, community_id=1):
+def _interest(cur, name, community_id=1) -> None:
     cur.execute(
         "INSERT INTO haf_fyp_app.user_interests VALUES (%s, %s, 1.0, now())",
         (name, community_id),
@@ -111,7 +111,7 @@ def _evict(cur, ceiling=1000):
 # --------------------------------------------------------------------------
 
 
-def test_evict_never_touches_a_user_with_declared_interests(conn):
+def test_evict_never_touches_a_user_with_declared_interests(conn) -> None:
     """THE #9 INVARIANT. An opted-in account has no automatic way back into the
     rotation — process_interactions only fires on-chain, the interests endpoint only
     on a NEW opt-in — so evicting one strands it on the global feed permanently.
@@ -123,7 +123,7 @@ def test_evict_never_touches_a_user_with_declared_interests(conn):
         assert _present(cur, "optedin_old")
 
 
-def test_evict_keeps_never_scored_users(conn):
+def test_evict_keeps_never_scored_users(conn) -> None:
     """A fresh opt-in awaiting its first rank. Also the opt-in race guard: the API
     inserts this row from another process, so it must survive a pass landing between
     the insert and the first ranking."""
@@ -133,7 +133,7 @@ def test_evict_keeps_never_scored_users(conn):
         assert _present(cur, "newbie")
 
 
-def test_evict_keeps_users_who_still_interact(conn):
+def test_evict_keeps_users_who_still_interact(conn) -> None:
     with conn.cursor() as cur:
         _active_user(cur, "recent_voter", interacted="10 days", scored="1 hour")
         assert _evict(cur) == 0
@@ -145,7 +145,7 @@ def test_evict_keeps_users_who_still_interact(conn):
 # --------------------------------------------------------------------------
 
 
-def test_evict_removes_an_opted_out_user_even_while_still_browsing(conn):
+def test_evict_removes_an_opted_out_user_even_while_still_browsing(conn) -> None:
     """The DELETE /v1/fyp/interests path. With neither interests nor interactions
     there is nothing to personalize from, so the slot only ever recomputes the global
     feed — which get_personalized_feed already serves. Re-added by a new opt-in."""
@@ -155,7 +155,7 @@ def test_evict_removes_an_opted_out_user_even_while_still_browsing(conn):
         assert not _present(cur, "unopted_in")
 
 
-def test_evict_deletes_feed_cache_in_the_same_pass(conn):
+def test_evict_deletes_feed_cache_in_the_same_pass(conn) -> None:
     """Leaving feed_cache behind is the #9 symptom: get_personalized_feed keeps
     serving a frozen personalized feed forever. Removing it drops the user through
     to the always-fresh global_feed_cache."""
@@ -171,7 +171,7 @@ def test_evict_deletes_feed_cache_in_the_same_pass(conn):
         assert [r[0] for r in cur.fetchall()] == ["stays"]
 
 
-def test_evict_respects_the_per_pass_ceiling(conn):
+def test_evict_respects_the_per_pass_ceiling(conn) -> None:
     with conn.cursor() as cur:
         for i in range(5):
             _active_user(cur, f"dead{i}", scored="1 hour")
@@ -181,7 +181,7 @@ def test_evict_respects_the_per_pass_ceiling(conn):
 
 
 @pytest.mark.parametrize("bad", [0, -5])
-def test_evict_rejects_a_nonpositive_ceiling(conn, bad):
+def test_evict_rejects_a_nonpositive_ceiling(conn, bad) -> None:
     """Zero/negative has no valid reading, and NULL would mean LIMIT NULL = no limit —
     the per-pass ceiling evaporating exactly when it is needed."""
     with conn.cursor() as cur, pytest.raises(psycopg2.errors.RaiseException):
@@ -197,7 +197,7 @@ def test_evict_rejects_a_nonpositive_ceiling(conn, bad):
 # --------------------------------------------------------------------------
 
 
-def test_evict_spares_an_account_that_opts_in_mid_pass(conn):
+def test_evict_spares_an_account_that_opts_in_mid_pass(conn) -> None:
     """ON CONFLICT DO NOTHING does not wait on the conflicting row, so an opt-in can
     commit while the eviction holds FOR UPDATE locks. The final DELETE re-states the
     full qualification under its own snapshot so such an account keeps its row (I1)."""
@@ -208,7 +208,7 @@ def test_evict_spares_an_account_that_opts_in_mid_pass(conn):
         assert _present(cur, "eve")
 
 
-def test_evict_rejects_a_null_ceiling(conn):
+def test_evict_rejects_a_null_ceiling(conn) -> None:
     """LIMIT NULL means NO LIMIT in Postgres. Unguarded, the per-pass ceiling —
     the one thing between a misconfigured horizon and an emptied rotation table —
     silently becomes unbounded."""
@@ -225,7 +225,7 @@ def test_evict_rejects_a_null_ceiling(conn):
 # --------------------------------------------------------------------------
 
 
-def _interaction(cur, name, post_id=1):
+def _interaction(cur, name, post_id=1) -> None:
     cur.execute(
         "INSERT INTO hivemind_app.hive_accounts (id, name) "
         "SELECT (SELECT coalesce(max(id), 0) + 1 FROM hivemind_app.hive_accounts), %s "
@@ -246,7 +246,7 @@ def _unsub(cur, names):
     return {r[0] for r in cur.fetchall()}
 
 
-def test_unsub_evicts_a_cleared_account_with_its_feed_and_vector(conn):
+def test_unsub_evicts_a_cleared_account_with_its_feed_and_vector(conn) -> None:
     """The account asked to be de-personalized, so unlike dormancy eviction the
     derived profile vector goes too — a surviving vector would silently
     re-personalize them if they ever re-entered the rotation."""
@@ -262,7 +262,7 @@ def test_unsub_evicts_a_cleared_account_with_its_feed_and_vector(conn):
         assert cur.fetchone()[0] == 0
 
 
-def test_unsub_keeps_an_account_that_still_has_interests(conn):
+def test_unsub_keeps_an_account_that_still_has_interests(conn) -> None:
     """I1 — the same #9 invariant the dormancy path honours."""
     with conn.cursor() as cur:
         _active_user(cur, "bob", scored="1 hour")
@@ -271,7 +271,7 @@ def test_unsub_keeps_an_account_that_still_has_interests(conn):
         assert _present(cur, "bob")
 
 
-def test_unsub_keeps_an_account_with_on_chain_history(conn):
+def test_unsub_keeps_an_account_with_on_chain_history(conn) -> None:
     """Membership came from process_interactions, not the picker."""
     with conn.cursor() as cur:
         _active_user(cur, "carol", scored="1 hour")
@@ -280,7 +280,7 @@ def test_unsub_keeps_an_account_with_on_chain_history(conn):
         assert _present(cur, "carol")
 
 
-def test_unsub_spares_collateral_for_an_account_it_does_not_evict(conn):
+def test_unsub_spares_collateral_for_an_account_it_does_not_evict(conn) -> None:
     """The old Python version deleted feed_cache and user_profile_vectors for every
     CANDIDATE before its (weaker) re-check, so an account the re-check spared lost
     both silently. Collateral is now driven by the DELETE's RETURNING."""
@@ -296,7 +296,7 @@ def test_unsub_spares_collateral_for_an_account_it_does_not_evict(conn):
         assert cur.fetchone()[0] == 1, "a spared account must keep its profile vector"
 
 
-def test_unsub_is_idempotent_and_tolerates_unknown_names(conn):
+def test_unsub_is_idempotent_and_tolerates_unknown_names(conn) -> None:
     with conn.cursor() as cur:
         _active_user(cur, "erin", scored="1 hour")
         assert _unsub(cur, ["erin"]) == {"erin"}
@@ -305,7 +305,7 @@ def test_unsub_is_idempotent_and_tolerates_unknown_names(conn):
         assert _unsub(cur, []) == set()
 
 
-def test_dormancy_and_unsub_agree_on_no_on_chain_history(conn):
+def test_dormancy_and_unsub_agree_on_no_on_chain_history(conn) -> None:
     """The two paths had drifted: dormancy case A trusted last_interaction_at while
     the un-opt-in probed user_interactions. A voter evicted by case B keeps their
     user_interactions rows, so on re-opt-in the API inserts active_users(username)
@@ -319,7 +319,7 @@ def test_dormancy_and_unsub_agree_on_no_on_chain_history(conn):
         assert _present(cur, "frank")
 
 
-def test_stale_interest_vector_is_dropped_for_an_interacted_user(conn):
+def test_stale_interest_vector_is_dropped_for_an_interacted_user(conn) -> None:
     """An account that cleared its picker but HAS on-chain history is deliberately
     not evicted — so eviction never touches its user_profile_vectors row, which was
     built from the communities it just deleted. _rank_user only overwrites that row
@@ -351,7 +351,7 @@ def test_stale_interest_vector_is_dropped_for_an_interacted_user(conn):
         assert _present(cur, "voter"), "but the account keeps its rotation row"
 
 
-def test_interaction_derived_vector_survives_interest_deletion(conn):
+def test_interaction_derived_vector_survives_interest_deletion(conn) -> None:
     """PROVENANCE, not mere absence of interests. posts_sampled > 0 means the vector
     was built from that many real interactions, so it is not interest-derived and must
     NOT be deleted — if current embeddings cannot rebuild it the stored fallback is
@@ -387,7 +387,7 @@ def _stranded(cur):
     return cur.fetchone()[0]
 
 
-def test_repair_restores_an_opt_in_stranded_by_the_race(conn):
+def test_repair_restores_an_opt_in_stranded_by_the_race(conn) -> None:
     """Before #10 nothing deleted from active_users, so the #9 invariant could not
     break. This change adds three delete paths and with them a race: a POST whose
     interests are still uncommitted when a maintenance pass evicts its rotation row.
@@ -406,7 +406,7 @@ def test_repair_restores_an_opt_in_stranded_by_the_race(conn):
         assert cur.fetchone()[0] is None
 
 
-def test_repair_never_resurrects_a_legitimately_evicted_account(conn):
+def test_repair_never_resurrects_a_legitimately_evicted_account(conn) -> None:
     """It runs immediately AFTER eviction in the same pass, so it must not undo it.
     Safe by construction: eviction removes accounts with NO interests, repair restores
     accounts WITH them — disjoint sets."""
@@ -418,7 +418,7 @@ def test_repair_never_resurrects_a_legitimately_evicted_account(conn):
         assert not _present(cur, "cleared"), "eviction must stand"
 
 
-def test_repair_is_idempotent(conn):
+def test_repair_is_idempotent(conn) -> None:
     with conn.cursor() as cur:
         _interest(cur, "stranded")
         cur.execute("SELECT haf_fyp_app.repair_stranded_optins()")
@@ -427,7 +427,7 @@ def test_repair_is_idempotent(conn):
         assert cur.fetchone()[0] == 0, "a second pass must find nothing to do"
 
 
-def test_eviction_then_repair_leaves_the_9_invariant_holding(conn):
+def test_eviction_then_repair_leaves_the_9_invariant_holding(conn) -> None:
     """The global invariant, asserted directly: after a full maintenance pass no
     account may hold interests without a rotation row."""
     with conn.cursor() as cur:
@@ -442,7 +442,7 @@ def test_eviction_then_repair_leaves_the_9_invariant_holding(conn):
         assert not _present(cur, "cleared")
 
 
-def test_sweep_deletes_the_bootstrapped_vector_so_a_reoptin_is_not_overridden(conn):
+def test_sweep_deletes_the_bootstrapped_vector_so_a_reoptin_is_not_overridden(conn) -> None:
     """LOST-REFRESH REGRESSION. If DELETE's Redis refresh is lost, the sweep removes
     the rotation row — and once it is gone nothing selects that username again
     (_fetch_personalised_users reads active_users), so the daemon reconcile can never
@@ -467,7 +467,7 @@ def test_sweep_deletes_the_bootstrapped_vector_so_a_reoptin_is_not_overridden(co
         assert cur.fetchone()[0] == 0, "_rank_user must bootstrap from the NEW communities"
 
 
-def test_sweep_keeps_an_interaction_derived_vector(conn):
+def test_sweep_keeps_an_interaction_derived_vector(conn) -> None:
     """posts_sampled > 0 means real interaction history, not an interest bootstrap."""
     with conn.cursor() as cur:
         _active_user(cur, "heavy", scored="1 hour")
@@ -480,7 +480,7 @@ def test_sweep_keeps_an_interaction_derived_vector(conn):
         assert cur.fetchone()[0] == 1
 
 
-def test_sweep_spares_the_vector_of_an_account_it_does_not_remove(conn):
+def test_sweep_spares_the_vector_of_an_account_it_does_not_remove(conn) -> None:
     """Vector deletion is driven by the DELETE's RETURNING, not the candidate list, so
     an account the re-qualification spares keeps everything."""
     with conn.cursor() as cur:
