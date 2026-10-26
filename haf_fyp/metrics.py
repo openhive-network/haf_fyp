@@ -45,6 +45,7 @@ from haf_fyp.credibility import (
     probe_credibility_sources,
     probe_relations,
 )
+from haf_fyp.scoring import FEED_CACHE_RANK_TYPE, FEED_CACHE_SHAPE_SQL
 
 log = logging.getLogger(__name__)
 
@@ -538,18 +539,24 @@ def fetch_credibility_sources(conn) -> dict | None:
 # from haf_fyp_app.active_users, so it needs nothing from the ranker process and says
 # what IS, not what a daemon that may have stopped last reported.
 #
-# Three figures depend on ranker settings this process is not given, so they are
+# Six figures depend on ranker settings this process is not given, so they are
 # computed with the settings' DEFAULTS and the report says which values it used:
 #   READER_WINDOW_SECONDS        -> READER_FIRST_WINDOW_SECONDS
 #       readers_in_window, readers_due, oldest_reader_feed_seconds
 #   READ_REFRESH_MIN_AGE_SECONDS -> READER_FIRST_DUE_AFTER_SECONDS
 #       readers_due
+#   FEED_CACHE_UNREAD_RETENTION_DAYS -> READER_FIRST_RETENTION_DAYS
+#       rotation_size, never_ranked, rotation_age_seconds: the rotation is the accounts
+#       the ranker ranks (#98), a read within that many days or interests, not every
+#       row of active_users. A drive-by voter is never ranked until it reads, so
+#       counting it would hold never_ranked above 0 and rotation_age rising for ever.
 # On a node that changed either, those three describe a lane the ranker does not run:
 # with a shorter window, accounts the ranker no longer treats as readers are counted
 # here, and their feeds are as old as the rotation. The same with READER_ACTIVE_WITHIN_DAYS
 # (#84) set: every recorded read is counted, including those that earned no slot.
 READER_FIRST_WINDOW_SECONDS = 24 * 60 * 60
 READER_FIRST_DUE_AFTER_SECONDS = 600
+READER_FIRST_RETENTION_DAYS = 30
 
 READER_FIRST_OK = "ok"
 READER_FIRST_UNSUPPORTED = "unsupported"
@@ -563,8 +570,9 @@ READER_FIRST_UNKNOWN = STATE_UNKNOWN
 # this route wait behind it, each holding one of the pool's five connections.
 _READER_FIRST_LOCK_TIMEOUT = "2s"
 
-# One pass over the rotation (one row per ranked account: 51 ms for 45,000 on a full
-# node). No index helps: the counts, the two MINs and the MAX need every row.
+# One pass over active_users (51 ms for 45,000 rows on a full node), hash-joined to the
+# accounts holding interests. No index helps: the counts, the two MINs and the MAX need
+# every row.
 #
 # last_scored_at and last_read_at are naive UTC, as the ranker writes them, so the
 # clock they are compared with is taken AT TIME ZONE 'utc'. It is the STATEMENT's
@@ -579,11 +587,19 @@ _READER_FIRST_LOCK_TIMEOUT = "2s"
 # under two exclusive lightweight locks, the same work a NOTIFY commit does now and
 # then. Microseconds, and fine at a monitor's rate; not something to call per request.
 _READER_FIRST_SQL = """
-WITH t AS (SELECT (statement_timestamp() AT TIME ZONE 'utc') AS now_utc)
+WITH t AS (SELECT (statement_timestamp() AT TIME ZONE 'utc') AS now_utc),
+rotation AS (
+    SELECT au.*,
+           (au.last_read_at >= (SELECT now_utc FROM t) - make_interval(days => %(retention)s)
+            OR ui.username IS NOT NULL) AS ranked
+      FROM haf_fyp_app.active_users au
+      LEFT JOIN (SELECT DISTINCT username FROM haf_fyp_app.user_interests) ui
+             ON ui.username = au.username
+)
 SELECT
-    COUNT(*),
-    COUNT(*) FILTER (WHERE au.last_scored_at IS NULL),
-    EXTRACT(EPOCH FROM (SELECT now_utc FROM t) - MIN(au.last_scored_at)),
+    COUNT(*) FILTER (WHERE au.ranked),
+    COUNT(*) FILTER (WHERE au.ranked AND au.last_scored_at IS NULL),
+    EXTRACT(EPOCH FROM (SELECT now_utc FROM t) - MIN(au.last_scored_at) FILTER (WHERE au.ranked)),
     EXTRACT(EPOCH FROM (SELECT now_utc FROM t) - MAX(au.last_scored_at)),
     COUNT(*) FILTER (WHERE au.last_read_at >= (SELECT now_utc FROM t) - make_interval(secs => %(window)s)),
     COUNT(*) FILTER (
@@ -593,7 +609,7 @@ SELECT
     EXTRACT(EPOCH FROM (SELECT now_utc FROM t) - MIN(au.last_scored_at) FILTER (
         WHERE au.last_read_at >= (SELECT now_utc FROM t) - make_interval(secs => %(window)s))),
     pg_notification_queue_usage()
-  FROM haf_fyp_app.active_users au
+  FROM rotation au
 """
 
 _READER_FIRST_SAVEPOINT = "haf_fyp_metrics_reader_first"
@@ -631,7 +647,8 @@ def fetch_reader_first(conn) -> dict | None:
                 cur.execute(f"SET LOCAL lock_timeout = '{_READER_FIRST_LOCK_TIMEOUT}'")
                 cur.execute(
                     _READER_FIRST_SQL,
-                    {"window": READER_FIRST_WINDOW_SECONDS, "due": READER_FIRST_DUE_AFTER_SECONDS},
+                    {"window": READER_FIRST_WINDOW_SECONDS, "due": READER_FIRST_DUE_AFTER_SECONDS,
+                     "retention": READER_FIRST_RETENTION_DAYS},
                 )
                 row = cur.fetchone()
             except Exception as exc:
@@ -702,8 +719,9 @@ def build_reader_first_report(probe: dict | None) -> dict:
           rotation takes now. Hours on a large node. It also grows without limit when
           ONE account fails to rank every cycle ("failed to rank user" in the ranker's
           log), so it is not the liveness figure; newest_feed_seconds is.
-      never_ranked -- accounts with no feed yet. They go first, so above 0 for more
-          than a few cycles means they are failing to rank, or nothing is ranking.
+      never_ranked -- accounts in the rotation with no feed yet. They go first, so above
+          0 for more than a few cycles means they are failing to rank, or nothing is
+          ranking. An account that has only voted is not in the rotation (#98).
       notification_queue_usage -- the fraction (0 to 1) of PostgreSQL's notification
           queue in use, cluster-wide. It grows only while some session that LISTENs,
           this app's or any other's, sits in a long transaction; at 1 every NOTIFY in
@@ -728,6 +746,7 @@ def build_reader_first_report(probe: dict | None) -> dict:
         "state": READER_FIRST_OK,
         "window_seconds": READER_FIRST_WINDOW_SECONDS,
         "due_after_seconds": READER_FIRST_DUE_AFTER_SECONDS,
+        "retention_days": READER_FIRST_RETENTION_DAYS,
         "readers_in_window": probe["readers_in_window"],
         "readers_due": probe["readers_due"],
         "oldest_reader_feed_seconds": probe["oldest_reader_feed_seconds"],
@@ -736,4 +755,63 @@ def build_reader_first_report(probe: dict | None) -> dict:
         "rotation_age_seconds": probe["rotation_age_seconds"],
         "newest_feed_seconds": probe["newest_feed_seconds"],
         "notification_queue_usage": probe["notification_queue_usage"],
+    }
+
+
+# ---------------------------------------------------------------------------------------
+# feed_cache: whether the installed table is the compact row the ranker writes (#98)
+# ---------------------------------------------------------------------------------------
+#
+# The SQL and the ranker image are upgraded separately. A ranker on SQL older than #98
+# refuses to rank and logs why; this section is where a monitor sees the same verdict.
+# The probe reads the catalog only, so it is the same answer the ranker gets.
+
+FEED_CACHE_OK = "ok"
+FEED_CACHE_OUTDATED = "outdated"
+FEED_CACHE_UNKNOWN = STATE_UNKNOWN
+
+
+def fetch_feed_cache_shape(conn) -> dict | None:
+    """
+    The installed feed_cache shape, or None if it could not be read.
+
+    Runs after reader_first, whose SAVEPOINT leaves the transaction usable, and is the
+    last read of the route: a failure here aborts nothing anybody reads afterwards.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(FEED_CACHE_SHAPE_SQL)
+            compact, rank_type, labels_present = cur.fetchone()
+        return {"compact": bool(compact), "rank": rank_type, "labels": bool(labels_present)}
+    except Exception as exc:
+        # As the sibling probes: no rollback (the pool does that), no exc_info.
+        log.warning("feed_cache: the installed shape could not be read (%s) -- reporting unknown", exc)
+        return None
+
+
+def build_feed_cache_report(probe: dict | None) -> dict:
+    """
+    The feed_cache section of GET /metrics.
+
+    `outdated` means the ranker is ranking nobody: the installed SQL predates the
+    compact feed_cache. It names what is installed against what is expected, and the
+    remedy. Sets no `degraded`, as reader_first: alert on the state.
+    """
+    if probe is None:
+        return {
+            "state": FEED_CACHE_UNKNOWN,
+            "detail": "the feed_cache shape could not be read; see the API log",
+        }
+    if probe["compact"]:
+        return {"state": FEED_CACHE_OK}
+    return {
+        "state": FEED_CACHE_OUTDATED,
+        "expected": {"rank": FEED_CACHE_RANK_TYPE, "feed_cache_labels": True},
+        "installed": {"rank": probe["rank"], "feed_cache_labels": probe["labels"]},
+        "detail": (
+            "haf_fyp_app.feed_cache predates the compact row the ranker writes, and the "
+            "ranker ranks nobody until it is upgraded. Re-run the install, with the block "
+            "processor and the ranker stopped (it is skipped while either holds HAF's "
+            "lock)."
+        ),
     }

@@ -310,6 +310,7 @@ services:
       EMBEDDING_COVERAGE_DAYS:
       ACTIVE_USERS_MAX_EVICTIONS:
       ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS:
+      FEED_CACHE_UNREAD_RETENTION_DAYS:
     depends_on:
       haf-fyp-setup:
         condition: service_completed_successfully

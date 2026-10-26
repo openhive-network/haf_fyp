@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 
 from tests.unit.shell_harness import clean_env, require_bash, write_exec
+from pytest import TempPathFactory
 
 try:
     import yaml
@@ -69,7 +70,7 @@ def services() -> dict:
 
 # --- the teardown must never start by accident ------------------------------------
 
-def test_the_uninstall_service_is_behind_a_profile(services):
+def test_the_uninstall_service_is_behind_a_profile(services) -> None:
     """Without `profiles:`, `docker compose up` runs the destructive teardown.
 
     Compose starts every service that has no profile. This one drops both schemas
@@ -82,7 +83,7 @@ def test_the_uninstall_service_is_behind_a_profile(services):
     )
 
 
-def test_no_other_service_is_profile_gated(services):
+def test_no_other_service_is_profile_gated(services) -> None:
     """The reason `run --rm` is documented instead of `--profile ... up`.
 
     Upstream profiles every app service, so `--profile x up` is safe there. Here only
@@ -95,7 +96,7 @@ def test_no_other_service_is_profile_gated(services):
     assert gated == [UNINSTALL], f"unexpected profile-gated services: {gated}"
 
 
-def test_the_teardown_runs_non_interactively(services):
+def test_the_teardown_runs_non_interactively(services) -> None:
     """Run from a terminal, `docker compose run` allocates a TTY, so without --force
     uninstall_app.sh stops at its type-the-database-name confirmation; with no TTY
     (`run -T`, CI, no terminal) it refuses.
@@ -109,7 +110,7 @@ def test_the_teardown_runs_non_interactively(services):
     ("service", "verb"),
     [(SETUP, "install_app"), (SYNC, "process_blocks"), (UNINSTALL, "uninstall_app")],
 )
-def test_services_invoke_the_entrypoint_verbs(services, service, verb):
+def test_services_invoke_the_entrypoint_verbs(services, service, verb) -> None:
     """Reverting these to /app/scripts/*.sh paths undoes the point of #27. The paths
     still WORK -- the entrypoint execs anything runnable -- so nothing else notices."""
     assert services[service]["command"][0] == verb
@@ -118,7 +119,7 @@ def test_services_invoke_the_entrypoint_verbs(services, service, verb):
 # --- block processing: its healthcheck, and what waits on it (#27) -----------------
 
 
-def test_the_block_processing_healthcheck_is_the_in_image_script(services):
+def test_the_block_processing_healthcheck_is_the_in_image_script(services) -> None:
     """Not a `psql -U haf_fyp_user -c 'SELECT 1'`: that proves only that PostgreSQL
     answers, and as a role that cannot see hafd.contexts rows, so any real check written
     that way reports unhealthy forever."""
@@ -126,7 +127,7 @@ def test_the_block_processing_healthcheck_is_the_in_image_script(services):
     assert test == ["CMD", "/app/block-processing-healthcheck.sh"], test
 
 
-def test_nothing_gates_on_block_processing_health(services):
+def test_nothing_gates_on_block_processing_health(services) -> None:
     """#27 changed what `healthy` MEANS for haf-fyp-sync, from `SELECT 1` to a committed
     block-processing iteration. Anything gated on service_healthy may then never start on
     a fresh node -- and `start_period: 72h` makes it worse, since the container reports
@@ -150,7 +151,7 @@ def test_nothing_gates_on_block_processing_health(services):
 
 
 @pytest.mark.parametrize("service", [SYNC, RANKER, API], ids=["sync", "ranker", "api"])
-def test_services_still_wait_for_the_install(services, service):
+def test_services_still_wait_for_the_install(services, service) -> None:
     """The relaxation above must not let anything start before the schemas exist. The
     gate on setup is what keeps that true, and it must stay
     service_completed_successfully -- service_started would release as soon as the
@@ -162,7 +163,7 @@ def test_services_still_wait_for_the_install(services, service):
 
 # --- CI assertions that cannot fail ------------------------------------------------
 
-def test_no_inverted_pipeline_assertions_in_ci():
+def test_no_inverted_pipeline_assertions_in_ci() -> None:
     """`! grep -q X file` can never fail a job: bash exempts a !-inverted pipeline from
     errexit, so what looks like an assertion is not one -- and nothing else in the repo
     would notice.
@@ -324,7 +325,7 @@ def early_exit_readers(ci_text: str) -> list[tuple[int, str, str]]:
     return found
 
 
-def test_no_early_exit_reader_after_a_pipe_in_ci():
+def test_no_early_exit_reader_after_a_pipe_in_ci() -> None:
     """`cmd | grep -q X` fails a job for having FOUND X: -q exits at its first match, a
     writer still streaming (the docker CLI in docker-build-sql's smoke step, job
     3337137) dies of SIGPIPE, and the runner's `pipefail` reports the pipeline as
@@ -377,7 +378,7 @@ def test_no_early_exit_reader_after_a_pipe_in_ci():
     "  - x | grep -q y || exit 1",
     "x | grep -q y  # trailing comment",
 ])
-def test_the_early_exit_matcher_catches(line):
+def test_the_early_exit_matcher_catches(line) -> None:
     assert early_exit_readers(line), f"not caught: {line}"
 
 
@@ -408,7 +409,7 @@ def test_the_early_exit_matcher_catches(line):
     "script: |",
     "- |",
 ])
-def test_the_early_exit_matcher_passes(line):
+def test_the_early_exit_matcher_passes(line) -> None:
     assert not early_exit_readers(line), early_exit_readers(line)
 
 
@@ -561,7 +562,7 @@ def _published(doc: dict, env: dict) -> tuple:
     return seen, collisions, ranged
 
 
-def test_no_two_services_publish_the_same_host_port():
+def test_no_two_services_publish_the_same_host_port() -> None:
     """Invisible to `docker compose config`: `up -d` fails with `port is already
     allocated` and whichever service loses the race never starts."""
     yaml_mod = _require_yaml()
@@ -573,7 +574,7 @@ def test_no_two_services_publish_the_same_host_port():
     assert not collisions, "; ".join(collisions)
 
 
-def test_documented_ports_reach_the_right_service():
+def test_documented_ports_reach_the_right_service() -> None:
     yaml_mod = _require_yaml()
     env = _read_env(ENV_FILE)
     doc = yaml_mod.safe_load(COMPOSE.read_text(encoding="utf-8"))
@@ -633,7 +634,7 @@ def _unresolved(port: str) -> bool:
 
 
 @pytest.mark.parametrize("path", [COMPOSE, CI_COMPOSE], ids=["stack", "ci"])
-def test_rewriter_proxies_to_the_postgrest_service_on_its_port(path, request):
+def test_rewriter_proxies_to_the_postgrest_service_on_its_port(path, request) -> None:
     """Each file's rewriter must set its upstream host AND port explicitly, to that file's
     PostgREST on its listen port, and equal to the image default -- so which one a
     deployment uses never matters (before #48 they disagreed).
@@ -755,7 +756,7 @@ def _haf_service(doc: dict) -> dict:
     return doc["services"][HAF_SERVICE] or {}
 
 
-def test_the_haf_service_pulls_the_image_haf_publishes():
+def test_the_haf_service_pulls_the_image_haf_publishes() -> None:
     """Resolved through docker/.env, the repository must be `<HAF_REGISTRY>/haf` exactly.
 
     A path with a flavour segment is what #56 was: every tag this stack could pin 404s
@@ -810,7 +811,7 @@ def test_the_haf_service_pulls_the_image_haf_publishes():
     assert tag, f"`{HAF_SERVICE}` names no tag, so `up` pulls whatever `latest` is today"
 
 
-def test_the_haf_image_takes_both_halves_from_the_env_file():
+def test_the_haf_image_takes_both_halves_from_the_env_file() -> None:
     """`${HAF_REGISTRY}` and `${HAF_VERSION}`, neither with a default behind it.
 
     Every documented command passes `--env-file docker/.env.local`, and an `--env-file`
@@ -843,7 +844,7 @@ def test_the_haf_image_takes_both_halves_from_the_env_file():
     )
 
 
-def test_the_pinned_haf_version_is_a_release_tag_that_has_the_app_registry():
+def test_the_pinned_haf_version_is_a_release_tag_that_has_the_app_registry() -> None:
     """docker/.env must pin a release tag, and not one older than HAF_MINIMUM_RELEASE.
 
     Two ways to ship a default that installs cleanly and disappoints later:
@@ -1038,7 +1039,7 @@ class Render:
         return _UPSTREAM.fullmatch(_lines(self.conf)[proxy_at]).groups()
 
 
-def _render(tmp_path_factory, **settings) -> Render:
+def _render(tmp_path_factory: TempPathFactory, **settings) -> Render:
     """Run the entrypoint once. A run that cannot happen -- no shell, a missing file, a
     timeout -- is recorded as a failed render, test_the_entrypoint_execs_..._foreground's
     to report.
@@ -1075,7 +1076,7 @@ def _kill_group(proc) -> None:
     proc.kill()
 
 
-def _run_entrypoint(sh, tmp_path_factory, settings) -> Render:
+def _run_entrypoint(sh, tmp_path_factory: TempPathFactory, settings) -> Render:
     root = tmp_path_factory.mktemp("openresty")
     (root / STAGE / CONF_DIR).mkdir(parents=True)
     (root / STAGE / "bin").mkdir()
@@ -1128,7 +1129,7 @@ def _run_entrypoint(sh, tmp_path_factory, settings) -> Render:
 
 
 @pytest.fixture(scope="module")
-def renders(tmp_path_factory) -> dict:
+def renders(tmp_path_factory: TempPathFactory) -> dict:
     return {
         "default": _render(tmp_path_factory),
         "override": _render(tmp_path_factory, POSTGREST_HOST="sentinel-upstream",
@@ -1146,7 +1147,7 @@ def _upstream(render: Render) -> tuple:
     return upstream
 
 
-def test_the_entrypoint_runs_under_posix_sh():
+def test_the_entrypoint_runs_under_posix_sh() -> None:
     """The image runs the file by its shebang; `#!/bin/bash` renders fine here under `sh`
     and fails in an image without bash."""
     if not ENTRYPOINT.is_file():
@@ -1158,7 +1159,7 @@ def test_the_entrypoint_runs_under_posix_sh():
     )
 
 
-def test_the_entrypoint_execs_openresty_in_the_foreground(renders):
+def test_the_entrypoint_execs_openresty_in_the_foreground(renders) -> None:
     """On every render -- the override is the path compose and node modules run --
     openresty must be exec'd with `daemon off;`, so it is PID 1 and stays in the
     foreground. As a child it never receives the container's signals; daemonized, the
@@ -1203,7 +1204,7 @@ def test_the_entrypoint_execs_openresty_in_the_foreground(renders):
     assert not problems, "\n".join(problems)
 
 
-def test_the_rendered_config_is_valid(renders):
+def test_the_rendered_config_is_valid(renders) -> None:
     """The template must keep one upstream line, `proxy_pass http://${POSTGREST_HOST}:
     ${POSTGREST_PORT};`, one `${REWRITE_LOG}` line and no other placeholder. Every render --
     defaults, an explicit upstream, REWRITE_LOG=on -- must equal it line for line apart from
@@ -1224,7 +1225,7 @@ def test_the_rendered_config_is_valid(renders):
     assert not problems, "\n".join(problems)
 
 
-def test_rewrite_logging_on_renders_the_directive(renders):
+def test_rewrite_logging_on_renders_the_directive(renders) -> None:
     r = renders["rewrite_log"]
     if r.upstream() is None:
         pytest.skip("REWRITE_LOG=on rendered no valid config -- see "
@@ -1236,7 +1237,7 @@ def test_rewrite_logging_on_renders_the_directive(renders):
     )
 
 
-def test_the_image_default_upstream_is_the_postgrest_service(services, renders):
+def test_the_image_default_upstream_is_the_postgrest_service(services, renders) -> None:
     """With nothing set, the image must proxy to this stack's PostgREST on its listen
     port -- on the REWRITE_LOG=on branch too, which must not change the upstream."""
     host, port = _upstream(renders["default"])
@@ -1259,7 +1260,7 @@ def test_the_image_default_upstream_is_the_postgrest_service(services, renders):
     )
 
 
-def test_an_explicit_upstream_overrides_the_image_default(renders):
+def test_an_explicit_upstream_overrides_the_image_default(renders) -> None:
     """Compose and node modules set the upstream explicitly, so the override path is the
     one that runs. A template hardcoded to the correct default, or an entrypoint that
     ignores the variable, renders the default right and every explicit value wrong."""
@@ -1325,7 +1326,7 @@ def _dockerfile_stages(text: str) -> list:
     return stages
 
 
-def test_the_rewriter_image_final_stage_is_as_expected():
+def test_the_rewriter_image_final_stage_is_as_expected() -> None:
     text = _dockerfile_text()
     assert not re.search(r"(?im)^\s*#\s*escape\s*=", text), (
         "Dockerfile.rewriter has a `# escape=` line, which Docker reads as a parser "
@@ -1352,7 +1353,7 @@ def _presets_upstream(instruction: str) -> bool:
         re.search(r"\bPOSTGREST_(HOST|PORT)\b", instruction))
 
 
-def test_no_stage_presets_the_upstream():
+def test_no_stage_presets_the_upstream() -> None:
     """`ENV POSTGREST_HOST=...` makes the entrypoint's default dead code."""
     preset = [i for stage in _dockerfile_stages(_dockerfile_text()) for i in stage
               if _presets_upstream(i)]
@@ -1373,7 +1374,7 @@ def _names_a_service(host: str) -> bool:
 
 
 @pytest.mark.parametrize("path", [COMPOSE, CI_COMPOSE], ids=["stack", "ci"])
-def test_every_service_reference_resolves_within_its_own_file(path):
+def test_every_service_reference_resolves_within_its_own_file(path) -> None:
     """depends_on targets, `*HOST` settings, and URI hosts must name services in the same
     file. A missed rename otherwise fails late: a dangling depends_on only at `up`
     (compose-validate resolves only docker-compose.yml), a stale host as connection errors
@@ -1434,7 +1435,7 @@ VOLUME_EXEMPTIONS = {
 }
 
 
-def test_no_service_carries_a_generic_name(services):
+def test_no_service_carries_a_generic_name(services) -> None:
     """Every service must be app-scoped, or an explicitly reasoned exemption."""
     offenders = sorted(
         name for name in services
@@ -1453,7 +1454,7 @@ def test_no_service_carries_a_generic_name(services):
     )
 
 
-def test_no_volume_carries_a_generic_name():
+def test_no_volume_carries_a_generic_name() -> None:
     """Volume keys, and the host-wide name of any pinned or external volume."""
     doc = _require_yaml().safe_load(COMPOSE.read_text(encoding="utf-8"))
     volumes = doc.get("volumes") or {}
@@ -1542,7 +1543,7 @@ VOLUME_NAME_OVERRIDES = {
 }
 
 
-def test_volume_names_follow_the_project_unless_overridden():
+def test_volume_names_follow_the_project_unless_overridden() -> None:
     """scripts/upgrade_standalone_stack.sh keeps the HAF database of a stack that ran under
     the default project `docker` by setting HAF_FYP_HAF_DATADIR_VOLUME. If a volume's
     `name:` stopped reading its variable -- removed, renamed,
@@ -1585,7 +1586,7 @@ def test_volume_names_follow_the_project_unless_overridden():
             )
 
 
-def test_no_project_network_or_container_name_escapes_the_naming_rule(services):
+def test_no_project_network_or_container_name_escapes_the_naming_rule(services) -> None:
     """The project name (from `name:`, or COMPOSE_PROJECT_NAME in docker/.env, which wins
     when loaded and which .env.local is copied from) must be app-scoped: a project a node
     also uses would recreate the node's containers. No top-level `networks:` (the header
@@ -1638,7 +1639,7 @@ def _seconds(duration) -> float:
     return sum(float(n) * scale[u] for n, u in parts)
 
 
-def test_haf_gets_time_to_shut_postgresql_down():
+def test_haf_gets_time_to_shut_postgresql_down() -> None:
     """Compose's default is ten seconds, then SIGKILL, and PostgreSQL then performs crash
     recovery on the next start. haf_api_node's haf_base.yaml gives `haf` two minutes, and
     the grace period is only worth anything if the stop signal is one HAF handles."""
@@ -1662,7 +1663,7 @@ def _clean(path: str) -> str:
     return re.sub(r"^/+", "/", posixpath.normpath(path))
 
 
-def test_haf_keeps_its_data_in_the_haf_datadir_volume():
+def test_haf_keeps_its_data_in_the_haf_datadir_volume() -> None:
     """HAF_FYP_HAF_DATADIR_VOLUME and scripts/upgrade_standalone_stack.sh both assume HAF's
     data directory is the `haf_datadir` volume. Mounted elsewhere, the override would keep
     a volume HAF no longer reads."""
@@ -1698,7 +1699,7 @@ def test_haf_keeps_its_data_in_the_haf_datadir_volume():
     )
 
 
-def test_run_tests_runs_compose_in_the_ci_project(tmp_path):
+def test_run_tests_runs_compose_in_the_ci_project(tmp_path: Path) -> None:
     """A COMPOSE_PROJECT_NAME left in the developer's shell outranks the CI file's `name:`,
     and would send run_tests.sh's `down -v --remove-orphans` into that project. So the
     script is RUN with a hostile COMPOSE_PROJECT_NAME and stubs for `docker` and
@@ -1826,7 +1827,7 @@ def test_run_tests_runs_compose_in_the_ci_project(tmp_path):
     assert not problems, "\n".join(problems)
 
 
-def test_run_tests_tears_down_when_it_is_interrupted(tmp_path):
+def test_run_tests_tears_down_when_it_is_interrupted(tmp_path: Path) -> None:
     """A signal must remove the CI stack too, and promptly (#55).
 
     The matrix above cannot reach this path: it only makes verbs fail. Two separate things
@@ -1893,7 +1894,7 @@ def test_run_tests_tears_down_when_it_is_interrupted(tmp_path):
         f"an interrupted run must exit 143 (128+SIGTERM), not {proc.returncode}; {outcome}")
 
 
-def test_nothing_is_pulled_in_from_another_file():
+def test_nothing_is_pulled_in_from_another_file() -> None:
     """Services arriving through `include:` or `extends: {file: ...}` are part of the
     project at `up` and invisible to the naming checks."""
     doc = _require_yaml().safe_load(COMPOSE.read_text(encoding="utf-8"))
@@ -1910,7 +1911,7 @@ def test_nothing_is_pulled_in_from_another_file():
 
 
 @pytest.mark.parametrize("service", [SYNC, RANKER], ids=["sync", "ranker"])
-def test_lock_holders_are_stopped_before_setup_is_recreated(services, service):
+def test_lock_holders_are_stopped_before_setup_is_recreated(services, service) -> None:
     """#67, #77: the processor and the ranker hold HAF's lock on haf_fyp, and the install
     skips while it is held. When only haf-fyp-setup is recreated, `restart: true` is what
     makes Compose stop them first -- without it the old one keeps the lock and the install
@@ -1937,7 +1938,7 @@ def _probe_command(test) -> str:
 
 
 @pytest.mark.parametrize("path", [COMPOSE, CI_COMPOSE], ids=["compose", "compose-ci"])
-def test_postgres_healthchecks_probe_tcp_not_the_socket(path):
+def test_postgres_healthchecks_probe_tcp_not_the_socket(path) -> None:
     """A socket-only pg_isready passes during the postgres image's first-boot init, whose
     temporary server listens on no TCP port (`listen_addresses=''`) -- so a dependant gated
     on service_healthy connects over the network and is refused. That failed postgrest-tests
@@ -1960,7 +1961,7 @@ def test_postgres_healthchecks_probe_tcp_not_the_socket(path):
         assert _TCP_HOST.fullmatch(hosts[0].strip("\"'")), (name, "host is not TCP", command)
 
 
-def test_ci_setup_waits_for_a_healthy_postgres():
+def test_ci_setup_waits_for_a_healthy_postgres() -> None:
     """The probe above only matters if setup waits for it: `service_started` is the
     original race with no probe at all."""
     doc = _require_yaml().safe_load(CI_COMPOSE.read_text(encoding="utf-8"))
@@ -1987,6 +1988,7 @@ TUNING = {
     "EMBEDDING_COVERAGE_DAYS",
     "ACTIVE_USERS_MAX_EVICTIONS",
     "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS",
+    "FEED_CACHE_UNREAD_RETENTION_DAYS",
 }
 
 # Read by the ranker and deliberately NOT passed by docker-compose.yml: two connection
@@ -2055,11 +2057,11 @@ def _ranker_environment(services) -> dict:
     return env
 
 
-def test_the_tuning_variables_are_the_documented_ones():
+def test_the_tuning_variables_are_the_documented_ones() -> None:
     assert _ranker_env_reads()["_tuning"] == TUNING
 
 
-def test_the_ranker_is_passed_every_tuning_variable_by_name_alone(services):
+def test_the_ranker_is_passed_every_tuning_variable_by_name_alone(services) -> None:
     """A setting the compose file does not pass can only be changed by editing the file.
 
     That is how a full node sat at MAX_USERS_PER_CYCLE=200, a 22-hour rotation. Each is
@@ -2074,7 +2076,7 @@ def test_the_ranker_is_passed_every_tuning_variable_by_name_alone(services):
             f"{RANKER}.environment.{name} is {env[name]!r}; expected the bare key, no value")
 
 
-def test_only_what_survives_an_empty_value_is_passed_without_one(services):
+def test_only_what_survives_an_empty_value_is_passed_without_one(services) -> None:
     """The other direction. A bare key, or `${X:-}`, can reach the daemon empty (a blank
     line in the env file), so everything passed that way must be read through _tuning().
     FEED_EVENTS_RETAIN_DAYS passed like this would bring back the crash with every test
@@ -2094,7 +2096,7 @@ def test_only_what_survives_an_empty_value_is_passed_without_one(services):
     assert may_be_empty == TUNING, sorted(may_be_empty ^ TUNING)
 
 
-def test_every_variable_the_ranker_reads_is_passed_or_listed_as_not(services):
+def test_every_variable_the_ranker_reads_is_passed_or_listed_as_not(services) -> None:
     """The bug class of #87: a setting added to the daemon and to nothing else."""
     env = set(_ranker_environment(services))
     read = set().union(*_ranker_env_reads().values())
@@ -2108,7 +2110,7 @@ def test_every_variable_the_ranker_reads_is_passed_or_listed_as_not(services):
     assert not unread, f"{sorted(unread)} is no longer read by the ranker: drop it from the list"
 
 
-def test_no_other_service_is_passed_the_ranker_tuning(services):
+def test_no_other_service_is_passed_the_ranker_tuning(services) -> None:
     for service, spec in services.items():
         if service == RANKER:
             continue
@@ -2119,7 +2121,7 @@ def test_no_other_service_is_passed_the_ranker_tuning(services):
         assert not stray, f"{service} is passed {sorted(stray)}, which only the ranker reads"
 
 
-def test_the_env_file_shows_every_tuning_variable_and_sets_none():
+def test_the_env_file_shows_every_tuning_variable_and_sets_none() -> None:
     """Shown, so an operator finds them; commented, so the tracked file changes nothing.
 
     Not even set empty: with a bare key in the compose file, `NAME=` here would put an
@@ -2133,7 +2135,7 @@ def test_the_env_file_shows_every_tuning_variable_and_sets_none():
             f"docker/.env has no commented `# {name}=` line for an operator to copy")
 
 
-def test_the_defaults_shown_in_the_env_file_are_the_daemons():
+def test_the_defaults_shown_in_the_env_file_are_the_daemons() -> None:
     """A default written in a comment drifts the day the code's changes."""
     import ast
 
@@ -2156,7 +2158,7 @@ def test_the_defaults_shown_in_the_env_file_are_the_daemons():
         "docker/.env's commented defaults differ from ranker_daemon.py's (compared as written)")
 
 
-def test_the_readme_table_shows_the_daemons_defaults():
+def test_the_readme_table_shows_the_daemons_defaults() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     for name, default in (
         ("MAX_USERS_PER_CYCLE", "200"),
@@ -2189,10 +2191,10 @@ def _coded_minimums() -> dict:
 
 RETENTION = ("FEED_EVENTS_MAINT_SECONDS", "FEED_EVENTS_RETAIN_DAYS", "FEED_EVENTS_MAX_ROWS",
              "EMBEDDING_COVERAGE_DAYS", "ACTIVE_USERS_MAX_EVICTIONS",
-             "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS")
+             "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS", "FEED_CACHE_UNREAD_RETENTION_DAYS")
 
 
-def test_the_readme_retention_table_shows_the_daemons_defaults_and_minimums():
+def test_the_readme_retention_table_shows_the_daemons_defaults_and_minimums() -> None:
     """The same drift guard as the reader table's, plus the Minimum column, which is read
     from the code's minimum= so a changed minimum cannot leave the README behind."""
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -2208,7 +2210,7 @@ def test_the_readme_retention_table_shows_the_daemons_defaults_and_minimums():
             f"({shown[name]!r}, {str(minimums[name])!r})")
 
 
-def test_the_retention_section_follows_the_reader_material_at_its_own_level():
+def test_the_retention_section_follows_the_reader_material_at_its_own_level() -> None:
     """Inserted as a sub-heading after the reader table, it once took over the reader-first
     material below it (what to expect, the cycle log line, the /metrics fields)."""
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -2223,7 +2225,7 @@ def test_the_retention_section_follows_the_reader_material_at_its_own_level():
         assert marker in reader_text, f"{marker!r} is no longer under 'How fresh a feed is'"
 
 
-def test_the_documented_recreate_command_reads_the_operators_file_and_builds():
+def test_the_documented_recreate_command_reads_the_operators_file_and_builds() -> None:
     """Without --env-file the value just set is ignored; without --build a ranker image
     from before #87 runs, and stops on a blank line; without --no-deps `up` reaches haf."""
     want = "up -d --build --no-deps haf-fyp-ranker"

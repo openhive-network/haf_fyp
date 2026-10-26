@@ -17,6 +17,7 @@ from haf_fyp.scoring import (
     compute_recency,
     compute_scores,
 )
+from pytest import MonkeyPatch
 
 _WEIGHTS = {
     "relevance": 0.40,
@@ -53,24 +54,24 @@ def _candidates(n: int = 3) -> pd.DataFrame:
 
 
 class TestComputeRecency:
-    def test_fresh_post_near_one(self):
+    def test_fresh_post_near_one(self) -> None:
         scores = compute_recency(pd.Series([_now()]))
         assert scores.iloc[0] > 0.99
 
-    def test_24h_old_post_near_half(self):
+    def test_24h_old_post_near_half(self) -> None:
         scores = compute_recency(pd.Series([_now() - timedelta(hours=24)]))
         assert abs(scores.iloc[0] - 0.5) < 0.01
 
-    def test_30_day_old_post_near_zero(self):
+    def test_30_day_old_post_near_zero(self) -> None:
         scores = compute_recency(pd.Series([_now() - timedelta(days=30)]))
         assert scores.iloc[0] < 0.01
 
-    def test_output_clipped_to_unit_interval(self):
+    def test_output_clipped_to_unit_interval(self) -> None:
         # A future timestamp should still not exceed 1.0
         scores = compute_recency(pd.Series([_now() + timedelta(hours=1)]))
         assert 0.0 <= scores.iloc[0] <= 1.0
 
-    def test_monotone_decay(self):
+    def test_monotone_decay(self) -> None:
         times = pd.Series(
             [_now() - timedelta(hours=h) for h in [0, 12, 24, 48, 72]]
         )
@@ -90,28 +91,28 @@ class TestComputeEngagementQuality:
             ]
         )
 
-    def test_zero_engagement_below_half(self):
+    def test_zero_engagement_below_half(self) -> None:
         scores = compute_engagement_quality(self._df(), {})
         assert scores.iloc[0] < 0.5
 
-    def test_moderate_engagement_near_half(self):
+    def test_moderate_engagement_near_half(self) -> None:
         # 3 unique commenters, 2 reblogs — midpoint per docstring
         scores = compute_engagement_quality(self._df(unique_commenters=3, reblog_count=2), {})
         assert 0.3 <= scores.iloc[0] <= 0.7
 
-    def test_high_engagement_above_half(self):
+    def test_high_engagement_above_half(self) -> None:
         scores = compute_engagement_quality(
             self._df(unique_commenters=50, reblog_count=30, net_rshares=10_000_000_000), {}
         )
         assert scores.iloc[0] > 0.5
 
-    def test_output_clipped_to_unit_interval(self):
+    def test_output_clipped_to_unit_interval(self) -> None:
         scores = compute_engagement_quality(
             self._df(unique_commenters=100_000, reblog_count=100_000), {}
         )
         assert 0.0 <= scores.iloc[0] <= 1.0
 
-    def test_monotone_in_commenters(self):
+    def test_monotone_in_commenters(self) -> None:
         scores = [
             compute_engagement_quality(self._df(unique_commenters=n), {}).iloc[0]
             for n in [0, 1, 5, 20, 100]
@@ -120,61 +121,61 @@ class TestComputeEngagementQuality:
 
 
 class TestComputeCredibility:
-    def test_known_author_returns_score(self):
+    def test_known_author_returns_score(self) -> None:
         scores = compute_credibility(pd.Series(["alice"]), {"alice": 0.75})
         assert scores.iloc[0] == pytest.approx(0.75)
 
-    def test_unknown_author_returns_default(self):
+    def test_unknown_author_returns_default(self) -> None:
         scores = compute_credibility(pd.Series(["nobody"]), {})
         assert scores.iloc[0] == pytest.approx(0.3)
 
-    def test_mixed_authors(self):
+    def test_mixed_authors(self) -> None:
         scores = compute_credibility(pd.Series(["alice", "nobody"]), {"alice": 0.8})
         assert scores.iloc[0] == pytest.approx(0.8)
         assert scores.iloc[1] == pytest.approx(0.3)
 
-    def test_zero_credibility_author(self):
+    def test_zero_credibility_author(self) -> None:
         scores = compute_credibility(pd.Series(["spammer"]), {"spammer": 0.0})
         assert scores.iloc[0] == pytest.approx(0.0)
 
 
 class TestComputeScores:
-    def test_returns_sorted_descending(self):
+    def test_returns_sorted_descending(self) -> None:
         result = compute_scores(_candidates(), None, {}, {}, set(), set(), _WEIGHTS)
         assert list(result["final_score"]) == sorted(result["final_score"], reverse=True)
 
-    def test_final_scores_in_unit_interval(self):
+    def test_final_scores_in_unit_interval(self) -> None:
         result = compute_scores(_candidates(), None, {}, {}, set(), set(), _WEIGHTS)
         assert (result["final_score"] >= 0.0).all()
         assert (result["final_score"] <= 1.0).all()
 
-    def test_cold_start_relevance_signal_dropped(self):
+    def test_cold_start_relevance_signal_dropped(self) -> None:
         # With user_vector=None, relevance weight is redistributed — all scores
         # should still be positive and finite
         result = compute_scores(_candidates(), None, {}, {}, set(), set(), _WEIGHTS)
         assert result["score_relevance"].notna().all()
 
-    def test_community_boost_flag_set_for_matching_posts(self):
+    def test_community_boost_flag_set_for_matching_posts(self) -> None:
         result = compute_scores(_candidates(), None, {}, {}, {123}, set(), _WEIGHTS)
         boosted = result.loc[result["post_id"] == 0, "community_boost_applied"]
         assert boosted.iloc[0] is True or bool(boosted.iloc[0])
 
-    def test_community_boost_increases_score(self):
+    def test_community_boost_increases_score(self) -> None:
         df = _candidates(1)  # single post with community_id=123
         without = compute_scores(df.copy(), None, {}, {}, set(), set(), _WEIGHTS)["final_score"].iloc[0]
         with_ = compute_scores(df.copy(), None, {}, {}, {123}, set(), _WEIGHTS)["final_score"].iloc[0]
         assert with_ >= without
 
-    def test_community_boost_does_not_exceed_one(self):
+    def test_community_boost_does_not_exceed_one(self) -> None:
         df = _candidates(1)
         result = compute_scores(df, None, {}, {}, {123}, set(), _WEIGHTS)
         assert result["final_score"].iloc[0] <= 1.0
 
-    def test_subscribed_tier_labels_boost_source(self):
+    def test_subscribed_tier_labels_boost_source(self) -> None:
         result = compute_scores(_candidates(1), None, {}, {}, {123}, set(), _WEIGHTS)
         assert result.loc[0, "boost_source"] == "subscribed"
 
-    def test_engaged_tier_smaller_and_labelled(self):
+    def test_engaged_tier_smaller_and_labelled(self) -> None:
         df = _candidates(1)  # single post, community_id=123
         sub = compute_scores(df.copy(), None, {}, {}, {123}, set(), _WEIGHTS)
         eng = compute_scores(df.copy(), None, {}, {}, set(), {123}, _WEIGHTS)
@@ -183,11 +184,11 @@ class TestComputeScores:
         # engaged multiplier (0.10) is smaller than subscribed (0.20)
         assert eng.loc[0, "final_score"] < sub.loc[0, "final_score"]
 
-    def test_subscribed_wins_when_both_apply(self):
+    def test_subscribed_wins_when_both_apply(self) -> None:
         result = compute_scores(_candidates(1), None, {}, {}, {123}, {123}, _WEIGHTS)
         assert result.loc[0, "boost_source"] == "subscribed"
 
-    def test_with_user_vector_relevance_defaults_to_neutral(self):
+    def test_with_user_vector_relevance_defaults_to_neutral(self) -> None:
         vec = np.ones(384, dtype=np.float32) / np.sqrt(384)
         result = compute_scores(_candidates(), vec, {}, {}, set(), set(), _WEIGHTS)
         # With a user vector but no post vectors, semantic relevance defaults to 0.5
@@ -195,16 +196,16 @@ class TestComputeScores:
 
 
 class _FakeCursor:
-    def __init__(self, rows):
+    def __init__(self, rows) -> None:
         self._rows = rows
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *exc) -> bool:
         return False
 
-    def execute(self, sql, params=None):
+    def execute(self, sql, params=None) -> None:
         self._captured = params
 
     def fetchall(self):
@@ -212,7 +213,7 @@ class _FakeCursor:
 
 
 class _FakeConn:
-    def __init__(self, rows):
+    def __init__(self, rows) -> None:
         self._rows = rows
 
     def cursor(self):
@@ -220,13 +221,13 @@ class _FakeConn:
 
 
 class TestBootstrapVectorFromCommunities:
-    def test_no_communities_returns_none(self):
+    def test_no_communities_returns_none(self) -> None:
         assert bootstrap_vector_from_communities(_FakeConn([]), set(), {}) is None
 
-    def test_no_top_posts_returns_none(self):
+    def test_no_top_posts_returns_none(self) -> None:
         assert bootstrap_vector_from_communities(_FakeConn([]), {123}, {}) is None
 
-    def test_fetches_embeddings_missing_from_candidate_pool(self, monkeypatch):
+    def test_fetches_embeddings_missing_from_candidate_pool(self, monkeypatch: MonkeyPatch) -> None:
         # The regression: a community's top-earning posts are older than the recent
         # candidate window, so none are in the candidate post_vectors dict. The
         # bootstrap must fetch them directly rather than returning None.
@@ -251,7 +252,7 @@ class TestBootstrapVectorFromCommunities:
         assert sorted(calls["ids"]) == [101, 102, 103]
         assert np.isclose(np.linalg.norm(result), 1.0, atol=1e-6)
 
-    def test_reuses_candidate_vectors_without_refetching(self, monkeypatch):
+    def test_reuses_candidate_vectors_without_refetching(self, monkeypatch: MonkeyPatch) -> None:
         top_posts = [(201,), (202,)]
         provided = {
             201: np.array([1.0, 0.0], dtype=np.float32),
@@ -282,7 +283,7 @@ def _ranked(community_ids: list) -> pd.DataFrame:
 
 
 class TestDiversityCap:
-    def test_caps_leading_positions_per_community(self):
+    def test_caps_leading_positions_per_community(self) -> None:
         # score order: A A A B B A ; cap=2
         out = _apply_diversity_cap(_ranked([100, 100, 100, 200, 200, 100]), 2)
         # leading 4 respect the cap (<=2 per community); overflow A-posts sink last
@@ -293,22 +294,22 @@ class TestDiversityCap:
         # nothing dropped
         assert sorted(out["post_id"]) == [0, 1, 2, 3, 4, 5]
 
-    def test_uncommunitied_posts_are_exempt(self):
+    def test_uncommunitied_posts_are_exempt(self) -> None:
         # community None must never be capped even beyond `cap`
         out = _apply_diversity_cap(_ranked([None, None, None, None]), 1)
         assert out["post_id"].tolist() == [0, 1, 2, 3]
 
-    def test_cap_zero_or_empty_is_noop(self):
+    def test_cap_zero_or_empty_is_noop(self) -> None:
         df = _ranked([100, 100, 200])
         assert _apply_diversity_cap(df, 0)["post_id"].tolist() == [0, 1, 2]
         assert _apply_diversity_cap(df.iloc[0:0], 2).empty
 
-    def test_compute_scores_without_cap_is_unchanged(self):
+    def test_compute_scores_without_cap_is_unchanged(self) -> None:
         # _WEIGHTS has no max_per_community -> ranking identical to plain sort
         base = compute_scores(_candidates(3), None, {}, {}, set(), set(), _WEIGHTS)
         assert list(base["final_score"]) == sorted(base["final_score"], reverse=True)
 
-    def test_compute_scores_applies_cap_when_configured(self):
+    def test_compute_scores_applies_cap_when_configured(self) -> None:
         # 5 posts all in community 500, one in 600; subscribe to 500 so all get boosted
         now = _now()
         df = pd.DataFrame(
@@ -338,27 +339,27 @@ class TestDiversityCap:
 class _CapturingCursor:
     """Captures execute_values' rows via the module-level psycopg2 shim."""
 
-    def __init__(self, sink):
+    def __init__(self, sink) -> None:
         self._sink = sink
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *exc) -> bool:
         return False
 
-    def execute(self, sql, params=None):
+    def execute(self, sql, params=None) -> None:
         self._sink["deleted"] = "DELETE FROM haf_fyp_app.global_feed_cache" in sql
 
 
 class _CapturingConn:
-    def __init__(self, sink):
+    def __init__(self, sink) -> None:
         self._sink = sink
 
     def cursor(self):
         return _CapturingCursor(self._sink)
 
-    def commit(self):
+    def commit(self) -> None:
         self._sink["committed"] = True
 
 
@@ -390,10 +391,10 @@ class TestWriteFeedCacheColumnAlignment:
     ]
 
     @staticmethod
-    def _run(monkeypatch, algo_version="1.2.0"):
+    def _run(monkeypatch: MonkeyPatch, algo_version="1.2.0"):
         captured = {}
 
-        def fake_execute_values(cur, sql, rows):
+        def fake_execute_values(cur, sql, rows) -> None:
             captured["sql"] = sql
             captured["rows"] = rows
 
@@ -434,11 +435,38 @@ class TestWriteFeedCacheColumnAlignment:
         inner = head[head.index("(") + 1:head.index(")")]
         return [c.strip() for c in inner.split(",")]
 
-    def test_the_insert_names_the_columns_it_writes_in_order(self, monkeypatch):
+    def test_the_insert_names_the_columns_it_writes_in_order(self, monkeypatch: MonkeyPatch) -> None:
         captured = self._run(monkeypatch)
         assert self._columns_in_sql(captured["sql"]) == self.COLUMNS
 
-    def test_every_column_receives_its_own_value(self, monkeypatch):
+    def test_the_values_pass_through_to_the_column_of_the_same_name(self, monkeypatch: MonkeyPatch) -> None:
+        # #98: the tuple lands in v(...), not in the column list, and each label goes
+        # through feed_cache_labels on its way. Every SELECT item must read v's column
+        # of the same name as the insert column it feeds, or the checks above, which
+        # map the tuple onto the column list, would be checking the wrong alignment.
+        captured = self._run(monkeypatch)
+        head = " ".join(captured["sql"].split())
+        aliases = head[head.index("AS v(") + len("AS v("):]
+        aliases = [c.strip() for c in aliases[: aliases.index(")")].split(",")]
+        assert aliases == self.COLUMNS
+        select = head[head.index("SELECT ") + len("SELECT "): head.index(" FROM (VALUES %s)")]
+        items, depth, start = [], 0, 0
+        for i, ch in enumerate(select):
+            depth += {"(": 1, ")": -1}.get(ch, 0)
+            if ch == "," and depth == 0:
+                items.append(select[start:i].strip())
+                start = i + 1
+        items.append(select[start:].strip())
+        select = items
+        fed = {
+            "boost_source": "COALESCE(lb.code, 0)",
+            "algorithm_version": "COALESCE(la.code, 0)",
+        }
+        assert select == [fed.get(c, f"v.{c}") for c in self.COLUMNS]
+        assert "ON lb.label = v.boost_source" in head
+        assert "ON la.label = v.algorithm_version" in head
+
+    def test_every_column_receives_its_own_value(self, monkeypatch: MonkeyPatch) -> None:
         # The core of #24: name -> value, so any transposition fails here even when
         # the tuple is still the right LENGTH and every value is still plausible.
         captured = self._run(monkeypatch)
@@ -456,7 +484,7 @@ class TestWriteFeedCacheColumnAlignment:
         assert first["rank"] == 1
         assert first["algorithm_version"] == "1.2.0"
 
-    def test_the_tuple_length_matches_the_column_count(self, monkeypatch):
+    def test_the_tuple_length_matches_the_column_count(self, monkeypatch: MonkeyPatch) -> None:
         # A dropped element makes execute_values fail at the DATABASE, not here, so
         # nothing above would name the cause. This does.
         captured = self._run(monkeypatch)
@@ -466,19 +494,19 @@ class TestWriteFeedCacheColumnAlignment:
                 f"{len(row)} values for {len(cols)} columns: {list(zip(cols, row))}"
             )
 
-    def test_rank_is_one_based_and_follows_score_order(self, monkeypatch):
+    def test_rank_is_one_based_and_follows_score_order(self, monkeypatch: MonkeyPatch) -> None:
         captured = self._run(monkeypatch)
         cols = self._columns_in_sql(captured["sql"])
         i = cols.index("rank")
         assert [r[i] for r in captured["rows"]] == [1, 2]
 
-    def test_every_row_carries_the_version(self, monkeypatch):
+    def test_every_row_carries_the_version(self, monkeypatch: MonkeyPatch) -> None:
         captured = self._run(monkeypatch)
         cols = self._columns_in_sql(captured["sql"])
         i = cols.index("algorithm_version")
         assert [r[i] for r in captured["rows"]] == ["1.2.0", "1.2.0"]
 
-    def test_a_nullable_boost_source_survives_as_none(self, monkeypatch):
+    def test_a_nullable_boost_source_survives_as_none(self, monkeypatch: MonkeyPatch) -> None:
         # boost_source sits between a bool and an int; coercing it would be exactly
         # the kind of quiet mis-write this class exists to catch.
         captured = self._run(monkeypatch)
@@ -486,7 +514,7 @@ class TestWriteFeedCacheColumnAlignment:
         i = cols.index("boost_source")
         assert [r[i] for r in captured["rows"]] == ["interest", None]
 
-    def test_the_post_id_keeps_full_precision(self, monkeypatch):
+    def test_the_post_id_keeps_full_precision(self, monkeypatch: MonkeyPatch) -> None:
         # post_id is HAF block/op-derived and exceeds 2^53; !32 shipped it as text to
         # the client for that reason. It must reach the DB as an exact int.
         captured = self._run(monkeypatch)
@@ -506,11 +534,11 @@ class TestWriteGlobalFeedCacheStampsAlgorithmVersion:
     have caught it, so this asserts the value reaches the INSERT.
     """
 
-    def _run(self, monkeypatch, algo_version, sink=None):
+    def _run(self, monkeypatch: MonkeyPatch, algo_version, sink=None):
         sink = {} if sink is None else sink
         captured = {}
 
-        def fake_execute_values(cur, sql, rows):
+        def fake_execute_values(cur, sql, rows) -> None:
             captured["sql"] = sql
             captured["rows"] = rows
 
@@ -540,7 +568,7 @@ class TestWriteGlobalFeedCacheStampsAlgorithmVersion:
         scoring.write_global_feed_cache(_CapturingConn(sink), df, algo_version)
         return captured
 
-    def test_algorithm_version_is_in_the_insert_columns(self, monkeypatch):
+    def test_algorithm_version_is_in_the_insert_columns(self, monkeypatch: MonkeyPatch) -> None:
         # Asserts the ORDERED substring, not mere presence. Presence alone lets a
         # swap of algorithm_version and computed_at in the column list slip past
         # every test in this class, even though the row tuple still pairs them the
@@ -548,17 +576,17 @@ class TestWriteGlobalFeedCacheStampsAlgorithmVersion:
         captured = self._run(monkeypatch, "1.2.0")
         assert "rank, algorithm_version, computed_at" in " ".join(captured["sql"].split())
 
-    def test_every_row_carries_the_version(self, monkeypatch):
+    def test_every_row_carries_the_version(self, monkeypatch: MonkeyPatch) -> None:
         captured = self._run(monkeypatch, "1.2.0")
         # (post_id, final_score, engagement, recency, credibility, rank, algo, now)
         assert [r[6] for r in captured["rows"]] == ["1.2.0", "1.2.0"]
 
-    def test_rank_is_still_positional_after_the_added_column(self, monkeypatch):
+    def test_rank_is_still_positional_after_the_added_column(self, monkeypatch: MonkeyPatch) -> None:
         # Guards the off-by-one the new tuple element could introduce.
         captured = self._run(monkeypatch, "1.2.0")
         assert [r[5] for r in captured["rows"]] == [1, 2]
 
-    def test_the_table_is_replaced_not_appended(self, monkeypatch):
+    def test_the_table_is_replaced_not_appended(self, monkeypatch: MonkeyPatch) -> None:
         # The DELETE-then-INSERT is load-bearing: global_feed_cache is a full
         # replacement each cycle, which is why no migration is needed for the
         # added column. The sink was previously captured and never asserted on.
@@ -597,11 +625,11 @@ class TestHiveSenseUnavailableDegradesInsteadOfRaising:
         handler in run_cycle discarded anyway.
         """
 
-        def __init__(self, rows):
+        def __init__(self, rows) -> None:
             super().__init__(rows)
             self.rolled_back = 0
 
-        def rollback(self):
+        def rollback(self) -> None:
             self.rolled_back += 1
 
     @staticmethod
@@ -610,7 +638,7 @@ class TestHiveSenseUnavailableDegradesInsteadOfRaising:
             raise exc
         return _fake
 
-    def test_profile_vector_returns_none_when_hivesense_is_missing(self, monkeypatch):
+    def test_profile_vector_returns_none_when_hivesense_is_missing(self, monkeypatch: MonkeyPatch) -> None:
         monkeypatch.setattr(
             embeddings, "fetch_user_interactions",
             lambda conn, username, days: [(1, 1.0, 0.0)],
@@ -622,7 +650,7 @@ class TestHiveSenseUnavailableDegradesInsteadOfRaising:
         vec, sampled = build_user_profile_vector(self._Conn([]), "alice", {})
         assert vec is None and sampled == 0
 
-    def test_profile_vector_returns_none_when_the_grant_is_revoked(self, monkeypatch):
+    def test_profile_vector_returns_none_when_the_grant_is_revoked(self, monkeypatch: MonkeyPatch) -> None:
         monkeypatch.setattr(
             embeddings, "fetch_user_interactions",
             lambda conn, username, days: [(1, 1.0, 0.0)],
@@ -634,14 +662,14 @@ class TestHiveSenseUnavailableDegradesInsteadOfRaising:
         vec, sampled = build_user_profile_vector(self._Conn([]), "alice", {})
         assert vec is None and sampled == 0
 
-    def test_bootstrap_returns_none_when_hivesense_is_missing(self, monkeypatch):
+    def test_bootstrap_returns_none_when_hivesense_is_missing(self, monkeypatch: MonkeyPatch) -> None:
         monkeypatch.setattr(
             embeddings, "fetch_post_vectors",
             self._explode(psycopg2.errors.lookup("42P01")("relation does not exist")),
         )
         assert bootstrap_vector_from_communities(self._Conn([(7,)]), {123}, {}) is None
 
-    def test_a_lost_connection_still_propagates(self, monkeypatch):
+    def test_a_lost_connection_still_propagates(self, monkeypatch: MonkeyPatch) -> None:
         # OperationalError must NOT be swallowed -- the main loop reconnects on it,
         # and degrading here would hide a dead database behind cold-start feeds.
         monkeypatch.setattr(
@@ -666,7 +694,7 @@ class TestStoredVectorDoesNotDefeatColdStart:
     the population reaching it, because those users previously raised at step 1.
     """
 
-    def test_a_stored_vector_with_no_post_embeddings_drops_relevance(self):
+    def test_a_stored_vector_with_no_post_embeddings_drops_relevance(self) -> None:
         stored = np.ones(1024, dtype=np.float32)
         df = compute_scores(
             _candidates(2), post_vectors={}, user_vector=stored,
@@ -682,7 +710,7 @@ class TestStoredVectorDoesNotDefeatColdStart:
         )
         assert np.allclose(df["final_score"], recomputed, atol=1e-6)
 
-    def test_a_stored_vector_WITH_embeddings_still_uses_relevance(self):
+    def test_a_stored_vector_WITH_embeddings_still_uses_relevance(self) -> None:
         # The guard must not fire when relevance IS computable, or every node loses
         # personalization.
         stored = np.ones(1024, dtype=np.float32)

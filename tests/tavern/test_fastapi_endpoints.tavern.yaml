@@ -95,6 +95,7 @@ stages:
           state: "ok"
           window_seconds: 86400
           due_after_seconds: 600
+          retention_days: 30
           readers_in_window: !anyint
           readers_due: !anyint
           oldest_reader_feed_seconds: !anything
@@ -103,6 +104,10 @@ stages:
           rotation_age_seconds: !anything
           newest_feed_seconds: !anything
           notification_queue_usage: !anyfloat
+        # Whether the installed feed_cache is the compact row (#99). Not pinned: this
+        # lane's feed_cache is the cut-down table of ci_fastapi_setup.sql, and the
+        # verdict is tested against PostgreSQL in test_feed_cache_format_db.py.
+        feed_cache: !anything
       # credibility_sources is a LIVE privilege probe, so a cached answer would keep
       # reporting degraded=false after a grant is lost (or true after it is repaired),
       # defeating the point of re-probing every request. Pinned here for the same

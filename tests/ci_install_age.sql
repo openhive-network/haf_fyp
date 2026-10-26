@@ -28,7 +28,9 @@ INSERT INTO haf_fyp_app.post_bridge_cache (post_id, bridge, computed_at) VALUES 
 INSERT INTO haf_fyp_app.user_profile_vectors (username, updated_at) VALUES ('ci-aged-user', '2016-09-15 19:47:21');
 INSERT INTO haf_fyp_app.user_communities (username, community_id, subscribed_at)
 VALUES ('ci-aged-user', 1, '2016-09-15 19:47:21');
-INSERT INTO haf_fyp_app.feed_cache (username, post_id, final_score, rank) VALUES ('ci-aged-user', 42, 0.5, 1);
+INSERT INTO haf_fyp_app.feed_cache_labels (label) VALUES ('ci-aged-label');
+INSERT INTO haf_fyp_app.feed_cache (username, post_id, final_score, rank, algorithm_version)
+SELECT 'ci-aged-user', 42, 0.5, 1, code FROM haf_fyp_app.feed_cache_labels WHERE label = 'ci-aged-label';
 INSERT INTO haf_fyp_app.global_feed_cache (post_id, final_score, rank) VALUES (42, 0.5, 1);
 INSERT INTO haf_fyp_app.feed_metrics_daily (day) VALUES ('2016-09-15');
 INSERT INTO haf_fyp_app.embedding_coverage_daily (day, computed_at) VALUES ('2016-09-15', '2016-09-15 19:47:21+00');

@@ -6,7 +6,7 @@
 -- the shared MAX_USERS_PER_CYCLE (200) budget every 5-minute cycle, diluting
 -- rotation freshness for everyone still using the app.
 --
--- Three functions, all running as haf_fyp_owner (see #14):
+-- Four functions, all running as haf_fyp_owner (see #14):
 --
 --   evict_unproductive_users()  — the periodic sweep. Deletes rows with nothing to
 --                                 personalize from, plus the evicted user's cached
@@ -15,6 +15,9 @@
 --                                 Runs on the targeted-refresh path and every cycle.
 --   repair_stranded_optins()    — restores the #9 invariant after a lost race. Runs
 --                                 LAST in the hourly pass, after the sweep.
+--   drop_unread_feeds()         — deletes the cached feeds nobody reads (#98), and
+--                                 leaves the rotation rows. Runs on the hourly pass,
+--                                 in transactions of its own.
 --
 -- NOTE for anyone adding an eviction rule that needs "is this account still alive?":
 -- an earlier revision of this file stamped a liveness column from the feed_events
@@ -48,6 +51,8 @@
 -- rotation-capacity threshold. That was an extension beyond what #10 asked for, it
 -- rested on an unmeasured assumption about which population actually dilutes the
 -- rotation, and it meant deleting cached feeds for accounts that never used the app.
+-- (Since #98 they keep the row but get no cached feed until they read one: the
+-- ranker's rotation lane skips them, and drop_unread_feeds below removes theirs.)
 -- If rotation freshness later proves to be a real problem, measure it first:
 --   SELECT count(*) AS ranked,
 --          round(ceil(count(*)::numeric / 200) * 300 / 3600.0, 1) AS hours_per_refresh
@@ -325,6 +330,91 @@ BEGIN
 END;
 $$;
 
+-- ---------------------------------------------------------------------------
+-- drop_unread_feeds — the cached feeds nobody reads (#98)
+-- ---------------------------------------------------------------------------
+
+-- Deletes the feed_cache rows of accounts that have not read their feed within
+-- retention_days (last_read_at older, or NULL: never read) and hold no user_interests.
+-- The rotation row stays, and with it the account's interaction signal: this is not an
+-- eviction. The ranker's rotation lane takes the same accounts out of the schedule, so
+-- the feed is not rebuilt; the account's next read is served the global feed and puts
+-- it in the reader lane. Returns how many accounts lost their feed; at most
+-- max_accounts per call, so a caller drains a large backlog in bounded transactions.
+--
+-- WHAT IS NEVER DROPPED:
+--   * the feed of an account with user_interests. An opt-in's feed is built from what
+--     it declared, before any read, and that is what it gets when it first opens one.
+--   * the feed of an account that read within the window. last_read_at is the
+--     ranker's stamp of a page-1 read (#81).
+--   * a feed being written right now. Rows of active_users another transaction holds
+--     are skipped, not waited for: write_feed_cache upserts the account's row before
+--     it rewrites the feed, so a feed being rewritten is never deleted under it, and
+--     the block processor's upserts never wait on this pass. A skipped account is
+--     reached by a later pass.
+--
+-- LOCK ORDER: active_users (FOR UPDATE) then feed_cache, the order of write_feed_cache
+-- and evict_unproductive_users. If you reorder any of them, reorder all.
+CREATE OR REPLACE FUNCTION haf_fyp_app.drop_unread_feeds(retention_days int, max_accounts int)
+RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    _cutoff timestamp;
+    victims varchar(16) [];
+    dropped bigint;
+BEGIN
+    -- IS NULL explicitly, as in evict_unproductive_users: NULL < 1 is NULL, and
+    -- LIMIT NULL means no limit.
+    IF retention_days IS NULL OR retention_days < 1 THEN
+        RAISE EXCEPTION 'retention_days must be a positive integer (got %)', retention_days;
+    END IF;
+    IF max_accounts IS NULL OR max_accounts < 1 THEN
+        RAISE EXCEPTION 'max_accounts must be a positive integer (got %)', max_accounts;
+    END IF;
+    -- last_read_at is naive UTC, as the ranker writes it.
+    _cutoff := (NOW() AT TIME ZONE 'utc') - make_interval(days => retention_days);
+
+    SELECT array_agg(d.username) INTO victims
+    FROM (
+        SELECT au.username
+        FROM haf_fyp_app.active_users au
+        WHERE (au.last_read_at IS NULL OR au.last_read_at < _cutoff)
+          AND NOT EXISTS (
+              SELECT 1 FROM haf_fyp_app.user_interests ui WHERE ui.username = au.username
+          )
+          AND EXISTS (
+              SELECT 1 FROM haf_fyp_app.feed_cache fc WHERE fc.username = au.username
+          )
+        LIMIT max_accounts
+        FOR UPDATE OF au SKIP LOCKED
+    ) d;
+
+    IF victims IS NULL THEN
+        RETURN 0;
+    END IF;
+
+    -- Re-stated in full, in a statement of its own: its snapshot sees an opt-in that
+    -- committed after the SELECT above (the interests endpoint inserts with ON CONFLICT
+    -- DO NOTHING and never waits on the locked row), and such an account keeps its feed.
+    WITH gone AS (
+        DELETE FROM haf_fyp_app.feed_cache fc
+        USING haf_fyp_app.active_users au
+        WHERE fc.username = au.username
+          AND au.username = ANY(victims)
+          AND (au.last_read_at IS NULL OR au.last_read_at < _cutoff)
+          AND NOT EXISTS (
+              SELECT 1 FROM haf_fyp_app.user_interests ui WHERE ui.username = au.username
+          )
+        RETURNING fc.username
+    )
+
+    SELECT count(DISTINCT g.username) INTO dropped FROM gone g;
+
+    RETURN dropped;
+END;
+$$;
+
 -- #14: maintenance is daemon-only. The ranker connects as haf_fyp_owner (which owns
 -- active_users / feed_cache / feed_events / user_interests), so these run with
 -- implicit privileges. Lock EXECUTE off PUBLIC / the anon-facing haf_fyp_user, which
@@ -338,3 +428,6 @@ GRANT EXECUTE ON FUNCTION haf_fyp_app.evict_unsubscribed_users(varchar []) TO ha
 REVOKE EXECUTE ON FUNCTION haf_fyp_app.evict_unproductive_users(int) FROM public;
 REVOKE EXECUTE ON FUNCTION haf_fyp_app.evict_unproductive_users(int) FROM haf_fyp_user;
 GRANT EXECUTE ON FUNCTION haf_fyp_app.evict_unproductive_users(int) TO haf_fyp_owner;
+REVOKE EXECUTE ON FUNCTION haf_fyp_app.drop_unread_feeds(int, int) FROM public;
+REVOKE EXECUTE ON FUNCTION haf_fyp_app.drop_unread_feeds(int, int) FROM haf_fyp_user;
+GRANT EXECUTE ON FUNCTION haf_fyp_app.drop_unread_feeds(int, int) TO haf_fyp_owner;

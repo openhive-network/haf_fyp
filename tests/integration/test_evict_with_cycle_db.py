@@ -42,6 +42,7 @@ import psycopg2
 import pytest
 
 from haf_fyp import ranker_daemon as rd
+from pytest import MonkeyPatch
 
 MAINT_SQL = os.path.join(
     os.path.dirname(__file__), "..", "..", "db", "active_users_maintenance.sql"
@@ -112,7 +113,7 @@ def other():
 
 
 @pytest.fixture(autouse=True)
-def _ranker_settings(monkeypatch):
+def _ranker_settings(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "_reads_supported", True)
     monkeypatch.setattr(rd, "_missing_column_warned_at", None)
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
@@ -129,7 +130,7 @@ def _ranker_settings(monkeypatch):
 # ---- the rotation, as the app's own writers leave it ---------------------------------
 
 
-def _member(conn, name, *, scored, interests=True, history=False, read=None, vector=False):
+def _member(conn, name, *, scored, interests=True, history=False, read=None, vector=False) -> None:
     """A rotation row with a cached feed (post 1).
 
     `interests`: an interest-picker opt-in (a user_interests row).
@@ -172,7 +173,7 @@ def _member(conn, name, *, scored, interests=True, history=False, read=None, vec
     conn.commit()
 
 
-def _clear_interests(session, name):
+def _clear_interests(session, name) -> None:
     """What DELETE /v1/fyp/interests does to the database, committed. (It also
     publishes a refresh on Redis, which the ranker handles after the running cycle.)"""
     with session.cursor() as cur:
@@ -181,7 +182,7 @@ def _clear_interests(session, name):
     session.commit()
 
 
-def _read_feed(session, *names):
+def _read_feed(session, *names) -> None:
     """What a first-page read of get_personalized_feed sends, in one transaction.
 
     Refuses to notify where the shipped function would not: it notifies only for an
@@ -236,7 +237,7 @@ class _Cycle:
     every check (a reader still waiting for its group); `expect` is a read the cycle
     must have heard before it goes on after the first account."""
 
-    def __init__(self, monkeypatch, conn, *, during=None, named=(), expect=None):
+    def __init__(self, monkeypatch: MonkeyPatch, conn, *, during=None, named=(), expect=None) -> None:
         self.conn, self.during, self.named, self.expect = conn, during or {}, set(named), expect
         self.order, self.reconciled, self.heard = [], [], set()
         real_evict = rd._evict_unsubscribed
@@ -257,7 +258,7 @@ class _Cycle:
         monkeypatch.setattr(rd, "compute_scores", lambda **k: pd.DataFrame())
         monkeypatch.setattr(rd, "_rank_user", self._rank)
 
-    def _rank(self, c, username, *_a, **_k):
+    def _rank(self, c, username, *_a, **_k) -> None:
         with c.cursor() as cur:
             cur.execute("SELECT count(*) FROM haf_fyp_app.active_users")  # the transaction opens
         action = self.during.get(username)
@@ -298,7 +299,7 @@ class _Cycle:
         return rd.run_cycle(self.conn, self._reads)
 
 
-def _three_in_the_queue(conn):
+def _three_in_the_queue(conn) -> None:
     for name, scored in (("acct1", "5 hours"), ("acct2", "4 hours"), ("acct3", "3 hours")):
         _member(conn, name, scored=scored)
 
@@ -306,7 +307,7 @@ def _three_in_the_queue(conn):
 # ---- the three ways an evicted account was ranked back in ------------------------------
 
 
-def test_a_waiting_reader_that_qualifies_is_evicted_once_and_stays_out(conn, other, monkeypatch):
+def test_a_waiting_reader_that_qualifies_is_evicted_once_and_stays_out(conn, other, monkeypatch: MonkeyPatch) -> None:
     """A reader waiting for its group is named by main() on EVERY check. Here the lane
     is full, so the reader is not in the cycle's queue: the first check evicts it, and
     the three checks after it must neither look at it again nor rank it.
@@ -331,7 +332,7 @@ def test_a_waiting_reader_that_qualifies_is_evicted_once_and_stays_out(conn, oth
     assert cycle.reconciled == [["acct1", "acct2", "acct3"], ["gone"]]
 
 
-def test_a_waiting_reader_the_cycles_own_reconcile_evicted_stays_out(conn, other, monkeypatch):
+def test_a_waiting_reader_the_cycles_own_reconcile_evicted_stays_out(conn, other, monkeypatch: MonkeyPatch) -> None:
     """Defect 1 (found reviewing !105's first commit, fixed in its second). The waiting
     reader is the stalest reader, so the lane puts it in the cycle's queue and the
     reconcile at the top of the cycle evicts it before any check runs. The first check
@@ -351,11 +352,14 @@ def test_a_waiting_reader_the_cycles_own_reconcile_evicted_stays_out(conn, other
     assert cycle.reconciled == [["acct1", "acct2", "gone"], ["gone"]]
 
 
-def test_an_account_the_cycles_own_reconcile_evicts_is_not_ranked(conn, other, monkeypatch):
+def test_an_account_the_cycles_own_reconcile_evicts_is_not_ranked(conn, other, monkeypatch: MonkeyPatch) -> None:
     """The same account with nobody naming it: what the top-of-cycle reconcile returns
     must be taken out of the queue. (#10, and older than #85: here so that the test
     above cannot be passing on this alone, or failing to notice it missing.)"""
-    _member(conn, "gone", scored="6 hours", interests=False)
+    # Read three days ago: outside the reader window, so it is in the queue as the
+    # rotation's stalest. (An opted-out account that never read is not in the queue at
+    # all since #98; the hourly sweep evicts it.)
+    _member(conn, "gone", scored="6 hours", interests=False, read="3 days")
     for name, scored in (("acct1", "5 hours"), ("acct2", "4 hours")):
         _member(conn, name, scored=scored)
 
@@ -368,15 +372,15 @@ def test_an_account_the_cycles_own_reconcile_evicts_is_not_ranked(conn, other, m
 
 
 def test_an_account_in_the_queue_that_opts_out_and_is_read_mid_cycle_stays_out(
-    conn, other, monkeypatch
-):
+    conn, other, monkeypatch: MonkeyPatch
+) -> None:
     """Defect 2 (found reviewing !105's second commit, fixed in its third). acct3
     passed the reconcile at the top of the cycle. While acct1 is being ranked it clears
     its interests and its feed is read. The check evicts it, but it was still in the
     queue: popped a moment later, ranked, row written back."""
     _three_in_the_queue(conn)
 
-    def _acct3_leaves_and_is_read():
+    def _acct3_leaves_and_is_read() -> None:
         _clear_interests(other, "acct3")
         _read_feed(other, "acct3")
 
@@ -389,8 +393,8 @@ def test_an_account_in_the_queue_that_opts_out_and_is_read_mid_cycle_stays_out(
 
 
 def test_an_evicted_account_stays_out_when_the_query_after_the_eviction_fails(
-    conn, other, monkeypatch
-):
+    conn, other, monkeypatch: MonkeyPatch
+) -> None:
     """Defect 3 (found reviewing !105's third commit, fixed in its fourth). The
     reconcile commits; the membership query after it fails on a live session; the
     eviction was not yet remembered, so acct3 was still ranked from the queue.
@@ -411,7 +415,7 @@ def test_an_evicted_account_stays_out_when_the_query_after_the_eviction_fails(
                 cur.execute("SELECT pg_sleep(5)")
         return real_members(c, names)
 
-    def _acct3_leaves_and_both_are_read():
+    def _acct3_leaves_and_both_are_read() -> None:
         _clear_interests(other, "acct3")
         _read_feed(other, "acct3", "zed")
 
@@ -433,8 +437,8 @@ def test_an_evicted_account_stays_out_when_the_query_after_the_eviction_fails(
 
 @pytest.mark.parametrize("history", [True, "stamp", "rows"], ids=["both", "stamp", "rows"])
 def test_clearing_interests_does_not_evict_an_account_with_on_chain_history(
-    conn, other, monkeypatch, history
-):
+    conn, other, monkeypatch: MonkeyPatch, history
+) -> None:
     """The reconcile's own rule, through the cycle. acct3 clears its interests and is
     read, exactly as above, but it has interacted on chain: it keeps its row, and as a
     stale reader it is ranked next, ahead of acct2. Either sign of history is enough:
@@ -443,7 +447,7 @@ def test_clearing_interests_does_not_evict_an_account_with_on_chain_history(
     _member(conn, "acct2", scored="4 hours")
     _member(conn, "acct3", scored="3 hours", history=history, vector=True)
 
-    def _acct3_leaves_and_is_read():
+    def _acct3_leaves_and_is_read() -> None:
         _clear_interests(other, "acct3")
         _read_feed(other, "acct3")
 
@@ -455,7 +459,7 @@ def test_clearing_interests_does_not_evict_an_account_with_on_chain_history(
     assert _state(other, "acct3") == {"row": True, "feed": [2], "vector": True, "read": True}
 
 
-def test_a_reader_in_good_standing_is_taken_ahead_and_loses_nothing(conn, other, monkeypatch):
+def test_a_reader_in_good_standing_is_taken_ahead_and_loses_nothing(conn, other, monkeypatch: MonkeyPatch) -> None:
     """The path all of the above guard, working: a stale reader that still has its
     interests is not in this cycle's queue, is read while acct1 is ranked, and goes
     next. The reconcile is asked about it and spares it and everything it has."""
@@ -479,7 +483,7 @@ def test_a_reader_in_good_standing_is_taken_ahead_and_loses_nothing(conn, other,
     assert _state(other, "zed") == {"row": True, "feed": [2], "vector": True, "read": True}
 
 
-def test_an_opt_out_that_nobody_reads_is_left_for_after_the_cycle(conn, other, monkeypatch):
+def test_an_opt_out_that_nobody_reads_is_left_for_after_the_cycle(conn, other, monkeypatch: MonkeyPatch) -> None:
     """Not a defect, and not new with #85: an account that clears its interests during a
     cycle and whose feed is NOT read is never looked at by a check. It is ranked from
     the queue as it always was. What removes it is the refresh that

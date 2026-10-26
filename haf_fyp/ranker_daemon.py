@@ -55,6 +55,8 @@ from haf_fyp import visibility
 from haf_fyp.credibility import credibility_failure_message, fetch_author_credibility
 from haf_fyp.embeddings import fetch_post_vectors_safe, register_vector_type
 from haf_fyp.scoring import (
+    FEED_CACHE_RANK_TYPE,
+    FEED_CACHE_SHAPE_SQL,
     bootstrap_vector_from_communities,
     build_user_profile_vector,
     compute_scores,
@@ -258,6 +260,16 @@ _lane_slots = 0
 _feed_read_failure_logged_at = 0.0
 _missing_column_warned_at: float | None = None
 
+# False until the installed feed_cache is the compact row write_feed_cache writes (#98).
+# The SQL and the ranker image are upgraded separately: on the old wide table every
+# write_feed_cache fails (no feed_cache_labels), once per account, and the log fills
+# with those. While False, main() ranks nothing and says why instead.
+_feed_cache_compact = False
+# What the last look found: the type of feed_cache.rank (None: no such column) and
+# whether feed_cache_labels exists. For the error, which names it.
+_feed_cache_installed: tuple[str | None, bool] = (None, False)
+_feed_cache_mismatch_logged_at: float | None = None
+
 
 # Rotation eviction + #9-invariant repair (#10), on the hourly maintenance cadence.
 # active_users means "users we rank" (#9) and nothing ever removed a row, so a cleared
@@ -279,6 +291,22 @@ ACTIVE_USERS_MAX_EVICTIONS = _tuning("ACTIVE_USERS_MAX_EVICTIONS", "1000", int, 
 ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS = _tuning(
     "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS", "1000", int, minimum=0
 )
+
+# Feeds are built for accounts that use the app, not for every account that ever voted
+# on a tracked post (#98): the rotation lane takes an account that has read its feed
+# within this many days, or that holds interests, and the hourly pass drops the cached
+# feed of any other. A replay from block 0 enrols hundreds of thousands of drive-by
+# voters, and ranking each of them stored 200 rows nobody asked for. Such an account
+# keeps its rotation row and its interaction history; its first read is served the
+# global feed and puts it in the reader lane, so its own feed follows within a cycle.
+# At most 100 years: a cutoff further back leaves PostgreSQL's date range.
+FEED_CACHE_UNREAD_RETENTION_DAYS = _tuning(
+    "FEED_CACHE_UNREAD_RETENTION_DAYS", "30", int, minimum=1, maximum=36500
+)
+# Accounts whose feed one transaction of the unread-feed pass drops. The pass repeats
+# until a batch comes back short, so the first pass on an existing install drains every
+# unread feed; the batch only bounds how long each transaction holds its row locks.
+_UNREAD_FEED_BATCH_ACCOUNTS = 10000
 
 # Bounds the post-eviction top-up below. Each round either fills the cycle or
 # permanently removes rows, so a handful of rounds drains any realistic backlog
@@ -410,6 +438,7 @@ def _connect() -> psycopg2.extensions.connection:
             _listen_for_feed_reads(conn)
             # Before the first cycle as well: main() handles reads before it runs one.
             _refresh_read_filter(conn)
+            _check_feed_cache_shape(conn)
             return conn
         except psycopg2.OperationalError as exc:
             log.warning("database not ready (%s) — retrying in 5s", exc)
@@ -437,6 +466,43 @@ def _warn_missing_read_column() -> None:
         "is older than this ranker. Ranking continues without the reader lane. "
         "Stop the block processor and this ranker (the install is skipped while "
         "either holds HAF's lock) and re-run the install to enable it."
+    )
+
+
+def _check_feed_cache_shape(conn) -> None:
+    """Decide whether the installed feed_cache is the one this ranker writes. On every
+    connection, and once per cycle period for as long as it is not."""
+    global _feed_cache_compact, _feed_cache_installed, _feed_cache_mismatch_logged_at
+    with conn.cursor() as cur:
+        cur.execute(FEED_CACHE_SHAPE_SQL)
+        row = cur.fetchone()
+    conn.commit()
+    _feed_cache_compact = bool(row[0])
+    if not _feed_cache_compact:
+        _feed_cache_installed = (row[1], bool(row[2]))
+    elif _feed_cache_mismatch_logged_at is not None:
+        log.info("haf_fyp_app.feed_cache is the compact row now: ranking resumes")
+        _feed_cache_mismatch_logged_at = None
+
+
+def _warn_feed_cache_mismatch() -> None:
+    """One error, not one failure per account; repeated hourly, as a ranker can sit
+    like this for weeks."""
+    global _feed_cache_mismatch_logged_at
+    now = time.monotonic()
+    if _feed_cache_mismatch_logged_at is not None and now - _feed_cache_mismatch_logged_at < 3600:
+        return
+    _feed_cache_mismatch_logged_at = now
+    rank_type, labels_present = _feed_cache_installed
+    log.error(
+        "the installed SQL does not match this ranker: it writes haf_fyp_app.feed_cache "
+        "with rank %s and label codes in haf_fyp_app.feed_cache_labels, and the installed "
+        "feed_cache has %s, %s feed_cache_labels. Ranking nothing until the SQL is "
+        "upgraded: stop the block processor and this ranker (the install is skipped "
+        "while either holds HAF's lock), re-run the install, and start them.",
+        FEED_CACHE_RANK_TYPE,
+        f"rank {rank_type}" if rank_type else "no rank column",
+        "with" if labels_present else "and no",
     )
 
 
@@ -727,9 +793,11 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
     engaged users at equal staleness — engagement signal should win ties.
 
     #81 puts recent readers ahead of that order, in at most READER_CYCLE_SHARE of the
-    cycle; the remainder is filled exactly as before, from everyone else. The round-
-    robin argument below therefore still holds for the remainder, at a rate reduced
-    by the share actually used.
+    cycle; the remainder is filled in that order from everyone else who uses the app
+    (#98): a read within FEED_CACHE_UNREAD_RETENTION_DAYS, or interests. An account
+    that has only voted is not ranked until it reads. The round-robin argument below
+    therefore holds for the remainder, over that set, at a rate reduced by the share
+    actually used.
 
     The remainder stays a single ORDER BY on purpose. #10 considered reserving a share of
     each cycle for never-interacted opt-ins, but the ordering above is ALREADY a
@@ -772,16 +840,37 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
             )
             readers = [r[0] for r in cur.fetchall()]
         _lane_taken, _lane_slots = len(readers), reader_slots
+        if not _reads_supported:
+            # No last_read_at, so no telling a reader from a drive-by voter: rank the
+            # whole rotation, as before #98, rather than only the opt-ins.
+            cur.execute(
+                """
+                SELECT username
+                  FROM haf_fyp_app.active_users
+                 WHERE NOT (username = ANY(%s))
+                 ORDER BY last_scored_at ASC NULLS FIRST,
+                          last_interaction_at DESC NULLS LAST
+                 LIMIT %s
+                """,
+                (readers, limit - len(readers)),
+            )
+            return readers + [r[0] for r in cur.fetchall()]
+        # #98: only accounts that use the app -- a read within the retention window, or
+        # interests. The same test as the unread-feed pass, so the rotation never
+        # rebuilds a feed that pass is about to drop.
         cur.execute(
             """
             SELECT username
-              FROM haf_fyp_app.active_users
+              FROM haf_fyp_app.active_users au
              WHERE NOT (username = ANY(%s))
+               AND (au.last_read_at >= (NOW() AT TIME ZONE 'utc') - make_interval(days => %s)
+                    OR EXISTS (SELECT 1 FROM haf_fyp_app.user_interests ui
+                                WHERE ui.username = au.username))
              ORDER BY last_scored_at ASC NULLS FIRST,
                       last_interaction_at DESC NULLS LAST
              LIMIT %s
             """,
-            (readers, limit - len(readers)),
+            (readers, FEED_CACHE_UNREAD_RETENTION_DAYS, limit - len(readers)),
         )
         return readers + [r[0] for r in cur.fetchall()]
 
@@ -1446,6 +1535,41 @@ def _run_active_users_maintenance(conn) -> None:
         log.exception("active_users maintenance failed — skipping")
 
 
+def _run_unread_feed_maintenance(conn) -> None:
+    """
+    Drop the cached feed of every account that has not read it within
+    FEED_CACHE_UNREAD_RETENTION_DAYS and holds no interests (#98), a batch of accounts
+    per transaction until a batch comes back short.
+
+    Not gated on block sync, unlike the eviction sweep: nothing it reads comes from the
+    chain. Best-effort: a maintenance failure must never take down ranking.
+    """
+    dropped = 0
+    try:
+        while True:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT haf_fyp_app.drop_unread_feeds(%s, %s)",
+                    (FEED_CACHE_UNREAD_RETENTION_DAYS, _UNREAD_FEED_BATCH_ACCOUNTS),
+                )
+                batch = cur.fetchone()[0]
+            conn.commit()
+            dropped += batch
+            if batch < _UNREAD_FEED_BATCH_ACCOUNTS:
+                break
+    except psycopg2.OperationalError:
+        raise
+    except Exception:
+        conn.rollback()
+        log.exception("unread-feed maintenance failed after %d account(s) — skipping", dropped)
+        return
+    log.info(
+        "feed_cache maintenance: dropped the unread feed of %d account(s) "
+        "(no read within %d days, no interests)",
+        dropped, FEED_CACHE_UNREAD_RETENTION_DAYS,
+    )
+
+
 def _safe_rollback(conn) -> None:
     """
     Clear a failed transaction so the shared connection stays usable.
@@ -1528,6 +1652,26 @@ def main() -> None:
         if conn.closed:
             log.warning("database connection is closed — reconnecting")
             conn = _reconnect(conn)
+
+        # Nothing below may run on a feed_cache this ranker cannot write: the cycle and
+        # every refresh would fail once per account, and the unread-feed pass calls a
+        # function the old SQL does not have. Looked at again once per cycle period.
+        if not _feed_cache_compact:
+            if time.monotonic() >= next_full_cycle:
+                next_full_cycle = time.monotonic() + CYCLE_SECONDS
+                try:
+                    _check_feed_cache_shape(conn)
+                except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                    log.warning("database connection lost (feed_cache check) — reconnecting")
+                    conn = _reconnect(conn)
+                except Exception:
+                    log.exception("could not check the schema for the compact feed_cache")
+                    _safe_rollback(conn)
+            if not _feed_cache_compact:
+                _warn_feed_cache_mismatch()
+                time.sleep(POLL_SECONDS)
+                continue
+            next_full_cycle = 0.0
 
         # Drain pending force-refresh requests
         pending: set[str] = set()
@@ -1621,6 +1765,7 @@ def main() -> None:
         if time.monotonic() >= next_feed_maint:
             try:
                 _run_active_users_maintenance(conn)
+                _run_unread_feed_maintenance(conn)
                 _run_feed_events_maintenance(conn)
                 _run_embedding_coverage_maintenance(conn)
             except (psycopg2.OperationalError, psycopg2.InterfaceError):

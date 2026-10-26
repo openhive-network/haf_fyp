@@ -487,7 +487,7 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Can this container serve: `503` when the database pool does not answer a query within 1.5 s. Redis is reported in the body (`redis`, `rate_limit_store`) and never fails it: the app serves without Redis. A probe slower than its deadline (1.5 s database, 1.0 s Redis) counts as no answer. Not sync-aware (#61) |
-| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), reader-first figures (#86, under `reader_first`: whether the ranker is ranking, readers in the last day, their stalest feed, rotation age; see "How fresh a feed is"), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why) — not feed analytics |
+| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), reader-first figures (#86, under `reader_first`: whether the ranker is ranking, readers in the last day, their stalest feed, rotation age; see "How fresh a feed is"), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why), whether the installed `feed_cache` is the one the ranker writes (#99, under `feed_cache`: `ok`, or `outdated` with both shapes) — not feed analytics |
 | GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
 | POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10/min per IP, 60/min total) |
 | DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5/min per IP, 30/min total) |
@@ -667,6 +667,25 @@ on a full node is tens of thousands, and a scheduled cycle ranks `MAX_USERS_PER_
 of them, then waits `CYCLE_SECONDS` (300). Ranked round-robin, an account was reached
 once per full rotation: about 22 hours at 45,000 accounts and the default 200.
 
+**Only accounts that use the app are ranked (#98).** Every account that votes on or
+reblogs a tracked post joins `active_users`, which after a replay from genesis is
+hundreds of thousands of accounts that never open a feed. The scheduled cycle ranks an
+account only once it has read its feed within `FEED_CACHE_UNREAD_RETENTION_DAYS` (30),
+or saved interests, and the hourly maintenance pass drops the cached feed of every
+other. Such an account keeps its rotation row and its votes; its first read is served
+the global feed, puts it in the reader lane below, and its own feed follows within a
+cycle.
+
+The SQL and the ranker image of this change go together: the ranker writes a compact
+`feed_cache` row (smallint `rank`, labels as codes into `feed_cache_labels`). A ranker
+started against SQL that predates it ranks nobody, logs one error naming the installed
+and the expected shape (repeated hourly), and `GET /metrics` reports
+`feed_cache.state: outdated`; it starts ranking once it sees the upgraded table. Stop the
+block processor and the ranker, run the install, start them. The install's upgrade of
+an existing table copies only the feeds of accounts that read within 30 days or hold
+interests, the ones the hourly pass would keep at the default retention, and drops the
+rest with the old table; its log names how many rows it copied and skipped.
+
 **Readers go first (#81).** Requesting the first page of a feed tells the ranker, which
 
 1. records the read (`active_users.last_read_at`);
@@ -774,14 +793,16 @@ ranker is running:
 | `readers_in_window` | Accounts whose feed was read in the last 24 h | Thousands with no audience to explain them: someone is requesting other people's feeds |
 | `oldest_reader_feed_seconds` | Age of the stalest feed among those readers (`null` with no readers, or when none of them has a feed yet) | The number this feature exists to keep low. Up to about 15 min plus the length of one cycle is healthy: 12 min on a small node, 35 min on one whose cycles take 20. Well above that, readers are not being put first: signal not arriving, lane full, or ranker stopped |
 | `readers_due` | Readers whose feed is over 10 min old: what the reader lane takes next | It falls after every cycle. *Staying* at or above the lane's size (`MAX_USERS_PER_CYCLE` x `READER_CYCLE_SHARE`, 100 at the defaults) across scrapes: the lane is full and everyone else rotates more slowly |
-| `rotation_size`, `never_ranked` | Accounts in the rotation, and how many have no feed yet | `never_ranked` above 0 for more than a few cycles: accounts are failing to rank, or nothing is ranking |
+| `rotation_size`, `never_ranked` | Accounts in the rotation (a read in the last 30 days, or interests; an account that has only voted is not ranked until it reads), and how many have no feed yet | `never_ranked` above 0 for more than a few cycles: accounts are failing to rank, or nothing is ranking |
 | `rotation_age_seconds` | Age of the stalest ranked feed: how long a full rotation takes now (`null` when no account has a feed yet) | Hours on a large node. Rising past what a rotation normally takes here: the ranker is not ranking, or one account fails every cycle (`failed to rank user` in the ranker's log). It lags by hours; for "is it alive" use `newest_feed_seconds` |
 | `notification_queue_usage` | Fraction (0 to 1) of PostgreSQL's notification queue in use, cluster-wide | Above 0 across scrapes: a session that listens, this app's or another's, is stuck in a transaction. At 1 every `NOTIFY` in the cluster fails |
 
 The 24 h and the 10 min are the defaults of `READER_WINDOW_SECONDS` and
 `READ_REFRESH_MIN_AGE_SECONDS`. The API is not given the ranker's settings, so
 `readers_in_window`, `readers_due` and `oldest_reader_feed_seconds` are computed with
-the defaults, and the section says which (`window_seconds`, `due_after_seconds`). On a
+the defaults, and the section says which (`window_seconds`, `due_after_seconds`); so are
+`rotation_size`, `never_ranked` and `rotation_age_seconds`, with the 30 days of
+`FEED_CACHE_UNREAD_RETENTION_DAYS` (`retention_days`). On a
 node that changed either setting, do not apply the rules above to those three: with a
 shorter window they count accounts the ranker no longer treats as readers, and read as
 trouble when there is none. The same goes for `READER_ACTIVE_WITHIN_DAYS`: with it set,
@@ -871,12 +892,13 @@ PostgreSQL's dates end) makes the prune fail on every pass, and the row ceiling 
 
 | Variable | Default | Minimum | What it bounds |
 |---|---|---|---|
-| `FEED_EVENTS_MAINT_SECONDS` | 3600 | 60 | How often the maintenance pass runs: feed-event rollup and prune, the embedding-coverage rollup, and eviction from the rotation. |
+| `FEED_EVENTS_MAINT_SECONDS` | 3600 | 60 | How often the maintenance pass runs: feed-event rollup and prune, the embedding-coverage rollup, eviction from the rotation, and dropping unread feeds. |
 | `FEED_EVENTS_RETAIN_DAYS` | 14 | 1 | Days of raw feed events (`POST /v1/fyp/events`) kept; the daily rollup outlives them. |
 | `FEED_EVENTS_MAX_ROWS` | 20000000 | 1 | Raw feed events kept at most, whatever their age: the ceiling on a flood of the unauthenticated endpoint. |
 | `EMBEDDING_COVERAGE_DAYS` | 14 | 1 | Days of embedding coverage recomputed on each pass, plus today. `GET /metrics` also shows up to 7 older days, as last computed. |
 | `ACTIVE_USERS_MAX_EVICTIONS` | 1000 | 1 | Accounts with nothing to personalize from removed from the rotation per pass. |
 | `ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS` | 1000 | 0 | Eviction waits until block processing is within this many blocks of the head. |
+| `FEED_CACHE_UNREAD_RETENTION_DAYS` | 30 | 1 | Days a cached feed outlives its last read. After that, and for an account that never read one, the feed is dropped and the rotation stops ranking it, unless the account holds interests. Its next read gets the global feed and its own within a cycle. |
 
 ## Database Schema
 
