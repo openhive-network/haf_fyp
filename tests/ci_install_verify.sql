@@ -474,7 +474,7 @@ DECLARE
         'feed_events_rollup_state:ae22e3f207a74f0d4ee3b1c51a2d4c63',
         'feed_metrics_daily:192c4d0610eb7c746f28d43819490adc',
         'global_feed_cache:6e555692efeb7ea04564cb05d91a1dc6',
-        'hivemind_follow:460b503dcc8f1629cd2e044b2efd6de1',
+        'hivemind_follow:96d3b7eb7ee36f98958afa2961920058',
         'post_bridge_cache:d89ced139f29421e601fa1b8cd35e864',
         'post_candidates:75ca3322bbdd3d031ad38ffee2735ecb',
         'post_commenters:dd6b3cc9b3898e67d2f725176626ba17',
