@@ -241,7 +241,8 @@ $$;
 -- the copy is current to (so a replay keeps its year), and the commenters and engagement
 -- of posts no longer in the window. Those two are found by what is missing rather than
 -- by the posts this pass deletes: a batch that counted a post while this pass deleted it
--- can write its engagement row back, and the next pass removes it.
+-- can write its engagement row back, and the next pass removes it. The rendered posts
+-- of post_bridge_cache go with their posts, by its foreign key's ON DELETE CASCADE.
 --
 -- Concurrent with block processing, which writes the same tables: this deletes only
 -- rows older than the window, which a batch touches only when one of its actions lands

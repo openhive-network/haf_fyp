@@ -325,8 +325,8 @@ DECLARE
         'active_users', 'algorithm_versions', 'app_config', 'app_status', 'app_version',
         'embedding_coverage_daily', 'engagement_metrics', 'feed_cache', 'feed_cache_labels', 'feed_events',
         'feed_events_rollup_state', 'feed_metrics_daily', 'global_feed_cache', 'haf_fyp', 'hivemind_follow',
-        'post_candidates', 'post_commenters', 'user_communities', 'user_interactions', 'user_interests',
-        'user_profile_vectors'
+        'post_bridge_cache', 'post_candidates', 'post_commenters', 'user_communities', 'user_interactions',
+        'user_interests', 'user_profile_vectors'
     ];
     _want_functions TEXT [] := ARRAY[
         'haf_fyp_app.allow_processing()',
@@ -413,6 +413,7 @@ DECLARE
         'index idx_user_communities_user on user_communities',
         'index idx_user_interactions_account_time on user_interactions',
         'index idx_user_interactions_created_at on user_interactions',
+        'index post_bridge_cache_pkey on post_bridge_cache (primary key)',
         'index post_candidates_pkey on post_candidates (primary key)',
         'index post_commenters_pkey on post_commenters (primary key)',
         'index uq_app_config_singleton on app_config (unique)',
@@ -441,6 +442,8 @@ DECLARE
         'constraint global_feed_cache_pkey on global_feed_cache: PRIMARY KEY (post_id)',
         'constraint hivemind_follow_pkey on hivemind_follow: PRIMARY KEY (only_row)',
         'constraint hivemind_follow_singleton on hivemind_follow: CHECK (only_row)',
+        'constraint post_bridge_cache_pkey on post_bridge_cache: PRIMARY KEY (post_id)',
+        'constraint post_bridge_cache_post_id_fkey on post_bridge_cache: FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates(post_id) ON DELETE CASCADE',
         'constraint post_candidates_pkey on post_candidates: PRIMARY KEY (post_id)',
         'constraint post_commenters_pkey on post_commenters: PRIMARY KEY (post_id, commenter_id)',
         'constraint user_communities_pkey on user_communities: PRIMARY KEY (username, community_id)',
@@ -472,6 +475,7 @@ DECLARE
         'feed_metrics_daily:192c4d0610eb7c746f28d43819490adc',
         'global_feed_cache:6e555692efeb7ea04564cb05d91a1dc6',
         'hivemind_follow:460b503dcc8f1629cd2e044b2efd6de1',
+        'post_bridge_cache:d89ced139f29421e601fa1b8cd35e864',
         'post_candidates:75ca3322bbdd3d031ad38ffee2735ecb',
         'post_commenters:dd6b3cc9b3898e67d2f725176626ba17',
         'user_communities:83146409c11276c9ea90534eabba3df9',

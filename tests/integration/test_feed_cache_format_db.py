@@ -190,6 +190,8 @@ def db() -> Iterator[Connection]:
             INSERT INTO {S}.algorithm_versions VALUES ('1.1.0', '{{"recency": 0.3}}');
             -- Every post is rendered from its hivemind id now (#97): a stand-in render,
             -- and a stand-in for the identity the explainer reads from hivemind.
+            -- Empty, so every post renders through the stand-in.
+            CREATE TABLE {S}.post_bridge_cache (post_id int, bridge jsonb);
             CREATE FUNCTION {S}.get_bridge_post(int, int, int) RETURNS jsonb
                 LANGUAGE sql STABLE AS $f$SELECT '{{"body": "x"}}'::jsonb$f$;
             CREATE FUNCTION {S}.hivemind_post_identity(int)
@@ -298,6 +300,7 @@ def _write_compact(
     db: Connection, monkeypatch: pytest.MonkeyPatch, username: str, rows: list[_Row],
     algo: str = "1.1.0",
 ) -> None:
+    monkeypatch.setattr(scoring, "render_bridge_for_posts", lambda *a, **k: None)
     scoring.write_feed_cache(_RehomedSession(db), username, _scored(rows), algo)
 
 

@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from typing import Any
 
 import numpy as np
 import pandas as pd
+import psycopg2
 import psycopg2.extras
 
 from haf_fyp.credibility import DEFAULT_CREDIBILITY
@@ -431,6 +433,64 @@ def compute_scores(
     return ranked
 
 
+def render_bridge_for_posts(conn: Any, post_ids: list[int]) -> None:
+    """Render and cache the observer-agnostic bridge JSON for the given posts.
+
+    post_ids are hivemind hive_posts ids, as the feed caches hold them. The result
+    lands in haf_fyp_app.post_bridge_cache, which the feed endpoints read before
+    rendering a post live. One set-based upsert that skips posts already cached and
+    paid out (frozen) or rendered in the last 5 minutes, so a post shared by many
+    feeds is rendered at most once per cycle; the skip is decided before the
+    get_bridge_post LATERAL, so a skipped post costs nothing. Posts no longer in
+    post_candidates are skipped too (the cache row would outlive the window).
+
+    Best-effort: a hivemind error is logged and rolled back, never raised, so it
+    cannot break a ranking cycle. A lost connection (OperationalError) propagates
+    for the main loop to reconnect.
+    """
+    if not post_ids:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO haf_fyp_app.post_bridge_cache
+                    (post_id, bridge, is_paidout, computed_at)
+                SELECT s.post_id, b.bridge,
+                       COALESCE((b.bridge->>'is_paidout')::boolean, FALSE), now()
+                FROM (
+                    SELECT pc.post_id
+                    FROM haf_fyp_app.post_candidates pc
+                    WHERE pc.post_id = ANY(%s::int[])
+                      AND NOT EXISTS (
+                          SELECT 1 FROM haf_fyp_app.post_bridge_cache c
+                          WHERE c.post_id = pc.post_id
+                            AND (c.is_paidout
+                                 OR c.computed_at > now() - INTERVAL '5 minutes')
+                      )
+                ) s
+                CROSS JOIN LATERAL
+                    haf_fyp_app.get_bridge_post(s.post_id, 0, 0) AS b(bridge)
+                WHERE b.bridge IS NOT NULL
+                ON CONFLICT (post_id) DO UPDATE
+                    SET bridge = EXCLUDED.bridge,
+                        is_paidout = EXCLUDED.is_paidout,
+                        computed_at = now()
+                """,
+                (post_ids,),
+            )
+        conn.commit()
+    except psycopg2.OperationalError:
+        raise
+    except psycopg2.Error:
+        conn.rollback()
+        log.warning(
+            "bridge cache render failed for %d posts (continuing)",
+            len(post_ids),
+            exc_info=True,
+        )
+
+
 # Whether the installed feed_cache is the row write_feed_cache writes (#98): rank a
 # smallint, and algorithm_version / boost_source codes into feed_cache_labels. One row:
 # that verdict, the installed type of feed_cache.rank (NULL: no such table) and whether
@@ -540,6 +600,9 @@ def write_feed_cache(
             rows,
         )
     conn.commit()
+    # The endpoint serves this feed's posts from the bridge cache instead of
+    # rendering each one live (the dominant per-request cost).
+    render_bridge_for_posts(conn, [int(x) for x in top["post_id"].tolist()])
 
 
 def write_global_feed_cache(conn, scored_df: pd.DataFrame, algo_version: str) -> None:
@@ -577,3 +640,5 @@ def write_global_feed_cache(conn, scored_df: pd.DataFrame, algo_version: str) ->
             rows,
         )
     conn.commit()
+    # Observer-agnostic, which is exactly what the unauthenticated global feed serves.
+    render_bridge_for_posts(conn, [int(x) for x in top["post_id"].tolist()])

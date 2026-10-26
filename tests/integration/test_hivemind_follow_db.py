@@ -536,6 +536,29 @@ def test_retention_deletes_what_has_left_the_window_and_what_hangs_off_it(conn: 
         assert cur.fetchone() == (0, 0)
 
 
+def test_retention_takes_the_rendered_posts_of_the_posts_it_deletes(conn: connection) -> None:
+    with conn.cursor() as cur:
+        cur.execute(ddl("post_bridge_cache"))
+        hm = Hivemind(cur)
+        seed_window(hm)
+        batch(cur, 1, 1000)
+        hm.at(2000)
+        cur.execute("UPDATE hive.ci_head SET block = 2000")
+        batch(cur, 1001, 2000)
+        cur.execute("INSERT INTO haf_fyp_app.post_bridge_cache (post_id, bridge) "
+                    "SELECT post_id, '{}' FROM haf_fyp_app.post_candidates")
+        cur.execute("SELECT count(*) FROM haf_fyp_app.post_bridge_cache")
+        cached = cur.fetchone()[0]
+        cur.execute("UPDATE haf_fyp_app.app_config SET history_days = 1")
+
+        cur.execute("SELECT posts, interactions FROM haf_fyp_app.prune_history()")
+        assert cur.fetchone()[0] == 1
+        cur.execute("SELECT post_id FROM haf_fyp_app.post_bridge_cache")
+        left = {r[0] for r in cur.fetchall()}
+        assert hm.posts["old"] not in left
+        assert len(left) == cached - 1
+
+
 def test_retention_before_the_backfill_deletes_nothing(conn: connection) -> None:
     with conn.cursor() as cur:
         cur.execute("SELECT posts, interactions FROM haf_fyp_app.prune_history()")

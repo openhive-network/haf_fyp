@@ -712,6 +712,7 @@ def shipped_feed(other):
                 score_engagement float, score_credibility float, algorithm_version text);
             CREATE TABLE {s}.hive_accounts (id int, name text);
             -- The feed renders each post from its hivemind id (#97): a stand-in render.
+            CREATE TABLE {s}.post_bridge_cache (post_id int, bridge jsonb);
             CREATE FUNCTION {s}.get_bridge_post(int, int, int) RETURNS jsonb
                 LANGUAGE sql STABLE AS $f$SELECT '{{"body": "x"}}'::jsonb$f$;
             INSERT INTO {s}.feed_cache (username, post_id, rank, final_score)

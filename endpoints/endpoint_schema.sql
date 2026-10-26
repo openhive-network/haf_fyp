@@ -1720,11 +1720,26 @@ BEGIN
             -- Hivemind no longer has renders as NULL and is left out.
             SELECT
                 page.rank,
-                haf_fyp_app.get_bridge_post(page.post_id, _observer_id, get_personalized_feed.truncate_body)
+                -- Serve the pre-rendered bridge JSON from post_bridge_cache when
+                -- present (re-applying truncate_body to the cached full body),
+                -- else render live. The cache is observer-agnostic (observer 0);
+                -- the live fallback keeps observer context on a miss.
+                COALESCE(
+                    CASE
+                        WHEN page.cached IS NOT NULL AND get_personalized_feed.truncate_body > 0
+                        THEN jsonb_set(
+                                 page.cached, '{body}',
+                                 to_jsonb(left(page.cached ->> 'body', get_personalized_feed.truncate_body))
+                             )
+                        ELSE page.cached
+                    END,
+                    haf_fyp_app.get_bridge_post(page.post_id, _observer_id, get_personalized_feed.truncate_body)
+                )
                 || jsonb_build_object('fyp', page.fyp) AS post
             FROM (
                 SELECT
                     fc.post_id::int AS post_id,
+                    pbc.bridge AS cached,
                     fc.rank AS rank,
                     jsonb_build_object(
                         'source', 'personalized',
@@ -1744,6 +1759,7 @@ BEGIN
                         'algorithm_version', la.label
                     ) AS fyp
                 FROM haf_fyp_app.feed_cache fc
+                LEFT JOIN haf_fyp_app.post_bridge_cache pbc ON pbc.post_id = fc.post_id
                 -- The two labels are stored as codes (#98); 0 has no row, which is NULL.
                 LEFT JOIN haf_fyp_app.feed_cache_labels lb ON lb.code = fc.boost_source
                 LEFT JOIN haf_fyp_app.feed_cache_labels la ON la.code = fc.algorithm_version
@@ -1752,6 +1768,10 @@ BEGIN
                 LIMIT _limit
                 OFFSET _offset
             ) AS page
+            -- Planner barrier: without it s is pulled up into the aggregate, and
+            -- "post" is evaluated twice per row (once for jsonb_agg, once for its
+            -- FILTER), rendering every uncached post twice.
+            OFFSET 0
         ) AS s;
         RETURN _result;
     END IF;
@@ -1772,11 +1792,26 @@ BEGIN
         FROM (
             SELECT
                 page.rank,
-                haf_fyp_app.get_bridge_post(page.post_id, _observer_id, get_personalized_feed.truncate_body)
+                -- Serve the pre-rendered bridge JSON from post_bridge_cache when
+                -- present (re-applying truncate_body to the cached full body),
+                -- else render live. The cache is observer-agnostic (observer 0);
+                -- the live fallback keeps observer context on a miss.
+                COALESCE(
+                    CASE
+                        WHEN page.cached IS NOT NULL AND get_personalized_feed.truncate_body > 0
+                        THEN jsonb_set(
+                                 page.cached, '{body}',
+                                 to_jsonb(left(page.cached ->> 'body', get_personalized_feed.truncate_body))
+                             )
+                        ELSE page.cached
+                    END,
+                    haf_fyp_app.get_bridge_post(page.post_id, _observer_id, get_personalized_feed.truncate_body)
+                )
                 || jsonb_build_object('fyp', page.fyp) AS post
             FROM (
                 SELECT
                     gfc.post_id::int AS post_id,
+                    pbc.bridge AS cached,
                     gfc.rank AS rank,
                     jsonb_build_object(
                         'source', 'global',
@@ -1800,10 +1835,15 @@ BEGIN
                         'algorithm_version', gfc.algorithm_version
                     ) AS fyp
                 FROM haf_fyp_app.global_feed_cache gfc
+                LEFT JOIN haf_fyp_app.post_bridge_cache pbc ON pbc.post_id = gfc.post_id
                 ORDER BY gfc.rank
                 LIMIT _limit
                 OFFSET _offset
             ) AS page
+            -- Planner barrier: without it s is pulled up into the aggregate, and
+            -- "post" is evaluated twice per row (once for jsonb_agg, once for its
+            -- FILTER), rendering every uncached post twice.
+            OFFSET 0
         ) AS s;
         RETURN _result;
     END IF;
@@ -1900,11 +1940,26 @@ BEGIN
             -- builders are called at most page-size times regardless of plan.
             SELECT
                 page.rank,
-                haf_fyp_app.get_bridge_post(page.post_id, 0, get_global_feed.truncate_body)
+                -- Serve the pre-rendered bridge JSON from post_bridge_cache when
+                -- present (re-applying truncate_body to the cached full body),
+                -- else render live. The cache is observer-agnostic (observer 0);
+                -- the live fallback keeps observer context on a miss.
+                COALESCE(
+                    CASE
+                        WHEN page.cached IS NOT NULL AND get_global_feed.truncate_body > 0
+                        THEN jsonb_set(
+                                 page.cached, '{body}',
+                                 to_jsonb(left(page.cached ->> 'body', get_global_feed.truncate_body))
+                             )
+                        ELSE page.cached
+                    END,
+                    haf_fyp_app.get_bridge_post(page.post_id, 0, get_global_feed.truncate_body)
+                )
                 || jsonb_build_object('fyp', page.fyp) AS post
             FROM (
                 SELECT
                     gfc.post_id::int AS post_id,
+                    pbc.bridge AS cached,
                     gfc.rank AS rank,
                     jsonb_build_object(
                         'source', 'global',
@@ -1929,6 +1984,7 @@ BEGIN
                 -- The community filter reads post_candidates (global_feed_cache is
                 -- capped at the top ~200 posts, so this is a tiny PK-probed scan).
                 FROM haf_fyp_app.global_feed_cache gfc
+                LEFT JOIN haf_fyp_app.post_bridge_cache pbc ON pbc.post_id = gfc.post_id
                 WHERE get_global_feed.community_id IS NULL
                    OR EXISTS (
                        SELECT 1 FROM haf_fyp_app.post_candidates pc
@@ -1939,6 +1995,10 @@ BEGIN
                 LIMIT _limit
                 OFFSET _offset
             ) AS page
+            -- Planner barrier: without it s is pulled up into the aggregate, and
+            -- "post" is evaluated twice per row (once for jsonb_agg, once for its
+            -- FILTER), rendering every uncached post twice.
+            OFFSET 0
         ) AS s;
         RETURN _result;
     END IF;

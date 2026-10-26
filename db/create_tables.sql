@@ -460,6 +460,27 @@ CREATE INDEX IF NOT EXISTS idx_global_feed_rank
 ON haf_fyp_app.global_feed_cache (rank ASC);
 
 -- ---------------------------------------------------------------------------
+-- Post bridge cache — pre-rendered, observer-agnostic bridge JSON
+--
+-- Rendered by the ranker (scoring.render_bridge_for_posts) for the posts the feed
+-- writers place, and read by the feed endpoints before they render a post live
+-- through hivemind's bridge builder, the dominant per-request cost. Keyed by the
+-- hivemind id like the feed caches. The one foreign key on the history copy: the
+-- cascade is what keeps the cache within the window when prune_history deletes a
+-- post. The replayed shape's cache is dropped by $history_from_hivemind$ above and
+-- refills on the next ranker cycle.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS haf_fyp_app.post_bridge_cache (
+    post_id int NOT NULL,                       -- hivemind_app.hive_posts.id
+    bridge jsonb NOT NULL,
+    is_paidout boolean NOT NULL DEFAULT FALSE,
+    computed_at timestamp NOT NULL DEFAULT now(),
+    PRIMARY KEY (post_id),
+    FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates (post_id) ON DELETE CASCADE
+);
+
+-- ---------------------------------------------------------------------------
 -- User communities — on-chain subscription state (synced from custom_json)
 -- NOTE (T-0.7): verify community custom_json_operation format on live node.
 -- ---------------------------------------------------------------------------
@@ -684,6 +705,7 @@ GRANT UPDATE ON haf_fyp_app.algorithm_versions TO haf_fyp_user;
 -- blanket grant above, so PostgREST still reads the caches to serve feeds.
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.feed_cache           FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.global_feed_cache    FROM haf_fyp_user;
+REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.post_bridge_cache    FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.user_profile_vectors FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.feed_metrics_daily   FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.embedding_coverage_daily FROM haf_fyp_user;
@@ -705,6 +727,7 @@ REVOKE UPDATE, DELETE       ON haf_fyp_app.active_users           FROM haf_fyp_u
 -- ranker cannot run without, and raise the ranker's REQUIRED_SCHEMA_VERSION with it.
 --   1  (implicit: no function) the replayed history
 --   2  history copied from hivemind, keyed by hivemind ids (#97)
+--   3  post_bridge_cache keyed by hivemind ids, which the feed writers render into
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.schema_version()
@@ -712,5 +735,5 @@ RETURNS int
 LANGUAGE sql
 IMMUTABLE
 AS $$
-    SELECT 2;
+    SELECT 3;
 $$;
