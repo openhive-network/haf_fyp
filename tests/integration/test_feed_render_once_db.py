@@ -46,9 +46,27 @@ def _shipped_function(name: str) -> str:
     return _rehome(sql[start : sql.index("\n$$;", start) + len("\n$$;")])
 
 
-def _unfenced(fn_sql: str) -> str:
-    """The same function with the OFFSET 0 fences taken out: the query before the fix."""
-    return re.sub(r"^[ \t]*OFFSET 0[ \t]*\n", "", fn_sql, flags=re.MULTILINE)
+_FENCE = re.compile(r"^[ \t]*OFFSET 0[ \t]*\r?\n", flags=re.MULTILINE)
+# Fences per function: the personalized page and its cold-start fallback, the global page.
+_FENCES = {"get_personalized_feed": 2, "get_global_feed": 1}
+
+
+def _install_unfenced(db: Connection) -> None:
+    """Replace both functions with the query before the fix: the fences taken out.
+
+    A fence that is reworded or moved would leave nothing to remove, and every
+    comparison against the "before" query would then pass trivially, so the number
+    removed is checked.
+    """
+    removed = 0
+    with db.cursor() as cur:
+        for name, expected in _FENCES.items():
+            sql, n = _FENCE.subn("", _shipped_function(name))
+            assert n == expected, f"{name}: removed {n} OFFSET 0 fences, expected {expected}"
+            removed += n
+            cur.execute(sql)
+    assert removed == 3
+    db.commit()
 
 
 @pytest.fixture()
@@ -213,11 +231,26 @@ def test_the_fence_leaves_the_page_unchanged(
         cur.execute(f"UPDATE {S}.post_candidates SET hive_post_id = %s WHERE hive_post_id = 12", (UNRENDERABLE,))
     db.commit()
     fenced, _ = _call(db, sql, args)
-    with db.cursor() as cur:
-        cur.execute(_unfenced(_shipped_function("get_personalized_feed")))
-        cur.execute(_unfenced(_shipped_function("get_global_feed")))
-    db.commit()
+    _install_unfenced(db)
     unfenced, _ = _call(db, sql, args)
     assert fenced == unfenced, label
     ranks = [p["fyp"]["rank"] for p in json.loads(fenced)]
     assert ranks == sorted(ranks) and len(set(ranks)) == len(ranks), label
+
+
+@pytest.mark.parametrize(("label", "sql", "args"), PAGES, ids=[p[0] for p in PAGES])
+def test_without_the_fence_each_miss_renders_twice(
+    db: Connection, label: str, sql: str, args: tuple[Any, ...]
+) -> None:
+    """Negative control: the fence is what holds the count at one call per post.
+
+    If the planner ever stops pulling the subquery up, this fails, and the fence
+    (and the once-per-post test) no longer prove anything.
+    """
+    _install_unfenced(db)
+    page, calls = _call(db, sql, args)
+    posts = json.loads(page)
+    assert posts, f"{label}: the page is empty, so it counts nothing"
+    assert calls == 2 * len(posts), (
+        f"{label}: unfenced, get_bridge_post ran {calls} times for {len(posts)} posts"
+    )
