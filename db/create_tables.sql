@@ -39,7 +39,16 @@
 --
 -- One DO block, one transaction: an install that dies in it leaves the old shape
 -- whole, and the next install starts it again.
+--
+-- A feed_cache still in the wide shape (#98) is compacted further down, and that copy
+-- keeps only the feeds of readers and opt-ins ($feed_cache_compact$, #99). On a
+-- replayed node nearly every wide row belongs to an account that never read, so only
+-- the kept accounts' rows are moved here; the rest keep their old ids and go with the
+-- wide table. Same predicate as $feed_cache_compact$.
 DO $history_from_hivemind$
+DECLARE
+    _wide boolean;
+    _kept varchar(16) [];
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_attribute
@@ -49,16 +58,33 @@ BEGIN
         RETURN;
     END IF;
 
+    _wide := EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = to_regclass('haf_fyp_app.feed_cache')
+          AND attname = 'rank' AND atttypid = 'int4'::regtype AND NOT attisdropped
+    );
+    IF _wide THEN
+        SELECT COALESCE(array_agg(k.username), '{}') INTO _kept
+        FROM (
+            SELECT au.username FROM haf_fyp_app.active_users AS au
+            WHERE au.last_read_at >= (NOW() AT TIME ZONE 'utc') - INTERVAL '30 days'
+            UNION
+            SELECT ui.username FROM haf_fyp_app.user_interests AS ui
+        ) AS k;
+    END IF;
+
     IF to_regclass('haf_fyp_app.feed_cache') IS NOT NULL THEN
         DELETE FROM haf_fyp_app.feed_cache AS fc
-        WHERE NOT EXISTS (
+        WHERE (NOT _wide OR fc.username = ANY(_kept))
+          AND NOT EXISTS (
             SELECT 1 FROM haf_fyp_app.post_candidates AS pc
             WHERE pc.post_id = fc.post_id AND pc.hive_post_id IS NOT NULL
         );
         UPDATE haf_fyp_app.feed_cache AS fc
         SET post_id = pc.hive_post_id
         FROM haf_fyp_app.post_candidates AS pc
-        WHERE pc.post_id = fc.post_id;
+        WHERE pc.post_id = fc.post_id
+          AND (NOT _wide OR fc.username = ANY(_kept));
     END IF;
     IF to_regclass('haf_fyp_app.global_feed_cache') IS NOT NULL THEN
         DELETE FROM haf_fyp_app.global_feed_cache AS gfc
@@ -337,20 +363,41 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_cache (
 
 -- Step 2 of 2: copy the wide rows across, labels to codes, and drop the old table. A
 -- rank repeated within one account cannot come from write_feed_cache; were one there,
--- the first copy wins rather than the install failing. Existing feeds are kept as
--- they are: the hourly unread-feed pass (db/active_users_maintenance.sql) is what
--- drops the ones nobody reads.
+-- the first copy wins rather than the install failing.
+--
+-- Only the feeds drop_unread_feeds (db/active_users_maintenance.sql) would keep are
+-- copied: those of accounts that read within 30 days (the ranker's default
+-- FEED_CACHE_UNREAD_RETENTION_DAYS) or hold user_interests. On a full replay nearly
+-- every row belongs to a voter who never read, and copying it would cost the copy,
+-- its WAL and the doubled space only for the hourly pass to delete it straight after.
+-- A node running a longer retention re-ranks a reader dropped here on its next read.
+-- user_interests is created further down: on a fresh install this block returns
+-- before naming it, and every install that has a wide feed_cache already has it.
 DO $feed_cache_compact$
+DECLARE
+    _cutoff timestamp := (NOW() AT TIME ZONE 'utc') - INTERVAL '30 days';
+    _total bigint;
+    _copied bigint;
+    _kept varchar(16) [];
 BEGIN
     IF to_regclass('haf_fyp_app.feed_cache_wide') IS NULL THEN
         RETURN;
     END IF;
+    SELECT COALESCE(array_agg(k.username), '{}') INTO _kept
+    FROM (
+        SELECT au.username FROM haf_fyp_app.active_users AS au WHERE au.last_read_at >= _cutoff
+        UNION
+        SELECT ui.username FROM haf_fyp_app.user_interests AS ui
+    ) AS k;
+
     INSERT INTO haf_fyp_app.feed_cache_labels (label)
     SELECT DISTINCT w.label
     FROM (
-        SELECT algorithm_version AS label FROM haf_fyp_app.feed_cache_wide
+        SELECT fw.algorithm_version AS label
+        FROM haf_fyp_app.feed_cache_wide AS fw JOIN unnest(_kept) AS k (username) USING (username)
         UNION
-        SELECT boost_source FROM haf_fyp_app.feed_cache_wide
+        SELECT fw.boost_source
+        FROM haf_fyp_app.feed_cache_wide AS fw JOIN unnest(_kept) AS k (username) USING (username)
     ) AS w
     WHERE w.label IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM haf_fyp_app.feed_cache_labels AS l WHERE l.label = w.label)
@@ -367,12 +414,22 @@ BEGIN
         COALESCE(la.code, 0), COALESCE(lb.code, 0),
         w.community_boost_applied, w.username
     FROM haf_fyp_app.feed_cache_wide AS w
+    JOIN unnest(_kept) AS k (username) USING (username)
     LEFT JOIN haf_fyp_app.feed_cache_labels AS la ON la.label = w.algorithm_version
     LEFT JOIN haf_fyp_app.feed_cache_labels AS lb ON lb.label = w.boost_source
+    -- A row $history_from_hivemind$ did not move still holds a HAF operation id (at or
+    -- above 2^32), which no endpoint can serve: an account that became a reader or
+    -- opted in between that block and this one, in an install resumed after dying here.
+    -- Its feed is re-ranked on its next read.
+    WHERE w.post_id < 4294967296
     ORDER BY w.username, w.rank
     ON CONFLICT (username, rank) DO NOTHING;
+    GET DIAGNOSTICS _copied = ROW_COUNT;
 
+    SELECT count(*) INTO _total FROM haf_fyp_app.feed_cache_wide;
     DROP TABLE haf_fyp_app.feed_cache_wide;
+    RAISE NOTICE 'feed_cache compacted: % row(s) copied for readers and opt-ins, % skipped',
+        _copied, _total - _copied;
 END
 $feed_cache_compact$;
 

@@ -658,6 +658,37 @@ def test_the_upgrade_moves_cached_feeds_to_hivemind_ids_and_drops_the_replayed_t
         assert cur.fetchall() == [(501,)]
 
 
+def test_an_upgrade_over_the_wide_feed_cache_moves_only_the_feeds_the_compaction_keeps(conn: connection) -> None:
+    """On a node still on the wide feed_cache (#98), only readers' and opt-ins' rows are
+    moved: $feed_cache_compact$ copies no others (#99), and moving every replayed
+    voter's feed first would rewrite the whole 137.7M-row table for nothing."""
+    with conn.cursor() as cur:
+        cur.execute(ddl("user_interests"))
+        cur.execute(REPLAYED)
+        cur.execute("DROP TABLE IF EXISTS haf_fyp_app.feed_cache")
+        cur.execute("CREATE TABLE haf_fyp_app.feed_cache (username varchar(16), post_id bigint, "
+                    "final_score float8, rank int, PRIMARY KEY (username, post_id))")
+        cur.execute("INSERT INTO haf_fyp_app.active_users (username, last_read_at) VALUES "
+                    "('reader', (NOW() AT TIME ZONE 'utc') - INTERVAL '1 day'), "
+                    "('lapsed', (NOW() AT TIME ZONE 'utc') - INTERVAL '31 days'), ('voter', NULL)")
+        cur.execute("INSERT INTO haf_fyp_app.user_interests (username, community_id, declared_at) "
+                    "VALUES ('optin', 1, '2026-01-01')")
+        cur.execute("INSERT INTO haf_fyp_app.feed_cache VALUES "
+                    + ", ".join(f"('{u}', 17179869184001, 0.9, 1), ('{u}', 17179869184002, 0.8, 2)"
+                                for u in ("reader", "optin", "lapsed", "voter")))
+
+        cur.execute(_upgrade_block())
+
+        cur.execute("SELECT username, post_id FROM haf_fyp_app.feed_cache ORDER BY username, post_id")
+        assert cur.fetchall() == [
+            # Not moved: dropped with the wide table by the compaction.
+            ("lapsed", 17179869184001), ("lapsed", 17179869184002),
+            ("optin", 501),
+            ("reader", 501),
+            ("voter", 17179869184001), ("voter", 17179869184002),
+        ]
+
+
 # --- the ranker's reads ------------------------------------------------------------
 
 def test_the_lookback_reads_the_account_s_index_in_order_and_stops_at_its_limit(conn: connection) -> None:

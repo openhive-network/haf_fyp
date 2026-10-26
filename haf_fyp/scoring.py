@@ -431,6 +431,22 @@ def compute_scores(
     return ranked
 
 
+# Whether the installed feed_cache is the row write_feed_cache writes (#98): rank a
+# smallint, and algorithm_version / boost_source codes into feed_cache_labels. One row:
+# that verdict, the installed type of feed_cache.rank (NULL: no such table) and whether
+# feed_cache_labels exists. Catalog reads only, so any role that can see the schema
+# can run it.
+FEED_CACHE_RANK_TYPE = "smallint"
+FEED_CACHE_SHAPE_SQL = f"""
+SELECT COALESCE(r.rank_type = '{FEED_CACHE_RANK_TYPE}' AND l.present, FALSE), r.rank_type, l.present
+  FROM (SELECT (SELECT format_type(a.atttypid, a.atttypmod)
+                  FROM pg_catalog.pg_attribute a
+                 WHERE a.attrelid = to_regclass('haf_fyp_app.feed_cache')
+                   AND a.attname = 'rank' AND NOT a.attisdropped) AS rank_type) AS r,
+       (SELECT to_regclass('haf_fyp_app.feed_cache_labels') IS NOT NULL AS present) AS l
+"""
+
+
 def write_feed_cache(
     conn, username: str, scored_df: pd.DataFrame, algo_version: str
 ) -> None:

@@ -45,6 +45,7 @@ from haf_fyp.credibility import (
     probe_credibility_sources,
     probe_relations,
 )
+from haf_fyp.scoring import FEED_CACHE_RANK_TYPE, FEED_CACHE_SHAPE_SQL
 
 log = logging.getLogger(__name__)
 
@@ -862,3 +863,62 @@ def build_history_report(probe: dict | None) -> dict:
             "Re-run the install"
         )
     return report
+
+
+# ---------------------------------------------------------------------------------------
+# feed_cache: whether the installed table is the compact row the ranker writes (#98)
+# ---------------------------------------------------------------------------------------
+#
+# The SQL and the ranker image are upgraded separately. A ranker on SQL older than #98
+# refuses to rank and logs why; this section is where a monitor sees the same verdict.
+# The probe reads the catalog only, so it is the same answer the ranker gets.
+
+FEED_CACHE_OK = "ok"
+FEED_CACHE_OUTDATED = "outdated"
+FEED_CACHE_UNKNOWN = STATE_UNKNOWN
+
+
+def fetch_feed_cache_shape(conn) -> dict | None:
+    """
+    The installed feed_cache shape, or None if it could not be read.
+
+    Runs after reader_first, whose SAVEPOINT leaves the transaction usable, and is the
+    last read of the route: a failure here aborts nothing anybody reads afterwards.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(FEED_CACHE_SHAPE_SQL)
+            compact, rank_type, labels_present = cur.fetchone()
+        return {"compact": bool(compact), "rank": rank_type, "labels": bool(labels_present)}
+    except Exception as exc:
+        # As the sibling probes: no rollback (the pool does that), no exc_info.
+        log.warning("feed_cache: the installed shape could not be read (%s) -- reporting unknown", exc)
+        return None
+
+
+def build_feed_cache_report(probe: dict | None) -> dict:
+    """
+    The feed_cache section of GET /metrics.
+
+    `outdated` means the ranker is ranking nobody: the installed SQL predates the
+    compact feed_cache. It names what is installed against what is expected, and the
+    remedy. Sets no `degraded`, as reader_first: alert on the state.
+    """
+    if probe is None:
+        return {
+            "state": FEED_CACHE_UNKNOWN,
+            "detail": "the feed_cache shape could not be read; see the API log",
+        }
+    if probe["compact"]:
+        return {"state": FEED_CACHE_OK}
+    return {
+        "state": FEED_CACHE_OUTDATED,
+        "expected": {"rank": FEED_CACHE_RANK_TYPE, "feed_cache_labels": True},
+        "installed": {"rank": probe["rank"], "feed_cache_labels": probe["labels"]},
+        "detail": (
+            "haf_fyp_app.feed_cache predates the compact row the ranker writes, and the "
+            "ranker ranks nobody until it is upgraded. Re-run the install, with the block "
+            "processor and the ranker stopped (it is skipped while either holds HAF's "
+            "lock)."
+        ),
+    }

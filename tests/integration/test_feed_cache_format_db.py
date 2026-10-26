@@ -17,6 +17,7 @@ the shipped code.
 """
 
 import json
+import logging
 import os
 from collections.abc import Iterator
 from typing import Any
@@ -27,7 +28,8 @@ import psycopg2
 import pytest
 from psycopg2.extensions import connection as Connection
 
-from haf_fyp import scoring
+from haf_fyp import metrics, scoring
+from haf_fyp import ranker_daemon as rd
 
 REPO = os.path.join(os.path.dirname(__file__), "..", "..")
 ENDPOINT_SQL = os.path.join(REPO, "endpoints", "endpoint_schema.sql")
@@ -175,6 +177,13 @@ def db() -> Iterator[Connection]:
             CREATE TABLE {S}.active_users (
                 username varchar(16) PRIMARY KEY, last_scored_at timestamp,
                 last_read_at timestamp);
+            CREATE TABLE {S}.user_interests (
+                username varchar(16) NOT NULL, community_id int NOT NULL,
+                PRIMARY KEY (username, community_id));
+            -- Readers, so the upgrade keeps their feeds; read just now, so the feed
+            -- function does not notify for them.
+            INSERT INTO {S}.active_users (username, last_read_at)
+            VALUES ('alice', NOW() AT TIME ZONE 'utc'), ('bob', NOW() AT TIME ZONE 'utc');
             CREATE TABLE {S}.global_feed_cache (post_id bigint, rank int);
             CREATE TABLE {S}.hive_accounts (id int, name text);
             CREATE TABLE {S}.algorithm_versions (version varchar(16), weights jsonb);
@@ -363,6 +372,127 @@ def test_an_upgrade_interrupted_after_the_set_aside_is_finished_by_the_next_inst
     _upgrade(db)
 
     assert _feed(db, "alice") == before
+
+
+def _compact_rows(db: Connection, username: str) -> list[tuple[Any, ...]]:
+    """An account's rows as stored, labels resolved, without the time of the write."""
+    with db.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT fc.post_id, fc.final_score, fc.score_engagement, fc.score_recency,
+                   fc.score_credibility, fc.score_relevance, fc.rank, la.label, lb.label,
+                   fc.community_boost_applied
+              FROM {S}.feed_cache fc
+              LEFT JOIN {S}.feed_cache_labels la ON la.code = fc.algorithm_version
+              LEFT JOIN {S}.feed_cache_labels lb ON lb.code = fc.boost_source
+             WHERE fc.username = %s
+             ORDER BY fc.rank
+            """,
+            (username,),
+        )
+        rows = list(cur.fetchall())
+    db.commit()
+    return rows
+
+
+def test_the_upgrade_copies_only_the_feeds_of_readers_and_opt_ins(
+    db: Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The feeds drop_unread_feeds would delete within the hour are not copied at all;
+    the ones it keeps are copied as write_feed_cache would have written them."""
+    with db.cursor() as cur:
+        cur.execute(_WIDE_DDL)
+        cur.execute(
+            f"""
+            INSERT INTO {S}.active_users (username, last_read_at) VALUES
+                ('reader', (NOW() AT TIME ZONE 'utc') - INTERVAL '29 days'),
+                ('lapsed', (NOW() AT TIME ZONE 'utc') - INTERVAL '31 days'),
+                ('voter', NULL),
+                ('lurker', NULL);
+            INSERT INTO {S}.user_interests VALUES ('lurker', 1), ('stranded', 2);
+            """
+        )
+    db.commit()
+    kept = ("alice", "bob", "reader", "lurker", "stranded")
+    dropped = ("lapsed", "voter", "unknown")
+    for user in kept + dropped:
+        _write_wide(db, user, _SHORT)
+    db.notices.clear()
+
+    _upgrade(db)
+
+    with db.cursor() as cur:
+        cur.execute(f"SELECT DISTINCT username FROM {S}.feed_cache")
+        assert sorted(r[0] for r in cur.fetchall()) == sorted(kept)
+        cur.execute(f"SELECT to_regclass('{S}.feed_cache_wide')")
+        assert cur.fetchone()[0] is None
+    db.commit()
+    copied, skipped = len(kept) * len(_SHORT), len(dropped) * len(_SHORT)
+    assert any(
+        f"{copied} row(s) copied for readers and opt-ins, {skipped} skipped" in n for n in db.notices
+    ), db.notices
+
+    upgraded = {u: _compact_rows(db, u) for u in kept}
+    for user in kept:
+        _write_compact(db, monkeypatch, user, _SHORT)
+        assert _compact_rows(db, user) == upgraded[user], user
+
+
+def test_an_upgrade_with_no_readers_copies_nothing(db: Connection) -> None:
+    with db.cursor() as cur:
+        cur.execute(_WIDE_DDL)
+        cur.execute(f"DELETE FROM {S}.active_users")
+    db.commit()
+    _write_wide(db, "alice", _SHORT)
+
+    _upgrade(db)
+
+    with db.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM {S}.feed_cache")
+        assert cur.fetchone()[0] == 0
+        cur.execute(f"SELECT count(*) FROM {S}.feed_cache_labels")
+        assert cur.fetchone()[0] == 0, "no label of a feed that was not copied"
+    db.commit()
+
+
+# --------------------------------------------------------------------------
+# A ranker newer than the installed SQL
+# --------------------------------------------------------------------------
+
+
+def test_the_ranker_and_metrics_see_a_wide_feed_cache_as_outdated(
+    db: Connection, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(rd, "_feed_cache_compact", True)
+    monkeypatch.setattr(rd, "_feed_cache_mismatch_logged_at", None)
+    with db.cursor() as cur:
+        cur.execute(_WIDE_DDL)
+    db.commit()
+
+    with caplog.at_level(logging.ERROR):
+        rd._check_feed_cache_shape(_RehomedSession(db))
+        rd._warn_feed_cache_mismatch()
+
+    assert rd._feed_cache_compact is False
+    (record,) = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert "rank smallint" in record.getMessage()
+    assert "has rank integer, and no feed_cache_labels" in record.getMessage()
+    report = metrics.build_feed_cache_report(metrics.fetch_feed_cache_shape(_RehomedSession(db)))
+    assert report["state"] == "outdated"
+    assert report["installed"] == {"rank": "integer", "feed_cache_labels": False}
+    assert report["expected"] == {"rank": "smallint", "feed_cache_labels": True}
+    db.rollback()
+
+    _upgrade(db)
+
+    with caplog.at_level(logging.INFO):
+        rd._check_feed_cache_shape(_RehomedSession(db))
+    assert rd._feed_cache_compact is True
+    assert "ranking resumes" in caplog.text
+    assert metrics.build_feed_cache_report(metrics.fetch_feed_cache_shape(_RehomedSession(db))) == {
+        "state": "ok"
+    }
+    db.rollback()
 
 
 # --------------------------------------------------------------------------
