@@ -95,6 +95,7 @@ stages:
           state: "ok"
           window_seconds: 86400
           due_after_seconds: 600
+          retention_days: 30
           readers_in_window: !anyint
           readers_due: !anyint
           oldest_reader_feed_seconds: !anything

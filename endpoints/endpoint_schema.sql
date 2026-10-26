@@ -1613,6 +1613,42 @@ DECLARE
     _limit int := LEAST(GREATEST(get_personalized_feed."page-size", 1), 20);
     _offset int := (GREATEST(get_personalized_feed."page", 1) - 1) * _limit;
 BEGIN
+    -- #81: tell the ranker this feed is being read, so readers are ranked ahead
+    -- of the accounts nobody looks at. A GET runs in a read-only transaction and
+    -- cannot change a table, but it can notify. The function stays STABLE in
+    -- spite of that side effect: PostgREST keeps a STABLE function read-only on
+    -- POST as well, which is what this endpoint should be.
+    --
+    -- A notifying commit is not free (it takes a transaction id and a brief
+    -- cluster-wide lock), so this is rationed:
+    --   * first page only: one signal per visit, not one per scroll;
+    --   * only when the last read the ranker recorded is over ten minutes old.
+    --     The ranker stamps last_read_at when it hears, so once it has, a client
+    --     that reloads costs one signal per ten minutes, not one per request.
+    --     Until it has (a few seconds normally, a whole cycle if one is running,
+    --     and for as long as the ranker is stopped) every first-page read notifies;
+    --   * never on a standby, where NOTIFY is an error and would fail the read;
+    --   * not at all when an operator sets haf_fyp.feed_read_notify to off
+    --     (ALTER ROLE haf_fyp_user SET haf_fyp.feed_read_notify = 'off'), which is
+    --     what to do if the ranker is going to be down for long.
+    -- The payload is always the name of an account in the rotation (active_users),
+    -- the only accounts the ranker stamps. Ahead of the cached-feed test, not inside
+    -- it (#98): the ranker builds no feed for an account until it reads, so the first
+    -- read of an account without one is the read that has to reach the ranker.
+    IF _offset = 0
+       AND NOT pg_is_in_recovery()
+       AND lower(btrim(COALESCE(current_setting('haf_fyp.feed_read_notify', true), 'on')))
+           NOT IN ('off', 'false', 'no', '0')
+       AND EXISTS (
+           SELECT 1 FROM haf_fyp_app.active_users au
+           WHERE au.username = get_personalized_feed.username
+             AND (au.last_read_at IS NULL
+                  OR au.last_read_at < (NOW() AT TIME ZONE 'utc') - INTERVAL '10 minutes')
+       )
+    THEN
+        PERFORM pg_notify('haf_fyp_feed_read', get_personalized_feed.username);
+    END IF;
+
     -- Personalized feed. Each cached (author, permlink) is resolved to its
     -- Hivemind post id and enriched into the bridge post object, then tagged
     -- with the FYP ranking data under "fyp". The Hivemind joins are reached only
@@ -1622,39 +1658,6 @@ BEGIN
         SELECT 1 FROM haf_fyp_app.feed_cache fc
         WHERE fc.username = get_personalized_feed.username
     ) THEN
-        -- #81: tell the ranker this feed is being read, so readers are ranked ahead
-        -- of the accounts nobody looks at. A GET runs in a read-only transaction and
-        -- cannot change a table, but it can notify. The function stays STABLE in
-        -- spite of that side effect: PostgREST keeps a STABLE function read-only on
-        -- POST as well, which is what this endpoint should be.
-        --
-        -- A notifying commit is not free (it takes a transaction id and a brief
-        -- cluster-wide lock), so this is rationed:
-        --   * first page only: one signal per visit, not one per scroll;
-        --   * only when the last read the ranker recorded is over ten minutes old.
-        --     The ranker stamps last_read_at when it hears, so once it has, a client
-        --     that reloads costs one signal per ten minutes, not one per request.
-        --     Until it has (a few seconds normally, a whole cycle if one is running,
-        --     and for as long as the ranker is stopped) every first-page read notifies;
-        --   * never on a standby, where NOTIFY is an error and would fail the read;
-        --   * not at all when an operator sets haf_fyp.feed_read_notify to off
-        --     (ALTER ROLE haf_fyp_user SET haf_fyp.feed_read_notify = 'off'), which is
-        --     what to do if the ranker is going to be down for long.
-        -- Inside the EXISTS branch, so the payload is always the name of an account
-        -- that has a cached feed.
-        IF _offset = 0
-           AND NOT pg_is_in_recovery()
-           AND lower(btrim(COALESCE(current_setting('haf_fyp.feed_read_notify', true), 'on')))
-               NOT IN ('off', 'false', 'no', '0')
-           AND EXISTS (
-               SELECT 1 FROM haf_fyp_app.active_users au
-               WHERE au.username = get_personalized_feed.username
-                 AND (au.last_read_at IS NULL
-                      OR au.last_read_at < (NOW() AT TIME ZONE 'utc') - INTERVAL '10 minutes')
-           )
-        THEN
-            PERFORM pg_notify('haf_fyp_feed_read', get_personalized_feed.username);
-        END IF;
         -- Observer context makes active_votes / muted state account-aware,
         -- exactly as a logged-in trending feed would be.
         _observer_id := COALESCE(
@@ -1703,12 +1706,12 @@ BEGIN
                         'score_engagement', fc.score_engagement,
                         'score_credibility', fc.score_credibility,
                         'community_boost_applied', fc.community_boost_applied,
-                        'boost_source', fc.boost_source,
+                        'boost_source', lb.label,
                         -- Exposed for client telemetry (#12): post_id is the
                         -- joinable key (matches feed_events.post_id) and
                         -- algorithm_version lets impressions be sliced for A/B.
                         'post_id', fc.post_id::text,
-                        'algorithm_version', fc.algorithm_version
+                        'algorithm_version', la.label
                     ) AS fyp
                 -- hive_post_id is precomputed by resolve_hivemind_post_ids (see
                 -- db/process_posts.sql), so the feed no longer joins
@@ -1719,6 +1722,9 @@ BEGIN
                 FROM haf_fyp_app.feed_cache fc
                 JOIN haf_fyp_app.post_candidates pc ON pc.post_id = fc.post_id
                 LEFT JOIN haf_fyp_app.post_bridge_cache pbc ON pbc.post_id = fc.post_id
+                -- The two labels are stored as codes (#98); 0 has no row, which is NULL.
+                LEFT JOIN haf_fyp_app.feed_cache_labels lb ON lb.code = fc.boost_source
+                LEFT JOIN haf_fyp_app.feed_cache_labels la ON la.code = fc.algorithm_version
                 WHERE fc.username = get_personalized_feed.username
                   AND pc.hive_post_id IS NOT NULL
                 ORDER BY fc.rank
@@ -2113,25 +2119,31 @@ RETURNS TABLE(post_id bigint, author varchar(16), permlink varchar(256), title t
 -- openapi-generated-code-end
 LANGUAGE sql STABLE
 AS $$
+    -- Scores are stored as real (#98). Widened through text, not directly: a direct
+    -- cast exposes the binary expansion (0.91 becomes 0.9100000262260437), while text
+    -- is the shortest form that reads back as the same real, the value the feed
+    -- endpoint reports for the same row.
     SELECT
         fc.post_id,
         pc.author,
         pc.permlink,
         pc.title,
-        fc.final_score,
-        fc.score_relevance,
-        fc.score_recency,
-        fc.score_engagement,
-        fc.score_credibility,
+        fc.final_score::text::float,
+        fc.score_relevance::text::float,
+        fc.score_recency::text::float,
+        fc.score_engagement::text::float,
+        fc.score_credibility::text::float,
         fc.community_boost_applied,
-        fc.boost_source,
-        fc.rank,
-        fc.algorithm_version,
+        lb.label,
+        fc.rank::int,
+        la.label,
         av.weights AS algorithm_weights,
         fc.computed_at
     FROM haf_fyp_app.feed_cache fc
     JOIN haf_fyp_app.post_candidates pc ON pc.post_id = fc.post_id
-    LEFT JOIN haf_fyp_app.algorithm_versions av ON av.version = fc.algorithm_version
+    LEFT JOIN haf_fyp_app.feed_cache_labels lb ON lb.code = fc.boost_source
+    LEFT JOIN haf_fyp_app.feed_cache_labels la ON la.code = fc.algorithm_version
+    LEFT JOIN haf_fyp_app.algorithm_versions av ON av.version = la.label
     WHERE fc.username = get_score_explanation.username
       AND fc.post_id = get_score_explanation.post_id;
 $$;

@@ -21,13 +21,14 @@ import psycopg2
 import pytest
 
 from haf_fyp import ranker_daemon as rd
+from pytest import LogCaptureFixture, MonkeyPatch
 
 REPO = os.path.join(os.path.dirname(__file__), "..", "..")
 ENDPOINT_SQL = os.path.join(REPO, "endpoints", "endpoint_schema.sql")
 
 
 @pytest.fixture(autouse=True)
-def _reader_state(monkeypatch):
+def _reader_state(monkeypatch: MonkeyPatch) -> None:
     """A ranker on a schema that has last_read_at, with clean counters."""
     monkeypatch.setattr(rd, "_reads_supported", True)
     monkeypatch.setattr(rd, "_reads_heard", 0)
@@ -54,7 +55,7 @@ def _mock_conn(rows_per_execute, fetchone=(True,)):
     cur.fetchone.return_value = fetchone
     pending = list(rows_per_execute)
 
-    def _execute(*_args, **_kwargs):
+    def _execute(*_args, **_kwargs) -> None:
         cur.fetchall.return_value = pending.pop(0) if pending else []
 
     cur.execute.side_effect = _execute
@@ -75,7 +76,7 @@ def _sql(call):
 # --------------------------------------------------------------------------
 
 
-def test_drain_polls_the_connection_and_empties_the_queue():
+def test_drain_polls_the_connection_and_empties_the_queue() -> None:
     conn = _conn_with_notifies([_note("alice"), _note("bob"), _note("alice")])
 
     assert rd._drain_feed_reads(conn) == {"alice", "bob"}
@@ -84,7 +85,7 @@ def test_drain_polls_the_connection_and_empties_the_queue():
     assert len(conn.notifies) == 0, "a drained notification must not be handled twice"
 
 
-def test_drain_ends_any_open_transaction_before_it_polls():
+def test_drain_ends_any_open_transaction_before_it_polls() -> None:
     # Postgres delivers nothing to a session inside a transaction, and several paths
     # of the main loop end a pass with one open.
     conn = _conn_with_notifies([])
@@ -97,7 +98,7 @@ def test_drain_ends_any_open_transaction_before_it_polls():
     assert order == ["rollback", "poll"]
 
 
-def test_drain_works_on_a_plain_list_too():
+def test_drain_works_on_a_plain_list_too() -> None:
     conn = MagicMock()
     conn.notifies = [_note("alice")]
 
@@ -105,7 +106,7 @@ def test_drain_works_on_a_plain_list_too():
     assert conn.notifies == []
 
 
-def test_drain_ignores_other_channels():
+def test_drain_ignores_other_channels() -> None:
     conn = _conn_with_notifies([_note("alice", channel="pgrst"), _note("bob")])
 
     assert rd._drain_feed_reads(conn) == {"bob"}
@@ -125,18 +126,18 @@ def test_drain_ignores_other_channels():
         "alice bob",
     ],
 )
-def test_drain_drops_payloads_that_are_not_account_names(payload):
+def test_drain_drops_payloads_that_are_not_account_names(payload) -> None:
     conn = _conn_with_notifies([_note(payload), _note("carol")])
 
     assert rd._drain_feed_reads(conn) == {"carol"}
 
 
 @pytest.mark.parametrize("name", ["abc", "a-b.c", "user.name-1", "a" * 16])
-def test_drain_keeps_real_shaped_account_names(name):
+def test_drain_keeps_real_shaped_account_names(name) -> None:
     assert rd._drain_feed_reads(_conn_with_notifies([_note(name)])) == {name}
 
 
-def test_drain_lets_a_dead_connection_propagate():
+def test_drain_lets_a_dead_connection_propagate() -> None:
     conn = _conn_with_notifies([])
     conn.poll.side_effect = psycopg2.OperationalError("server closed the connection")
 
@@ -144,7 +145,7 @@ def test_drain_lets_a_dead_connection_propagate():
         rd._drain_feed_reads(conn)
 
 
-def test_drain_discards_everything_when_the_schema_has_no_read_column(monkeypatch):
+def test_drain_discards_everything_when_the_schema_has_no_read_column(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "_reads_supported", False)
     conn = _conn_with_notifies([_note("alice")])
 
@@ -157,7 +158,7 @@ def test_drain_discards_everything_when_the_schema_has_no_read_column(monkeypatc
 # --------------------------------------------------------------------------
 
 
-def test_note_does_nothing_without_reads():
+def test_note_does_nothing_without_reads() -> None:
     conn, cur = _mock_conn([])
 
     assert rd._note_feed_reads(conn, set(), 10) == set()
@@ -166,7 +167,7 @@ def test_note_does_nothing_without_reads():
     conn.commit.assert_not_called()
 
 
-def test_note_stamps_in_one_statement_and_commits(monkeypatch):
+def test_note_stamps_in_one_statement_and_commits(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 123)
     monkeypatch.setattr(rd, "_read_filter_days", 30)
     monkeypatch.setattr(rd, "_reads_unearned", 0)
@@ -183,7 +184,7 @@ def test_note_stamps_in_one_statement_and_commits(monkeypatch):
     conn.commit.assert_called_once()
 
 
-def test_note_never_sends_a_negative_limit():
+def test_note_never_sends_a_negative_limit() -> None:
     # LIMIT -1 is an error in Postgres: the whole statement, stamps included, would
     # fail on every pass that had a read.
     conn, cur = _mock_conn([[]])
@@ -193,7 +194,7 @@ def test_note_never_sends_a_negative_limit():
     assert cur.execute.call_args.args[1][-1] == 0  # the LIMIT
 
 
-def test_note_does_not_commit_when_the_statement_fails():
+def test_note_does_not_commit_when_the_statement_fails() -> None:
     conn, cur = _mock_conn([])
     cur.execute.side_effect = RuntimeError("boom")
 
@@ -208,7 +209,7 @@ def test_note_does_not_commit_when_the_statement_fails():
 # --------------------------------------------------------------------------
 
 
-def test_readers_come_first_and_the_rest_fills_the_cycle(monkeypatch):
+def test_readers_come_first_and_the_rest_fills_the_cycle(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 3600)
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 77)
@@ -221,23 +222,23 @@ def test_readers_come_first_and_the_rest_fills_the_cycle(monkeypatch):
     # (window, min age, the filter's days twice, slots)
     assert reader_call.args[1] == (3600, 77, 30, 30, 5), "readers may take at most the share"
     # The remainder excludes the readers already taken and fills what is left of the
-    # cycle, so two readers leave eight slots, not five.
-    assert rest_call.args[1] == (["r1", "r2"], 8)
+    # cycle, so two readers leave eight slots, not five; it reaches back over the
+    # feed-retention window (#98), not the reader window.
+    assert rest_call.args[1] == (["r1", "r2"], rd.FEED_CACHE_UNREAD_RETENTION_DAYS, 8)
     assert "last_read_at" in reader_call.args[0]
-    assert "last_read_at" not in rest_call.args[0]
 
 
-def test_a_share_of_zero_turns_the_reader_lane_off(monkeypatch):
+def test_a_share_of_zero_turns_the_reader_lane_off(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.0)
     conn, cur = _mock_conn([[("s1",)]])
 
     assert rd._fetch_personalised_users(conn, 10) == ["s1"]
 
     (only_call,) = cur.execute.call_args_list
-    assert only_call.args[1] == ([], 10)
+    assert only_call.args[1] == ([], rd.FEED_CACHE_UNREAD_RETENTION_DAYS, 10)
 
 
-def test_a_schema_without_the_read_column_is_never_asked_for_readers(monkeypatch):
+def test_a_schema_without_the_read_column_is_never_asked_for_readers(monkeypatch: MonkeyPatch) -> None:
     # A new ranker on old SQL: the reader query would raise UndefinedColumn on every
     # scheduled cycle and no personalized feed would be refreshed at all.
     monkeypatch.setattr(rd, "_reads_supported", False)
@@ -252,7 +253,7 @@ def test_a_schema_without_the_read_column_is_never_asked_for_readers(monkeypatch
 
 
 @pytest.mark.parametrize("limit, slots", [(3, 1), (5, 2), (199, 99)])
-def test_the_reader_share_of_an_odd_cycle_rounds_down(monkeypatch, limit, slots):
+def test_the_reader_share_of_an_odd_cycle_rounds_down(monkeypatch: MonkeyPatch, limit, slots) -> None:
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     conn, cur = _mock_conn([[], []])
 
@@ -261,7 +262,7 @@ def test_the_reader_share_of_an_odd_cycle_rounds_down(monkeypatch, limit, slots)
     assert cur.execute.call_args_list[0].args[1][-1] == slots  # the LIMIT
 
 
-def test_a_cycle_of_one_goes_to_the_rotation_not_to_a_reader(monkeypatch):
+def test_a_cycle_of_one_goes_to_the_rotation_not_to_a_reader(monkeypatch: MonkeyPatch) -> None:
     # Rounded up, the single slot would be a reader's every time and the rotation
     # would stop for as long as anyone reads.
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
@@ -270,20 +271,20 @@ def test_a_cycle_of_one_goes_to_the_rotation_not_to_a_reader(monkeypatch):
     assert rd._fetch_personalised_users(conn, 1) == ["s1"]
 
     (only_call,) = cur.execute.call_args_list
-    assert only_call.args[1] == ([], 1)
+    assert only_call.args[1][-1] == 1
 
 
-def test_even_the_largest_share_leaves_the_rotation_a_slot(monkeypatch):
+def test_even_the_largest_share_leaves_the_rotation_a_slot(monkeypatch: MonkeyPatch) -> None:
     # The remainder is what keeps the rotation moving when the reader lane is full.
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.9)
     conn, cur = _mock_conn([[(f"r{i}",) for i in range(9)], []])
 
     rd._fetch_personalised_users(conn, 10)
 
-    assert cur.execute.call_args_list[1].args[1][1] == 1
+    assert cur.execute.call_args_list[1].args[1][-1] == 1
 
 
-def test_the_lane_leaves_out_a_feed_that_was_ranked_a_moment_ago():
+def test_the_lane_leaves_out_a_feed_that_was_ranked_a_moment_ago() -> None:
     # Otherwise the lane re-ranks the same accounts every cycle however fresh they are,
     # and a full lane holds everyone else at half speed for nothing.
     conn, cur = _mock_conn([[], []])
@@ -296,7 +297,7 @@ def test_the_lane_leaves_out_a_feed_that_was_ranked_a_moment_ago():
     )
 
 
-def test_the_cycle_remembers_how_full_the_reader_lane_was(monkeypatch):
+def test_the_cycle_remembers_how_full_the_reader_lane_was(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     conn, _cur = _mock_conn([[("r1",), ("r2",)], []])
 
@@ -305,7 +306,7 @@ def test_the_cycle_remembers_how_full_the_reader_lane_was(monkeypatch):
     assert (rd._lane_taken, rd._lane_slots) == (2, 5)
 
 
-def test_the_remainder_keeps_the_rotation_order():
+def test_the_remainder_keeps_the_rotation_order() -> None:
     conn, cur = _mock_conn([[], []])
 
     rd._fetch_personalised_users(conn, 10)
@@ -316,7 +317,23 @@ def test_the_remainder_keeps_the_rotation_order():
     )
 
 
-def test_the_reader_lane_takes_the_stalest_feed_first():
+def test_the_remainder_takes_only_accounts_that_read_or_opted_in() -> None:
+    # #98: an account that has only voted on a tracked post is not ranked until it
+    # reads; the retention window is the unread-feed pass's, so nothing the pass drops
+    # is rebuilt.
+    conn, cur = _mock_conn([[], []])
+
+    rd._fetch_personalised_users(conn, 10)
+
+    rest = _sql(cur.execute.call_args_list[-1])
+    assert (
+        "AND (au.last_read_at >= (NOW() AT TIME ZONE 'utc') - make_interval(days => %s) "
+        "OR EXISTS (SELECT 1 FROM haf_fyp_app.user_interests ui "
+        "WHERE ui.username = au.username))" in rest
+    )
+
+
+def test_the_reader_lane_takes_the_stalest_feed_first() -> None:
     conn, cur = _mock_conn([[], []])
 
     rd._fetch_personalised_users(conn, 10)
@@ -331,7 +348,7 @@ def test_the_reader_lane_takes_the_stalest_feed_first():
 # --------------------------------------------------------------------------
 
 
-def test_every_connection_listens_after_taking_the_locks(monkeypatch):
+def test_every_connection_listens_after_taking_the_locks(monkeypatch: MonkeyPatch) -> None:
     order = []
     fake = MagicMock()
     monkeypatch.setattr(rd.psycopg2, "connect", lambda _dsn: fake)
@@ -344,7 +361,7 @@ def test_every_connection_listens_after_taking_the_locks(monkeypatch):
     assert order == ["locks", "listen"]
 
 
-def test_listen_names_the_channel_the_feed_notifies_and_commits(monkeypatch):
+def test_listen_names_the_channel_the_feed_notifies_and_commits(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "_reads_supported", False)
     conn, cur = _mock_conn([], fetchone=(True,))
 
@@ -355,7 +372,7 @@ def test_listen_names_the_channel_the_feed_notifies_and_commits(monkeypatch):
     assert rd._reads_supported is True
 
 
-def test_listen_bounds_what_the_connection_may_hold():
+def test_listen_bounds_what_the_connection_may_hold() -> None:
     conn, _cur = _mock_conn([], fetchone=(True,))
 
     rd._listen_for_feed_reads(conn)
@@ -364,7 +381,7 @@ def test_listen_bounds_what_the_connection_may_hold():
     assert conn.notifies.maxlen == rd._FEED_READ_BACKLOG_MAX
 
 
-def test_a_schema_without_the_read_column_is_reported_once_and_not_listened_to(caplog):
+def test_a_schema_without_the_read_column_is_reported_once_and_not_listened_to(caplog: LogCaptureFixture) -> None:
     conn, cur = _mock_conn([], fetchone=(False,))
 
     with caplog.at_level("WARNING"):
@@ -378,7 +395,7 @@ def test_a_schema_without_the_read_column_is_reported_once_and_not_listened_to(c
     assert conn.commit.call_count == 2
 
 
-def test_a_ranker_that_stays_without_the_column_says_so_every_hour(monkeypatch, caplog):
+def test_a_ranker_that_stays_without_the_column_says_so_every_hour(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     # One line at startup is not something anybody finds weeks later.
     now = [1000.0]
     monkeypatch.setattr(rd.time, "monotonic", lambda: now[0])
@@ -392,7 +409,7 @@ def test_a_ranker_that_stays_without_the_column_says_so_every_hour(monkeypatch, 
     assert caplog.text.count("no last_read_at column") == 3
 
 
-def test_a_listen_that_fails_does_not_leave_the_ranker_believing_it_listens(monkeypatch):
+def test_a_listen_that_fails_does_not_leave_the_ranker_believing_it_listens(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "_reads_supported", False)
     conn, cur = _mock_conn([], fetchone=(True,))
     calls = []
@@ -410,7 +427,7 @@ def test_a_listen_that_fails_does_not_leave_the_ranker_believing_it_listens(monk
     assert rd._reads_supported is False, "or main() would never look at the schema again"
 
 
-def test_the_reader_lane_is_announced_when_the_column_appears(caplog):
+def test_the_reader_lane_is_announced_when_the_column_appears(caplog: LogCaptureFixture) -> None:
     old, _ = _mock_conn([], fetchone=(False,))
     new, cur = _mock_conn([], fetchone=(True,))
 
@@ -423,7 +440,7 @@ def test_the_reader_lane_is_announced_when_the_column_appears(caplog):
     assert "reader lane enabled" in caplog.text
 
 
-def test_a_failure_to_listen_is_not_reported_as_a_lock_failure(monkeypatch, caplog):
+def test_a_failure_to_listen_is_not_reported_as_a_lock_failure(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     fake = MagicMock()
     connects = []
 
@@ -458,7 +475,7 @@ class _StopLoop(BaseException):
 class _Clock:
     """time.monotonic() for main(): each pass of the loop is POLL_SECONDS long."""
 
-    def __init__(self, start=1000.0):
+    def __init__(self, start=1000.0) -> None:
         self.now = start
 
     def __call__(self):
@@ -466,7 +483,7 @@ class _Clock:
 
 
 def _drive_main(
-    monkeypatch, *, passes=1, drain, note, queued=(), first_closed=0,
+    monkeypatch: MonkeyPatch, *, passes=1, drain, note, queued=(), first_closed=0,
     cycle_every_pass=False, cycle=(), clock=None, queue_after=None,
 ):
     """Run main() for `passes` passes with everything but the feed-read block stubbed.
@@ -518,10 +535,10 @@ def _drive_main(
             raise _StopLoop
 
     class _Subscriber:
-        def __init__(self, *_args, **_kwargs):
+        def __init__(self, *_args, **_kwargs) -> None:
             pass
 
-        def start(self):
+        def start(self) -> None:
             for name in queued:
                 rd._refresh_queue.put(name)
 
@@ -556,7 +573,7 @@ def _drive_main(
     return seen
 
 
-def test_main_stamps_every_read_and_reranks_only_the_stale_ones(monkeypatch):
+def test_main_stamps_every_read_and_reranks_only_the_stale_ones(monkeypatch: MonkeyPatch) -> None:
     seen = _drive_main(monkeypatch, drain=[{"alice", "bob"}], note=[{"alice"}])
 
     assert seen.note == [(seen.first, {"alice", "bob"})]
@@ -565,20 +582,20 @@ def test_main_stamps_every_read_and_reranks_only_the_stale_ones(monkeypatch):
     assert seen.targeted == [(seen.first, {"alice"})]
 
 
-def test_main_does_not_start_a_targeted_refresh_when_no_reader_is_stale(monkeypatch):
+def test_main_does_not_start_a_targeted_refresh_when_no_reader_is_stale(monkeypatch: MonkeyPatch) -> None:
     seen = _drive_main(monkeypatch, drain=[{"alice"}], note=[set()])
 
     assert seen.targeted == []
     assert seen.cycle == [seen.first]
 
 
-def test_main_merges_stale_readers_with_the_redis_refresh_requests(monkeypatch):
+def test_main_merges_stale_readers_with_the_redis_refresh_requests(monkeypatch: MonkeyPatch) -> None:
     seen = _drive_main(monkeypatch, drain=[{"alice"}], note=[{"alice"}], queued=["carol"])
 
     assert seen.targeted == [(seen.first, {"alice", "carol"})]
 
 
-def test_main_reads_the_notifications_on_every_pass(monkeypatch):
+def test_main_reads_the_notifications_on_every_pass(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 0)
     seen = _drive_main(
         monkeypatch, passes=3, drain=[{"alice"}, set(), {"bob"}], note=[{"alice"}, set(), {"bob"}]
@@ -593,14 +610,14 @@ def test_main_reads_the_notifications_on_every_pass(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_the_first_read_after_a_quiet_spell_is_not_held_back(monkeypatch):
+def test_the_first_read_after_a_quiet_spell_is_not_held_back(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 30)
     seen = _drive_main(monkeypatch, clock=_Clock(), drain=[{"alice"}], note=[{"alice"}])
 
     assert seen.targeted == [(seen.first, {"alice"})]
 
 
-def test_reads_that_follow_closely_are_ranked_together_not_one_call_each(monkeypatch):
+def test_reads_that_follow_closely_are_ranked_together_not_one_call_each(monkeypatch: MonkeyPatch) -> None:
     # One call per read let a trickle of reads for different accounts keep the ranker
     # fetching candidates (about 8 s a time on a full node) between cycles.
     monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 30)
@@ -617,7 +634,7 @@ def test_reads_that_follow_closely_are_ranked_together_not_one_call_each(monkeyp
     ]
 
 
-def test_a_redis_refresh_takes_the_waiting_readers_along(monkeypatch):
+def test_a_redis_refresh_takes_the_waiting_readers_along(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 30)
     seen = _drive_main(
         monkeypatch, clock=_Clock(), passes=3,
@@ -630,7 +647,7 @@ def test_a_redis_refresh_takes_the_waiting_readers_along(monkeypatch):
     assert [names for _conn, names in seen.targeted] == [{"a1"}, {"b1", "carol"}]
 
 
-def test_a_cycle_takes_over_the_readers_still_waiting(monkeypatch):
+def test_a_cycle_takes_over_the_readers_still_waiting(monkeypatch: MonkeyPatch) -> None:
     # They are stamped and stale, so the cycle's reader lane takes them first.
     # Ranking them again straight after would be the same work twice.
     monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 30)
@@ -658,8 +675,8 @@ def test_a_cycle_takes_over_the_readers_still_waiting(monkeypatch):
     ],
 )
 def test_readers_a_cycle_did_not_rank_keep_waiting_for_the_grouped_rerank(
-    monkeypatch, second_cycle
-):
+    monkeypatch: MonkeyPatch, second_cycle
+) -> None:
     # They are stamped, so the feed function will not signal for them again for ten
     # minutes, and their budget is spent: dropped here they would simply be forgotten.
     monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 30)
@@ -673,7 +690,7 @@ def test_readers_a_cycle_did_not_rank_keep_waiting_for_the_grouped_rerank(
     assert [names for _conn, names in seen.targeted] == [{"a1"}, {"b1"}]
 
 
-def test_grouping_can_be_switched_off(monkeypatch):
+def test_grouping_can_be_switched_off(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 0)
     seen = _drive_main(
         monkeypatch, clock=_Clock(), passes=3,
@@ -683,7 +700,7 @@ def test_grouping_can_be_switched_off(monkeypatch):
     assert [names for _conn, names in seen.targeted] == [{"a1"}, {"b1"}, {"c1"}]
 
 
-def test_the_rerank_budget_is_spent_across_passes_not_renewed_by_each(monkeypatch):
+def test_the_rerank_budget_is_spent_across_passes_not_renewed_by_each(monkeypatch: MonkeyPatch) -> None:
     # A pass is five seconds. A limit per pass let one caller keep the ranker busy
     # continuously; a budget per cycle is what makes it a ceiling.
     monkeypatch.setattr(rd, "READ_REFRESH_MAX_PER_CYCLE", 5)
@@ -699,7 +716,7 @@ def test_the_rerank_budget_is_spent_across_passes_not_renewed_by_each(monkeypatc
     assert len(seen.cycle) == 1
 
 
-def test_a_scheduled_cycle_renews_the_rerank_budget(monkeypatch):
+def test_a_scheduled_cycle_renews_the_rerank_budget(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READ_REFRESH_MAX_PER_CYCLE", 5)
     seen = _drive_main(
         monkeypatch,
@@ -713,7 +730,7 @@ def test_a_scheduled_cycle_renews_the_rerank_budget(monkeypatch):
     assert len(seen.cycle) == 3
 
 
-def test_main_reconnects_when_the_connection_dies_while_reading_notifications(monkeypatch):
+def test_main_reconnects_when_the_connection_dies_while_reading_notifications(monkeypatch: MonkeyPatch) -> None:
     seen = _drive_main(
         monkeypatch, drain=[psycopg2.OperationalError("server closed the connection")], note=[]
     )
@@ -724,7 +741,7 @@ def test_main_reconnects_when_the_connection_dies_while_reading_notifications(mo
     assert seen.cycle == [seen.second]
 
 
-def test_main_reconnects_on_the_error_a_closed_connection_raises(monkeypatch):
+def test_main_reconnects_on_the_error_a_closed_connection_raises(monkeypatch: MonkeyPatch) -> None:
     # poll() and rollback() on a connection that is already closed raise InterfaceError,
     # not OperationalError. Treated as an ordinary failure it was retried on the same
     # dead session every five seconds, for ever.
@@ -736,7 +753,7 @@ def test_main_reconnects_on_the_error_a_closed_connection_raises(monkeypatch):
     assert seen.cycle == [seen.second]
 
 
-def test_main_survives_a_failed_stamp_and_still_runs_the_cycle(monkeypatch):
+def test_main_survives_a_failed_stamp_and_still_runs_the_cycle(monkeypatch: MonkeyPatch) -> None:
     boom = psycopg2.ProgrammingError("permission denied for table active_users")
     seen = _drive_main(monkeypatch, drain=[{"alice"}], note=[boom])
 
@@ -749,7 +766,7 @@ def test_main_survives_a_failed_stamp_and_still_runs_the_cycle(monkeypatch):
 
 
 @pytest.mark.parametrize("closed", [1, 2])
-def test_main_replaces_a_connection_that_is_closed_or_broken(monkeypatch, closed):
+def test_main_replaces_a_connection_that_is_closed_or_broken(monkeypatch: MonkeyPatch, closed) -> None:
     # psycopg2 sets closed to 1 after close() and to 2 for a broken connection.
     seen = _drive_main(monkeypatch, drain=[{"alice"}], note=[set()], first_closed=closed)
 
@@ -767,8 +784,8 @@ def test_main_replaces_a_connection_that_is_closed_or_broken(monkeypatch, closed
     ],
 )
 def test_a_failed_cycle_still_renews_the_budget_and_writes_the_summary(
-    monkeypatch, caplog, failure
-):
+    monkeypatch: MonkeyPatch, caplog: LogCaptureFixture, failure
+) -> None:
     # The budget is a ceiling per cycle PERIOD. Renewed only after a good cycle, a
     # standing cycle failure left immediate re-ranks off once it was spent, and the
     # summary silent exactly when someone would be looking for it.
@@ -789,8 +806,8 @@ def test_a_failed_cycle_still_renews_the_budget_and_writes_the_summary(
     [(psycopg2.InterfaceError("connection already closed"), 1), (RuntimeError("boom"), 0)],
 )
 def test_a_closed_connection_in_the_cycle_is_replaced_not_logged_as_a_failed_cycle(
-    monkeypatch, caplog, failure, reconnects
-):
+    monkeypatch: MonkeyPatch, caplog: LogCaptureFixture, failure, reconnects
+) -> None:
     with caplog.at_level("ERROR"):
         seen = _drive_main(monkeypatch, drain=[set()], note=[], cycle=[failure])
 
@@ -798,7 +815,7 @@ def test_a_closed_connection_in_the_cycle_is_replaced_not_logged_as_a_failed_cyc
     assert ("ranking cycle failed" in caplog.text) == (reconnects == 0)
 
 
-def test_a_standing_fault_is_logged_once_per_cycle_of_real_time(monkeypatch, caplog):
+def test_a_standing_fault_is_logged_once_per_cycle_of_real_time(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     # 130 passes of 5 s = 650 s: the first failure, then one at 300 s and one at 600 s.
     passes = 130
     with caplog.at_level("ERROR"):
@@ -810,7 +827,7 @@ def test_a_standing_fault_is_logged_once_per_cycle_of_real_time(monkeypatch, cap
     assert caplog.text.count("feed-read handling failed") == 3
 
 
-def test_the_first_fault_is_logged_on_a_host_that_has_just_booted(monkeypatch, caplog):
+def test_the_first_fault_is_logged_on_a_host_that_has_just_booted(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     # time.monotonic() counts from boot on Linux: under CYCLE_SECONDS of uptime only the
     # "never logged" clause speaks.
     with caplog.at_level("ERROR"):
@@ -822,7 +839,7 @@ def test_the_first_fault_is_logged_on_a_host_that_has_just_booted(monkeypatch, c
     assert caplog.text.count("feed-read handling failed") == 1
 
 
-def test_the_summary_is_per_cycle_and_counts_every_pass_since_the_last(monkeypatch, caplog):
+def test_the_summary_is_per_cycle_and_counts_every_pass_since_the_last(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     monkeypatch.setattr(rd, "_lane_taken", 3)
     monkeypatch.setattr(rd, "_lane_slots", 100)
     with caplog.at_level("INFO"):
@@ -842,7 +859,7 @@ def test_the_summary_is_per_cycle_and_counts_every_pass_since_the_last(monkeypat
     assert (rd._reads_heard, rd._reads_reranked) == (6, 3)
 
 
-def test_no_summary_on_a_schema_without_the_read_column(monkeypatch, caplog):
+def test_no_summary_on_a_schema_without_the_read_column(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     monkeypatch.setattr(rd, "_reads_supported", False)
     monkeypatch.setattr(rd, "_reads_heard", 4)
     with caplog.at_level("INFO"):
@@ -852,7 +869,7 @@ def test_no_summary_on_a_schema_without_the_read_column(monkeypatch, caplog):
     assert rd._reads_heard == 0
 
 
-def test_a_ranker_without_the_read_column_looks_again_after_each_cycle(monkeypatch):
+def test_a_ranker_without_the_read_column_looks_again_after_each_cycle(monkeypatch: MonkeyPatch) -> None:
     # On a HAF without application locks an install can run under a running ranker,
     # and nothing else would ever notice the column had arrived.
     monkeypatch.setattr(rd, "_reads_supported", False)
@@ -861,7 +878,7 @@ def test_a_ranker_without_the_read_column_looks_again_after_each_cycle(monkeypat
     assert seen.listened == [seen.first], "once per cycle, not once per pass"
 
 
-def test_a_ranker_with_the_read_column_does_not_keep_checking(monkeypatch):
+def test_a_ranker_with_the_read_column_does_not_keep_checking(monkeypatch: MonkeyPatch) -> None:
     seen = _drive_main(monkeypatch, passes=2, drain=[set(), set()], note=[])
 
     assert seen.listened == []
@@ -872,7 +889,7 @@ def test_a_ranker_with_the_read_column_does_not_keep_checking(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def _targeted(monkeypatch, names):
+def _targeted(monkeypatch: MonkeyPatch, names) -> None:
     conn, _ = _mock_conn([])
     monkeypatch.setattr(rd, "register_vector_type", lambda _c: None)
     monkeypatch.setattr(rd, "_evict_unsubscribed", lambda _c, _u: set())
@@ -887,7 +904,7 @@ def _targeted(monkeypatch, names):
     rd._run_targeted_refresh(conn, set(names))
 
 
-def test_a_small_refresh_is_logged_by_name_as_before(monkeypatch, caplog):
+def test_a_small_refresh_is_logged_by_name_as_before(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     with caplog.at_level(logging.INFO):
         _targeted(monkeypatch, ["alice", "bobby"])
 
@@ -895,7 +912,7 @@ def test_a_small_refresh_is_logged_by_name_as_before(monkeypatch, caplog):
     assert "force-refresh complete for alice" in caplog.text
 
 
-def test_a_large_refresh_is_logged_as_a_count(monkeypatch, caplog):
+def test_a_large_refresh_is_logged_as_a_count(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     names = [f"user{i:03d}" for i in range(rd._QUIET_REFRESH_ABOVE + 1)]
     with caplog.at_level(logging.INFO):
         _targeted(monkeypatch, names)
@@ -916,6 +933,7 @@ RETENTION = {
     "EMBEDDING_COVERAGE_DAYS": 14,
     "ACTIVE_USERS_MAX_EVICTIONS": 1000,
     "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS": 1000,
+    "FEED_CACHE_UNREAD_RETENTION_DAYS": 30,
 }
 
 _NAMES = (
@@ -939,7 +957,8 @@ import haf_fyp.ranker_daemon as rd
 for env in envs:
     for key in list(os.environ):
         if key.startswith(("READER_", "READ_REFRESH_", "MAX_USERS_PER_CYCLE",
-                           "FEED_EVENTS_", "EMBEDDING_COVERAGE_", "ACTIVE_USERS_")):
+                           "FEED_EVENTS_", "EMBEDDING_COVERAGE_", "ACTIVE_USERS_",
+                           "FEED_CACHE_")):
             del os.environ[key]
     os.environ.update(env)
     rd = importlib.reload(rd)
@@ -981,6 +1000,7 @@ def settings():
             "EMBEDDING_COVERAGE_DAYS": "1",
             "ACTIVE_USERS_MAX_EVICTIONS": "1",
             "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS": "0",
+            "FEED_CACHE_UNREAD_RETENTION_DAYS": "1",
         },
         "cycle_only_rest_empty": {
             "MAX_USERS_PER_CYCLE": "3000",
@@ -1011,7 +1031,7 @@ def settings():
     return dict(zip(envs, json.loads(out.stdout.strip().splitlines()[-1])))
 
 
-def test_the_reader_defaults_are_the_documented_ones(settings):
+def test_the_reader_defaults_are_the_documented_ones(settings) -> None:
     assert settings["defaults"] == {
         "READER_WINDOW_SECONDS": 24 * 60 * 60,
         "READER_CYCLE_SHARE": 0.5,
@@ -1026,12 +1046,12 @@ def test_the_reader_defaults_are_the_documented_ones(settings):
     }
 
 
-def test_the_retention_settings_are_read_from_the_environment(settings):
+def test_the_retention_settings_are_read_from_the_environment(settings) -> None:
     got = settings["retention_set"]
     assert {name: got[name] for name in RETENTION} == {n: v + 1 for n, v in RETENTION.items()}
 
 
-def test_counts_stay_whole_numbers(settings):
+def test_counts_stay_whole_numbers(settings) -> None:
     """They reach SQL functions declared int / bigint, and 20000000.0 == 20000000 in Python:
     read as a float, the prune would be called with a numeric and fail every pass, and the
     flood ceiling on the events table with it. JSON keeps the difference."""
@@ -1040,7 +1060,7 @@ def test_counts_stay_whole_numbers(settings):
             assert type(settings[case][name]) is int, (case, name)
 
 
-def test_main_says_so_before_it_ranks_anything():
+def test_main_says_so_before_it_ranks_anything() -> None:
     """The warning is only worth having if main() gives it, and gives it at start."""
     import ast
     import inspect
@@ -1067,7 +1087,7 @@ _ZERO_NO_READS = ("MAX_USERS_PER_CYCLE=0: no personal feed is refreshed on sched
     (1, 0, []),
     (200, 100, []),
 ])
-def test_no_scheduled_ranking_is_said_at_start(monkeypatch, caplog, cycle, budget, said_at_start):
+def test_no_scheduled_ranking_is_said_at_start(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture, cycle, budget, said_at_start) -> None:
     monkeypatch.setattr(rd, "MAX_USERS_PER_CYCLE", cycle)
     monkeypatch.setattr(rd, "READ_REFRESH_MAX_PER_CYCLE", budget)
     with caplog.at_level(logging.WARNING, logger=rd.log.name):
@@ -1075,14 +1095,14 @@ def test_no_scheduled_ranking_is_said_at_start(monkeypatch, caplog, cycle, budge
     assert [r.getMessage() for r in caplog.records] == said_at_start
 
 
-def test_a_setting_at_its_minimum_is_taken(settings):
+def test_a_setting_at_its_minimum_is_taken(settings) -> None:
     got = settings["at_the_minimums"]
     assert got["MAX_USERS_PER_CYCLE"] == 0
     assert got["READ_REFRESH_MAX_PER_CYCLE"] == 0  # its default follows the cycle size
     assert got["FEED_EVENTS_MAINT_SECONDS"] == 60
     assert got["ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS"] == 0
     for name in ("FEED_EVENTS_RETAIN_DAYS", "FEED_EVENTS_MAX_ROWS", "EMBEDDING_COVERAGE_DAYS",
-                 "ACTIVE_USERS_MAX_EVICTIONS"):
+                 "ACTIVE_USERS_MAX_EVICTIONS", "FEED_CACHE_UNREAD_RETENTION_DAYS"):
         assert got[name] == 1, name
 
 
@@ -1101,11 +1121,13 @@ def test_a_setting_at_its_minimum_is_taken(settings):
     ("ACTIVE_USERS_MAX_EVICTIONS", "0"),
     ("ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS", "-1"),
     ("READER_ACTIVE_WITHIN_DAYS", "-1"),
+    # Every cached feed but an opt-in's dropped on each pass.
+    ("FEED_CACHE_UNREAD_RETENTION_DAYS", "0"),
 ])
-def test_a_setting_below_its_minimum_stops_the_ranker_and_says_which(name, value):
+def test_a_setting_below_its_minimum_stops_the_ranker_and_says_which(name, value) -> None:
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("MAX_USERS_PER_CYCLE", "FEED_EVENTS_", "EMBEDDING_COVERAGE_",
-                                "ACTIVE_USERS_"))}
+                                "ACTIVE_USERS_", "FEED_CACHE_"))}
     out = subprocess.run(
         [sys.executable, "-c", "import haf_fyp.ranker_daemon"],
         cwd=REPO,
@@ -1117,7 +1139,7 @@ def test_a_setting_below_its_minimum_stops_the_ranker_and_says_which(name, value
     assert f"ValueError: {name}='{value}' is below its minimum" in out.stderr, out.stderr[-500:]
 
 
-def test_the_activity_filter_has_a_ceiling():
+def test_the_activity_filter_has_a_ceiling() -> None:
     """A cutoff further back than PostgreSQL's dates would fail both statements on every
     pass, and the lane with them."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("READER_")}
@@ -1139,7 +1161,7 @@ def test_the_activity_filter_has_a_ceiling():
     (30, False, 0),   # replay or catch-up: every account would look lapsed
     (30, RuntimeError("no app_status"), 0),  # cannot tell: every read counts
 ])
-def test_the_activity_filter_waits_for_block_processing(monkeypatch, caplog, setting, caught_up, effective):
+def test_the_activity_filter_waits_for_block_processing(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture, setting, caught_up, effective) -> None:
     monkeypatch.setattr(rd, "READER_ACTIVE_WITHIN_DAYS", setting)
     monkeypatch.setattr(rd, "_read_filter_days", 0 if effective else 30)  # so a change is logged
     asked = []
@@ -1163,7 +1185,7 @@ def test_the_activity_filter_waits_for_block_processing(monkeypatch, caplog, set
         assert any("READER_ACTIVE_WITHIN_DAYS=30" in r.getMessage() for r in caplog.records)
 
 
-def test_a_lost_connection_while_checking_the_filter_is_not_swallowed(monkeypatch):
+def test_a_lost_connection_while_checking_the_filter_is_not_swallowed(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READER_ACTIVE_WITHIN_DAYS", 30)
 
     def _gone(_cur):
@@ -1181,7 +1203,7 @@ def test_a_lost_connection_while_checking_the_filter_is_not_swallowed(monkeypatc
     (30, 0, "read filter since the last cycle: 5 read(s) earned no slot (READER_ACTIVE_WITHIN_DAYS=30; "
             "filter off: block processing is behind or not known)"),
 ])
-def test_the_cycle_line_says_how_many_reads_earned_nothing(monkeypatch, caplog, setting, effective, line):
+def test_the_cycle_line_says_how_many_reads_earned_nothing(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture, setting, effective, line) -> None:
     monkeypatch.setattr(rd, "_reads_supported", True)
     monkeypatch.setattr(rd, "READER_ACTIVE_WITHIN_DAYS", setting)
     monkeypatch.setattr(rd, "_read_filter_days", effective)
@@ -1195,7 +1217,7 @@ def test_the_cycle_line_says_how_many_reads_earned_nothing(monkeypatch, caplog, 
     assert sum("feed reads since the last cycle" in r.getMessage() for r in caplog.records) == 1
 
 
-def test_a_read_with_no_interaction_at_all_earns_nothing_and_is_counted():
+def test_a_read_with_no_interaction_at_all_earns_nothing_and_is_counted() -> None:
     """last_interaction_at is NULL for an account that never voted or reblogged; without
     the COALESCE, or with it defaulting to true, the condition is NULL or true for it --
     uncounted, or a slot for the very account a forger would use. The database test
@@ -1204,7 +1226,7 @@ def test_a_read_with_no_interaction_at_all_earns_nothing_and_is_counted():
     assert sql.startswith("COALESCE(( ") and sql.endswith(" ), false)"), sql
 
 
-def test_the_unearned_count_adds_up_over_a_cycles_passes(monkeypatch):
+def test_the_unearned_count_adds_up_over_a_cycles_passes(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "_reads_unearned", 0)
     for unearned in (3, 4):
         conn, _cur = _mock_conn([[(None, unearned)]])
@@ -1213,7 +1235,7 @@ def test_the_unearned_count_adds_up_over_a_cycles_passes(monkeypatch):
 
 
 @pytest.mark.parametrize("raw, ok", [("3", True), ("2", True), ("1", False), (" ", True)])
-def test_a_minimum_is_checked_after_the_default_is_taken(monkeypatch, raw, ok):
+def test_a_minimum_is_checked_after_the_default_is_taken(monkeypatch: MonkeyPatch, raw, ok) -> None:
     monkeypatch.setenv("HAF_FYP_TEST_TUNING", raw)
     if ok:
         assert rd._tuning("HAF_FYP_TEST_TUNING", "5", int, minimum=2) == int(raw.strip() or 5)
@@ -1222,13 +1244,13 @@ def test_a_minimum_is_checked_after_the_default_is_taken(monkeypatch, raw, ok):
             rd._tuning("HAF_FYP_TEST_TUNING", "5", int, minimum=2)
 
 
-def test_settings_left_blank_in_the_env_file_are_the_defaults(settings):
+def test_settings_left_blank_in_the_env_file_are_the_defaults(settings) -> None:
     # `NAME=` in the env file reaches the daemon as an empty string. int("") raises, so
     # before #87 a blanked-out line stopped the ranker.
     assert settings["blank_in_env_file"] == settings["defaults"]
 
 
-def test_an_empty_setting_still_follows_the_ones_that_are_set(settings):
+def test_an_empty_setting_still_follows_the_ones_that_are_set(settings) -> None:
     got = settings["cycle_only_rest_empty"]
 
     assert got["MAX_USERS_PER_CYCLE"] == 3000
@@ -1236,7 +1258,7 @@ def test_an_empty_setting_still_follows_the_ones_that_are_set(settings):
     assert got["READ_REFRESH_MAX_PER_CYCLE"] == 300  # 3000 x 0.5, held at the ceiling
 
 
-def test_the_cycle_size_stays_a_whole_number(settings):
+def test_the_cycle_size_stays_a_whole_number(settings) -> None:
     # It is a LIMIT and a slice bound: 200.0 equals 200 and still breaks the slice.
     for case in ("defaults", "blank_in_env_file", "bigger_cycle"):
         assert type(settings[case]["MAX_USERS_PER_CYCLE"]) is int, case
@@ -1247,7 +1269,7 @@ def test_the_cycle_size_stays_a_whole_number(settings):
     "raw, expected",
     [(None, 5), ("", 5), ("   ", 5), ("7", 7), (" 7 ", 7), ("0", 0), ("-2", -2)],
 )
-def test_a_tuning_variable_unset_or_empty_takes_the_default(monkeypatch, raw, expected):
+def test_a_tuning_variable_unset_or_empty_takes_the_default(monkeypatch: MonkeyPatch, raw, expected) -> None:
     monkeypatch.delenv("HAF_FYP_TEST_TUNING", raising=False)
     if raw is not None:
         monkeypatch.setenv("HAF_FYP_TEST_TUNING", raw)
@@ -1255,7 +1277,7 @@ def test_a_tuning_variable_unset_or_empty_takes_the_default(monkeypatch, raw, ex
     assert rd._tuning("HAF_FYP_TEST_TUNING", "5", int) == expected
 
 
-def test_a_tuning_variable_that_is_not_a_number_names_itself(monkeypatch):
+def test_a_tuning_variable_that_is_not_a_number_names_itself(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("HAF_FYP_TEST_TUNING", "lots")
 
     with pytest.raises(ValueError, match="^HAF_FYP_TEST_TUNING='lots' is not a valid int$"):
@@ -1271,7 +1293,7 @@ def test_a_tuning_variable_that_is_not_a_number_names_itself(monkeypatch):
     assert rd._tuning("HAF_FYP_TEST_TUNING", "5", float) == 0.5  # the same value is a valid share
 
 
-def test_the_reader_settings_are_read_from_the_environment(settings):
+def test_the_reader_settings_are_read_from_the_environment(settings) -> None:
     got = settings["overridden"]
 
     assert got["READER_WINDOW_SECONDS"] == 3600
@@ -1281,29 +1303,29 @@ def test_the_reader_settings_are_read_from_the_environment(settings):
     assert got["READ_REFRESH_BATCH_SECONDS"] == 7
 
 
-def test_the_default_rerank_budget_is_the_readers_share_of_the_cycle(settings):
+def test_the_default_rerank_budget_is_the_readers_share_of_the_cycle(settings) -> None:
     assert settings["share_only"]["READ_REFRESH_MAX_PER_CYCLE"] == 50  # 200 x 0.25
     assert settings["too_high"]["READ_REFRESH_MAX_PER_CYCLE"] == 180  # 200 x the 0.9 cap
 
 
-def test_the_default_rerank_budget_stops_growing_with_the_cycle(settings):
+def test_the_default_rerank_budget_stops_growing_with_the_cycle(settings) -> None:
     # These run in the 300 s the ranker waits between cycles. The plain share of a
     # 3000-account cycle is 1500, about five minutes of ranking: enough to start
     # delaying the cycle itself.
     assert settings["bigger_cycle"]["READ_REFRESH_MAX_PER_CYCLE"] == 300
 
 
-def test_an_operator_can_still_set_a_larger_budget_by_hand(settings):
+def test_an_operator_can_still_set_a_larger_budget_by_hand(settings) -> None:
     assert settings["by_hand"]["READ_REFRESH_MAX_PER_CYCLE"] == 1500
 
 
 @pytest.mark.parametrize("case", ["too_high", "exactly_one"])
-def test_the_share_can_never_reach_the_whole_cycle(settings, case):
+def test_the_share_can_never_reach_the_whole_cycle(settings, case) -> None:
     # At 1.0 a full reader lane leaves the rotation LIMIT 0: it stops.
     assert settings[case]["READER_CYCLE_SHARE"] == 0.9
 
 
-def test_negative_settings_are_treated_as_zero(settings):
+def test_negative_settings_are_treated_as_zero(settings) -> None:
     got = settings["negative"]
 
     assert got["READER_CYCLE_SHARE"] == 0.0
@@ -1336,19 +1358,25 @@ def _notify_guard():
     return code, code[start:end]
 
 
-def test_the_feed_function_notifies_the_channel_the_ranker_listens_on():
+def test_the_feed_function_notifies_the_channel_the_ranker_listens_on() -> None:
     _code, guard = _notify_guard()
 
     assert guard.rstrip().endswith("THEN")
 
 
-def test_the_notify_is_inside_the_branch_for_an_account_with_a_feed():
+def test_the_notify_comes_before_the_cached_feed_test() -> None:
     code, guard = _notify_guard()
 
-    # Between the EXISTS test on feed_cache and the first statement of that branch:
-    # a name with no cached feed is never broadcast.
-    opens = code.index("IF EXISTS ( SELECT 1 FROM haf_fyp_app.feed_cache fc")
-    assert opens < code.index(guard) < code.index("_observer_id :=")
+    # #98: the ranker builds no feed for an account until it reads, so the read of an
+    # account with no cached feed (served the global one) must reach it too. Both
+    # branches follow the notify; the active_users test in the guard is what keeps a
+    # name outside the rotation from being broadcast.
+    assert (
+        code.index("BEGIN")
+        < code.index(guard)
+        < code.index("IF EXISTS ( SELECT 1 FROM haf_fyp_app.feed_cache fc")
+        < code.index("IF EXISTS (SELECT 1 FROM haf_fyp_app.global_feed_cache)")
+    )
 
 
 @pytest.mark.parametrize(
@@ -1368,19 +1396,19 @@ def test_the_notify_is_inside_the_branch_for_an_account_with_a_feed():
         "OR au.last_read_at < (NOW() AT TIME ZONE 'utc') - INTERVAL '10 minutes') )",
     ],
 )
-def test_the_notify_is_rationed(condition):
+def test_the_notify_is_rationed(condition) -> None:
     _code, guard = _notify_guard()
 
     assert condition in guard
 
 
-def test_every_condition_must_hold_for_a_notify():
+def test_every_condition_must_hold_for_a_notify() -> None:
     _code, guard = _notify_guard()
 
     assert " OR " not in guard.replace("au.last_read_at IS NULL OR au.last_read_at <", "")
 
 
-def test_the_feed_function_is_still_stable():
+def test_the_feed_function_is_still_stable() -> None:
     # PostgREST runs a STABLE function read-only whatever the HTTP verb; VOLATILE would
     # make a POST to /rpc/get_personalized_feed a read-write transaction.
     assert re.search(
@@ -1409,7 +1437,7 @@ def _active_users_columns(path):
     return columns
 
 
-def test_the_table_the_db_tests_run_against_has_the_shipped_columns():
+def test_the_table_the_db_tests_run_against_has_the_shipped_columns() -> None:
     # tests/integration/ runs the ranker's SQL against tests/ci_fastapi_setup.sql, a
     # hand-kept mirror, so a column the ranker needs that db/create_tables.sql does not
     # create would otherwise be found on a node.
@@ -1419,7 +1447,7 @@ def test_the_table_the_db_tests_run_against_has_the_shipped_columns():
     assert shipped["last_read_at"] == "timestamp"
 
 
-def test_last_read_at_is_a_plain_nullable_column_where_the_table_is_created():
+def test_last_read_at_is_a_plain_nullable_column_where_the_table_is_created() -> None:
     for path in ("db/create_tables.sql", "tests/ci_fastapi_setup.sql"):
         sql = open(os.path.join(REPO, path), encoding="utf-8").read()
         body = re.search(
@@ -1429,7 +1457,7 @@ def test_last_read_at_is_a_plain_nullable_column_where_the_table_is_created():
         assert line.split("--", 1)[0].strip().lower() == "last_read_at timestamp,", path
 
 
-def test_an_installed_table_gets_the_column_in_place():
+def test_an_installed_table_gets_the_column_in_place() -> None:
     sql = open(os.path.join(REPO, "db", "create_tables.sql"), encoding="utf-8").read()
     code = " ".join(line.split("--", 1)[0] for line in sql.splitlines()).split()
 

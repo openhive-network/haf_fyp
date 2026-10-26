@@ -539,6 +539,23 @@ def write_feed_cache(
             """,
             (username, now),
         )
+        # feed_cache stores algorithm_version and boost_source as feed_cache_labels
+        # codes. Register a label the first time it is written. NOT EXISTS before the
+        # insert, not ON CONFLICT alone: a conflicting insert still draws a value from
+        # the smallint identity, and at one draw per label per feed that would run out
+        # within days.
+        cur.execute(
+            """
+            INSERT INTO haf_fyp_app.feed_cache_labels (label)
+            SELECT DISTINCT l.label
+              FROM unnest(%s::text[]) AS l(label)
+             WHERE l.label IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM haf_fyp_app.feed_cache_labels x WHERE x.label = l.label)
+            ON CONFLICT (label) DO NOTHING
+            """,
+            ([algo_version, *{s for s in top["boost_source"] if isinstance(s, str)}],),
+        )
         cur.execute(
             "DELETE FROM haf_fyp_app.feed_cache WHERE username = %s", (username,)
         )
@@ -549,7 +566,16 @@ def write_feed_cache(
                 (username, post_id, final_score, score_engagement, score_recency,
                  score_credibility, score_relevance, community_boost_applied,
                  boost_source, rank, algorithm_version, computed_at)
-            VALUES %s
+            SELECT v.username, v.post_id, v.final_score, v.score_engagement,
+                   v.score_recency, v.score_credibility, v.score_relevance,
+                   v.community_boost_applied, COALESCE(lb.code, 0), v.rank,
+                   COALESCE(la.code, 0), v.computed_at
+              FROM (VALUES %s)
+                AS v(username, post_id, final_score, score_engagement, score_recency,
+                     score_credibility, score_relevance, community_boost_applied,
+                     boost_source, rank, algorithm_version, computed_at)
+              LEFT JOIN haf_fyp_app.feed_cache_labels lb ON lb.label = v.boost_source
+              LEFT JOIN haf_fyp_app.feed_cache_labels la ON la.label = v.algorithm_version
             """,
             rows,
         )
