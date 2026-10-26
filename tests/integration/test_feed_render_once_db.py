@@ -31,7 +31,6 @@ REPO = os.path.join(os.path.dirname(__file__), "..", "..")
 ENDPOINT_SQL = os.path.join(REPO, "endpoints", "endpoint_schema.sql")
 
 S = "fyp_render_once"
-UNRENDERABLE = 99  # hive_post_id the stub answers NULL for (deleted in hivemind)
 
 
 def _rehome(sql: str) -> str:
@@ -105,15 +104,17 @@ def db() -> Iterator[Connection]:
                     post_id bigint, rank int, final_score float, score_recency float,
                     score_engagement float, score_credibility float,
                     algorithm_version varchar(16));
-                CREATE TABLE {S}.post_candidates (
-                    post_id bigint PRIMARY KEY, hive_post_id int, community_id int);
-                CREATE TABLE {S}.post_bridge_cache (post_id bigint PRIMARY KEY, bridge jsonb);
+                -- Keyed by hivemind's hive_posts.id since #97, as the feed caches are.
+                CREATE TABLE {S}.post_candidates (post_id int PRIMARY KEY, community_id int);
+                CREATE TABLE {S}.post_bridge_cache (post_id int PRIMARY KEY, bridge jsonb);
+                -- Posts hivemind no longer has: the stub renders them as NULL.
+                CREATE TABLE {S}.vanished (post_id int PRIMARY KEY);
                 CREATE TABLE {S}.hive_accounts (id int, name text);
                 INSERT INTO {S}.hive_accounts VALUES (7, 'alice');
                 CREATE FUNCTION {S}.get_bridge_post(_post_id int, _observer_id int, _truncate int)
                 RETURNS jsonb LANGUAGE plpgsql STABLE AS $$
                 BEGIN
-                    IF _post_id = {UNRENDERABLE} THEN
+                    IF EXISTS (SELECT 1 FROM {S}.vanished v WHERE v.post_id = _post_id) THEN
                         RETURN NULL;
                     END IF;
                     RETURN jsonb_build_object(
@@ -125,10 +126,10 @@ def db() -> Iterator[Connection]:
             # 25 posts, so page 1 is a full 20 and page 2 the last 5. Ranks run against
             # post ids, so a page in id order would be visibly wrong.
             for n in range(1, 26):
-                post_id = 1000 + n
+                post_id = n
                 cur.execute(
-                    f"INSERT INTO {S}.post_candidates VALUES (%s, %s, %s)",
-                    (post_id, n, 1 if n % 2 else 2),
+                    f"INSERT INTO {S}.post_candidates VALUES (%s, %s)",
+                    (post_id, 1 if n % 2 else 2),
                 )
                 cur.execute(
                     f"INSERT INTO {S}.feed_cache VALUES "
@@ -181,16 +182,22 @@ def _call(db: Connection, sql: str, args: tuple[Any, ...]) -> tuple[str, int]:
         db.set_session(readonly=False)
 
 
-def _cache(db: Connection, hive_post_ids: list[int]) -> None:
+def _cache(db: Connection, post_ids: list[int]) -> None:
     """Give these posts a post_bridge_cache row, so only the rest render live."""
     with db.cursor() as cur:
-        for n in hive_post_ids:
+        for n in post_ids:
             cur.execute(
                 f"INSERT INTO {S}.post_bridge_cache "
-                f"SELECT post_id, jsonb_build_object('cached', %s, 'body', 'cached body') "
-                f"FROM {S}.post_candidates WHERE hive_post_id = %s",
+                f"VALUES (%s, jsonb_build_object('cached', %s, 'body', 'cached body'))",
                 (n, n),
             )
+    db.commit()
+
+
+def _vanish(db: Connection, post_id: int) -> None:
+    """The post is gone from hivemind: get_bridge_post renders it as NULL."""
+    with db.cursor() as cur:
+        cur.execute(f"INSERT INTO {S}.vanished VALUES (%s)", (post_id,))
     db.commit()
 
 
@@ -208,12 +215,10 @@ def test_a_page_of_cache_misses_renders_each_post_once(
 
 
 def test_only_misses_render_and_a_vanished_post_is_dropped_after_one_call(db: Connection) -> None:
-    # Ranks 1..20 on page 1 are hive_post_ids 25..6. Cache five of them, and make one
+    # Ranks 1..20 on page 1 are post ids 25..6. Cache five of them, and make one
     # miss unrenderable: the page then holds 19 posts from 15 live calls.
     _cache(db, [25, 22, 19, 16, 13])
-    with db.cursor() as cur:
-        cur.execute(f"UPDATE {S}.post_candidates SET hive_post_id = %s WHERE hive_post_id = 10", (UNRENDERABLE,))
-    db.commit()
+    _vanish(db, 10)
     page, calls = _call(db, PAGES[0][1], PAGES[0][2])
     posts = json.loads(page)
     assert len(posts) == 19
@@ -227,9 +232,7 @@ def test_the_fence_leaves_the_page_unchanged(
 ) -> None:
     """Same JSON, same order, with and without the fence; cached, live and dropped mixed."""
     _cache(db, [25, 21, 17, 4])
-    with db.cursor() as cur:
-        cur.execute(f"UPDATE {S}.post_candidates SET hive_post_id = %s WHERE hive_post_id = 12", (UNRENDERABLE,))
-    db.commit()
+    _vanish(db, 12)
     fenced, _ = _call(db, sql, args)
     _install_unfenced(db)
     unfenced, _ = _call(db, sql, args)
