@@ -1,91 +1,98 @@
--- Phase 8: User-interactions processor.
--- Records each user's votes (weight 1.0) and reblogs (weight 1.5) on tracked
--- posts into haf_fyp_app.user_interactions as blocks are processed. The ranker
--- reads this table (an indexed per-user lookup) to build interest vectors,
--- instead of re-scanning hive.account_operations_view every cycle — which is
--- far too slow per user to run at scale.
+-- Each account's votes and reblogs of root posts, copied from hivemind (#97).
 --
--- Reads the batch's vote_operation and custom_json reblogs, with their block timestamps
--- (the interaction time), as stage_operations (db/process_block_range.sql) staged them.
+-- copy_hivemind_interactions() is one of the steps db/hivemind_follow.sql runs for a
+-- range of hivemind blocks: once over the whole window as the backfill, then over each
+-- batch's blocks. The ranker reads the result one account at a time to build interest
+-- vectors (haf_fyp/embeddings.py).
 --
--- Only interactions whose target post is already tracked (post_lookup) are kept,
--- so the table is bounded by tracked posts. Deduplicated to one row per
--- (username, post_id): the strongest action wins, keeping the latest time/block.
+-- What it reads. hive_votes holds one row per (voter, post), upserted in place: a
+-- revote, or a vote withdrawn at 0%, moves the row's block_num and last_update on, so a
+-- block range sees each vote's latest state and a vote reappears in the range of its
+-- latest change. hive_reblogs holds one row per (account, post), from hivemind's
+-- parsing of follow/["reblog", ...] (the form the replayed path never matched, #91).
+-- Both read through their block_num indexes, joined to hive_posts for root posts only.
+--
+-- What it does NOT see: an un-reblog deletes hivemind's row, and a deleted row is in
+-- no block range. Accepted as stale for the window: the interaction keeps its reblog
+-- weight until it ages out (prune_history), and the post's reblog_count is right again
+-- the next time anything touches the post (copy_hivemind_engagement counts it whole).
+--
+-- One row per (account, post) here as before: the strongest action wins (reblog 1.5 >
+-- vote 1.0) and created_at is the time of the latest, both kept across ranges by the
+-- upsert. active_users gets each account's latest interaction, as the ranker's
+-- rotation needs it.
 
-CREATE OR REPLACE FUNCTION haf_fyp_app.process_interactions(
-    _first_block int,
-    _last_block int
+DROP FUNCTION IF EXISTS haf_fyp_app.process_interactions(int, int);
+
+CREATE OR REPLACE FUNCTION haf_fyp_app.copy_hivemind_interactions(
+    _from int,
+    _to int
 )
-RETURNS void
+RETURNS bigint
 LANGUAGE plpgsql
 AS $$
+DECLARE
+    _copied bigint;
 BEGIN
-    WITH interactions AS (
-        -- Votes (weight 1.0) cast by the voter on a tracked post
-        SELECT
-            v.voter AS username,
-            pl.post_id,
-            1.0::real AS action_weight,
-            v.created_at,
-            v.block_num
-        FROM pg_temp.haf_fyp_batch_votes v
-        JOIN haf_fyp_app.post_lookup pl
-            ON  pl.author   = v.author
-            AND pl.permlink = v.permlink
-        WHERE v.block_num BETWEEN _first_block AND _last_block
-          AND v.created_at IS NOT NULL
-          AND length(v.voter) BETWEEN 3 AND 16
-
-        UNION ALL
-
-        -- Reblogs (weight 1.5) by the reblogging account of a tracked post.
-        -- json field is a string-encoded array (T-0.7):
-        --   ["reblog", {"account": "...", "author": "...", "permlink": "..."}]
-        SELECT
-            cj.account AS username,
-            pl.post_id,
-            1.5::real AS action_weight,
-            cj.created_at,
-            cj.block_num
-        FROM pg_temp.haf_fyp_batch_custom_json cj
-        JOIN haf_fyp_app.post_lookup pl
-            ON  pl.author   = cj.author
-            AND pl.permlink = cj.permlink
-        WHERE cj.block_num BETWEEN _first_block AND _last_block
-          AND cj.created_at IS NOT NULL
-          AND cj.custom_json_id = 'reblog'
-          AND cj.action = 'reblog'
-          AND length(cj.account) BETWEEN 3 AND 16
+    WITH votes AS (
+        SELECT v.voter_id AS account_id, v.post_id, v.last_update AS created_at, v.block_num
+        FROM hivemind_app.hive_votes AS v
+        JOIN hivemind_app.hive_posts AS hp ON hp.id = v.post_id AND hp.depth = 0
+        WHERE v.block_num BETWEEN _from AND _to
     ),
-    -- One row per (username, post_id) for this block range: strongest action,
-    -- latest block/time.
-    deduped AS (
-        SELECT DISTINCT ON (username, post_id)
-            username, post_id, action_weight, created_at, block_num
-        FROM interactions
-        WHERE username IS NOT NULL
-        ORDER BY username, post_id, action_weight DESC, block_num DESC
+
+    reblogs AS (
+        SELECT r.blogger_id AS account_id, r.post_id, r.created_at, r.block_num
+        FROM hivemind_app.hive_reblogs AS r
+        JOIN hivemind_app.hive_posts AS hp ON hp.id = r.post_id AND hp.depth = 0
+        WHERE r.block_num BETWEEN _from AND _to
     ),
-    -- Upsert the interactions; RETURNING feeds the active_users maintenance
-    -- below so we don't rescan the operations for it.
-    ins AS (
+
+    -- At most one vote and one reblog per (account, post), so a full join pairs them.
+    -- GREATEST ignores the NULL side.
+    actions AS (
+        SELECT
+            coalesce(v.account_id, r.account_id) AS account_id,
+            coalesce(v.post_id, r.post_id) AS post_id,
+            (CASE WHEN r.post_id IS NULL THEN 1.0 ELSE 1.5 END)::real AS action_weight,
+            greatest(v.created_at, r.created_at) AS created_at,
+            greatest(v.block_num, r.block_num) AS block_num
+        FROM votes AS v
+        FULL JOIN reblogs AS r ON r.account_id = v.account_id AND r.post_id = v.post_id
+    ),
+
+    -- In account order: the ranker reads one account's latest rows, and written as a
+    -- hash join hands them over, those rows would sit on as many heap pages as there are
+    -- rows. For a batch the sort is of a few hundred rows; for the backfill it is the one
+    -- the measured slim build (#97) paid as well.
+    upserted AS (
         INSERT INTO haf_fyp_app.user_interactions AS ui
-            (username, post_id, action_weight, created_at, block_num)
-        SELECT username, post_id, action_weight, created_at, block_num FROM deduped
-        ON CONFLICT (username, post_id) DO UPDATE SET
-            action_weight = GREATEST(ui.action_weight, EXCLUDED.action_weight),
-            created_at    = GREATEST(ui.created_at, EXCLUDED.created_at),
-            block_num     = GREATEST(ui.block_num, EXCLUDED.block_num)
-        RETURNING username, created_at, block_num
+            (account_id, post_id, action_weight, created_at)
+        SELECT account_id, post_id, action_weight, created_at FROM actions
+        ORDER BY account_id, created_at
+        ON CONFLICT (account_id, post_id) DO UPDATE SET
+            action_weight = greatest(ui.action_weight, excluded.action_weight),
+            created_at = greatest(ui.created_at, excluded.created_at)
+        RETURNING 1
+    ),
+
+    latest AS (
+        SELECT account_id, max(created_at) AS created_at, max(block_num) AS block_num
+        FROM actions
+        GROUP BY account_id
+    ),
+
+    enrolled AS (
+        INSERT INTO haf_fyp_app.active_users AS au (username, last_interaction_at, last_block)
+        SELECT ha.name, l.created_at, l.block_num
+        FROM latest AS l
+        JOIN hivemind_app.hive_accounts AS ha ON ha.id = l.account_id
+        ON CONFLICT (username) DO UPDATE SET
+            last_interaction_at = greatest(au.last_interaction_at, excluded.last_interaction_at),
+            last_block = greatest(au.last_block, excluded.last_block)
     )
-    -- Maintain the one-row-per-user active_users index (latest activity).
-    INSERT INTO haf_fyp_app.active_users AS au
-        (username, last_interaction_at, last_block)
-    SELECT username, MAX(created_at), MAX(block_num)
-    FROM ins
-    GROUP BY username
-    ON CONFLICT (username) DO UPDATE SET
-        last_interaction_at = GREATEST(au.last_interaction_at, EXCLUDED.last_interaction_at),
-        last_block          = GREATEST(au.last_block, EXCLUDED.last_block);
+
+    SELECT count(*) INTO _copied FROM upserted;
+    RETURN _copied;
 END;
 $$;

@@ -7,12 +7,15 @@ A HAF (Hive Application Framework) application that delivers a personalized "For
 ```
 hived ──► sql_serializer ──► HAF PostgreSQL
                                    │
+      hivemind_app ─────────────┐   (votes, reblogs, posts: copied by block_num)
+                                │
                          haf_fyp_app schema
-                         ┌──────────────────┐
-                         │ post_candidates  │  ◄── process_posts.sql
+                         ┌───────────────────┐
+                         │ post_candidates   │  ◄── process_posts.sql
                          │ engagement_metrics│  ◄── process_engagement.sql
-                         │ user_communities  │  ◄── process_communities.sql
-                         └──────────────────┘
+                         │ user_interactions │  ◄── process_interactions.sql
+                         │ user_communities  │  ◄── process_communities.sql (operations)
+                         └───────────────────┘  ◄── hivemind_follow.sql drives the copy
                                    │
                           Python ranker (5 min)
                           ┌────────────────────┐
@@ -83,45 +86,38 @@ hived ──► sql_serializer ──► HAF PostgreSQL
 - **[Hivemind](https://gitlab.syncad.com/hive/hivemind), installed and synced on the
   same PostgreSQL server.** This is a hard dependency, not an accuracy enhancement:
 
-  > **Without Hivemind, every feed returns `[]`.**
+  > **Without Hivemind there is nothing to rank, and every feed returns `[]`.**
 
-  The feed endpoints render each post through
-  `hivemind_app.get_full_post_view_by_id` and select only rows where
-  `post_candidates.hive_post_id IS NOT NULL`. That column is filled by
-  `haf_fyp_app.resolve_hivemind_post_ids`, which returns immediately when
-  `hivemind_app.hive_posts` is absent, so on a node without Hivemind it stays NULL
-  for every post and both `/v1/fyp/feed` and `/v1/fyp/global` return an empty list.
-  Block processing continues normally and nothing raises — the resolver is
-  deliberately exception-guarded so a missing schema cannot stall the processor —
-  so the only symptom is empty feeds.
+  haf_fyp does not replay votes, reblogs or comments (#97). Block processing copies
+  the last `FYP_HISTORY_DAYS` (365 by default) of them from hivemind's own tables into
+  slim tables keyed by hivemind's integer ids, and the feed endpoints render each post
+  through `hivemind_app.get_full_post_view_by_id`. Hivemind is also the bridge to
+  HiveSense: embeddings are keyed by hivemind post id.
 
-  Hivemind is also the bridge to HiveSense: embeddings are keyed by hivemind post
-  id, so without Hivemind there is no relevance signal either.
+  The copy starts by itself. Until hivemind is within `FYP_HIVEMIND_MAX_LAG_BLOCKS`
+  (1000) of the chain's irreversible head **with its `block_num` indexes in place** —
+  hivemind drops them while it is 2,000,000 or more blocks behind — block processing
+  waits: it copies nothing, a fresh install skips the community operations too, and
+  `GET /sync-status` and `GET /metrics` report `history: waiting_for_hivemind`. The
+  first batch that finds hivemind there backfills the whole window in one set-based
+  pass (about a minute for a year on a full node: 71.1M interactions, 556k root posts),
+  takes `user_communities` from hivemind's subscriptions on a fresh install, and from
+  then on every batch follows hivemind by `block_num`. `history: following_hivemind`
+  says it has. The ranker's hourly maintenance deletes what has aged out of the window
+  (`haf_fyp_app.prune_history()`).
 
-  **If you install Hivemind AFTER haf_fyp has been syncing, you must run the
-  backfill**, or the feeds stay empty even though everything now looks correct:
+  Two things to know:
+  - **Install hivemind, then re-run `scripts/grant_cross_schema.sh`** if haf_fyp was
+    installed first: until haf_fyp's roles can read hivemind, it waits as if hivemind
+    were absent, and `GET /metrics` says so (`history.detail`).
+  - **An un-reblog is not seen.** Hivemind deletes its row, and a block range cannot
+    show a deleted row: the interaction keeps its reblog weight until it ages out of the
+    window. A post's reblog count is right again the next time anything touches it.
 
-  ```sql
-  CALL haf_fyp_app.run_hive_post_id_backfill();              -- 1-month chunks
-  CALL haf_fyp_app.run_hive_post_id_backfill('1 week', 0.2); -- finer + throttled
-  ```
-
-  The per-block resolver only looks back **7 days** (`process_block_range.sql`), so
-  every `post_candidates` row older than that keeps `hive_post_id IS NULL` forever
-  and is filtered out of both feeds. This is the most likely way to hit the empty-feed
-  failure in practice. **`GET /metrics` cannot currently detect this**, and that is worth stating rather
-  than leaving to be discovered. A request-time probe for it turns out not to be
-  affordable: the cheap version (unresolved and older than the window) counts posts
-  *deleted on-chain*, which never resolve by design — on a healthy caught-up node
-  507 of 507 sampled unresolved rows were deletions — so it would report a permanent
-  false alarm with a remedy that cannot clear it. The correct predicate has to join
-  hivemind to exclude them, and measured **1.9 s** on the reference node, getting
-  slower as the backlog grows. Detecting it properly needs a precomputed rollup on
-  the ranker's maintenance pass, the same pattern `embedding_coverage_daily` uses;
-  [#43](https://gitlab.syncad.com/hive/haf_fyp/-/issues/43) stays open for it. Every privilege state
-  reads `readable` throughout, which is why the earlier privilege-only check could
-  not see it. The backfill is resumable and only ever touches NULL rows, so
-  re-running it is safe.
+  Upgrading a node that replayed the old way needs no replay either: the install drops
+  the replayed tables (moving the cached feeds' post ids to hivemind's first), and the
+  first batch backfills the window from hivemind. The time is the backfill's, whatever
+  the size of the old tables.
 
 ### External HAF Apps (optional)
 
@@ -211,19 +207,18 @@ That is a correction with some history behind it. #36 shipped a `feeds_empty`
 boolean as the alert field and #43 tried to make it authoritative; review showed it
 was wrong in *both* directions, so it is gone rather than left to mislead:
 
-* it read `true` on nodes that were **serving** — both feed endpoints answer from
-  `post_bridge_cache`, so revoking `SELECT` on `hive_posts` on a warm node stops
-  resolution while every request keeps succeeding;
+* it read `true` on nodes that were **serving** — the feed endpoints then answered
+  from pre-rendered JSON, so revoking `SELECT` on `hive_posts` on a warm node left
+  every request succeeding;
 * it read `false` on nodes that were **not** — `global_feed_cache` is the
-  recency-weighted top 200, so the backfill case leaves it green while older
-  per-user rows are unresolvable.
+  recency-weighted top 200, so it can stay green while per-user feeds are empty.
 
 So the section reports two independent observations and lets `degraded` combine
 them, instead of collapsing them into one boolean that is wrong at both ends:
 
 | field | question it answers |
 |-------|--------------------|
-| `global_feed` | does the global cache hold anything (`cached`), and is any of it servable (`servable`)? `cached: true, servable: false` is a failure no privilege probe can see |
+| `global_feed` | does the global cache hold anything (`cached`), and is any of it still a post in the history window (`servable`)? `cached: true, servable: false` is a failure no privilege probe can see |
 | `sources` | per-relation privilege states — the diagnosis of *why*, not the detection |
 
 `global_feed` reading `null` means that probe could not run; `degraded` is set and `state` is `ranking_unknown`, because "I could not check"
@@ -235,21 +230,36 @@ every relation reads `unknown` instead.
 | state | meaning | do |
 |-------|---------|----|
 | `ranking_full` | nothing standing between this node and a served feed | nothing |
-| `ranking_no_feed` | hivemind absent or unreadable, a resolver input unreadable, the global cache holds nothing servable, or the ranker has not run yet | `detail` distinguishes these; only the last is expected, and it is the one that does not set `degraded` by itself |
+| `ranking_no_feed` | hivemind absent or unreadable, a history input unreadable, the global cache holds nothing servable, or the ranker has not run yet (which includes a node still waiting for hivemind — see `history`) | `detail` distinguishes these; only the last is expected, and it is the one that does not set `degraded` by itself |
 | `ranking_no_personalization` | hivesense absent or unreadable | optional — see above. `absent` is not a fault; `unreadable` is. Only reported when nothing more serious applies: a hivesense fault on a node whose global cache is also unservable shows up in `sources`, not in `state` |
 | `ranking_unknown` | a probe could not run | investigate; `detail` names which one. Never means healthy |
 
-A lost grant on `hive_accounts` or `hive_permlink_data` stops resolution just as
-dead as one on `hive_posts`, and #36 shipped with both invisible — an operator saw
-`hivemind: readable` while nothing resolved. They are now probed and reported under
-`sources.resolver_inputs`, with their own `state` and a `detail` naming the grant to
-repair. That case matters more than it looks: `get_personalized_feed` reads
-`hive_accounts` **unguarded**, so an authenticated feed request *raises* rather than
-returning `[]`.
+A lost grant on `hive_accounts`, `hive_votes` or `hive_reblogs` stops the copy of
+hivemind's history (#97) just as dead as one on `hive_posts`: block processing raises
+on it. They are probed and reported under `sources.history_inputs`, with their own
+`state` and a `detail` naming the grant to repair. That case matters more than it
+looks: `get_personalized_feed` reads `hive_accounts` **unguarded**, so an
+authenticated feed request *raises* rather than returning `[]`.
 
 The per-relation states remain as the **diagnosis** rather than the detector,
-including `resolver_inputs` — the other two relations `resolve_hivemind_post_ids`
-joins.
+including `history_inputs`.
+
+#### `history`: the copy of hivemind's history (#97)
+
+Informational, never `degraded`: every fresh install waits for as long as hivemind's
+own sync takes.
+
+| field | meaning |
+|-------|---------|
+| `state` | `waiting_for_hivemind` until block processing has backfilled the window, then `following_hivemind`; `unknown` when the installed SQL predates it |
+| `history_days` | the window, `FYP_HISTORY_DAYS` |
+| `hivemind_block`, `hivemind_behind_head` | where hivemind is, and how far behind the irreversible head; `null` when it is absent or unreadable to haf_fyp |
+| `followed_through_block`, `behind_hivemind_blocks` | where the copy is current to, and how far it trails hivemind. A few batches is normal (the dependency gate); growing without end means the copy stopped |
+| `backfill_seconds` | how long the backfill took |
+| `live_to_backfilled_seconds` | from the first batch that found hivemind live to the end of the backfill: a fresh install's time from hivemind live to having a window to rank. The ranker's next cycle turns it into feeds |
+
+`GET /sync-status` carries the same `history` state as a third key, after the two the
+ecosystem shares.
 
 #### What this still does not catch
 
@@ -258,21 +268,20 @@ broken while it reads servable:
 
 * **Per-user feeds.** The check reads the *global* feed, and `get_personalized_feed`
   does **not** fall back to the global feed for a user who already has `feed_cache`
-  rows — that branch returns on its own. A user whose cached rows are all
-  unresolvable gets `[]` while this reads healthy. In the backfill scenario
-  specifically, the 7-day window keeps recent posts resolved, so the
-  recency-weighted global cache stays servable while older per-user rows do not.
-* **The render step.** A post can resolve and still be dropped: `get_bridge_post`
-  returns NULL for a post deleted in hivemind, and the endpoint filters it out.
-* **The hivemind views** behind `get_full_post_view_by_id`. A grant lost there never
-  touches `hive_post_id`, so nothing here notices.
+  rows — that branch returns on its own. A user whose cached rows all fail to render
+  gets `[]` while this reads healthy.
+* **The render step.** A post can be in the window and still be dropped:
+  `get_bridge_post` returns NULL for a post deleted in hivemind, and the endpoint
+  filters it out.
+* **The hivemind views** behind `get_full_post_view_by_id`. A grant lost there is not
+  among the relations probed, so nothing here notices.
 
 Answering "can every user be served" would mean probing `feed_cache` per user and
 modelling the render filter. That is a larger change and is not attempted here.
 
 To check one specific user, call `/rpc/get_user_profile` for them and compare:
 **`has_feed: true` together with an empty `/rpc/get_personalized_feed` response
-means their cached rows are unresolvable.** Note it has to be that pair — `fyp` is
+means their cached rows do not render.** Note it has to be that pair — `fyp` is
 built per feed entry, so an empty response carries no `fyp` object at all and
 `fyp.source` cannot be read from it. (An earlier version of this section said to
 read `fyp.source`; that state is not observable.)
@@ -900,14 +909,24 @@ PostgreSQL's dates end) makes the prune fail on every pass, and the row ceiling 
 | `ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS` | 1000 | 0 | Eviction waits until block processing is within this many blocks of the head. |
 | `FEED_CACHE_UNREAD_RETENTION_DAYS` | 30 | 1 | Days a cached feed outlives its last read. After that, and for an account that never read one, the feed is dropped and the rotation stops ranking it, unless the account holds interests. Its next read gets the global feed and its own within a cycle. |
 
+The history window is the install's, not the ranker's: `FYP_HISTORY_DAYS` (365, 1 to
+36500) and `FYP_HIVEMIND_MAX_LAG_BLOCKS` (1000) are read by `haf-fyp-setup` and written
+to `haf_fyp_app.app_config` on every install (#97). A value out of range refuses the
+install before anything is changed. The ranker's hourly pass deletes the posts and
+interactions older than the window, counted back from the block the copy is current to.
+Widening the window later does not reach back by itself: to fill the wider window, clear
+`hivemind_follow.backfilled_at` and the next batch backfills again (the copy is
+idempotent).
+
 ## Database Schema
 
 ```
 haf_fyp_app
-├── post_candidates       — root posts eligible for ranking
-├── post_lookup           — (author, permlink) index for processor joins
-├── post_commenters       — unique commenter pairs per post
-├── engagement_metrics    — comment/reblog/vote counts, net rshares
+├── post_candidates       — root posts of the history window, by hivemind post id
+├── post_commenters       — unique (post, commenter) pairs, hivemind ids
+├── engagement_metrics    — comment/reblog/vote counts, net rshares, counted from hivemind
+├── user_interactions     — strongest vote/reblog per (account, post), hivemind ids
+├── hivemind_follow       — where the copy of hivemind's history stands (one row)
 ├── user_profile_vectors  — 1024-dim interest vector per user (pgvector)
 ├── feed_cache            — precomputed top-200 ranked feeds
 ├── global_feed_cache     — unauthenticated global feed
@@ -1312,8 +1331,7 @@ Before going live:
 - [ ] **`TRUSTED_PROXY_IPS` set to the reverse proxy's address or CIDR** (or the literal `direct` if nothing fronts this app). Since #28 this also gates *when* limits are charged: with it unset the app logs an ERROR at startup and falls back to charging only after validation, because charging a request before it is validated is safe only when the bucket identifies the caller — into one shared bucket it lets a single sender 429 everybody else, which is worse than the bug #28 fixes. Rate limits key on `X-Real-IP` only from a trusted peer; unset, every caller keys on the proxy's address instead — one shared bucket for all of them, which is no per-client limit at all. The app logs a warning at startup when it is unset, and once more if a peer outside the list presents the header (which usually means the proxy was recreated with a new address and the list is now stale). Re-check it after anything that can renumber the proxy container.
 - [ ] **The reverse proxy sends `X-Real-IP`.** Setting `TRUSTED_PROXY_IPS` only says whose header to believe; the outermost proxy still has to set one (set, not append) to the client's address, and every proxy after it has to pass it on. In Caddy that is `header_up X-Real-IP {client_ip}` on the haf_fyp routes, which `haf_api_node`'s `caddy/Caddyfile.tmpl` carries wherever it has the haf_fyp route (the 1.28.8 series) — a local Caddy snippet with its own `reverse_proxy` for a haf_fyp path needs the line too. Requests from a trusted peer without a usable header (absent, empty, not an address, or naming the peer itself) all share that peer's bucket, as with an empty list: they are charged only after validation, and the app logs one warning per process naming the peer the request came from (`Trusted peer ... sent a request with no usable X-Real-IP`). To confirm: restart the API, send one `POST` to the events endpoint through the edge (`/haf-fyp-admin/v1/fyp/events` on `haf_api_node`; only the four rate-limited routes can raise it, and any body will do), and check that the log since that start has neither this warning, nor the `not in TRUSTED_PROXY_IPS` one, nor the startup error about an unset list. This proves the header only if the trust list matches the peer: with a list that is set but wrong, a missing header is silent.
 - [ ] `HAF_VERSION` pinned to a specific release tag — not `latest`, which moves, and not a commit tag, which the registry sweeps once it falls out of the five newest — at `1.29.0-rc2` or newer so the app registers itself instead of falling back to the legacy loop. Pinned **before the first sync**: changing it later is a replay, not an upgrade (see Prerequisites)
-- [ ] **If Hivemind was installed AFTER haf_fyp started syncing: `CALL haf_fyp_app.run_hive_post_id_backfill();`** — the per-block resolver only covers a rolling 7-day window, so without this every older post stays unresolved and the feeds stay empty. `/metrics` cannot detect this yet ([#43](https://gitlab.syncad.com/hive/haf_fyp/-/issues/43)) — run the backfill on the strength of the install order alone.
-- [ ] **Hivemind installed and synced** → `grant_cross_schema.sh` re-run. REQUIRED: with hivemind ABSENT every feed returns `[]`. (A lost *grant* on an already-running node is different — resolution stops, but already-rendered posts keep serving from `post_bridge_cache`, so the outage is delayed rather than immediate.) Confirm with `GET /metrics` → `ranking_sources.degraded` is `false`, not by assuming — alert on that rather than on `sources.hivemind == "readable"`, which misses both the `readable_unverified` case and everything the servability probe sees. (Losing `SELECT` on the table does at least `RAISE WARNING` from the resolver; an absent schema — or a revoked `USAGE` on it, which makes `to_regclass` return NULL — is entirely silent.)
+- [ ] **Hivemind installed and synced** → `grant_cross_schema.sh` re-run. REQUIRED: with hivemind ABSENT every feed returns `[]`. Block processing then copies the history window from it by itself, once hivemind is within `FYP_HIVEMIND_MAX_LAG_BLOCKS` of head: confirm with `GET /metrics` → `history.state` is `following_hivemind` and `ranking_sources.degraded` is `false`, not by assuming — alert on that rather than on `sources.hivemind == "readable"`, which misses both the `readable_unverified` case and everything the servability probe sees. (A lost grant on a running node stops the copy and every feed render at once: block processing raises on it.)
 - [ ] HiveSense installed and synced → `grant_cross_schema.sh` re-run (optional; without it nobody is personalized — see [Without HiveSense there is no personalization](#without-hivesense-there-is-no-personalization-not-neutral-relevance))
 - [ ] balance_tracker installed and synced → `grant_cross_schema.sh` re-run (optional)
 - [ ] reputation_tracker installed and synced → `grant_cross_schema.sh` re-run (optional)
@@ -1403,11 +1421,11 @@ the work up regardless.
 | Phase | Status | What |
 |-------|--------|------|
 | **1 — Skeleton** | ✅ | Schema, tables, stubs, Docker stack |
-| **2 — Post ingestion** | ✅ | `process_posts.sql` — ingest root posts, post_lookup, engagement init |
-| **3 — Engagement tracking** | ✅ | `process_engagement.sql` — comments, reblogs, votes, payout windows |
+| **2 — Post ingestion** | ✅ | `process_posts.sql` — root posts, copied from hivemind since #97 |
+| **3 — Engagement tracking** | ✅ | `process_engagement.sql` — comments, reblogs, votes counted from hivemind; payout windows |
 | **4 — Community sync** | ✅ | `process_communities.sql` — subscribe/unsubscribe from custom_json |
 | **5 — Python ranker** | ✅ | `scoring.py` — recency + engagement scoring, feed_cache writes |
-| **6 — HiveSense** | ✅ | Semantic relevance via pgvector embeddings (1024-dim halfvec, `posts_vectors`, bridged through hivemind post id) |
+| **6 — HiveSense** | ✅ | Semantic relevance via pgvector embeddings (1024-dim halfvec, `posts_vectors`, keyed by hivemind post id) |
 | **7 — Credibility** | ✅ | btracker VESTS + reptracker reputation, cross-schema reads |
 | **8 — Cold start** | ✅ | Interest picker, `POST /v1/fyp/interests`, vector bootstrap chain |
 | **9 — Production** | ✅ | Rate limiting, score explainer, algorithm governance |

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -229,13 +230,16 @@ def fetch_top_communities(conn, username: str, limit: int = 5) -> list[int]:
     interacted with, most-interacted first. Used both for the profile's
     top_communities and for the engaged tier of the community boost.
     """
+    # The account id as a scalar subquery, for the reason embeddings._ACCOUNT_ID_SQL
+    # gives: compared with a scalar, the read is a range of the account's index.
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT pc.community_id
             FROM haf_fyp_app.user_interactions ui
             JOIN haf_fyp_app.post_candidates pc ON pc.post_id = ui.post_id
-            WHERE ui.username = %s
+            WHERE ui.account_id = (SELECT ha.id FROM hivemind_app.hive_accounts ha
+                                    WHERE ha.name = %s)
               AND pc.community_id IS NOT NULL
             GROUP BY pc.community_id
             ORDER BY COUNT(*) DESC
@@ -429,21 +433,20 @@ def compute_scores(
     return ranked
 
 
-def render_bridge_for_posts(conn, post_ids: list[int]) -> None:
+def render_bridge_for_posts(conn: Any, post_ids: list[int]) -> None:
     """Render and cache the observer-agnostic bridge JSON for the given posts.
 
-    The feed endpoints' dominant cost is the per-post Hivemind bridge build; this
-    precomputes it into haf_fyp_app.post_bridge_cache so feeds become a single
-    indexed read. Called by the feed-cache writers for the posts they place into
-    feeds, so only posts that actually appear in a feed are ever rendered.
+    post_ids are hivemind hive_posts ids, as the feed caches hold them. The result
+    lands in haf_fyp_app.post_bridge_cache, which the feed endpoints read before
+    rendering a post live. One set-based upsert that skips posts already cached and
+    paid out (frozen) or rendered in the last 5 minutes, so a post shared by many
+    feeds is rendered at most once per cycle; the skip is decided before the
+    get_bridge_post LATERAL, so a skipped post costs nothing. Posts no longer in
+    post_candidates are skipped too (the cache row would outlive the window).
 
-    A single set-based upsert that:
-      - skips posts already cached and paid out (frozen) or rendered in the last
-        5 minutes (an in-payout-window post shared across many users' feeds is
-        rendered at most once per cycle, not once per feed), and
-      - resolves the SKIP before the expensive get_bridge_post LATERAL, so frozen
-        posts cost nothing.
-    Best-effort: a Hivemind hiccup must never break a ranking cycle.
+    Best-effort: a hivemind error is logged and rolled back, never raised, so it
+    cannot break a ranking cycle. A lost connection (OperationalError) propagates
+    for the main loop to reconnect.
     """
     if not post_ids:
         return
@@ -456,10 +459,9 @@ def render_bridge_for_posts(conn, post_ids: list[int]) -> None:
                 SELECT s.post_id, b.bridge,
                        COALESCE((b.bridge->>'is_paidout')::boolean, FALSE), now()
                 FROM (
-                    SELECT pc.post_id, pc.hive_post_id
+                    SELECT pc.post_id
                     FROM haf_fyp_app.post_candidates pc
-                    WHERE pc.post_id = ANY(%s)
-                      AND pc.hive_post_id IS NOT NULL
+                    WHERE pc.post_id = ANY(%s::int[])
                       AND NOT EXISTS (
                           SELECT 1 FROM haf_fyp_app.post_bridge_cache c
                           WHERE c.post_id = pc.post_id
@@ -468,7 +470,7 @@ def render_bridge_for_posts(conn, post_ids: list[int]) -> None:
                       )
                 ) s
                 CROSS JOIN LATERAL
-                    haf_fyp_app.get_bridge_post(s.hive_post_id, 0, 0) AS b(bridge)
+                    haf_fyp_app.get_bridge_post(s.post_id, 0, 0) AS b(bridge)
                 WHERE b.bridge IS NOT NULL
                 ON CONFLICT (post_id) DO UPDATE
                     SET bridge = EXCLUDED.bridge,
@@ -478,6 +480,8 @@ def render_bridge_for_posts(conn, post_ids: list[int]) -> None:
                 (post_ids,),
             )
         conn.commit()
+    except psycopg2.OperationalError:
+        raise
     except psycopg2.Error:
         conn.rollback()
         log.warning(
@@ -542,7 +546,7 @@ def write_feed_cache(
         #
         # Stamp scoring time on the active_users index so the scheduled cycle can pick
         # stalest-scored users without scanning feed_cache. Upsert, not UPDATE: opted-in
-        # users who never interacted have no process_interactions row, and the old UPDATE
+        # users who never interacted have no row from block processing, and the old UPDATE
         # silently no-opped for them — so they never entered the scheduled rotation and
         # their feed froze at onboarding (#9). last_interaction_at / last_block stay NULL
         # until a first interaction. Same transaction as the cache write below, so the
@@ -596,8 +600,8 @@ def write_feed_cache(
             rows,
         )
     conn.commit()
-    # Precompute the bridge JSON for this user's feed so the endpoint serves it
-    # from cache instead of rendering each post live (the dominant feed cost).
+    # The endpoint serves this feed's posts from the bridge cache instead of
+    # rendering each one live (the dominant per-request cost).
     render_bridge_for_posts(conn, [int(x) for x in top["post_id"].tolist()])
 
 
@@ -636,7 +640,5 @@ def write_global_feed_cache(conn, scored_df: pd.DataFrame, algo_version: str) ->
             rows,
         )
     conn.commit()
-    # Precompute the bridge JSON for the global feed (observer-agnostic, which is
-    # exactly what the unauthenticated global endpoint serves) so it reads from
-    # cache instead of rendering each post live.
+    # Observer-agnostic, which is exactly what the unauthenticated global feed serves.
     render_bridge_for_posts(conn, [int(x) for x in top["post_id"].tolist()])

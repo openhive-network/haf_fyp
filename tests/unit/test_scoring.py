@@ -1,9 +1,11 @@
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import psycopg2
 import psycopg2.errors
+import psycopg2.extras
 import pytest
 
 import haf_fyp.embeddings as embeddings
@@ -401,7 +403,6 @@ class TestWriteFeedCacheColumnAlignment:
         monkeypatch.setattr(
             scoring.psycopg2.extras, "execute_values", fake_execute_values
         )
-        monkeypatch.setattr(scoring, "render_bridge_for_posts", lambda *a, **k: None)
 
         # Every score distinct, and none equal to another column's value: an
         # alignment test whose sentinels collide cannot see a swap.
@@ -426,6 +427,7 @@ class TestWriteFeedCacheColumnAlignment:
         df["community_boost_applied"] = [True, False]
         df["boost_source"] = None
         df.loc[0, "boost_source"] = "interest"
+        monkeypatch.setattr(scoring, "render_bridge_for_posts", lambda *a, **k: None)
         scoring.write_feed_cache(_CapturingConn({}), "alice", df, algo_version)
         return captured
 
@@ -545,7 +547,6 @@ class TestWriteGlobalFeedCacheStampsAlgorithmVersion:
         monkeypatch.setattr(
             scoring.psycopg2.extras, "execute_values", fake_execute_values
         )
-        monkeypatch.setattr(scoring, "render_bridge_for_posts", lambda *a, **k: None)
 
         df = pd.DataFrame(
             [
@@ -565,6 +566,7 @@ class TestWriteGlobalFeedCacheStampsAlgorithmVersion:
                 },
             ]
         )
+        monkeypatch.setattr(scoring, "render_bridge_for_posts", lambda *a, **k: None)
         scoring.write_global_feed_cache(_CapturingConn(sink), df, algo_version)
         return captured
 
@@ -594,6 +596,105 @@ class TestWriteGlobalFeedCacheStampsAlgorithmVersion:
         self._run(monkeypatch, "1.2.0", sink=sink)
         assert sink.get("deleted") is True
         assert sink.get("committed") is True
+
+
+class TestFeedWritersRenderThePostsTheyPlace:
+    """Both writers hand the posts they placed, in rank order, to the bridge cache once
+    their feed is committed, so the endpoint reads them instead of rendering live."""
+
+    @staticmethod
+    def _scored(n: int) -> pd.DataFrame:
+        df = pd.DataFrame({
+            "post_id": list(range(1000, 1000 + n)), "final_score": [0.5] * n,
+            "score_engagement": [0.5] * n, "score_recency": [0.5] * n,
+            "score_credibility": [0.5] * n, "score_relevance": [0.5] * n,
+        })
+        df["community_boost_applied"] = False
+        df["boost_source"] = None
+        return df
+
+    @staticmethod
+    def _capture(monkeypatch: MonkeyPatch, sink: dict[str, Any]) -> list[tuple[list[int], bool]]:
+        calls: list[tuple[list[int], bool]] = []
+        monkeypatch.setattr(psycopg2.extras, "execute_values", lambda *a, **k: None)
+        monkeypatch.setattr(
+            scoring, "render_bridge_for_posts",
+            lambda conn, ids: calls.append((ids, sink.get("committed", False))),
+        )
+        return calls
+
+    def test_the_personalized_writer_renders_its_top_200_after_committing(
+            self, monkeypatch: MonkeyPatch) -> None:
+        sink: dict[str, Any] = {}
+        calls = self._capture(monkeypatch, sink)
+        scoring.write_feed_cache(_CapturingConn(sink), "alice", self._scored(250), "1.2.0")
+        assert calls == [(list(range(1000, 1200)), True)]
+
+    def test_the_global_writer_renders_its_top_200_after_committing(
+            self, monkeypatch: MonkeyPatch) -> None:
+        sink: dict[str, Any] = {}
+        calls = self._capture(monkeypatch, sink)
+        scoring.write_global_feed_cache(_CapturingConn(sink), self._scored(250), "1.2.0")
+        assert calls == [(list(range(1000, 1200)), True)]
+
+
+class _RenderConn:
+    """A connection whose one statement raises `exc`, or succeeds when it is None."""
+
+    def __init__(self, exc: Exception | None = None) -> None:
+        self.exc = exc
+        self.executed: list[tuple[str, Any]] = []
+        self.committed = self.rolled_back = 0
+
+    def cursor(self) -> Any:
+        conn = self
+
+        class _Cur:
+            def __enter__(self) -> Any:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+            def execute(self, sql: str, params: Any = None) -> None:
+                conn.executed.append((sql, params))
+                if conn.exc is not None:
+                    raise conn.exc
+
+        return _Cur()
+
+    def commit(self) -> None:
+        self.committed += 1
+
+    def rollback(self) -> None:
+        self.rolled_back += 1
+
+
+class TestRenderBridgeForPostsIsBestEffort:
+    def test_no_posts_touch_nothing(self) -> None:
+        conn = _RenderConn()
+        scoring.render_bridge_for_posts(conn, [])
+        assert conn.executed == [] and conn.committed == 0
+
+    def test_a_render_is_one_statement_over_every_post_and_commits(self) -> None:
+        conn = _RenderConn()
+        scoring.render_bridge_for_posts(conn, [3, 1, 2])
+        assert len(conn.executed) == 1
+        assert conn.executed[0][1] == ([3, 1, 2],)
+        assert conn.committed == 1 and conn.rolled_back == 0
+
+    def test_a_hivemind_error_is_rolled_back_and_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        conn = _RenderConn(psycopg2.errors.lookup("42501")("permission denied for table hive_posts"))
+        with caplog.at_level("WARNING", logger="haf_fyp.scoring"):
+            scoring.render_bridge_for_posts(conn, [1, 2])
+        assert conn.rolled_back == 1 and conn.committed == 0
+        assert "bridge cache render failed for 2 posts (continuing)" in caplog.text
+
+    def test_a_lost_connection_propagates(self) -> None:
+        conn = _RenderConn(psycopg2.OperationalError("connection lost"))
+        with pytest.raises(psycopg2.OperationalError):
+            scoring.render_bridge_for_posts(conn, [1])
+        assert conn.rolled_back == 0
 
 
 class TestHiveSenseUnavailableDegradesInsteadOfRaising:

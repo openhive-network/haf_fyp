@@ -2,6 +2,12 @@
 -- Steps 8–9: sync unsubscribe and subscribe events from custom_json_operation
 -- into user_communities, which drives the community_boost signal in the ranker.
 --
+-- Still processed from operations, not copied from hivemind (#97): an unsubscribe
+-- deletes hivemind's row, which no block range can show, and these operations are few.
+-- A fresh install does not replay them from genesis either: its backfill takes
+-- user_communities from hivemind once (copy_hivemind_subscriptions, below), and block
+-- processing applies the operations from there on (db/process_block_range.sql).
+--
 -- Reads the batch's custom_json as stage_operations (db/process_block_range.sql) staged
 -- it, and hafd.blocks for subscribed_at.
 --   haf_fyp_app.community_id_from_name() — defined in process_posts.sql
@@ -145,10 +151,17 @@ $$;
 -- and written again by the second. The two never disagree about a pair, because both
 -- read the one community_membership_changes() result stage_operations staged, and it
 -- gives each pair one outcome.
+--
+-- _apply false: the batch has staged nothing, because user_communities is still to be
+-- taken from hivemind or already holds the batch's blocks (process_block_range). The
+-- steps are timed all the same, so every batch reports every processor.
+
+DROP FUNCTION IF EXISTS haf_fyp_app.process_communities(int, int);
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.process_communities(
     _first_block int,
-    _last_block int
+    _last_block int,
+    _apply boolean DEFAULT TRUE
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -159,9 +172,49 @@ DECLARE
     _t timestamptz;
 BEGIN
     IF _timed THEN _t := clock_timestamp(); END IF;
-    PERFORM haf_fyp_app.process_unsubscribe(_first_block, _last_block);
+    IF _apply THEN
+        PERFORM haf_fyp_app.process_unsubscribe(_first_block, _last_block);
+    END IF;
     IF _timed THEN _t := haf_fyp_app.report_processor_timing('unsubscribe', _first_block, _last_block, _t, '{custom_json_operation}'); END IF;
-    PERFORM haf_fyp_app.process_subscribe(_first_block, _last_block);
+    IF _apply THEN
+        PERFORM haf_fyp_app.process_subscribe(_first_block, _last_block);
+    END IF;
     IF _timed THEN PERFORM haf_fyp_app.report_processor_timing('subscribe', _first_block, _last_block, _t, '{custom_json_operation}'); END IF;
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- copy_hivemind_subscriptions: user_communities as hivemind has it now
+-- ---------------------------------------------------------------------------
+-- Run once, by the backfill of an install that has not applied community operations
+-- from genesis (hivemind_follow.snapshot_communities). Replaces the table: hivemind's
+-- hive_subscriptions is the state after every operation up to its head, unsubscribes
+-- included. The backfill records the block it was taken at
+-- (hivemind_follow.communities_snapshot_block), and block processing applies only the
+-- operations above it: re-applying the ones hivemind had already read would change
+-- nothing but a subscription to a community hivemind does not know, and reading them
+-- was the whole cost of a fresh install's sync to hivemind's block.
+--
+-- Hivemind keeps a subscription only to a community it knows, where the operations
+-- alone accept any well-formed hive-N; and its hive_communities.id is its own key, so
+-- the id here is the N of the community's name, as community_id_from_name gives it.
+
+CREATE OR REPLACE FUNCTION haf_fyp_app.copy_hivemind_subscriptions()
+RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    _copied bigint;
+BEGIN
+    DELETE FROM haf_fyp_app.user_communities;
+    INSERT INTO haf_fyp_app.user_communities (username, community_id, subscribed_at)
+    SELECT ha.name, haf_fyp_app.community_id_from_name(hc.name), hs.created_at
+    FROM hivemind_app.hive_subscriptions AS hs
+    JOIN hivemind_app.hive_accounts AS ha ON ha.id = hs.account_id
+    JOIN hivemind_app.hive_communities AS hc ON hc.id = hs.community_id
+    WHERE haf_fyp_app.community_id_from_name(hc.name) IS NOT NULL
+    ON CONFLICT (username, community_id) DO NOTHING;
+    GET DIAGNOSTICS _copied = ROW_COUNT;
+    RETURN _copied;
 END;
 $$;

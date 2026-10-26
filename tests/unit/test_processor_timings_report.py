@@ -1,10 +1,11 @@
 """scripts/processor_timings_report.py: the per-processor timings report of a replay.
 
-The fixture is three batches (blocks 990001..1020000) of a real haf_app_driver.py log,
-recorded with haf_fyp.processor_timings on over a clone of the shared 5M-block HAF, with
-the driver's own lines around them. The expected numbers are recomputed from the fixture
-here, independently of the script, so a report that sums the wrong field or drops a
-batch disagrees with them.
+The fixture is three batches (blocks 990001..1020000) of the shipped dispatcher's output,
+recorded with haf_fyp.processor_timings on over the HAF stub and the hivemind model
+(tests/hivemind_stub.sql): one batch waiting for hivemind, the batch that backfilled the
+window, and one following it. The driver's own lines are around them, as haf_app_driver.py
+writes them. The expected numbers are recomputed from the fixture here, independently of
+the script, so a report that sums the wrong field or drops a batch disagrees with them.
 """
 
 from __future__ import annotations
@@ -27,8 +28,8 @@ FIXTURE = Path(__file__).resolve().parent / "data" / "processor_timings_driver_l
 FIRST, LAST = 990001, 1020000
 
 PROCESSORS = [
-    "stage_operations", "process_posts", "comments", "reblogs", "votes", "engagement_metrics",
-    "payout_windows", "unsubscribe", "subscribe", "process_interactions", "resolve_hivemind_post_ids",
+    "stage_operations", "unsubscribe", "subscribe", "hivemind_subscriptions", "hivemind_posts",
+    "hivemind_interactions", "hivemind_engagement", "payout_windows",
 ]
 
 
@@ -98,7 +99,7 @@ def test_a_recorded_run_makes_the_report(tmp_path: Path, lines: list[str],
     assert report["blocks_per_second"] == pytest.approx(30000 / 12.5, abs=0.1)
     counts = _records(lines, "haf_fyp_operation_counts")
     assert report["instrumentation_seconds"] == pytest.approx(sum(c["seconds"] for c in counts), abs=1e-3)
-    assert len(report["limits"]) == 2
+    assert len(report["limits"]) == 3
 
 
 def test_the_index_restore_is_reported_beside_the_sync_and_added_to_it(
@@ -144,9 +145,9 @@ def test_each_batch_counts_towards_the_million_its_first_block_is_in(tmp_path: P
     by_batch: defaultdict[int, dict[str, float]] = defaultdict(dict)
     for t in _records(lines, "haf_fyp_processor_timing"):
         by_batch[t["first_block"]][t["processor"]] = t["seconds"]
-    assert buckets[0]["seconds"]["votes"] == pytest.approx(by_batch[990001]["votes"], abs=1e-3)
-    assert buckets[1]["seconds"]["votes"] == pytest.approx(
-        by_batch[1000001]["votes"] + by_batch[1010001]["votes"], abs=1e-3)
+    p = "hivemind_interactions"
+    assert buckets[0]["seconds"][p] == pytest.approx(by_batch[990001][p], abs=1e-3)
+    assert buckets[1]["seconds"][p] == pytest.approx(by_batch[1000001][p] + by_batch[1010001][p], abs=1e-3)
     for b in buckets:
         assert b["total_seconds"] == pytest.approx(sum(b["seconds"].values()), abs=1e-2)
 
@@ -156,20 +157,39 @@ def test_rows_read_are_the_batch_counts_of_the_types_a_processor_reads(tmp_path:
     assert rc == 0
     report = json.loads(out.read_text(encoding="utf-8"))
     per_type: defaultdict[str, int] = defaultdict(int)
+    by_id: defaultdict[str, int] = defaultdict(int)
     for c in _records(lines, "haf_fyp_operation_counts"):
         for row in c["counts"]:
             per_type[row["op_type"]] += row["rows"]
-    assert per_type["vote_operation"] > 0, "the fixture's batches hold votes"
+            by_id[row["custom_json_id"]] += row["rows"]
+    assert per_type["custom_json_operation"] > 0, "the fixture's batches hold custom_json"
     assert report["operations"] == dict(per_type)
-    assert report["rows_read"]["votes"] == {
-        "vote_operation": per_type["vote_operation"],
-        "effective_comment_vote_operation": per_type["effective_comment_vote_operation"],
-    }
-    assert report["rows_read"]["process_posts"] == {"comment_operation": per_type["comment_operation"]}
+    assert report["custom_json_by_id"] == dict(sorted(by_id.items()))
+    assert report["rows_read"]["stage_operations"] == {"custom_json_operation": per_type["custom_json_operation"]}
+    assert report["rows_read"]["subscribe"] == {"custom_json_operation": per_type["custom_json_operation"]}
+    # The hivemind_* processors read hivemind's tables, not operations.
+    assert report["rows_read"]["hivemind_interactions"] == {}
     assert report["rows_read"]["payout_windows"] == {}
 
 
-def test_the_summary_table_shows_every_processor_and_the_reblog_ids(
+def test_the_backfill_is_reported_from_its_own_line(tmp_path: Path, lines: list[str]) -> None:
+    rc, out = _run(tmp_path, lines)
+    assert rc == 0
+    [want] = _records(lines, "haf_fyp_backfill")
+    backfill = json.loads(out.read_text(encoding="utf-8"))["backfill"]
+    assert backfill == {k: want[k] for k in ("seconds", "hivemind_block", "first_block", "history_days",
+                                             "posts", "interactions", "commenters")}
+
+
+def test_a_run_without_a_backfill_reports_none(tmp_path: Path, lines: list[str],
+                                               capsys: pytest.CaptureFixture[str]) -> None:
+    rc, out = _run(tmp_path, [line for line in lines if "haf_fyp_backfill" not in line])
+    assert rc == 0
+    assert json.loads(out.read_text(encoding="utf-8"))["backfill"] is None
+    assert "no backfill in this run" in capsys.readouterr().out
+
+
+def test_the_summary_table_shows_every_processor_and_the_backfill(
         tmp_path: Path, lines: list[str], capsys: pytest.CaptureFixture[str]) -> None:
     rc, _ = _run(tmp_path, lines)
     assert rc == 0
@@ -178,42 +198,8 @@ def test_the_summary_table_shows_every_processor_and_the_reblog_ids(
         assert re.search(rf"^{p}\s+\d+\.\d\d\s", table, re.M), p
     assert "0M-1M" in table and "1M-2M" in table
     assert "sync wall 12.5s over 3 batches" in table
-    assert "id='reblog'" in table
-
-
-def _counts_line(first: int, last: int, counts: list[dict[str, Any]]) -> str:
-    return ("2026-10-25T00:00:00.000Z INFO:  haf_fyp_operation_counts "
-            + json.dumps({"first_block": first, "last_block": last, "seconds": 0.001, "counts": counts}) + "\n")
-
-
-def _batch(first: int, last: int, counts: list[dict[str, Any]]) -> list[str]:
-    lines = ["2026-10-25T00:00:00.000Z INFO:  haf_fyp_processor_timing "
-             + json.dumps({"first_block": first, "last_block": last, "processor": p, "seconds": 0.5,
-                           "reads": ["custom_json_operation"]}) + "\n" for p in PROCESSORS]
-    return lines + [_counts_line(first, last, counts)]
-
-
-@pytest.mark.parametrize(("reblog", "follow_reblog", "finding"), [
-    (20, 4000, "follow/[\"reblog\", ...] form is the one in use"),
-    (4000, 20, "id='reblog' is at least as common"),
-    (10, 4, "Only 14 reblogs of either form in this range: too few"),
-    (0, 0, "Only 0 reblogs"),
-])
-def test_the_reblog_finding_follows_the_counts(tmp_path: Path, reblog: int, follow_reblog: int,
-                                                finding: str) -> None:
-    counts: list[dict[str, Any]] = [
-        {"op_type": "custom_json_operation", "custom_json_id": "follow", "json_action": "follow", "rows": 99},
-        {"op_type": "custom_json_operation", "custom_json_id": "follow", "json_action": "reblog", "rows": follow_reblog},
-        {"op_type": "custom_json_operation", "custom_json_id": "reblog", "json_action": "reblog", "rows": reblog},
-    ]
-    rc, out = _run(tmp_path, _batch(1, 10, counts), first=1, last=10)
-    assert rc == 0
-    report = json.loads(out.read_text(encoding="utf-8"))
-    assert report["reblog_ids"]["custom_json_id_reblog"] == reblog
-    assert report["reblog_ids"]["custom_json_id_follow_payload_reblog"] == follow_reblog
-    assert finding in report["reblog_ids"]["finding"]
-    assert report["custom_json_by_id"] == {"follow": 99 + follow_reblog, "reblog": reblog}
-    assert report["rows_read"]["reblogs"] == {"custom_json_operation": 99 + follow_reblog + reblog}
+    [want] = _records(lines, "haf_fyp_backfill")
+    assert f"at hivemind block {want['hivemind_block']}" in table
 
 
 def _drop(lines: list[str], needle: str) -> list[str]:
@@ -231,11 +217,13 @@ def _edit(lines: list[str], needle: str, old: str, new: str) -> list[str]:
 BROKEN: dict[str, Callable[[list[str]], list[str]]] = {
     "no timings at all": lambda ls: [line for line in ls if "haf_fyp_" not in line],
     "an empty log": lambda ls: [],
-    "a line that is not JSON": lambda ls: _edit(ls, '"processor" : "votes"', '"seconds"', '"seconds'),
-    "a negative time": lambda ls: _edit(ls, '"processor" : "votes"', '"seconds" : ', '"seconds" : -'),
+    "a line that is not JSON": lambda ls: _edit(ls, '"processor" : "hivemind_interactions"', '"seconds"', '"seconds'),
+    "a negative time": lambda ls: _edit(ls, '"processor" : "hivemind_interactions"', '"seconds" : ', '"seconds" : -'),
     "a time that is text": lambda ls: _edit(ls, '"processor" : "subscribe"', '"seconds" : ', '"seconds" : "1" , "x" : '),
-    "a processor missing": lambda ls: _drop(ls, '"processor" : "reblogs"'),
-    "a processor timed twice": lambda ls: ls + [next(line for line in ls if '"processor" : "comments"' in line)],
+    "a processor missing": lambda ls: _drop(ls, '"processor" : "hivemind_posts"'),
+    "a processor timed twice": lambda ls: ls + [next(line for line in ls if '"processor" : "hivemind_engagement"' in line)],
+    "two backfills": lambda ls: ls + [next(line for line in ls if "haf_fyp_backfill" in line)],
+    "a backfill without its counts": lambda ls: _edit(ls, "haf_fyp_backfill", '"posts" : ', '"posts_" : '),
     "an unknown processor": lambda ls: _edit(ls, '"processor" : "subscribe"', '"subscribe"', '"subscribe_v2"'),
     "no operation counts for a batch": lambda ls: _drop(ls, "haf_fyp_operation_counts"),
     "a missing batch": lambda ls: [line for line in ls if '"first_block" : 1000001,' not in line],

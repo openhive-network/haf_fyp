@@ -73,13 +73,16 @@ def _run_main(monkeypatch: MonkeyPatch, conn: MagicMock, passes: int) -> SimpleN
     monkeypatch.setattr(threading, "Thread", MagicMock())
     monkeypatch.setattr(psycopg2, "connect", lambda _dsn: conn)
     monkeypatch.setattr(rd, "_take_app_locks", lambda _c: None)
+    # #97's schema_version() refusal runs first; this file is about the shape check.
+    monkeypatch.setattr(rd, "_refuse_older_schema", lambda _c: None)
     monkeypatch.setattr(rd, "_listen_for_feed_reads", lambda _c: None)
     monkeypatch.setattr(rd, "_refresh_read_filter", lambda _c: None)
     monkeypatch.setattr(rd, "_handle_feed_reads", _count("reads"))
     monkeypatch.setattr(rd, "_run_targeted_refresh", _count("targeted"))
     monkeypatch.setattr(rd, "run_cycle", _count("cycle"))
     for name in ("_run_active_users_maintenance", "_run_unread_feed_maintenance",
-                 "_run_feed_events_maintenance", "_run_embedding_coverage_maintenance"):
+                 "_run_feed_events_maintenance", "_run_embedding_coverage_maintenance",
+                 "_run_history_retention"):
         monkeypatch.setattr(rd, name, _count("maintenance"))
     monkeypatch.setattr(time, "monotonic", lambda: now[0])
     monkeypatch.setattr(time, "sleep", _sleep)
@@ -116,7 +119,7 @@ def test_the_ranker_starts_ranking_once_the_sql_is_upgraded(
     with caplog.at_level(logging.INFO):
         seen = _run_main(monkeypatch, _conn([WIDE, WIDE, COMPACT]), passes)
 
-    assert seen.cycle == 1 and seen.targeted == 1 and seen.maintenance == 4
+    assert seen.cycle == 1 and seen.targeted == 1 and seen.maintenance == 5
     assert "ranking resumes" in caplog.text
 
 
@@ -182,11 +185,12 @@ def test_the_route_carries_the_section(monkeypatch: MonkeyPatch) -> None:
 
     monkeypatch.setattr(api, "_db_conn", _conn_cm)
     for name in ("fetch_coverage_rows", "fetch_ranking_sources", "fetch_feed_servability",
-                 "fetch_credibility_sources", "fetch_reader_first"):
+                 "fetch_credibility_sources", "fetch_reader_first", "fetch_history"):
         monkeypatch.setattr(api, name, lambda _c: None)
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
     monkeypatch.setattr(api, "build_credibility_sources_report", lambda probe: {})
     monkeypatch.setattr(api, "build_ranking_sources_report", lambda probe, serv: {})
     monkeypatch.setattr(api, "build_reader_first_report", lambda probe: {})
+    monkeypatch.setattr(api, "build_history_report", lambda probe: {})
 
     assert api.metrics(MagicMock())["feed_cache"]["state"] == "outdated"

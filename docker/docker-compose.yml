@@ -143,6 +143,10 @@ services:
       POSTGRES_HOST: haf
       POSTGRES_USER: haf_admin   # install requires DDL privileges
       POSTGRES_DB:   haf_block_log
+      # The history window copied from hivemind (#97); install_app.sh defaults an unset
+      # or empty one (365 days, 1000 blocks).
+      FYP_HISTORY_DAYS:
+      FYP_HIVEMIND_MAX_LAG_BLOCKS:
     depends_on:
       haf:
         condition: service_healthy

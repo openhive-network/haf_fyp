@@ -28,16 +28,25 @@
 #   - install-haf       install-test-haf: the same chain over the stack's HAF
 #   - replay-install    two copy-on-write clones of the shared 5M-block HAF for this run
 #                       (haf_shared.clone_run_database on AIDEV_EXTERNAL_HAF_HOST:_PORT,
-#                       as haf_shared_consumer), scripts/install_app.sh into each
-#   - replay-sync       scripts/process_blocks.sh --stop-at-block=5000000 over both clones
-#                       at once, one with haf_fyp.processor_timings on; each run's wall
-#                       time, and the timed run's driver log, under test-results/<suite>/;
-#                       then haf_fyp_app.restore_deferred_indexes() in each, timed: the
-#                       lane stops at 5M while the context is still massive
-#   - replay-parity     row counts and checksums of post_candidates, engagement_metrics
-#                       and user_interactions agree between the two clones, and each
-#                       clone's indexes and constraints are the ones its install made,
-#                       all valid
+#                       as haf_shared_consumer); in each a stub of the hivemind tables
+#                       haf_fyp reads, built from the clone's own operations
+#                       (tests/hivemind_stub_from_haf.sql: the shared HAF has no
+#                       hivemind, #97) -- to block 4000000 in the timed clone, to 5000000
+#                       in the plain one -- then scripts/install_app.sh into each
+#   - replay-sync       scripts/process_blocks.sh over both clones at once, one with
+#                       haf_fyp.processor_timings on. The plain clone syncs to 5000000
+#                       and backfills its window from the stub at 5000000. The timed one
+#                       syncs to 4000000 (backfilling at 4000000), its stub is extended to
+#                       5000000 as hivemind's sync would, and it syncs on to 5000000,
+#                       following the stub block by block. Each run's wall time, and the
+#                       timed run's driver log, under test-results/<suite>/; then
+#                       haf_fyp_app.restore_deferred_indexes() in each, timed: the lane
+#                       stops at 5M while the context is still massive
+#   - replay-parity     row counts and checksums of the history tables agree between the
+#                       two clones -- so following hivemind ends where a backfill at the
+#                       same block does -- each clone's history state is the one its path
+#                       leaves, and each clone's indexes and constraints are the ones its
+#                       install made, all valid
 #   - replay-report     scripts/processor_timings_report.py over the timed run's log:
 #                       processor-timings.json and its summary table
 #
@@ -80,6 +89,9 @@ job() { python3 .aidev/ci_job.py "$@" --out "$out"; }
 # The two syncs run at the same time, on two clones: one after another they would not
 # fit the slot's wall. So each one's wall time is measured beside the other.
 STOP_AT_BLOCK=5000000
+# Where the timed clone's stub of hivemind stands when it backfills (#97); it is extended
+# to STOP_AT_BLOCK between its two syncs, so the rest of the range is followed.
+FOLLOW_FROM_BLOCK=4000000
 # The shared HAF trusts haf_shared_consumer from the fleet LAN: no password.
 CONSUMER_URL="postgresql://haf_shared_consumer@${AIDEV_EXTERNAL_HAF_HOST:-}:${AIDEV_EXTERNAL_HAF_PORT:-5432}"
 declare -A clones=()
@@ -148,8 +160,18 @@ replace_once() {
     python3 -c 'import sys; p, a, b = sys.argv[1:]; t = open(p).read(); open(p, "w").write(t.replace(a, b))' "$file" "$from" "$to"
 }
 
+# The stub of hivemind's tables for one clone, from its own operations, up to $3.
+build_hivemind_stub() {
+    local which="$1" first="$2" last="$3" t0
+    t0="$(date +%s.%N)"
+    clone_q "$which" -q -f tests/hivemind_stub.sql || return 1
+    clone_q "$which" -q -At -v first_block="$first" -v last_block="$last" \
+        -f tests/hivemind_stub_from_haf.sql || return 1
+    echo "$which: hivemind stub $first..$last built in $(echo "$t0 $(date +%s.%N)" | awk '{ printf "%.1f", $2 - $1 }')s"
+}
+
 replay_install() {
-    local which has_vector
+    local which has_vector lag pids=() rc=0 pid
     if [ -z "${AIDEV_EXTERNAL_HAF_HOST:-}" ]; then
         echo "AIDEV_EXTERNAL_HAF_HOST is unset: this step needs sandbox.external haf (provider haf/haf)"
         return 1
@@ -157,13 +179,24 @@ replay_install() {
     for which in timed plain; do open_clone "$which" || return 1; done
     has_vector="$(clone_q timed -Atc "select to_regtype('vector') is not null")" || return 1
     stage_replay_sources "$has_vector" || return 1
+    # Before the install, as hivemind is on a node: the install grants haf_fyp's roles
+    # what they read of it.
+    build_hivemind_stub timed 1 "$FOLLOW_FROM_BLOCK" & pids+=("$!")
+    build_hivemind_stub plain 1 "$STOP_AT_BLOCK" & pids+=("$!")
+    for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
+    [ "$rc" -eq 0 ] || return 1
     for which in timed plain; do
         # The consumer owns the clone; the app's roles need to create its schemas in it.
         clone_q "$which" -c "GRANT CREATE, CONNECT ON DATABASE \"${clones[$which]}\" TO haf_fyp_owner, haf_fyp_user" || return 1
+        # The timed clone's stub is a million blocks behind the HAF's head: allowed, so
+        # it backfills there and then follows.
+        lag=1000
+        [ "$which" = timed ] && lag=$((STOP_AT_BLOCK - FOLLOW_FROM_BLOCK))
         echo "== install into ${clones[$which]}"
         (cd "$replay_stage" && POSTGRES_HOST="$AIDEV_EXTERNAL_HAF_HOST" POSTGRES_PORT="${AIDEV_EXTERNAL_HAF_PORT:-5432}" \
             POSTGRES_USER=haf_shared_consumer POSTGRES_DB="${clones[$which]}" \
             GIT_HASH="$(git rev-parse HEAD 2>/dev/null || echo aidev)" \
+            FYP_HIVEMIND_MAX_LAG_BLOCKS="$lag" \
             HAF_FYP_INSTALL_LOCK_WRAPPER=/opt/psql-image/usr/local/bin/install_with_app_lock.py \
             bash scripts/install_app.sh) || return 1
         schema_shape "$which" > "$out/replay-schema-$which-installed.txt" || return 1
@@ -171,26 +204,42 @@ replay_install() {
     replay_installed=yes
 }
 
-# One sync, in the background: scripts/process_blocks.sh as production runs it, connected
-# as the consumer acting as haf_fyp_owner. Writes its wall time to <log>.seconds. A TERM
+# One run of scripts/process_blocks.sh as production runs it, connected as the consumer
+# acting as haf_fyp_owner, to block $2, appending to <log>. Prints its wall time. A TERM
 # (cleanup) is passed on to the driver, which stops after its current batch.
-start_sync() {
-    local which="$1" options="-c role=haf_fyp_owner" log="$out/replay-sync-$1.log"
+run_sync() {
+    local which="$1" stop="$2" options="-c role=haf_fyp_owner" log="$out/replay-sync-$1.log"
     [ "$which" = timed ] && options="$options -c haf_fyp.processor_timings=on"
+    local t0 child rc=0
+    t0="$(date +%s.%N)"
+    PATH="/opt/psql-image/usr/local/bin:$PATH" PGOPTIONS="$options" \
+        POSTGRES_HOST="$AIDEV_EXTERNAL_HAF_HOST" POSTGRES_PORT="${AIDEV_EXTERNAL_HAF_PORT:-5432}" \
+        POSTGRES_USER=haf_shared_consumer POSTGRES_DB="${clones[$which]}" \
+        HAF_FYP_STARTUP_TIME_FILE="$(mktemp)" HAF_FYP_PARKED_FILE="$(mktemp -u)" \
+        bash scripts/process_blocks.sh --stop-at-block="$stop" >> "$log" 2>&1 &
+    child=$!
+    trap 'kill -TERM "$child" 2>/dev/null' TERM
+    wait "$child" || rc=$?
+    while kill -0 "$child" 2>/dev/null; do wait "$child" || rc=$?; done
+    echo "$t0 $(date +%s.%N)" | awk '{ printf "%.3f\n", $2 - $1 }'
+    return "$rc"
+}
+
+# A clone's whole sync, in the background. Writes the wall time of its process_blocks.sh
+# runs to <log>.seconds: the timed clone's two, without the stub extension between them.
+start_sync() {
+    local which="$1" log="$out/replay-sync-$1.log"
+    : > "$log"
     (
-        t0="$(date +%s.%N)"
-        PATH="/opt/psql-image/usr/local/bin:$PATH" PGOPTIONS="$options" \
-            POSTGRES_HOST="$AIDEV_EXTERNAL_HAF_HOST" POSTGRES_PORT="${AIDEV_EXTERNAL_HAF_PORT:-5432}" \
-            POSTGRES_USER=haf_shared_consumer POSTGRES_DB="${clones[$which]}" \
-            HAF_FYP_STARTUP_TIME_FILE="$(mktemp)" HAF_FYP_PARKED_FILE="$(mktemp -u)" \
-            bash scripts/process_blocks.sh --stop-at-block="$STOP_AT_BLOCK" > "$log" 2>&1 &
-        child=$!
-        trap 'kill -TERM "$child" 2>/dev/null' TERM
-        rc=0
-        wait "$child" || rc=$?
-        while kill -0 "$child" 2>/dev/null; do wait "$child" || rc=$?; done
-        echo "$t0 $(date +%s.%N)" | awk '{ printf "%.3f\n", $2 - $1 }' > "$log.seconds"
-        exit "$rc"
+        trap 'exit 143' TERM
+        if [ "$which" = plain ]; then
+            run_sync plain "$STOP_AT_BLOCK" > "$log.seconds" || exit 1
+        else
+            first="$(run_sync timed "$FOLLOW_FROM_BLOCK")" || exit 1
+            build_hivemind_stub timed "$((FOLLOW_FROM_BLOCK + 1))" "$STOP_AT_BLOCK" >> "$log" 2>&1 || exit 1
+            second="$(run_sync timed "$STOP_AT_BLOCK")" || exit 1
+            echo "$first $second" | awk '{ printf "%.3f\n", $1 + $2 }' > "$log.seconds"
+        fi
     ) &
     sync_pids+=("$!")
 }
@@ -216,6 +265,7 @@ replay_sync() {
         echo "$which: processed up to block $block"
         [ "$block" -ge "$STOP_AT_BLOCK" ] || { echo "expected block $STOP_AT_BLOCK"; return 1; }
         sync_seconds[$which]="$(cat "$out/replay-sync-$which.log.seconds")"
+        grep -h "haf_fyp_backfill" "$out/replay-sync-$which.log" | sed "s/^/$which: /" || true
     done
     # The sync stops at a fixed block, still in MASSIVE_PROCESSING, so the first live
     # range that would rebuild the deferred indexes never runs: rebuild them here.
@@ -251,7 +301,7 @@ schema_shape() {
 # updated_at is NOW() at processing time, so it is left out.
 table_checksums() {
     local table sql="" row
-    for table in post_candidates post_lookup post_commenters engagement_metrics user_interactions \
+    for table in post_candidates post_commenters engagement_metrics user_interactions \
         active_users user_communities; do
         row="t"
         [ "$table" = engagement_metrics ] &&
@@ -263,13 +313,24 @@ table_checksums() {
     clone_q "$1" -Atc "$sql"
 }
 
+# Where each clone's copy of hivemind stands: the block it backfilled at, and the block
+# it is current to.
+history_state() {
+    clone_q "$1" -Atc "SELECT backfill_block, followed_through_block, snapshot_communities FROM haf_fyp_app.hivemind_follow"
+}
+
 replay_parity() {
     local timed plain which
     timed="$(table_checksums timed)" || return 1
     plain="$(table_checksums plain)" || return 1
-    echo "instrumentation on (table rows checksum):"; echo "$timed"
-    echo "instrumentation off:"; echo "$plain"
+    echo "backfilled at $FOLLOW_FROM_BLOCK and followed to $STOP_AT_BLOCK, instrumentation on (table rows checksum):"
+    echo "$timed"
+    echo "backfilled at $STOP_AT_BLOCK, instrumentation off:"; echo "$plain"
     [ "$timed" = "$plain" ] || { echo "the two clones differ"; return 1; }
+    [ "$(history_state timed)" = "$FOLLOW_FROM_BLOCK|$STOP_AT_BLOCK|f" ] ||
+        { echo "timed clone's history state is $(history_state timed)"; return 1; }
+    [ "$(history_state plain)" = "$STOP_AT_BLOCK|$STOP_AT_BLOCK|f" ] ||
+        { echo "plain clone's history state is $(history_state plain)"; return 1; }
     for which in timed plain; do
         schema_shape "$which" > "$out/replay-schema-$which-synced.txt" || return 1
         if ! diff "$out/replay-schema-$which-installed.txt" "$out/replay-schema-$which-synced.txt"; then

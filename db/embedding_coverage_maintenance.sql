@@ -7,10 +7,9 @@
 -- suspected HiveSense sync hole — the 2026-07-02 interruption that motivated #15).
 --
 -- Run on the ranker daemon's hourly maintenance cadence (as haf_fyp_owner — see
--- #14), NOT inline in the endpoint: the candidate side is a multi-second scan
--- because post_candidates has only PARTIAL created_at indexes (idx_post_candidates_
--- unresolved / _payout_window), so a WHERE created_at >= ... over the general table
--- falls back to a sequential scan. Precomputing keeps GET /metrics a tiny read.
+-- #14), NOT inline in the endpoint, so GET /metrics stays a read of a tiny table
+-- however long the candidate count takes. post_candidates.post_id is hivemind's post
+-- id (#97), the key HiveSense stores embeddings under.
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.refresh_embedding_coverage(_days int DEFAULT 14)
 RETURNS void
@@ -30,13 +29,12 @@ BEGIN
         count(*) FILTER (
             WHERE EXISTS (
                 SELECT 1 FROM hivesense_app.posts_vectors pv
-                WHERE pv.post_id = pc.hive_post_id
+                WHERE pv.post_id = pc.post_id
             )
         ) AS embedded,
         now()
     FROM haf_fyp_app.post_candidates pc
     WHERE pc.created_at >= (date_trunc('day', now()) - make_interval(days => _days))
-      AND pc.hive_post_id IS NOT NULL
     GROUP BY pc.created_at::date
     ON CONFLICT (day) DO UPDATE SET
         candidates  = EXCLUDED.candidates,

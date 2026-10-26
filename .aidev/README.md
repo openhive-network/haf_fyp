@@ -39,9 +39,9 @@ instead, and a pin the image does not carry fails the step (rebuild the image, b
 | `postgrest` | `postgrest-tests` | `docker/docker-compose-ci.yml`'s `setup` and `tavern` against the stack's database, PostgREST and rewriter |
 | `install` | `install-test` | `docker/docker-compose-ci-install.yml`: install, install under a held lock, reinstall, uninstall, each verified, over the model of HAF |
 | `install-haf` | `install-test-haf` | the same chain over the stack's HAF |
-| `replay-install` | — | two copy-on-write clones of the shared 5M-block HAF, `scripts/install_app.sh` into each as `haf_shared_consumer` |
-| `replay-sync` | — | `scripts/process_blocks.sh --stop-at-block=5000000` over both clones at once, one with `haf_fyp.processor_timings` on, then `haf_fyp_app.restore_deferred_indexes()` in each, timed |
-| `replay-parity` | — | `post_candidates`, `engagement_metrics` and `user_interactions` hold the same rows in both clones, and each clone's indexes and constraints are the ones its install made, all valid |
+| `replay-install` | — | two copy-on-write clones of the shared 5M-block HAF, a stub of the hivemind tables haf_fyp reads built in each from its own operations (`tests/hivemind_stub_from_haf.sql`), `scripts/install_app.sh` into each as `haf_shared_consumer` |
+| `replay-sync` | — | `scripts/process_blocks.sh` over both clones at once, one with `haf_fyp.processor_timings` on: the plain one backfills from its stub at 5,000,000, the timed one backfills at 4,000,000 and follows its stub, extended, to 5,000,000; then `haf_fyp_app.restore_deferred_indexes()` in each, timed |
+| `replay-parity` | — | the history tables (`post_candidates`, `post_commenters`, `engagement_metrics`, `user_interactions`, `active_users`, `user_communities`) hold the same rows in both clones, each clone's history state is the one its path leaves, and each clone's indexes and constraints are the ones its install made, all valid |
 | `replay-report` | — | `scripts/processor_timings_report.py` over the timed run's driver log: `processor-timings.json` and a summary table |
 
 | Slot | Steps | Stack |
@@ -70,20 +70,34 @@ right alone. It has no pgvector either, which the consumer cannot create, so the
 runs from a scratch copy that declares `interest_vector` as `real[]` (block processing
 never touches it); the copy is the tree unchanged once the HAF has pgvector.
 
-`replay-sync` runs `scripts/process_blocks.sh --stop-at-block=5000000` over both clones at
-the same time, connected as the consumer with `role=haf_fyp_owner`: one after the other
-they would not fit the slot's wall. One run has `haf_fyp.processor_timings=on`
-(`db/process_block_range.sql`), so its driver log, `replay-sync-timed.log`, holds every
-processor's time for every batch; the other is the production path. The sync stops at
-block 5,000,000 with the context still in `MASSIVE_PROCESSING`, so the indexes and foreign
-keys HAF dropped for it (`haf_fyp_app.deferred_during_massive_sync()`) are still dropped:
-`replay-sync` then rebuilds them in each clone with `haf_fyp_app.restore_deferred_indexes()`
-and times that. `replay-parity` checks that both left the same rows and that each clone's
-indexes and constraints are the ones its install made, all valid, and `replay-report`
-turns the timed log into `processor-timings.json` (per-processor time in total and per 1M
-blocks, rows read per op type, both runs' sync and restore wall times and their sums, the
-reblog custom_json ids) and prints its table. The clones are dropped when the script
-exits, pass or fail.
+haf_fyp copies its history from hivemind (#97), and the shared HAF has no hivemind, so
+`replay-install` first builds, in each clone, a stub of the hivemind tables haf_fyp reads
+(`tests/hivemind_stub.sql`), filled from the clone's own operations by
+`tests/hivemind_stub_from_haf.sql`: posts, votes and reblogs as hivemind keeps them, ids
+in chain order, so a stub built in two ranges is the stub built in one. About two minutes
+for 5,000,000 blocks. The timed clone's stub stops at block 4,000,000, the plain clone's
+at 5,000,000; the timed clone is installed with `FYP_HIVEMIND_MAX_LAG_BLOCKS=1000000`, so
+a stub a million blocks behind the HAF's head counts as live.
+
+`replay-sync` runs `scripts/process_blocks.sh` over both clones at the same time,
+connected as the consumer with `role=haf_fyp_owner`: one after the other they would not
+fit the slot's wall. The plain clone syncs to block 5,000,000 and backfills its window
+from the stub, at 5,000,000, in its first batch. The timed clone syncs to 4,000,000,
+backfilling at 4,000,000; its stub is then extended to 5,000,000, as hivemind's own sync
+would, and it syncs on to 5,000,000, following the stub batch by batch. It has
+`haf_fyp.processor_timings=on` (`db/process_block_range.sql`), so its driver log,
+`replay-sync-timed.log`, holds every processor's time for every batch and the backfill's
+own line. The sync stops at block 5,000,000 with the context still in
+`MASSIVE_PROCESSING`, so the indexes HAF dropped for it
+(`haf_fyp_app.deferred_during_massive_sync()`) are still dropped: `replay-sync` then
+rebuilds them in each clone with `haf_fyp_app.restore_deferred_indexes()` and times that.
+`replay-parity` checks that both left the same rows -- so following hivemind ends where a
+backfill at the same block does -- that each clone's history state is the one its path
+leaves, and that each clone's indexes and constraints are the ones its install made, all
+valid. `replay-report` turns the timed log into `processor-timings.json` (per-processor
+time in total and per 1M blocks, rows read per op type, the backfill, both runs' sync and
+restore wall times and their sums) and prints its table. The clones are dropped when the
+script exits, pass or fail.
 
 ### The compose lanes
 

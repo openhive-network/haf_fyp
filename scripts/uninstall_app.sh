@@ -9,8 +9,8 @@
 #
 # THIS IS DESTRUCTIVE AND HAS NO UNDO. It drops both schemas CASCADE, taking every
 # table with them -- user_interests, feed_events, the caches, and the post_candidates /
-# user_interactions tables that hold the ranker's whole history and take hours to
-# rebuild. There is no backup step.
+# user_interactions tables that hold the ranker's history window (copied again from
+# hivemind by the next install's first batch). There is no backup step.
 #
 # OPTIONS:                                                      # --- help-start ---
 #   --force        Skip the interactive confirmation. Required to run without a TTY.

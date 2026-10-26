@@ -1,40 +1,32 @@
-2026-10-25T07:13:33.825Z blocks 980001..990000 (10000) processed in 0.08s (0.0 ms/block), 0 iteration(s)
-2026-10-25T07:13:34.101Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "stage_operations", "seconds" : 0.037028, "reads" : ["comment_operation","vote_operation","effective_comment_vote_operation","custom_json_operation"]}
-2026-10-25T07:13:34.101Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "process_posts", "seconds" : 0.001827, "reads" : ["comment_operation"]}
-2026-10-25T07:13:34.101Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "comments", "seconds" : 0.002239, "reads" : ["comment_operation"]}
-2026-10-25T07:13:34.101Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "reblogs", "seconds" : 0.000199, "reads" : ["custom_json_operation"]}
-2026-10-25T07:13:34.101Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "votes", "seconds" : 0.000949, "reads" : ["vote_operation","effective_comment_vote_operation"]}
-2026-10-25T07:13:34.101Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "engagement_metrics", "seconds" : 0.000754, "reads" : []}
-2026-10-25T07:13:34.101Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "payout_windows", "seconds" : 0.000165, "reads" : []}
-2026-10-25T07:13:34.101Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "unsubscribe", "seconds" : 0.000187, "reads" : ["custom_json_operation"]}
-2026-10-25T07:13:34.101Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "subscribe", "seconds" : 0.000130, "reads" : ["custom_json_operation"]}
-2026-10-25T07:13:34.101Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "process_interactions", "seconds" : 0.001821, "reads" : ["vote_operation","custom_json_operation"]}
-2026-10-25T07:13:34.101Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "resolve_hivemind_post_ids", "seconds" : 0.000039, "reads" : []}
-2026-10-25T07:13:34.101Z INFO:  haf_fyp_operation_counts {"counts": [{"rows": 78, "op_type": "comment_operation", "json_action": null, "custom_json_id": null}, {"rows": 106, "op_type": "effective_comment_vote_operation", "json_action": null, "custom_json_id": null}, {"rows": 106, "op_type": "vote_operation", "json_action": null, "custom_json_id": null}], "seconds": 0.001099, "last_block": 1000000, "first_block": 990001}
-2026-10-25T07:13:34.101Z blocks 990001..1000000 (10000) processed in 0.08s (0.0 ms/block), 0 iteration(s)
-2026-10-25T07:13:34.462Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "stage_operations", "seconds" : 0.036381, "reads" : ["comment_operation","vote_operation","effective_comment_vote_operation","custom_json_operation"]}
-2026-10-25T07:13:34.462Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "process_posts", "seconds" : 0.001034, "reads" : ["comment_operation"]}
-2026-10-25T07:13:34.462Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "comments", "seconds" : 0.001535, "reads" : ["comment_operation"]}
-2026-10-25T07:13:34.462Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "reblogs", "seconds" : 0.000156, "reads" : ["custom_json_operation"]}
-2026-10-25T07:13:34.462Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "votes", "seconds" : 0.001094, "reads" : ["vote_operation","effective_comment_vote_operation"]}
-2026-10-25T07:13:34.462Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "engagement_metrics", "seconds" : 0.000619, "reads" : []}
-2026-10-25T07:13:34.462Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "payout_windows", "seconds" : 0.000108, "reads" : []}
-2026-10-25T07:13:34.462Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "unsubscribe", "seconds" : 0.000132, "reads" : ["custom_json_operation"]}
-2026-10-25T07:13:34.462Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "subscribe", "seconds" : 0.000102, "reads" : ["custom_json_operation"]}
-2026-10-25T07:13:34.462Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "process_interactions", "seconds" : 0.001828, "reads" : ["vote_operation","custom_json_operation"]}
-2026-10-25T07:13:34.462Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "resolve_hivemind_post_ids", "seconds" : 0.000031, "reads" : []}
-2026-10-25T07:13:34.462Z INFO:  haf_fyp_operation_counts {"counts": [{"rows": 83, "op_type": "comment_operation", "json_action": null, "custom_json_id": null}, {"rows": 162, "op_type": "effective_comment_vote_operation", "json_action": null, "custom_json_id": null}, {"rows": 162, "op_type": "vote_operation", "json_action": null, "custom_json_id": null}], "seconds": 0.001021, "last_block": 1010000, "first_block": 1000001}
-2026-10-25T07:13:34.462Z blocks 1000001..1010000 (10000) processed in 0.17s (0.0 ms/block), 0 iteration(s)
-2026-10-25T07:13:34.729Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "stage_operations", "seconds" : 0.037867, "reads" : ["comment_operation","vote_operation","effective_comment_vote_operation","custom_json_operation"]}
-2026-10-25T07:13:34.729Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "process_posts", "seconds" : 0.000756, "reads" : ["comment_operation"]}
-2026-10-25T07:13:34.729Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "comments", "seconds" : 0.001835, "reads" : ["comment_operation"]}
-2026-10-25T07:13:34.729Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "reblogs", "seconds" : 0.000176, "reads" : ["custom_json_operation"]}
-2026-10-25T07:13:34.729Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "votes", "seconds" : 0.001194, "reads" : ["vote_operation","effective_comment_vote_operation"]}
-2026-10-25T07:13:34.729Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "engagement_metrics", "seconds" : 0.000535, "reads" : []}
-2026-10-25T07:13:34.729Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "payout_windows", "seconds" : 0.000465, "reads" : []}
-2026-10-25T07:13:34.729Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "unsubscribe", "seconds" : 0.000156, "reads" : ["custom_json_operation"]}
-2026-10-25T07:13:34.729Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "subscribe", "seconds" : 0.000128, "reads" : ["custom_json_operation"]}
-2026-10-25T07:13:34.730Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "process_interactions", "seconds" : 0.001992, "reads" : ["vote_operation","custom_json_operation"]}
-2026-10-25T07:13:34.730Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "resolve_hivemind_post_ids", "seconds" : 0.000036, "reads" : []}
-2026-10-25T07:13:34.730Z INFO:  haf_fyp_operation_counts {"counts": [{"rows": 56, "op_type": "comment_operation", "json_action": null, "custom_json_id": null}, {"rows": 158, "op_type": "effective_comment_vote_operation", "json_action": null, "custom_json_id": null}, {"rows": 158, "op_type": "vote_operation", "json_action": null, "custom_json_id": null}], "seconds": 0.000980, "last_block": 1020000, "first_block": 1010001}
-2026-10-25T07:13:34.730Z blocks 1010001..1020000 (10000) processed in 0.08s (0.0 ms/block), 0 iteration(s)
+2026-10-26T03:14:19.950Z haf_app_driver: application haf_fyp, contexts ['haf_fyp'], processing blocks
+2026-10-26T03:14:20.010Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "stage_operations", "seconds" : 0.000259, "reads" : ["custom_json_operation"]}
+2026-10-26T03:14:20.010Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "unsubscribe", "seconds" : 0.000023, "reads" : ["custom_json_operation"]}
+2026-10-26T03:14:20.010Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "subscribe", "seconds" : 0.000047, "reads" : ["custom_json_operation"]}
+2026-10-26T03:14:20.010Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "hivemind_subscriptions", "seconds" : 0.000068, "reads" : []}
+2026-10-26T03:14:20.010Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "hivemind_posts", "seconds" : 0.000024, "reads" : []}
+2026-10-26T03:14:20.010Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "hivemind_interactions", "seconds" : 0.000021, "reads" : []}
+2026-10-26T03:14:20.010Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "hivemind_engagement", "seconds" : 0.000021, "reads" : []}
+2026-10-26T03:14:20.010Z INFO:  haf_fyp_processor_timing {"first_block" : 990001, "last_block" : 1000000, "processor" : "payout_windows", "seconds" : 0.000253, "reads" : []}
+2026-10-26T03:14:20.010Z INFO:  haf_fyp_operation_counts {"counts": [{"rows": 34, "op_type": "custom_json_operation", "json_action": null, "custom_json_id": "community"}, {"rows": 69, "op_type": "custom_json_operation", "json_action": null, "custom_json_id": "follow"}], "seconds": 0.000597, "last_block": 1000000, "first_block": 990001}
+2026-10-26T03:14:20.010Z blocks 990001..1000000 (10000) processed in 0.12s (0.0 ms/block), 0 iteration(s)
+2026-10-26T03:14:20.191Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "stage_operations", "seconds" : 0.000007, "reads" : ["custom_json_operation"]}
+2026-10-26T03:14:20.191Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "unsubscribe", "seconds" : 0.000003, "reads" : ["custom_json_operation"]}
+2026-10-26T03:14:20.191Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "subscribe", "seconds" : 0.000005, "reads" : ["custom_json_operation"]}
+2026-10-26T03:14:20.191Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "hivemind_subscriptions", "seconds" : 0.001196, "reads" : []}
+2026-10-26T03:14:20.191Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "hivemind_posts", "seconds" : 0.003121, "reads" : []}
+2026-10-26T03:14:20.191Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "hivemind_interactions", "seconds" : 0.039551, "reads" : []}
+2026-10-26T03:14:20.191Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "hivemind_engagement", "seconds" : 0.007843, "reads" : []}
+2026-10-26T03:14:20.191Z INFO:  haf_fyp_backfill {"hivemind_block" : 1010000, "first_block" : 989000, "history_days" : 365, "seconds" : 0.105666, "posts" : 266, "interactions" : 4818, "commenters" : 266}
+2026-10-26T03:14:20.191Z INFO:  haf_fyp_processor_timing {"first_block" : 1000001, "last_block" : 1010000, "processor" : "payout_windows", "seconds" : 0.000100, "reads" : []}
+2026-10-26T03:14:20.191Z INFO:  haf_fyp_operation_counts {"counts": [{"rows": 34, "op_type": "custom_json_operation", "json_action": null, "custom_json_id": "community"}, {"rows": 69, "op_type": "custom_json_operation", "json_action": null, "custom_json_id": "follow"}], "seconds": 0.000298, "last_block": 1010000, "first_block": 1000001}
+2026-10-26T03:14:20.191Z blocks 1000001..1010000 (10000) processed in 0.12s (0.0 ms/block), 0 iteration(s)
+2026-10-26T03:14:20.262Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "stage_operations", "seconds" : 0.004354, "reads" : ["custom_json_operation"]}
+2026-10-26T03:14:20.262Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "unsubscribe", "seconds" : 0.000227, "reads" : ["custom_json_operation"]}
+2026-10-26T03:14:20.262Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "subscribe", "seconds" : 0.004486, "reads" : ["custom_json_operation"]}
+2026-10-26T03:14:20.262Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "hivemind_subscriptions", "seconds" : 0.000013, "reads" : []}
+2026-10-26T03:14:20.262Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "hivemind_posts", "seconds" : 0.001815, "reads" : []}
+2026-10-26T03:14:20.262Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "hivemind_interactions", "seconds" : 0.027724, "reads" : []}
+2026-10-26T03:14:20.262Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "hivemind_engagement", "seconds" : 0.004502, "reads" : []}
+2026-10-26T03:14:20.262Z INFO:  haf_fyp_processor_timing {"first_block" : 1010001, "last_block" : 1020000, "processor" : "payout_windows", "seconds" : 0.000072, "reads" : []}
+2026-10-26T03:14:20.262Z INFO:  haf_fyp_operation_counts {"counts": [{"rows": 32, "op_type": "custom_json_operation", "json_action": null, "custom_json_id": "community"}, {"rows": 62, "op_type": "custom_json_operation", "json_action": null, "custom_json_id": "follow"}], "seconds": 0.000241, "last_block": 1020000, "first_block": 1010001}
+2026-10-26T03:14:20.262Z blocks 1010001..1020000 (10000) processed in 0.12s (0.0 ms/block), 0 iteration(s)

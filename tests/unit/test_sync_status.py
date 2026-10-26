@@ -33,7 +33,7 @@ class _FakePgError(Exception):
     real instance cannot be given a SQLSTATE; the production code reads it with
     getattr(), so any object carrying the attribute exercises the same path."""
 
-    def __init__(self, pgcode, message):
+    def __init__(self, pgcode, message) -> None:
         super().__init__(message)
         self.pgcode = pgcode
 
@@ -59,14 +59,21 @@ def _mock_conn(*fetchone_results):
 # ---------------------------------------------------------------------------
 
 
-def test_payload_is_exactly_the_two_documented_keys():
-    assert build_sync_status((5000000, BLOCK_TIME)) == {
+def test_payload_is_the_two_ecosystem_keys_and_the_history_state() -> None:
+    """The two keys every HAF app's /sync-status carries, and haf_fyp's own third
+    (#97): whether its history window has been copied from hivemind yet."""
+    assert build_sync_status((5000000, BLOCK_TIME, "following_hivemind")) == {
         "last_block_num": 5000000,
         "last_block_time": "2016-09-15T19:47:21",
+        "history": "following_hivemind",
     }
 
 
-def test_block_time_is_19_chars_with_a_literal_T_and_no_timezone_suffix():
+def test_a_node_waiting_for_hivemind_says_so() -> None:
+    assert build_sync_status((0, None, "waiting_for_hivemind"))["history"] == "waiting_for_hivemind"
+
+
+def test_block_time_is_19_chars_with_a_literal_T_and_no_timezone_suffix() -> None:
     # Consumers parse this with a fixed format; an offset or a 'Z' would be a
     # silent breaking change across every HAF app monitor.
     s = format_block_time(BLOCK_TIME)
@@ -76,13 +83,13 @@ def test_block_time_is_19_chars_with_a_literal_T_and_no_timezone_suffix():
     assert "+" not in s and not s.endswith("Z")
 
 
-def test_fractional_seconds_are_dropped():
+def test_fractional_seconds_are_dropped() -> None:
     # Block timestamps are whole seconds today, but isoformat() would append
     # ".123456" the moment that stopped being true, widening the field.
     assert format_block_time(BLOCK_TIME.replace(microsecond=123456)) == "2016-09-15T19:47:21"
 
 
-def test_aware_timestamp_is_converted_to_utc_not_local():
+def test_aware_timestamp_is_converted_to_utc_not_local() -> None:
     # hafd.blocks.created_at is `timestamp without time zone` in UTC, so psycopg2
     # yields a naive datetime. A TIMESTAMPTZ stub or a future HAF change would
     # yield an aware one — it must be converted to UTC, not to the host's local
@@ -91,19 +98,20 @@ def test_aware_timestamp_is_converted_to_utc_not_local():
     assert format_block_time(aware) == "2016-09-15T19:47:21"
 
 
-def test_null_block_time_when_no_block_row_matched():
+def test_null_block_time_when_no_block_row_matched() -> None:
     # LEFT JOIN miss: the context points at a block hafd.blocks does not have.
     # Must be a null time, not an error.
-    assert build_sync_status((0, None)) == {"last_block_num": 0, "last_block_time": None}
+    assert build_sync_status((0, None, "waiting_for_hivemind")) == {
+        "last_block_num": 0, "last_block_time": None, "history": "waiting_for_hivemind"}
 
 
-def test_block_zero_is_a_real_answer_not_a_missing_context():
+def test_block_zero_is_a_real_answer_not_a_missing_context() -> None:
     # Guards the `if not block_num` class of bug — 0 means "context registered,
     # nothing processed yet", which is exactly what a fresh install reports.
-    assert build_sync_status((0, BLOCK_TIME))["last_block_num"] == 0
+    assert build_sync_status((0, BLOCK_TIME, "waiting_for_hivemind"))["last_block_num"] == 0
 
 
-def test_context_name_is_the_context_not_the_schema():
+def test_context_name_is_the_context_not_the_schema() -> None:
     # The HAF context is 'haf_fyp'; the schema is 'haf_fyp_app'. Querying
     # hafd.contexts with the schema name returns no rows and looks like an
     # uninstalled app.
@@ -115,7 +123,7 @@ def test_context_name_is_the_context_not_the_schema():
 # ---------------------------------------------------------------------------
 
 
-def test_missing_context_row_raises_rather_than_returning_a_null_block():
+def test_missing_context_row_raises_rather_than_returning_a_null_block() -> None:
     # An empty result is the exact signature of the silent-RLS misconfiguration
     # (a role that does not inherit hive_applications_group reads zero rows with
     # no error), so it must never be reported as a successful response.
@@ -123,12 +131,12 @@ def test_missing_context_row_raises_rather_than_returning_a_null_block():
         build_sync_status(None)
 
 
-def test_context_not_found_names_the_privilege_cause():
+def test_context_not_found_names_the_privilege_cause() -> None:
     with pytest.raises(ContextNotFound, match="hive_applications_group"):
         build_sync_status(None)
 
 
-def test_massive_sync_sqlstate_maps_to_instance_not_ready():
+def test_massive_sync_sqlstate_maps_to_instance_not_ready() -> None:
     # The SECURITY DEFINER function raises SQLSTATE 55000 when
     # hive.is_instance_ready() is false; that must surface as the typed exception
     # the route maps to 503, not as a generic 500.
@@ -138,7 +146,7 @@ def test_massive_sync_sqlstate_maps_to_instance_not_ready():
         fetch_sync_status_row(conn)
 
 
-def test_permission_error_is_not_mistaken_for_not_ready():
+def test_permission_error_is_not_mistaken_for_not_ready() -> None:
     # 42501 insufficient_privilege is the signature of a broken EXECUTE grant. It
     # must NOT be reported as "massive sync in progress" — that would tell an
     # operator to wait for a condition that will never clear.
@@ -148,13 +156,13 @@ def test_permission_error_is_not_mistaken_for_not_ready():
         fetch_sync_status_row(conn)
 
 
-def test_is_not_ready_predicate():
+def test_is_not_ready_predicate() -> None:
     assert is_not_ready(type("E", (Exception,), {"pgcode": "55000"})())
     assert not is_not_ready(type("E", (Exception,), {"pgcode": "42501"})())
     assert not is_not_ready(Exception("no pgcode at all"))
 
 
-def test_reads_through_the_security_definer_function_not_hafd_directly():
+def test_reads_through_the_security_definer_function_not_hafd_directly() -> None:
     # The API role has no hafd privileges by design; querying hafd.contexts
     # directly would work only if someone put it in hive_applications_group,
     # which carries TRUNCATE on that table.
@@ -162,17 +170,17 @@ def test_reads_through_the_security_definer_function_not_hafd_directly():
     assert "hafd." not in SYNC_STATUS_SQL
 
 
-def test_ready_instance_returns_the_row():
+def test_ready_instance_returns_the_row() -> None:
     conn, _ = _mock_conn((5000000, BLOCK_TIME))
     assert fetch_sync_status_row(conn) == (5000000, BLOCK_TIME)
 
 
-def test_invisible_context_returns_none_for_the_caller_to_reject():
+def test_invisible_context_returns_none_for_the_caller_to_reject() -> None:
     conn, _ = _mock_conn(None)
     assert fetch_sync_status_row(conn) is None
 
 
-def test_not_ready_detail_does_not_leak_plpgsql_context():
+def test_not_ready_detail_does_not_leak_plpgsql_context() -> None:
     # psycopg2 appends "CONTEXT: PL/pgSQL function ... at RAISE" to the error
     # string. This endpoint is unauthenticated, so the 503 body must carry the
     # fixed message only.

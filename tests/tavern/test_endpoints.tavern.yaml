@@ -231,6 +231,8 @@ stages:
       json:
         last_block_num: 5000000
         last_block_time: "2016-09-15T19:47:21"
+        # #97: no hivemind in this lane, so the history copy waits for it.
+        history: "waiting_for_hivemind"
 
   # THE ACTUAL DELIVERABLE. The stage above proves the SQL function works and proves
   # nothing about /sync-status: it addresses PostgREST directly. Removing the rewrite
@@ -245,6 +247,7 @@ stages:
       json:
         last_block_num: 5000000
         last_block_time: "2016-09-15T19:47:21"
+        history: "waiting_for_hivemind"
 
 ---
 test_name: Sync status - the documented error contract (#34)

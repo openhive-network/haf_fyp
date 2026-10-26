@@ -24,6 +24,13 @@
 #   --postgres-url=URI  NOT SUPPORTED YET -- recognised and refused with a message
 #                       pointing at --host/--port/--user. --url= is the same flag.
 #   --help,-h,-?        Show this and exit                       # --- help-end ---
+#
+# ENVIRONMENT (#97), written to haf_fyp_app.app_config on every run, so a run without
+# them puts the defaults back:
+#   FYP_HISTORY_DAYS             days of votes, reblogs and posts copied from hivemind
+#                                and kept (1-36500, default 365)
+#   FYP_HIVEMIND_MAX_LAG_BLOCKS  how far behind head hivemind may be for the first copy
+#                                to start (0-10000000, default 1000)
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -172,6 +179,20 @@ for arg in "$@"; do
     esac
 done
 
+# The history window (#97, step 8b), checked before anything is installed: a value that
+# cannot be meant refuses the install rather than leaving it half done. Unset or empty
+# is the default.
+FYP_HISTORY_DAYS="${FYP_HISTORY_DAYS:-365}"
+FYP_HIVEMIND_MAX_LAG_BLOCKS="${FYP_HIVEMIND_MAX_LAG_BLOCKS:-1000}"
+if ! [[ "${FYP_HISTORY_DAYS}" =~ ^[1-9][0-9]{0,4}$ ]] || [ "${FYP_HISTORY_DAYS}" -gt 36500 ]; then
+    log "ERROR: FYP_HISTORY_DAYS='${FYP_HISTORY_DAYS}' is not a number of days from 1 to 36500. Nothing has been modified."
+    exit 1
+fi
+if ! [[ "${FYP_HIVEMIND_MAX_LAG_BLOCKS}" =~ ^(0|[1-9][0-9]{0,7})$ ]] || [ "${FYP_HIVEMIND_MAX_LAG_BLOCKS}" -gt 10000000 ]; then
+    log "ERROR: FYP_HIVEMIND_MAX_LAG_BLOCKS='${FYP_HIVEMIND_MAX_LAG_BLOCKS}' is not a block count from 0 to 10000000. Nothing has been modified."
+    exit 1
+fi
+
 wait_for_postgres
 
 # HAF's install lock (#67). A block processor holds a SHARED advisory lock on haf_fyp for
@@ -318,23 +339,31 @@ run_sql_file "${SCRIPT_DIR}/../db/embedding_coverage_maintenance.sql"
 # 3d. Rotation eviction + #9-invariant repair functions (#10) — needs the tables above
 run_sql_file "${SCRIPT_DIR}/../db/active_users_maintenance.sql"
 
-# 4. Phase 2: post ingestion
+# 4. Root posts, copied from hivemind
 run_sql_file "${SCRIPT_DIR}/../db/process_posts.sql"
 
-# 5. Phase 3: engagement tracking
+# 5. Engagement and payout windows, counted from hivemind
 run_sql_file "${SCRIPT_DIR}/../db/process_engagement.sql"
 
 # 6. Phase 4: community subscription sync
 run_sql_file "${SCRIPT_DIR}/../db/process_communities.sql"
 
-# 6b. Phase 8: per-user interaction recording (feeds the ranker's interest vectors)
+# 6b. Votes and reblogs, copied from hivemind (feed the ranker's interest vectors)
 run_sql_file "${SCRIPT_DIR}/../db/process_interactions.sql"
+
+# 6c. The copy of hivemind's history: backfill, follow, retention (#97)
+run_sql_file "${SCRIPT_DIR}/../db/hivemind_follow.sql"
 
 # 7. Block range dispatcher (loads after all processors are defined)
 run_sql_file "${SCRIPT_DIR}/../db/process_block_range.sql"
 
 # 8. Seed data (algorithm versions)
 run_sql_file "${SCRIPT_DIR}/../db/seed_data.sql"
+
+# 8b. The history window (#97), checked before anything was installed (above), beside
+#     the other setting an install writes.
+psql_cmd -v history_days="${FYP_HISTORY_DAYS}" -v hivemind_max_lag_blocks="${FYP_HIVEMIND_MAX_LAG_BLOCKS}" \
+    -f "${SCRIPT_DIR}/../scripts/set_history_config.sql"
 
 # 9. API endpoints (includes score explainer + algorithm registry — Phase 9)
 #

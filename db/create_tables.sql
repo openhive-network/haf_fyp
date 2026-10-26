@@ -4,119 +4,170 @@
 --   CREATE EXTENSION IF NOT EXISTS vector;
 
 -- ---------------------------------------------------------------------------
--- Post candidates — root posts eligible for ranking
+-- History copied from hivemind (#97)
+--
+-- haf_fyp does not replay votes, reblogs or comments. It keeps a slim copy of the
+-- last app_config.history_days of them (FYP_HISTORY_DAYS, 365 by default), read
+-- from hivemind's own tables by db/hivemind_follow.sql and keyed by hivemind's
+-- integer ids: every post_id below is hivemind_app.hive_posts.id, every account_id
+-- and commenter_id is hivemind_app.hive_accounts.id. Author, permlink, title and
+-- tags are not copied; what needs them reads hivemind. feed_cache and
+-- global_feed_cache keep their shape, and their post_id is the same hivemind id.
+--
+-- No foreign keys between these tables: the hourly retention pass
+-- (haf_fyp_app.prune_history) deletes each table by its own time column, and the
+-- tables are filled by set-based statements that never write a post_id hivemind
+-- does not have.
+-- ---------------------------------------------------------------------------
+
+-- Upgrade from the replayed shape, whose post_candidates is keyed by haf_fyp's own
+-- operation ids and carries author and permlink. Nothing in it is converted: the
+-- first batch the block processor runs once hivemind is live fills the window
+-- again from hivemind (db/hivemind_follow.sql), in the time a backfill takes
+-- whatever the size of the old tables, so dropping them is the whole conversion.
+-- The cached feeds are kept: their post ids move to hivemind's through the old
+-- post_candidates.hive_post_id, and a cached post that never resolved, which no
+-- endpoint could serve, is dropped. The old ids are HAF operation ids, all at or
+-- above 2^32, so no moved id can meet one that has not moved yet.
+--
+-- HAF keeps the indexes deferred during massive sync by name
+-- (haf_fyp_app.deferred_during_massive_sync), and would one day try to rebuild the
+-- dropped tables' from their old definitions; their records go with them, and
+-- install_app.sh step 10c registers the new ones. Not while HAF holds any of them
+-- dropped, which only a node stopped mid initial sync can be in: it is warned about
+-- instead.
+--
+-- One DO block, one transaction: an install that dies in it leaves the old shape
+-- whole, and the next install starts it again.
+--
+-- A feed_cache still in the wide shape (#98) is compacted further down, and that copy
+-- keeps only the feeds of readers and opt-ins ($feed_cache_compact$, #99). On a
+-- replayed node nearly every wide row belongs to an account that never read, so only
+-- the kept accounts' rows are moved here; the rest keep their old ids and go with the
+-- wide table. Same predicate as $feed_cache_compact$.
+DO $history_from_hivemind$
+DECLARE
+    _wide boolean;
+    _kept varchar(16) [];
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = to_regclass('haf_fyp_app.post_candidates')
+          AND attname = 'author' AND NOT attisdropped
+    ) THEN
+        RETURN;
+    END IF;
+
+    _wide := EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = to_regclass('haf_fyp_app.feed_cache')
+          AND attname = 'rank' AND atttypid = 'int4'::regtype AND NOT attisdropped
+    );
+    IF _wide THEN
+        SELECT COALESCE(array_agg(k.username), '{}') INTO _kept
+        FROM (
+            SELECT au.username FROM haf_fyp_app.active_users AS au
+            WHERE au.last_read_at >= (NOW() AT TIME ZONE 'utc') - INTERVAL '30 days'
+            UNION
+            SELECT ui.username FROM haf_fyp_app.user_interests AS ui
+        ) AS k;
+    END IF;
+
+    IF to_regclass('haf_fyp_app.feed_cache') IS NOT NULL THEN
+        DELETE FROM haf_fyp_app.feed_cache AS fc
+        WHERE (NOT _wide OR fc.username = ANY(_kept))
+          AND NOT EXISTS (
+            SELECT 1 FROM haf_fyp_app.post_candidates AS pc
+            WHERE pc.post_id = fc.post_id AND pc.hive_post_id IS NOT NULL
+        );
+        UPDATE haf_fyp_app.feed_cache AS fc
+        SET post_id = pc.hive_post_id
+        FROM haf_fyp_app.post_candidates AS pc
+        WHERE pc.post_id = fc.post_id
+          AND (NOT _wide OR fc.username = ANY(_kept));
+    END IF;
+    IF to_regclass('haf_fyp_app.global_feed_cache') IS NOT NULL THEN
+        DELETE FROM haf_fyp_app.global_feed_cache AS gfc
+        WHERE NOT EXISTS (
+            SELECT 1 FROM haf_fyp_app.post_candidates AS pc
+            WHERE pc.post_id = gfc.post_id AND pc.hive_post_id IS NOT NULL
+        );
+        UPDATE haf_fyp_app.global_feed_cache AS gfc
+        SET post_id = pc.hive_post_id
+        FROM haf_fyp_app.post_candidates AS pc
+        WHERE pc.post_id = gfc.post_id;
+    END IF;
+
+    -- Nested IFs, not ANDs: plpgsql prepares a whole condition before evaluating any of
+    -- it, so a call to a function this database lacks fails even behind a false test.
+    IF to_regprocedure('hive.app_remove_index_dependencies(text)') IS NOT NULL THEN
+        IF haf_fyp_app.deferred_indexes_dropped() THEN
+            RAISE WARNING 'HAF holds indexes of haf_fyp dropped (a sync stopped during massive processing): their records are kept. Run SELECT haf_fyp_app.restore_deferred_indexes() as haf_fyp_owner, then re-run this install.';
+        ELSIF hive.app_context_exists('haf_fyp') THEN
+            PERFORM hive.app_remove_index_dependencies('haf_fyp');
+        END IF;
+    END IF;
+
+    DROP TABLE IF EXISTS
+        haf_fyp_app.post_bridge_cache,
+        haf_fyp_app.post_lookup,
+        haf_fyp_app.post_commenters,
+        haf_fyp_app.engagement_metrics,
+        haf_fyp_app.user_interactions,
+        haf_fyp_app.post_candidates;
+
+    RAISE NOTICE 'haf_fyp: the replayed history tables are dropped; block processing refills the window from hivemind once hivemind is live.';
+END
+$history_from_hivemind$;
+
+-- ---------------------------------------------------------------------------
+-- Post candidates — root posts created within the window
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.post_candidates (
-    post_id bigint NOT NULL,
-    author varchar(16) NOT NULL,
-    permlink varchar(256) NOT NULL,
-    community_id int,
-    title text,
-    tags text [],
-    category varchar(256),
+    post_id int NOT NULL,                       -- hivemind_app.hive_posts.id
+    community_id int,                           -- the N of a hive-N category, as user_communities
     created_at timestamp NOT NULL,
     body_length int,
     payout_window boolean NOT NULL DEFAULT TRUE,
     in_discovery boolean NOT NULL DEFAULT TRUE,
-    -- hive_post_id: the hivemind hive_posts.id for this (author, permlink),
-    -- resolved once by resolve_hivemind_post_ids() so the feed endpoints can call
-    -- get_bridge_post directly instead of re-joining hive_accounts /
-    -- hive_permlink_data / hive_posts on every request. NULL until resolved (or for
-    -- posts Hivemind has not indexed yet / has deleted).
-    hive_post_id int,
-    PRIMARY KEY (post_id),
-    UNIQUE (author, permlink)
+    PRIMARY KEY (post_id)
 );
 
--- Added via ALTER as well so in-place upgrades pick up the column (the CREATE
--- above is IF NOT EXISTS and is a no-op on an already-installed table).
-ALTER TABLE haf_fyp_app.post_candidates
-ADD COLUMN IF NOT EXISTS hive_post_id int;
+-- The ranker's candidate read (newest first) and the retention pass.
+CREATE INDEX IF NOT EXISTS idx_post_candidates_created_at
+ON haf_fyp_app.post_candidates (created_at);
 
--- Bounds resolve_hivemind_post_ids()'s scan to the not-yet-resolved posts.
-CREATE INDEX IF NOT EXISTS idx_post_candidates_unresolved
-ON haf_fyp_app.post_candidates (created_at)
-WHERE hive_post_id IS NULL;
-
--- process_payout_windows() runs an UPDATE ... WHERE payout_window AND created_at <= cutoff
--- every block. Without this, that is a sequential scan of the whole post_candidates table
--- (25M+ rows / 17GB on mainnet) every ~3s, even though only a few thousand rows have an
--- open payout window — it dominated the haf_fyp processor's CPU (~98% of per-block time)
--- and starved co-located apps. This partial index holds only the open-window rows
--- (payout_window = TRUE), turning that UPDATE into a sub-millisecond index range scan.
--- On an already-populated node, build it once with CREATE INDEX CONCURRENTLY (non-blocking);
--- at install the table is empty so a plain CREATE INDEX is instant.
--- NOTE (existing nodes): CREATE INDEX does not force long-lived sessions to re-plan, so after
--- building the index restart the block processor (haf-fyp-sync) — otherwise its cached plpgsql
--- plan for the payout UPDATE, compiled before the index existed, keeps sequential-scanning. Its
--- re-planned generic plan then adopts the index (EXPLAIN (GENERIC_PLAN) -> Index Scan). Fresh
--- installs are unaffected (the plan is first built with the index already present).
+-- process_payout_windows() closes payout windows every batch with an UPDATE ... WHERE
+-- payout_window AND created_at <= cutoff. This partial index holds only the open rows,
+-- a week of posts, so that UPDATE is an index range scan rather than a scan of the window.
 CREATE INDEX IF NOT EXISTS idx_post_candidates_payout_window
 ON haf_fyp_app.post_candidates (created_at)
 WHERE payout_window;
 
 -- ---------------------------------------------------------------------------
--- Post lookup — indexed (author, permlink) for efficient joins in processors
--- ---------------------------------------------------------------------------
--- The foreign keys to post_candidates here and on post_commenters, engagement_metrics
--- and post_bridge_cache are dropped for the initial massive sync and rebuilt when it
--- ends: see haf_fyp_app.deferred_during_massive_sync() (db/haf_fyp_app.sql).
-
-CREATE TABLE IF NOT EXISTS haf_fyp_app.post_lookup (
-    post_id bigint NOT NULL,
-    author varchar(16) NOT NULL,
-    permlink varchar(256) NOT NULL,
-    PRIMARY KEY (post_id),
-    FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates (post_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_post_lookup_ap
-ON haf_fyp_app.post_lookup (author, permlink);
-
--- ---------------------------------------------------------------------------
--- Post commenters — one row per (post, unique commenter) pair
+-- Post commenters — one row per (post, account that replied to it directly)
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.post_commenters (
-    post_id bigint NOT NULL,
-    commenter varchar(16) NOT NULL,
-    PRIMARY KEY (post_id, commenter),
-    FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates (post_id)
+    post_id int NOT NULL,                       -- hivemind_app.hive_posts.id
+    commenter_id int NOT NULL,                  -- hivemind_app.hive_accounts.id
+    PRIMARY KEY (post_id, commenter_id)
 );
 
--- No separate (post_id) index (#18): PRIMARY KEY (post_id, commenter) already serves
--- every post_id lookup through its leftmost prefix, so idx_post_commenters_pid was pure
--- overhead — ~928 MB and 0 scans on mainnet since the 2026-07-16 stats reset (figures
--- from issue #18; not reproducible from this repo), plus one index write per insert.
--- Two post_id-keyed paths touch this table and the PK prefix covers both: the ON CONFLICT
--- arbiter in process_comments() (db/process_engagement.sql), which uses the PK because the
--- dropped index was never unique; and the FK check that runs when a post_candidates row is
--- DELETEd or has its post_id UPDATEd, which scans this table for referencing rows. The
--- insert-time direction needs no index here at all — it reads post_candidates' own PK and
--- touches no post_commenters index.
--- DROPped rather than merely un-CREATEd so an already-installed node reclaims the space on
--- its next install run; this file is re-run on every deploy (scripts/install_app.sh). On a
--- live node the plain DROP takes ACCESS EXCLUSIVE: queued behind the block processor's open
--- transaction it also stalls every later reader of post_commenters until it clears. To avoid
--- that, run DROP INDEX CONCURRENTLY haf_fyp_app.idx_post_commenters_pid; ahead of the deploy
--- and this statement becomes a no-op. Do NOT re-add the index.
-DROP INDEX IF EXISTS haf_fyp_app.idx_post_commenters_pid;
-
 -- ---------------------------------------------------------------------------
--- Engagement metrics — updated incrementally per block range
+-- Engagement metrics — counted from hivemind for each post a batch touches
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.engagement_metrics (
-    post_id bigint NOT NULL,
+    post_id int NOT NULL,                       -- hivemind_app.hive_posts.id
     comment_count int NOT NULL DEFAULT 0,
     unique_commenters int NOT NULL DEFAULT 0,
     reblog_count int NOT NULL DEFAULT 0,
     vote_count int NOT NULL DEFAULT 0,
     net_rshares bigint NOT NULL DEFAULT 0,
     updated_at timestamp,
-    PRIMARY KEY (post_id),
-    FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates (post_id)
+    PRIMARY KEY (post_id)
 );
 
 -- ---------------------------------------------------------------------------
@@ -134,28 +185,83 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.user_profile_vectors (
 );
 
 -- ---------------------------------------------------------------------------
--- User interactions — incremental record of each user's votes/reblogs on
--- tracked posts, populated by process_interactions as blocks are processed.
--- Replaces the per-cycle scan of hive.account_operations_view in the ranker:
--- building a user's interest vector becomes an indexed lookup of a few rows
--- instead of re-parsing thousands of raw operations every cycle. Deduplicated
--- to one row per (user, post); the strongest action (reblog > vote) wins.
+-- User interactions — each account's votes and reblogs of root posts within the
+-- window, one row per (account, post): the strongest action (reblog > vote) and the
+-- time of the latest. The ranker reads one account's most recent rows to build its
+-- interest vector, through the (account_id, created_at) index, with the account id
+-- taken from a scalar subquery on hivemind_app.hive_accounts (haf_fyp/embeddings.py).
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.user_interactions (
-    username varchar(16) NOT NULL,
-    post_id bigint NOT NULL,
-    action_weight real NOT NULL,     -- 1.0 vote, 1.5 reblog
-    created_at timestamp NOT NULL,   -- block time of the interaction
-    block_num int NOT NULL,
-    PRIMARY KEY (username, post_id)
+    account_id int NOT NULL,                    -- hivemind_app.hive_accounts.id
+    post_id int NOT NULL,                       -- hivemind_app.hive_posts.id, a root post
+    action_weight real NOT NULL,                -- 1.0 vote, 1.5 reblog
+    created_at timestamp NOT NULL,              -- block time of the latest of those actions
+    PRIMARY KEY (account_id, post_id)
 );
 
--- Lookup pattern: most-recent interactions for one user within a time window.
--- Dropped for the initial massive sync and rebuilt when it ends: see
--- haf_fyp_app.deferred_during_massive_sync() (db/haf_fyp_app.sql).
-CREATE INDEX IF NOT EXISTS idx_user_interactions_user_time
-ON haf_fyp_app.user_interactions (username, created_at DESC);
+-- The ranker's per-account read. Dropped for the initial massive sync and rebuilt when
+-- it ends: see haf_fyp_app.deferred_during_massive_sync() (db/haf_fyp_app.sql).
+CREATE INDEX IF NOT EXISTS idx_user_interactions_account_time
+ON haf_fyp_app.user_interactions (account_id, created_at DESC);
+
+-- The retention pass deletes by created_at alone. Rows arrive roughly in time order,
+-- which is what a BRIN index needs, and it costs a few pages where a btree would cost
+-- a fifth of the table.
+CREATE INDEX IF NOT EXISTS idx_user_interactions_created_at
+ON haf_fyp_app.user_interactions USING brin (created_at);
+
+-- ---------------------------------------------------------------------------
+-- Where the copy of hivemind stands: one row (db/hivemind_follow.sql)
+--
+--   snapshot_communities   user_communities is to be taken from hivemind's
+--                          subscriptions at the backfill, because block processing
+--                          has not applied community operations from genesis. True
+--                          on a fresh install; false where the context has processed
+--                          blocks, whose user_communities is already current.
+--   hivemind_live_at       when a batch first found hivemind within reach of head.
+--   backfill_started_at, backfilled_at
+--                          the backfill's wall-clock start and end; NULL until it has
+--                          run. backfilled_at - hivemind_live_at is the time from
+--                          hivemind being live to haf_fyp having a window to rank.
+--   backfill_block         hivemind's block when the backfill read it.
+--   communities_snapshot_block
+--                          hivemind's block when the backfill took user_communities
+--                          from it; NULL where it did not. Block processing applies
+--                          community operations only above it (process_block_range).
+--   followed_through_block hivemind's block the copy is current to.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS haf_fyp_app.hivemind_follow (
+    only_row boolean PRIMARY KEY DEFAULT TRUE,
+    snapshot_communities boolean NOT NULL,
+    hivemind_live_at timestamptz,
+    backfill_started_at timestamptz,
+    backfilled_at timestamptz,
+    backfill_block int,
+    followed_through_block int,
+    communities_snapshot_block int,
+    CONSTRAINT hivemind_follow_singleton CHECK (only_row)
+);
+
+-- A node past its backfill without the column keeps applying every batch's operations.
+ALTER TABLE haf_fyp_app.hivemind_follow
+ADD COLUMN IF NOT EXISTS communities_snapshot_block int;
+
+DO $hivemind_follow_seed$
+BEGIN
+    IF EXISTS (SELECT 1 FROM haf_fyp_app.hivemind_follow) THEN
+        RETURN;
+    END IF;
+    -- app_status is db/haf_fyp_app.sql's; a database without it has processed nothing.
+    IF to_regclass('haf_fyp_app.app_status') IS NOT NULL THEN
+        INSERT INTO haf_fyp_app.hivemind_follow (snapshot_communities)
+        SELECT NOT EXISTS (SELECT 1 FROM haf_fyp_app.app_status WHERE last_processed_block > 0);
+    ELSE
+        INSERT INTO haf_fyp_app.hivemind_follow (snapshot_communities) VALUES (TRUE);
+    END IF;
+END
+$hivemind_follow_seed$;
 
 -- ---------------------------------------------------------------------------
 -- Active users — one row per account the ranker keeps fresh ("users we rank",
@@ -320,6 +426,11 @@ BEGIN
     JOIN unnest(_kept) AS k (username) USING (username)
     LEFT JOIN haf_fyp_app.feed_cache_labels AS la ON la.label = w.algorithm_version
     LEFT JOIN haf_fyp_app.feed_cache_labels AS lb ON lb.label = w.boost_source
+    -- A row $history_from_hivemind$ did not move still holds a HAF operation id (at or
+    -- above 2^32), which no endpoint can serve: an account that became a reader or
+    -- opted in between that block and this one, in an install resumed after dying here.
+    -- Its feed is re-ranked on its next read.
+    WHERE w.post_id < 4294967296
     ORDER BY w.username, w.rank
     ON CONFLICT (username, rank) DO NOTHING;
     GET DIAGNOSTICS _copied = ROW_COUNT;
@@ -358,26 +469,24 @@ CREATE INDEX IF NOT EXISTS idx_global_feed_rank
 ON haf_fyp_app.global_feed_cache (rank ASC);
 
 -- ---------------------------------------------------------------------------
--- Post bridge cache — pre-rendered bridge.get_ranked_posts JSON per post
+-- Post bridge cache — pre-rendered, observer-agnostic bridge JSON
 --
--- The feed endpoints' dominant cost is the per-post Hivemind bridge build
--- (get_full_post_view_by_id + create_bridge_post_object, ~25-30 ms/post). The
--- expensive fields (payout / votes / reputation) are volatile only during a
--- post's ~7-day payout window, then freeze, so the rendered object is cacheable.
--- The ranker renders the OBSERVER-AGNOSTIC bridge (observer_id = 0) for the posts
--- it places into feeds and refreshes in-payout-window entries each cycle; once a
--- post is paid out its entry is frozen (is_paidout). The feed endpoints read this
--- directly (single PK-indexed read) and fall back to a live render only on a
--- cache miss, so they work while the cache is still warming.
+-- Rendered by the ranker (scoring.render_bridge_for_posts) for the posts the feed
+-- writers place, and read by the feed endpoints before they render a post live
+-- through hivemind's bridge builder, the dominant per-request cost. Keyed by the
+-- hivemind id like the feed caches. The one foreign key on the history copy: the
+-- cascade is what keeps the cache within the window when prune_history deletes a
+-- post. The replayed shape's cache is dropped by $history_from_hivemind$ above and
+-- refills on the next ranker cycle.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.post_bridge_cache (
-    post_id bigint NOT NULL,
+    post_id int NOT NULL,                       -- hivemind_app.hive_posts.id
     bridge jsonb NOT NULL,
     is_paidout boolean NOT NULL DEFAULT FALSE,
     computed_at timestamp NOT NULL DEFAULT now(),
     PRIMARY KEY (post_id),
-    FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates (post_id)
+    FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates (post_id) ON DELETE CASCADE
 );
 
 -- ---------------------------------------------------------------------------
@@ -523,9 +632,8 @@ ON CONFLICT DO NOTHING;
 -- interruption that motivated #15 would have shown as ~0% coverage that day).
 -- Refreshed on the ranker daemon's hourly maintenance cadence by
 -- haf_fyp_app.refresh_embedding_coverage() (db/embedding_coverage_maintenance.sql).
--- Precomputed rather than queried inline because the candidate scan is a
--- multi-second sequential scan (post_candidates has only PARTIAL created_at
--- indexes), so the endpoint reads this tiny table instead.
+-- Precomputed rather than queried inline, so the endpoint reads this tiny table
+-- whatever the candidate count costs.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.embedding_coverage_daily (
@@ -606,8 +714,8 @@ GRANT UPDATE ON haf_fyp_app.algorithm_versions TO haf_fyp_user;
 -- blanket grant above, so PostgREST still reads the caches to serve feeds.
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.feed_cache           FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.global_feed_cache    FROM haf_fyp_user;
-REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.user_profile_vectors FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.post_bridge_cache    FROM haf_fyp_user;
+REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.user_profile_vectors FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.feed_metrics_daily   FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.embedding_coverage_daily FROM haf_fyp_user;
 REVOKE UPDATE               ON haf_fyp_app.feed_events_rollup_state FROM haf_fyp_user;
@@ -617,3 +725,24 @@ REVOKE DELETE               ON haf_fyp_app.feed_events            FROM haf_fyp_u
 -- than merely left ungranted, so an older deployment that ever received a blanket
 -- grant is narrowed too and the un-opt-in endpoint cannot quietly acquire them.
 REVOKE UPDATE, DELETE       ON haf_fyp_app.active_users           FROM haf_fyp_user;
+
+-- ---------------------------------------------------------------------------
+-- Schema version: what the ranker checks before it starts (#97)
+--
+-- The SQL and the ranker are separate images, installed separately, and a ranker
+-- whose queries this schema cannot answer fails on every cycle while the global feed
+-- goes on looking healthy. haf_fyp/schema_version.py refuses to start against a
+-- version below the one it was written for, naming both. Raise it with any change the
+-- ranker cannot run without, and raise the ranker's REQUIRED_SCHEMA_VERSION with it.
+--   1  (implicit: no function) the replayed history
+--   2  history copied from hivemind, keyed by hivemind ids (#97)
+--   3  post_bridge_cache keyed by hivemind ids, which the feed writers render into
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION haf_fyp_app.schema_version()
+RETURNS int
+LANGUAGE sql
+IMMUTABLE
+AS $$
+    SELECT 3;
+$$;

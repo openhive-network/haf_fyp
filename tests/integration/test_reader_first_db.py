@@ -710,16 +710,14 @@ def shipped_feed(other):
             CREATE TABLE {s}.global_feed_cache (
                 post_id bigint, rank int, final_score float, score_recency float,
                 score_engagement float, score_credibility float, algorithm_version text);
-            CREATE TABLE {s}.post_candidates (post_id bigint, hive_post_id int);
-            CREATE TABLE {s}.post_bridge_cache (post_id bigint, bridge jsonb);
             CREATE TABLE {s}.hive_accounts (id int, name text);
+            -- The feed renders each post from its hivemind id (#97): a stand-in render.
+            CREATE TABLE {s}.post_bridge_cache (post_id int, bridge jsonb);
             CREATE FUNCTION {s}.get_bridge_post(int, int, int) RETURNS jsonb
-                LANGUAGE sql STABLE AS 'SELECT NULL::jsonb';
+                LANGUAGE sql STABLE AS $f$SELECT '{{"body": "x"}}'::jsonb$f$;
             INSERT INTO {s}.feed_cache (username, post_id, rank, final_score)
-                 VALUES ('alice', 1, 1, 1.0);
+                 VALUES ('alice', 101, 1, 1.0);
             INSERT INTO {s}.active_users (username) VALUES ('alice');
-            INSERT INTO {s}.post_candidates VALUES (1, 101);
-            INSERT INTO {s}.post_bridge_cache VALUES (1, '{{"body": "x"}}');
             """
         )
         cur.execute(_shipped_feed_function())

@@ -117,7 +117,7 @@ def conn():
             c.close()
 
 
-def load(cur, path):
+def load(cur, path) -> None:
     cur.execute(open(path).read())
 
 
@@ -142,7 +142,7 @@ def is_the_placeholder(cur) -> bool:
 
 # --- a re-install -------------------------------------------------------------------
 
-def test_a_reinstall_leaves_the_working_dispatcher_alone(conn):
+def test_a_reinstall_leaves_the_working_dispatcher_alone(conn) -> None:
     """The #83 case. The file is loaded over a dispatcher that works, twice, as two
     re-installs would; its body is unchanged afterwards, and a range handed to it in
     between is processed."""
@@ -162,7 +162,7 @@ def test_a_reinstall_leaves_the_working_dispatcher_alone(conn):
             "a range handed over during a re-install was not processed")
 
 
-def test_the_processor_keeps_working_through_a_reinstall(conn):
+def test_the_processor_keeps_working_through_a_reinstall(conn) -> None:
     """The same, through the entry point HAF's driver calls: the range is dispatched and
     the app's own clock moves to its last block."""
     with conn.cursor() as cur:
@@ -180,7 +180,7 @@ def test_the_processor_keeps_working_through_a_reinstall(conn):
 
 # --- no dispatcher yet --------------------------------------------------------------
 
-def test_a_first_install_gets_a_placeholder_that_cannot_be_run_quietly(conn):
+def test_a_first_install_gets_a_placeholder_that_cannot_be_run_quietly(conn) -> None:
     """No dispatcher yet: the file leaves exactly one function, an ordinary one, and
     running it raises and says what is missing. A no-op here is what turned a short
     window into lost blocks."""
@@ -197,7 +197,7 @@ def test_a_first_install_gets_a_placeholder_that_cannot_be_run_quietly(conn):
         assert "1 to 10000" in message, message
 
 
-def test_the_placeholder_stalls_the_processor_instead_of_skipping(conn):
+def test_the_placeholder_stalls_the_processor_instead_of_skipping(conn) -> None:
     """Through the entry point: the range fails, and the app's clock does not move. The
     old no-op returned, and the clock moved to the end of a range nobody had processed."""
     with conn.cursor() as cur:
@@ -213,7 +213,7 @@ def test_the_placeholder_stalls_the_processor_instead_of_skipping(conn):
         assert cur.fetchall() == clock
 
 
-def test_loading_the_file_again_keeps_the_one_placeholder(conn):
+def test_loading_the_file_again_keeps_the_one_placeholder(conn) -> None:
     with conn.cursor() as cur:
         load(cur, APP_SQL)
         first = snapshot(cur)
@@ -221,7 +221,7 @@ def test_loading_the_file_again_keeps_the_one_placeholder(conn):
         assert snapshot(cur) == first and len(first) == 1
 
 
-def test_a_namesake_does_not_stand_in_for_the_dispatcher(conn):
+def test_a_namesake_does_not_stand_in_for_the_dispatcher(conn) -> None:
     """A function of the same name in another schema, and one in this schema with other
     arguments, are not the dispatcher main() calls. The (int, int) one is still created."""
     with conn.cursor() as cur:
@@ -239,7 +239,7 @@ def test_a_namesake_does_not_stand_in_for_the_dispatcher(conn):
 
 # --- a node the old file left half-installed -----------------------------------------
 
-def test_the_old_no_op_is_not_mistaken_for_a_dispatcher(conn):
+def test_the_old_no_op_is_not_mistaken_for_a_dispatcher(conn) -> None:
     """An install under the old file that died before process_block_range.sql left the
     no-op in the database. It is not a dispatcher: it is replaced by the placeholder, so
     such a node stalls with a reason and stops skipping."""
@@ -256,7 +256,7 @@ def test_the_old_no_op_is_not_mistaken_for_a_dispatcher(conn):
 
 # --- the rest of the install ---------------------------------------------------------
 
-def test_the_shipped_dispatcher_takes_the_placeholders_place(conn):
+def test_the_shipped_dispatcher_takes_the_placeholders_place(conn) -> None:
     """db/process_block_range.sql must still be able to replace what this file left, and
     a later re-install must not bring the placeholder back."""
     with conn.cursor() as cur:
@@ -269,9 +269,11 @@ def test_the_shipped_dispatcher_takes_the_placeholders_place(conn):
         body = installed[0][0]
         assert "install placeholder" not in body
         # Read, not run: the processors it calls are not loaded in this lane.
-        for processor in ("process_posts", "process_engagement", "process_communities",
-                          "process_interactions"):
-            assert f"haf_fyp_app.{processor}(_first_block, _last_block)" in body, processor
+        for call in ("stage_operations(_apply_from, _last_block)",
+                     "process_communities(_first_block, _last_block, _apply_operations)",
+                     "follow_hivemind(_first_block, _last_block)",
+                     "process_payout_windows(_last_block)"):
+            assert f"haf_fyp_app.{call}" in body, call
 
         load(cur, APP_SQL)
         assert snapshot(cur) == installed

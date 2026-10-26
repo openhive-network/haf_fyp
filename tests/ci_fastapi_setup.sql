@@ -51,12 +51,13 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_cache (
 
 -- #10: both eviction paths test "has this account ever acted on-chain?" against
 -- user_interactions rather than trusting active_users.last_interaction_at, which is
--- only a proxy and goes stale when an evicted voter re-opts-in. Mirrors only the
--- columns those predicates touch.
+-- only a proxy and goes stale when an evicted voter re-opts-in. Keyed by hivemind's
+-- account id since #97; the tests that need it make a hivemind_app.hive_accounts.
+-- Mirrors only the columns those predicates touch.
 CREATE TABLE IF NOT EXISTS haf_fyp_app.user_interactions (
-    username VARCHAR(16) NOT NULL,
-    post_id BIGINT NOT NULL,
-    PRIMARY KEY (username, post_id)
+    account_id INT NOT NULL,
+    post_id INT NOT NULL,
+    PRIMARY KEY (account_id, post_id)
 );
 
 -- #10: an explicit un-opt-in also drops the derived profile vector (unlike dormancy
@@ -142,9 +143,9 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.embedding_coverage_daily (
 -- pgvector, live in db/create_tables.sql / the HiveSense app and are not loaded
 -- in this pgvector-less lane).
 CREATE TABLE IF NOT EXISTS haf_fyp_app.post_candidates (
-    post_id BIGINT PRIMARY KEY,
-    created_at TIMESTAMP NOT NULL,
-    hive_post_id INT
+    post_id INT PRIMARY KEY,
+    community_id INT,
+    created_at TIMESTAMP NOT NULL
 );
 
 -- Needed by the servability check GET /metrics runs (#43). Without it that query
@@ -202,3 +203,21 @@ GRANT USAGE ON SCHEMA hafd, hive TO haf_fyp_owner;
 GRANT SELECT ON hafd.contexts, hafd.blocks TO haf_fyp_owner;
 GRANT SELECT ON hive.ci_instance_state TO haf_fyp_owner;
 GRANT EXECUTE ON FUNCTION hive.is_instance_ready() TO haf_fyp_owner;
+
+-- #97: where the copy of hivemind's history stands, as a fresh install seeds it.
+-- haf_fyp_app.sync_status() reads it through history_status(), both SECURITY DEFINER
+-- as haf_fyp_owner, so the definer is given what it reads on a node as owner.
+CREATE TABLE IF NOT EXISTS haf_fyp_app.hivemind_follow (
+    only_row BOOLEAN PRIMARY KEY DEFAULT TRUE,
+    snapshot_communities BOOLEAN NOT NULL,
+    hivemind_live_at TIMESTAMPTZ,
+    backfill_started_at TIMESTAMPTZ,
+    backfilled_at TIMESTAMPTZ,
+    backfill_block INT,
+    followed_through_block INT,
+    CONSTRAINT hivemind_follow_singleton CHECK (only_row)
+);
+INSERT INTO haf_fyp_app.hivemind_follow (snapshot_communities) VALUES (TRUE)
+ON CONFLICT DO NOTHING;
+GRANT USAGE ON SCHEMA haf_fyp_app TO haf_fyp_owner;
+GRANT SELECT ON haf_fyp_app.hivemind_follow TO haf_fyp_owner;

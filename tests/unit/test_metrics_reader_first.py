@@ -389,6 +389,7 @@ def _route(monkeypatch: MonkeyPatch, reader_first):
     monkeypatch.setattr(api, "fetch_feed_servability", _stub("servability", None))
     monkeypatch.setattr(api, "fetch_credibility_sources", _stub("credibility", None))
     monkeypatch.setattr(api, "fetch_reader_first", _stub("reader_first", reader_first))
+    monkeypatch.setattr(api, "fetch_history", _stub("history", None))
     monkeypatch.setattr(api, "fetch_feed_cache_shape", lambda conn: None)
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {"embedding_coverage": []})
     monkeypatch.setattr(api, "build_credibility_sources_report", lambda probe: {"c": 1})
@@ -410,14 +411,15 @@ def test_the_route_reports_the_section_built_from_its_own_probe(monkeypatch: Mon
     assert report["credibility_sources"] == {"c": 1} and report["ranking_sources"] == {"r": 1}
 
 
-def test_the_route_reads_reader_first_last_and_on_the_same_connection(monkeypatch: MonkeyPatch) -> None:
-    # Last: an earlier probe that fails must degrade its own section, not be pre-empted
-    # by a newcomer. Same connection: a second borrow doubles what a polled route takes
-    # from a pool of five.
+def test_the_route_reads_reader_first_after_the_others_and_on_the_same_connection(monkeypatch: MonkeyPatch) -> None:
+    # After the probes before it: an earlier probe that fails must degrade its own
+    # section, not be pre-empted by a newcomer. The history read (#97) is newer still,
+    # and goes after it. Same connection: a second borrow doubles what a polled route
+    # takes from a pool of five.
     _report, order, conns = _route(monkeypatch, None)
 
     names = [name for name, _c in order]
-    assert names == ["coverage", "ranking", "servability", "credibility", "reader_first"]
+    assert names == ["coverage", "ranking", "servability", "credibility", "reader_first", "history"]
     assert len(conns) == 1 and all(c is conns[0] for _n, c in order)
 
 
@@ -425,6 +427,7 @@ def test_a_reader_first_read_that_fails_does_not_take_the_route_down(monkeypatch
     report, _order, _conns = _route(monkeypatch, None)
 
     assert report["reader_first"]["state"] == "unknown"
+    assert report["history"]["state"] == "unknown"
     assert "embedding_coverage" in report
 
 
@@ -448,11 +451,14 @@ def test_the_route_reads_reader_first_while_it_still_holds_the_connection(monkey
     monkeypatch.setattr(api, "fetch_feed_servability", lambda conn: None)
     monkeypatch.setattr(api, "fetch_credibility_sources", lambda conn: None)
     monkeypatch.setattr(api, "fetch_reader_first", lambda conn: seen.append(conn in held))
+    monkeypatch.setattr(api, "fetch_history", lambda conn: seen.append(conn in held))
     monkeypatch.setattr(api, "fetch_feed_cache_shape", lambda conn: None)
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
     monkeypatch.setattr(api, "build_credibility_sources_report", lambda probe: {})
     monkeypatch.setattr(api, "build_ranking_sources_report", lambda probe, serv: {})
 
+    monkeypatch.setattr(api, "build_history_report", lambda probe: {})
+
     api.metrics(MagicMock())
 
-    assert seen == [True]  # after the `with`, the connection is back in the pool
+    assert seen == [True, True]  # after the `with`, the connection is back in the pool

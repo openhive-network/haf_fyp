@@ -142,16 +142,15 @@ def _source(relation: str, state: str) -> dict:
     }
 # The relations the RANKING signals read, as opposed to the credibility ones.
 #
-#   hivemind_app.hive_posts     -- the relation resolve_hivemind_post_ids writes
-#       post_candidates.hive_post_id from, and the one both feed endpoints filter
-#       on. A HARD dependency, but a quiet one: the resolver is exception-guarded
-#       so a missing schema cannot stall block processing, and nothing raises.
-#   hive_accounts, hive_permlink_data -- the other two relations the resolver
-#       joins. Lose SELECT on either and resolution stops just as dead. #36
-#       shipped with them invisible, so an operator saw "hivemind: readable" while
-#       nothing resolved. get_personalized_feed also reads hive_accounts
-#       UNGUARDED, so losing that one makes every authenticated feed request RAISE
-#       rather than return [].
+#   hivemind_app.hive_posts     -- every post haf_fyp ranks is a hivemind post (#97):
+#       block processing copies the window's root posts from it, the ranker reads
+#       their authors through it, and both feed endpoints render each post from it
+#       (get_bridge_post). A HARD dependency.
+#   hive_accounts, hive_votes, hive_reblogs -- the other relations the copy of
+#       hivemind's history reads (db/process_interactions.sql). Lose SELECT on one and
+#       the copy stops: block processing raises on it. get_personalized_feed also
+#       reads hive_accounts UNGUARDED, so losing that one makes every authenticated
+#       feed request RAISE rather than return [].
 #   hivesense_app.posts_vectors -- optional. Without it compute_scores drops the
 #       relevance weight and renormalises the other three, so every user is still
 #       ranked and still gets the community boost -- just not on what they read.
@@ -160,37 +159,34 @@ def _source(relation: str, state: str) -> dict:
 #       community raised inside _rank_user and got no feed_cache row at all.)
 _HIVEMIND_RELATION = ("hivemind_app", "hive_posts")
 _HIVESENSE_RELATION = ("hivesense_app", "posts_vectors")
-_RESOLVER_RELATIONS = (
+_HISTORY_RELATIONS = (
     ("hivemind_app", "hive_accounts"),
-    ("hivemind_app", "hive_permlink_data"),
+    ("hivemind_app", "hive_votes"),
+    ("hivemind_app", "hive_reblogs"),
 )
-_RANKING_SOURCES = (_HIVEMIND_RELATION, _HIVESENSE_RELATION) + _RESOLVER_RELATIONS
+_RANKING_SOURCES = (_HIVEMIND_RELATION, _HIVESENSE_RELATION) + _HISTORY_RELATIONS
 _HIVEMIND_KEY = ".".join(_HIVEMIND_RELATION)
 _HIVESENSE_KEY = ".".join(_HIVESENSE_RELATION)
 
-# Can the global feed serve a post right now? It catches one thing no privilege
-# probe can: the cache holds rows and not one of them resolves.
+# Does the global feed hold a post that is still in the window? It catches one thing
+# no privilege probe can: the cache holds rows and none of them is a post haf_fyp
+# still has.
 #
-# It is NOT a proof of health, and an earlier revision of this module claimed it
-# was, twice. Three reasons, all verified in the endpoint SQL:
+# It is NOT a proof of health. Three reasons, all verified in the endpoint SQL:
 #   * get_personalized_feed does NOT fall back to the global feed for a user who
 #     already has feed_cache rows -- that branch ends in its own RETURN. So a user
-#     whose cached rows are all unresolvable gets [] while this reads servable.
-#   * a post can resolve and still be dropped: get_bridge_post returns NULL for a
-#     post deleted in hivemind and the endpoint filters it out.
-#   * global_feed_cache is the recency-weighted top 200, so on a node whose older
-#     posts are unresolvable it stays servable while per-user feeds are empty.
-#     Detecting THAT needs a precomputed rollup over post_candidates, not a
-#     request-time probe -- see #43, which stays open for it.
-# Cost: 0.121 ms serving, 0.876 ms when nothing is servable (200 PK probes through
-# a nested loop). Bounded by write_global_feed_cache's 200-row cap.
+#     whose cached rows all fail to render gets [] while this reads servable.
+#   * a post can be in the window and still be dropped: get_bridge_post returns NULL
+#     for a post deleted in hivemind and the endpoint filters it out.
+#   * global_feed_cache is the recency-weighted top 200, so it can stay servable
+#     while per-user feeds are empty -- see #43, which stays open for that.
+# Bounded by write_global_feed_cache's 200-row cap: 200 PK probes at most.
 _SERVABILITY_SQL = """
     SELECT EXISTS (SELECT 1 FROM haf_fyp_app.global_feed_cache) AS cached,
            EXISTS (
                SELECT 1
                  FROM haf_fyp_app.global_feed_cache g
                  JOIN haf_fyp_app.post_candidates p ON p.post_id = g.post_id
-                WHERE p.hive_post_id IS NOT NULL
            ) AS servable
 """
 
@@ -284,20 +280,18 @@ def build_ranking_sources_report(
     and #43 tried to make it authoritative; three review rounds showed it cannot be,
     in BOTH directions, so it is gone rather than left to mislead:
 
-      * it read true when the node was serving -- both endpoints serve pre-rendered
-        JSON from post_bridge_cache, so revoking SELECT on hive_posts on a warm node
-        stops resolution while every request keeps succeeding. A privilege-derived
-        "every feed returns []" was simply wrong there.
+      * it read true when the node was serving -- the endpoints then served
+        pre-rendered JSON, so a privilege-derived "every feed returns []" was simply
+        wrong there.
       * it read false when the node was not serving -- the global cache is the
-        recency-weighted top 200, so the backfill case this section exists to catch
-        leaves it green while per-user feeds are empty.
+        recency-weighted top 200, so it can stay green while per-user feeds are empty.
 
     So the payload now reports two INDEPENDENT observations and lets the operator
     (and `degraded`) combine them, instead of collapsing them into one boolean that
     is wrong at both ends:
 
-      global_feed        -- whether the global feed cache holds anything servable,
-          and whether it holds anything at all.
+      global_feed        -- whether the global feed cache holds a post still in the
+          window, and whether it holds anything at all.
       sources            -- per-relation privilege states, the diagnosis of why.
 
     A probe that could not run reports null for its own section and sets degraded.
@@ -306,32 +300,32 @@ def build_ranking_sources_report(
     sources = {
         "hivemind": (probe or {}).get(_HIVEMIND_KEY, STATE_UNKNOWN),
         "hivesense": (probe or {}).get(_HIVESENSE_KEY, STATE_UNKNOWN),
-        "resolver_inputs": {
+        "history_inputs": {
             ".".join(r): (probe or {}).get(".".join(r), STATE_UNKNOWN)
-            for r in _RESOLVER_RELATIONS
+            for r in _HISTORY_RELATIONS
         },
     }
     hivemind, hivesense = sources["hivemind"], sources["hivesense"]
 
-    # Split by what they explain: a resolution fault is caused by the hivemind
-    # relations the resolver joins, and hivesense has nothing to do with it. Naming
-    # hivesense in a resolution remedy sent the operator to the wrong grant.
+    # Split by what they explain: a fault in the copy of hivemind's history is caused
+    # by the hivemind relations it reads, and hivesense has nothing to do with it.
+    # Naming hivesense in that remedy sent the operator to the wrong grant.
     # NOT readable, rather than == UNREADABLE. Equality tests fail OPEN on the one
     # value that must not: `unknown` is what a probe reports when it could not
     # answer, and an earlier revision of this chain reported state ranking_full and
     # degraded false for it -- contradicting this module's own rule that "I could
     # not check" never reads as fine. ABSENT belongs here too: a renamed or dropped
-    # resolver relation stops resolution exactly as dead as a revoked grant, and
+    # relation stops the copy exactly as dead as a revoked grant, and
     # get_personalized_feed reads hive_accounts UNGUARDED, so authenticated requests
     # RAISE. The remedy differs (see the detail below), the severity does not.
-    broken_resolution = [
+    broken_history = [
         name
         for name, state in [(_HIVEMIND_KEY, hivemind)]
-        + list(sources["resolver_inputs"].items())
+        + list(sources["history_inputs"].items())
         if not _readable(state)
     ]
-    # Resolver inputs only -- hivemind itself has its own earlier branches.
-    broken_resolver_inputs = [n for n in broken_resolution if n != _HIVEMIND_KEY]
+    # History inputs only -- hivemind itself has its own earlier branches.
+    broken_history_inputs = [n for n in broken_history if n != _HIVEMIND_KEY]
 
     global_section = None if servability is None else {
         "cached": servability["cached"],
@@ -346,7 +340,7 @@ def build_ranking_sources_report(
     # rather than a fault, so it is excluded here while still costing
     # personalization below.
     degraded = bool(
-        broken_resolution
+        broken_history
         or hivesense == STATE_UNREADABLE
         or cache_unservable
         or probe is None
@@ -368,7 +362,8 @@ def build_ranking_sources_report(
         state = RANKING_STATE_NO_FEED
         detail = (
             f"{_HIVEMIND_KEY} is absent -- hivemind is a required dependency; "
-            "install it, then run CALL haf_fyp_app.run_hive_post_id_backfill()"
+            "install it and run scripts/grant_cross_schema.sh: block processing "
+            "copies the history window from it once it is live"
         )
     elif not _readable(hivemind):
         state = RANKING_STATE_NO_FEED
@@ -381,16 +376,12 @@ def build_ranking_sources_report(
             else "the probe could not determine its state -- check the database"
         )
         outcome = (
-            "resolution has stopped"
+            "the history copy has stopped and feeds cannot be rendered"
             if hivemind == STATE_UNREADABLE
-            else "resolution is presumed stopped"
+            else "the history copy and feed rendering are presumed stopped"
         )
-        detail = (
-            f"{_HIVEMIND_KEY} is {hivemind} -- {outcome}; {remedy}. "
-            "Already-rendered posts may still serve from post_bridge_cache, so this "
-            "is not necessarily a visible outage yet"
-        )
-    elif broken_resolver_inputs:
+        detail = f"{_HIVEMIND_KEY} is {hivemind} -- {outcome}; {remedy}"
+    elif broken_history_inputs:
         # Without this branch the payload reported state ranking_full with detail
         # "global feed servable" WHILE degraded was true: health asserted in two
         # fields and a fault in a third. get_personalized_feed reads hive_accounts
@@ -399,31 +390,32 @@ def build_ranking_sources_report(
         state = RANKING_STATE_NO_FEED
         # The remedy differs by WHY it is not readable, so say which.
         states = ", ".join(
-            f"{n} is {sources['resolver_inputs'][n]}" for n in broken_resolver_inputs
+            f"{n} is {sources['history_inputs'][n]}" for n in broken_history_inputs
         )
         remedy = (
             "re-run scripts/grant_cross_schema.sh"
             if any(
-                sources["resolver_inputs"][n] == STATE_UNREADABLE
-                for n in broken_resolver_inputs
+                sources["history_inputs"][n] == STATE_UNREADABLE
+                for n in broken_history_inputs
             )
             else "the relation is missing -- check the hivemind install/version"
         )
         detail = (
-            f"{states} -- resolution has stopped; authenticated feed requests that "
-            f"read hive_accounts raise now. {remedy}"
+            f"{states} -- the history copy has stopped; authenticated feed requests "
+            f"that read hive_accounts raise now. {remedy}"
         )
     elif cache_unservable:
         state = RANKING_STATE_NO_FEED
         detail = (
-            "global_feed_cache has rows but none resolve to a hivemind post -- the "
-            "global feed returns []"
+            "global_feed_cache has rows but none is a post still in the history "
+            "window -- the global feed is stale"
         )
     elif no_cycle_yet:
         state = RANKING_STATE_NO_FEED
         detail = (
-            "global_feed_cache is empty -- the ranker has not completed a cycle. "
-            "Expected on a node that has just been installed"
+            "global_feed_cache is empty -- the ranker has not completed a cycle, or "
+            "the history copy is still waiting for hivemind (see history). Expected "
+            "on a node that has just been installed"
         )
     elif not _readable(hivesense):
         state = RANKING_STATE_NO_PERSONALIZATION
@@ -756,6 +748,121 @@ def build_reader_first_report(probe: dict | None) -> dict:
         "newest_feed_seconds": probe["newest_feed_seconds"],
         "notification_queue_usage": probe["notification_queue_usage"],
     }
+
+
+# ---------------------------------------------------------------------------
+# history (#97): the copy of hivemind's votes, reblogs and posts
+# ---------------------------------------------------------------------------
+
+HISTORY_WAITING = "waiting_for_hivemind"
+HISTORY_FOLLOWING = "following_hivemind"
+HISTORY_UNKNOWN = "unknown"
+
+_HISTORY_SQL = """
+SELECT state, history_days, hivemind_block, hivemind_behind_head, followed_through_block,
+       hivemind_live_at, backfill_started_at, backfilled_at
+  FROM haf_fyp_app.history_status()
+"""
+
+_HISTORY_SAVEPOINT = "haf_fyp_metrics_history"
+
+
+def fetch_history(conn) -> dict | None:
+    """
+    Read where the copy of hivemind's history stands, or None if it could not be read.
+
+    In a SAVEPOINT of its own, as fetch_reader_first: it can fail without leaving the
+    route's transaction aborted for anything read after it.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SAVEPOINT {_HISTORY_SAVEPOINT}")
+            try:
+                cur.execute(_HISTORY_SQL)
+                row = cur.fetchone()
+            except Exception:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {_HISTORY_SAVEPOINT}")
+                raise
+            cur.execute(f"RELEASE SAVEPOINT {_HISTORY_SAVEPOINT}")
+        if row is None:
+            return None
+        keys = ("state", "history_days", "hivemind_block", "hivemind_behind_head",
+                "followed_through_block", "hivemind_live_at", "backfill_started_at",
+                "backfilled_at")
+        return dict(zip(keys, row))
+    except Exception as exc:
+        # As the sibling probes: no rollback of the connection (the pool does that),
+        # and no exc_info, because monitors poll this route.
+        log.warning("history: state could not be read (%s) -- reporting unknown", exc)
+        return None
+
+
+def _iso(value) -> str | None:
+    return None if value is None else value.isoformat()
+
+
+def _between(start, end) -> float | None:
+    if start is None or end is None:
+        return None
+    return round((end - start).total_seconds(), 3)
+
+
+def build_history_report(probe: dict | None) -> dict:
+    """
+    The history section of GET /metrics.
+
+    state -- waiting_for_hivemind until block processing has backfilled the window from
+        hivemind, following_hivemind after. While waiting there is nothing to rank: the
+        endpoints serve whatever global feed is cached.
+    backfill_seconds -- how long the backfill took, inside its batch.
+    live_to_backfilled_seconds -- from the first batch that found hivemind live to the
+        backfill's end: how long a fresh install takes from hivemind being there to
+        having a window to rank. The ranker's next cycle (CYCLE_SECONDS at most) turns
+        it into feeds.
+    behind_hivemind_blocks -- how far the copy trails hivemind. Block processing trails
+        hivemind by design (the dependency gate), so a few batches is normal; growing
+        without end means the copy stopped (hivemind's indexes are gone, or a grant).
+
+    Informational: it never sets a `degraded`. Waiting is what every fresh install does,
+    for as long as hivemind's own sync takes.
+    """
+    if probe is None:
+        return {
+            "state": HISTORY_UNKNOWN,
+            "detail": "the history state could not be read; see the API log",
+        }
+    hivemind_block, through = probe["hivemind_block"], probe["followed_through_block"]
+    report = {
+        "state": probe["state"],
+        "history_days": probe["history_days"],
+        "hivemind_block": hivemind_block,
+        "hivemind_behind_head": probe["hivemind_behind_head"],
+        "followed_through_block": through,
+        "behind_hivemind_blocks": (
+            None if hivemind_block is None or through is None else max(0, hivemind_block - through)
+        ),
+        "hivemind_live_at": _iso(probe["hivemind_live_at"]),
+        "backfilled_at": _iso(probe["backfilled_at"]),
+        "backfill_seconds": _between(probe["backfill_started_at"], probe["backfilled_at"]),
+        "live_to_backfilled_seconds": _between(probe["hivemind_live_at"], probe["backfilled_at"]),
+    }
+    if probe["state"] == HISTORY_WAITING:
+        report["detail"] = (
+            "waiting for hivemind: block processing copies the history window once "
+            "hivemind is close enough to head with its indexes in place "
+            "(FYP_HIVEMIND_MAX_LAG_BLOCKS); until then there is nothing to rank"
+            if hivemind_block is not None
+            else "waiting for hivemind: it is not installed here, or haf_fyp cannot "
+            "read it (scripts/grant_cross_schema.sh)"
+        )
+    elif probe["state"] == HISTORY_FOLLOWING:
+        report["detail"] = "the window is copied from hivemind and followed block by block"
+    else:
+        report["detail"] = (
+            "the installed SQL has no history state: it predates the copy from hivemind. "
+            "Re-run the install"
+        )
+    return report
 
 
 # ---------------------------------------------------------------------------------------

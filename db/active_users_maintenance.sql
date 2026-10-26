@@ -46,8 +46,8 @@
 -- eviction is fully self-healing.
 --
 -- DELIBERATELY NOT EVICTED: accounts with on-chain history but no interests
--- ("drive-by voters" — process_interactions enrols every account that votes on a
--- tracked post, replaying from block 0). An earlier revision reaped them under a
+-- ("drive-by voters" — copy_hivemind_interactions enrols every account that voted on
+-- or reblogged a root post within the window). An earlier revision reaped them under a
 -- rotation-capacity threshold. That was an extension beyond what #10 asked for, it
 -- rested on an unmeasured assumption about which population actually dilutes the
 -- rotation, and it meant deleting cached feeds for accounts that never used the app.
@@ -66,6 +66,8 @@
 --     proxy and goes stale reachably: an account re-opting-in after an eviction gets
 --     active_users(username) only, so the stamp is NULL again while real interaction
 --     history still exists. build_user_profile_vector reads the table, not the stamp.
+--     The table is keyed by hivemind's account id (#97), so the test resolves the name
+--     through hivemind_app.hive_accounts, as the ranker's own read does.
 --   * last_scored_at IS NULL — freshly added and still awaiting its first rank. Also
 --     the opt-in race guard: the API inserts that row from another process.
 --
@@ -108,7 +110,8 @@ BEGIN
               SELECT 1 FROM haf_fyp_app.user_interests ui WHERE ui.username = au.username
           )
           AND NOT EXISTS (
-              SELECT 1 FROM haf_fyp_app.user_interactions x WHERE x.username = au.username
+              SELECT 1 FROM haf_fyp_app.user_interactions x
+              WHERE x.account_id = (SELECT ha.id FROM hivemind_app.hive_accounts ha WHERE ha.name = au.username)
           )
         -- username tie-breaks so a bounded pass is deterministic; without it two
         -- rows with equal last_scored_at can swap between passes.
@@ -138,7 +141,8 @@ BEGIN
               SELECT 1 FROM haf_fyp_app.user_interests ui WHERE ui.username = au.username
           )
           AND NOT EXISTS (
-              SELECT 1 FROM haf_fyp_app.user_interactions x WHERE x.username = au.username
+              SELECT 1 FROM haf_fyp_app.user_interactions x
+              WHERE x.account_id = (SELECT ha.id FROM hivemind_app.hive_accounts ha WHERE ha.name = au.username)
           )
         RETURNING au.username
     )
@@ -215,7 +219,8 @@ BEGIN
               SELECT 1 FROM haf_fyp_app.user_interests ui WHERE ui.username = au.username
           )
           AND NOT EXISTS (
-              SELECT 1 FROM haf_fyp_app.user_interactions x WHERE x.username = au.username
+              SELECT 1 FROM haf_fyp_app.user_interactions x
+              WHERE x.account_id = (SELECT ha.id FROM hivemind_app.hive_accounts ha WHERE ha.name = au.username)
           )
         FOR UPDATE
     ) d;
@@ -242,7 +247,8 @@ BEGIN
               SELECT 1 FROM haf_fyp_app.user_interests ui WHERE ui.username = au.username
           )
           AND NOT EXISTS (
-              SELECT 1 FROM haf_fyp_app.user_interactions x WHERE x.username = au.username
+              SELECT 1 FROM haf_fyp_app.user_interactions x
+              WHERE x.account_id = (SELECT ha.id FROM hivemind_app.hive_accounts ha WHERE ha.name = au.username)
           )
         RETURNING au.username
     )
@@ -276,7 +282,7 @@ $$;
 --   finds the active_users row already present, so it inserts nothing. Before it
 --   commits, a maintenance pass — which cannot see the uncommitted interests —
 --   evicts that row as unproductive. The POST commits. The account now has
---   interests and NO rotation row, and nothing repairs it: process_interactions
+--   interests and NO rotation row, and nothing repairs it: block processing
 --   fires only on-chain, the endpoint only on a NEW opt-in, and the scheduled
 --   cycle reads active_users, so it cannot see the account at all.
 --

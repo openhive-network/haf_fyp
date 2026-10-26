@@ -524,12 +524,22 @@ DECLARE
                       ],
                       "format": "date-time",
                       "description": "UTC timestamp of that block; null if it has no hafd.blocks row"
+                    },
+                    "history": {
+                      "type": "string",
+                      "enum": [
+                        "waiting_for_hivemind",
+                        "following_hivemind",
+                        "unknown"
+                      ],
+                      "description": "Whether haf_fyp has copied its history window from hivemind yet: waiting_for_hivemind until the backfill has run, then following_hivemind"
                     }
                   }
                 },
                 "example": {
                   "last_block_num": 109603308,
-                  "last_block_time": "2026-09-03T22:46:54"
+                  "last_block_time": "2026-09-03T22:46:54",
+                  "history": "following_hivemind"
                 }
               }
             }
@@ -1273,9 +1283,17 @@ $$;
                   format: date-time
                   description: >-
                     UTC timestamp of that block; null if it has no hafd.blocks row
+                history:
+                  type: string
+                  enum: [waiting_for_hivemind, following_hivemind, unknown]
+                  description: >-
+                    Whether haf_fyp has copied its history window from hivemind yet:
+                    waiting_for_hivemind until the backfill has run, then
+                    following_hivemind
             example:
               last_block_num: 109603308
               last_block_time: '2026-09-03T22:46:54'
+              history: following_hivemind
       '500':
         description: >-
           Unavailable, and the two cases are distinguished by message rather than by
@@ -1364,10 +1382,11 @@ BEGIN
             USING ERRCODE = '55000';
     END IF;
 
-    -- Two keys only. The CONTRACT is the key names and the timestamp format --
+    -- The CONTRACT is the two ecosystem keys' names and the timestamp format --
     -- literal 'T', 19 characters, no fractional seconds, no timezone suffix --
     -- because consumers parse it with a fixed format, so drift there is a silent
-    -- breaking change.
+    -- breaking change. history (#97) is haf_fyp's own, added after them: whether the
+    -- window has been copied from hivemind yet.
     --
     -- Byte-identical to haf_stats' /sync-status, which builds it the same way.
     -- NOT byte-identical to this app's own FastAPI twin: json_build_object (json,
@@ -1377,7 +1396,8 @@ BEGIN
     -- hafbe, hafah and balance_tracker serve no /sync-status at all.
     RETURN json_build_object(
         'last_block_num', _s.last_block_num,
-        'last_block_time', to_char(_s.last_block_time, 'YYYY-MM-DD"T"HH24:MI:SS')
+        'last_block_time', to_char(_s.last_block_time, 'YYYY-MM-DD"T"HH24:MI:SS'),
+        'history', _s.history
     );
 END
 $$;
@@ -1492,8 +1512,8 @@ $$;
 -- Returns NULL when the post no longer exists in Hivemind (e.g. it was deleted
 -- after the ranker cached it) so the caller can filter it out of the feed.
 --
--- _post_id here is the Hivemind hive_posts.id (resolved by the feed endpoints
--- from the cached (author, permlink)), NOT the FYP post_candidates.post_id.
+-- _post_id is the Hivemind hive_posts.id, which is also what feed_cache,
+-- global_feed_cache and post_candidates key posts by (#97).
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.get_bridge_post(
@@ -1533,6 +1553,29 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION haf_fyp_app.get_bridge_post(int, int, int) TO haf_fyp_user;
+
+-- A post's author, permlink and title, which haf_fyp does not copy (#97): read from
+-- hivemind when an endpoint names them. No row for a post hivemind does not have.
+-- plpgsql so that it binds to hivemind's tables when called, not when created: a SQL
+-- function's body is checked at CREATE, and the endpoints load on databases without
+-- hivemind (the CI lanes, a node that installs haf_fyp first).
+CREATE OR REPLACE FUNCTION haf_fyp_app.hivemind_post_identity(_post_id int)
+RETURNS TABLE (author varchar(16), permlink varchar(256), title text)
+LANGUAGE plpgsql
+STABLE
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT ha.name::varchar(16), pd.permlink::varchar(256), hpd.title::text
+    FROM hivemind_app.hive_posts AS hp
+    JOIN hivemind_app.hive_accounts AS ha ON ha.id = hp.author_id
+    JOIN hivemind_app.hive_permlink_data AS pd ON pd.id = hp.permlink_id
+    LEFT JOIN hivemind_app.hive_post_data AS hpd ON hpd.id = hp.id
+    WHERE hp.id = _post_id;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION haf_fyp_app.hivemind_post_identity(int) TO haf_fyp_user;
 
 -- ---------------------------------------------------------------------------
 -- Personalized feed
@@ -1649,11 +1692,11 @@ BEGIN
         PERFORM pg_notify('haf_fyp_feed_read', get_personalized_feed.username);
     END IF;
 
-    -- Personalized feed. Each cached (author, permlink) is resolved to its
-    -- Hivemind post id and enriched into the bridge post object, then tagged
-    -- with the FYP ranking data under "fyp". The Hivemind joins are reached only
-    -- when the user actually has a cached feed, so an empty feed never touches
-    -- Hivemind (keeps the endpoint usable before the ranker runs / in CI).
+    -- Personalized feed. Each cached post is rendered into the bridge post object
+    -- from its Hivemind id, then tagged with the FYP ranking data under "fyp". The
+    -- Hivemind joins are reached only when the user actually has a cached feed, so an
+    -- empty feed never touches Hivemind (keeps the endpoint usable before the ranker
+    -- runs / in CI).
     IF EXISTS (
         SELECT 1 FROM haf_fyp_app.feed_cache fc
         WHERE fc.username = get_personalized_feed.username
@@ -1673,12 +1716,13 @@ BEGIN
             -- Enrich only the page: get_bridge_post runs at this level, over the
             -- already-windowed "page" rows, so the Hivemind builders are called
             -- at most page-size times regardless of the join plan (the inner
-            -- LIMIT is a cardinality barrier the projection cannot cross).
+            -- LIMIT is a cardinality barrier the projection cannot cross). A post
+            -- Hivemind no longer has renders as NULL and is left out.
             SELECT
                 page.rank,
                 -- Serve the pre-rendered bridge JSON from post_bridge_cache when
                 -- present (re-applying truncate_body to the cached full body),
-                -- else render live. The cache is observer-agnostic (observer_id 0);
+                -- else render live. The cache is observer-agnostic (observer 0);
                 -- the live fallback keeps observer context on a miss.
                 COALESCE(
                     CASE
@@ -1689,12 +1733,12 @@ BEGIN
                              )
                         ELSE page.cached
                     END,
-                    haf_fyp_app.get_bridge_post(page.hive_post_id, _observer_id, get_personalized_feed.truncate_body)
+                    haf_fyp_app.get_bridge_post(page.post_id, _observer_id, get_personalized_feed.truncate_body)
                 )
                 || jsonb_build_object('fyp', page.fyp) AS post
             FROM (
                 SELECT
-                    pc.hive_post_id AS hive_post_id,
+                    fc.post_id::int AS post_id,
                     pbc.bridge AS cached,
                     fc.rank AS rank,
                     jsonb_build_object(
@@ -1710,23 +1754,16 @@ BEGIN
                         -- Exposed for client telemetry (#12): post_id is the
                         -- joinable key (matches feed_events.post_id) and
                         -- algorithm_version lets impressions be sliced for A/B.
+                        -- It is the Hivemind post id (#97).
                         'post_id', fc.post_id::text,
                         'algorithm_version', la.label
                     ) AS fyp
-                -- hive_post_id is precomputed by resolve_hivemind_post_ids (see
-                -- db/process_posts.sql), so the feed no longer joins
-                -- hive_accounts / hive_permlink_data / hive_posts per request; it
-                -- is a single PK join to post_candidates. Posts not yet resolved
-                -- (hive_post_id IS NULL) are skipped until a later processor batch
-                -- resolves them.
                 FROM haf_fyp_app.feed_cache fc
-                JOIN haf_fyp_app.post_candidates pc ON pc.post_id = fc.post_id
                 LEFT JOIN haf_fyp_app.post_bridge_cache pbc ON pbc.post_id = fc.post_id
                 -- The two labels are stored as codes (#98); 0 has no row, which is NULL.
                 LEFT JOIN haf_fyp_app.feed_cache_labels lb ON lb.code = fc.boost_source
                 LEFT JOIN haf_fyp_app.feed_cache_labels la ON la.code = fc.algorithm_version
                 WHERE fc.username = get_personalized_feed.username
-                  AND pc.hive_post_id IS NOT NULL
                 ORDER BY fc.rank
                 LIMIT _limit
                 OFFSET _offset
@@ -1758,7 +1795,7 @@ BEGIN
                 page.rank,
                 -- Serve the pre-rendered bridge JSON from post_bridge_cache when
                 -- present (re-applying truncate_body to the cached full body),
-                -- else render live. The cache is observer-agnostic (observer_id 0);
+                -- else render live. The cache is observer-agnostic (observer 0);
                 -- the live fallback keeps observer context on a miss.
                 COALESCE(
                     CASE
@@ -1769,12 +1806,12 @@ BEGIN
                              )
                         ELSE page.cached
                     END,
-                    haf_fyp_app.get_bridge_post(page.hive_post_id, _observer_id, get_personalized_feed.truncate_body)
+                    haf_fyp_app.get_bridge_post(page.post_id, _observer_id, get_personalized_feed.truncate_body)
                 )
                 || jsonb_build_object('fyp', page.fyp) AS post
             FROM (
                 SELECT
-                    pc.hive_post_id AS hive_post_id,
+                    gfc.post_id::int AS post_id,
                     pbc.bridge AS cached,
                     gfc.rank AS rank,
                     jsonb_build_object(
@@ -1798,12 +1835,8 @@ BEGIN
                         -- attribution across a version change, not concurrent A/B arms.
                         'algorithm_version', gfc.algorithm_version
                     ) AS fyp
-                -- See get_personalized_feed: hive_post_id is precomputed, so no
-                -- per-request Hivemind join (single PK join to post_candidates).
                 FROM haf_fyp_app.global_feed_cache gfc
-                JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
                 LEFT JOIN haf_fyp_app.post_bridge_cache pbc ON pbc.post_id = gfc.post_id
-                WHERE pc.hive_post_id IS NOT NULL
                 ORDER BY gfc.rank
                 LIMIT _limit
                 OFFSET _offset
@@ -1906,9 +1939,10 @@ BEGIN
             -- builders are called at most page-size times regardless of plan.
             SELECT
                 page.rank,
-                -- See get_personalized_feed: serve cached bridge if present (the
-                -- global feed is observer-agnostic, so the cache is an exact match),
-                -- else render live.
+                -- Serve the pre-rendered bridge JSON from post_bridge_cache when
+                -- present (re-applying truncate_body to the cached full body),
+                -- else render live. The cache is observer-agnostic (observer 0);
+                -- the live fallback keeps observer context on a miss.
                 COALESCE(
                     CASE
                         WHEN page.cached IS NOT NULL AND get_global_feed.truncate_body > 0
@@ -1918,12 +1952,12 @@ BEGIN
                              )
                         ELSE page.cached
                     END,
-                    haf_fyp_app.get_bridge_post(page.hive_post_id, 0, get_global_feed.truncate_body)
+                    haf_fyp_app.get_bridge_post(page.post_id, 0, get_global_feed.truncate_body)
                 )
                 || jsonb_build_object('fyp', page.fyp) AS post
             FROM (
                 SELECT
-                    pc.hive_post_id AS hive_post_id,
+                    gfc.post_id::int AS post_id,
                     pbc.bridge AS cached,
                     gfc.rank AS rank,
                     jsonb_build_object(
@@ -1946,18 +1980,16 @@ BEGIN
                         -- attribution across a version change, not concurrent A/B arms.
                         'algorithm_version', gfc.algorithm_version
                     ) AS fyp
-                -- See get_personalized_feed: hive_post_id is precomputed, so no
-                -- per-request Hivemind join. The community filter stays on
-                -- post_candidates (global_feed_cache is capped at the top ~200 posts,
-                -- so this is a tiny PK-joined scan, not a perf concern).
+                -- The community filter reads post_candidates (global_feed_cache is
+                -- capped at the top ~200 posts, so this is a tiny PK-probed scan).
                 FROM haf_fyp_app.global_feed_cache gfc
-                JOIN haf_fyp_app.post_candidates pc ON pc.post_id = gfc.post_id
                 LEFT JOIN haf_fyp_app.post_bridge_cache pbc ON pbc.post_id = gfc.post_id
-                WHERE pc.hive_post_id IS NOT NULL
-                  AND (
-                    get_global_feed.community_id IS NULL
-                    OR pc.community_id = get_global_feed.community_id
-                  )
+                WHERE get_global_feed.community_id IS NULL
+                   OR EXISTS (
+                       SELECT 1 FROM haf_fyp_app.post_candidates pc
+                       WHERE pc.post_id = gfc.post_id
+                         AND pc.community_id = get_global_feed.community_id
+                   )
                 ORDER BY gfc.rank
                 LIMIT _limit
                 OFFSET _offset
@@ -2132,11 +2164,12 @@ AS $$
     -- cast exposes the binary expansion (0.91 becomes 0.9100000262260437), while text
     -- is the shortest form that reads back as the same real, the value the feed
     -- endpoint reports for the same row.
+    -- author, permlink and title are hivemind's (#97); NULL for a post it no longer has.
     SELECT
         fc.post_id,
-        pc.author,
-        pc.permlink,
-        pc.title,
+        pi.author,
+        pi.permlink,
+        pi.title,
         fc.final_score::text::float,
         fc.score_relevance::text::float,
         fc.score_recency::text::float,
@@ -2149,7 +2182,7 @@ AS $$
         av.weights AS algorithm_weights,
         fc.computed_at
     FROM haf_fyp_app.feed_cache fc
-    JOIN haf_fyp_app.post_candidates pc ON pc.post_id = fc.post_id
+    LEFT JOIN LATERAL haf_fyp_app.hivemind_post_identity(fc.post_id::int) pi ON TRUE
     LEFT JOIN haf_fyp_app.feed_cache_labels lb ON lb.code = fc.boost_source
     LEFT JOIN haf_fyp_app.feed_cache_labels la ON la.code = fc.algorithm_version
     LEFT JOIN haf_fyp_app.algorithm_versions av ON av.version = la.label

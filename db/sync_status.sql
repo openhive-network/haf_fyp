@@ -33,8 +33,143 @@
 -- Returns a ROW rather than JSON: haf_fyp/sync_status.py owns the wire format so
 -- there is exactly one place that decides it and it stays unit-testable.
 
+-- ---------------------------------------------------------------------------
+-- Where hivemind stands (#97): read by block processing, to know when to backfill and
+-- how far to follow (db/hivemind_follow.sql), and by history_status() below.
+-- ---------------------------------------------------------------------------
+-- hivemind_block   hivemind_app.hive_state.last_completed_block_num; NULL when hivemind
+--                  is not installed or this role cannot read it.
+-- behind_head      how far that is behind hive.app_get_irreversible_block(); NULL when
+--                  either is unknown.
+-- indexed          hive_votes and hive_reblogs have an index leading with block_num and
+--                  hive_posts one leading with block_num_created, valid: what every read
+--                  of block processing goes through. Hivemind drops them while it is
+--                  2,000,000 or more blocks behind (hive/conf.py:33). Asked by column,
+--                  not by index name, so a renamed index is still found.
+--
+-- Asked of the catalog first, not with to_regclass(): to_regclass resolves the schema,
+-- and that raises for a role without USAGE on hivemind_app, which is this role exactly
+-- until scripts/grant_cross_schema.sh has run since hivemind was installed.
+CREATE OR REPLACE FUNCTION haf_fyp_app.hivemind_reach()
+RETURNS TABLE (hivemind_block int, behind_head int, indexed boolean)
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    _block int;
+    _head int;
+    _indexed boolean;
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_class AS c
+        INNER JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
+        WHERE n.nspname = 'hivemind_app' AND c.relname = 'hive_state'
+    ) THEN
+        RETURN QUERY SELECT NULL::int, NULL::int, FALSE;
+        RETURN;
+    END IF;
+    -- Two IFs, not one OR: SQL does not promise the order an OR is evaluated in, and
+    -- the second raises without the first.
+    IF NOT has_schema_privilege('hivemind_app', 'USAGE') THEN
+        RETURN QUERY SELECT NULL::int, NULL::int, FALSE;
+        RETURN;
+    END IF;
+    IF NOT has_table_privilege('hivemind_app.hive_state', 'SELECT') THEN
+        RETURN QUERY SELECT NULL::int, NULL::int, FALSE;
+        RETURN;
+    END IF;
+
+    EXECUTE 'SELECT last_completed_block_num FROM hivemind_app.hive_state LIMIT 1' INTO _block;
+    -- The head is HAF's to tell, and a role outside its application groups may not ask:
+    -- then behind_head is unknown rather than an error.
+    IF to_regprocedure('hive.app_get_irreversible_block()') IS NOT NULL THEN
+        IF has_function_privilege('hive.app_get_irreversible_block()', 'EXECUTE') THEN
+            EXECUTE 'SELECT hive.app_get_irreversible_block()' INTO _head;
+        END IF;
+    END IF;
+
+    SELECT count(*) = 3 INTO _indexed
+    FROM (VALUES ('hive_votes', 'block_num'), ('hive_reblogs', 'block_num'),
+                 ('hive_posts', 'block_num_created')) AS want (relname, attname)
+    WHERE EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_class AS c
+        INNER JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
+        INNER JOIN pg_catalog.pg_index AS i ON i.indrelid = c.oid
+        INNER JOIN pg_catalog.pg_attribute AS a ON a.attrelid = c.oid AND a.attnum = i.indkey[0]
+        WHERE n.nspname = 'hivemind_app'
+          AND c.relname = want.relname
+          AND a.attname = want.attname
+          AND i.indisvalid
+    );
+
+    RETURN QUERY SELECT _block, greatest(_head - _block, 0), _indexed;
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- history_status: the copy of hivemind's history, for GET /metrics and /sync-status
+-- ---------------------------------------------------------------------------
+-- state is 'waiting_for_hivemind' until the backfill has committed, then
+-- 'following_hivemind'; 'unknown' where the state row cannot be read (an install that
+-- predates it). Runs as its caller: GET /metrics calls it as haf_fyp_user, which reads
+-- these tables and hivemind's, and gets a NULL hivemind_behind_head when HAF does not let
+-- it ask for the head; sync_status() below calls it as its definer.
+CREATE OR REPLACE FUNCTION haf_fyp_app.history_status()
+RETURNS TABLE (
+    state text,
+    history_days int,
+    hivemind_block int,
+    hivemind_behind_head int,
+    followed_through_block int,
+    hivemind_live_at timestamptz,
+    backfill_started_at timestamptz,
+    backfilled_at timestamptz
+)
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    _reach record;
+    _days int := 365;
+BEGIN
+    SELECT * INTO _reach FROM haf_fyp_app.hivemind_reach();
+    IF to_regclass('haf_fyp_app.app_config') IS NOT NULL THEN
+        EXECUTE 'SELECT history_days FROM haf_fyp_app.app_config LIMIT 1' INTO _days;
+    END IF;
+    IF to_regclass('haf_fyp_app.hivemind_follow') IS NULL THEN
+        RETURN QUERY SELECT 'unknown'::text, _days, _reach.hivemind_block, _reach.behind_head,
+            NULL::int, NULL::timestamptz, NULL::timestamptz, NULL::timestamptz;
+        RETURN;
+    END IF;
+    RETURN QUERY EXECUTE
+        'SELECT CASE WHEN f.backfilled_at IS NULL THEN ''waiting_for_hivemind''
+                     ELSE ''following_hivemind'' END,
+                $1, $2, $3, f.followed_through_block, f.hivemind_live_at,
+                f.backfill_started_at, f.backfilled_at
+         FROM haf_fyp_app.hivemind_follow AS f'
+        USING _days, _reach.hivemind_block, _reach.behind_head;
+END;
+$$;
+
+-- The third column is new (#97), and CREATE OR REPLACE cannot change what a function
+-- returns: an install over the two-column function drops it first. Only then, so a
+-- re-install does not take the function away from callers for the moment in between.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_catalog.pg_proc AS p
+        WHERE p.oid = to_regprocedure('haf_fyp_app.sync_status()')
+          AND NOT ('history' = ANY (coalesce(p.proargnames, '{}')))
+    ) THEN
+        DROP FUNCTION haf_fyp_app.sync_status();
+    END IF;
+END
+$$;
+
 CREATE OR REPLACE FUNCTION haf_fyp_app.sync_status()
-RETURNS TABLE (last_block_num int, last_block_time timestamp)
+RETURNS TABLE (last_block_num int, last_block_time timestamp, history text)
 LANGUAGE plpgsql
 STABLE
 SECURITY DEFINER
@@ -55,8 +190,10 @@ BEGIN
     -- LEFT JOIN, not inner: a fresh install sits at block 0 and there is no block
     -- 0, so this yields one row with a NULL time rather than no row at all. The
     -- caller distinguishes "no row" (context missing/invisible) from "null time".
+    -- history (#97): whether the window has been copied from hivemind yet, see
+    -- history_status() above.
     RETURN QUERY
-    SELECT c.current_block_num, b.created_at
+    SELECT c.current_block_num, b.created_at, (SELECT h.state FROM haf_fyp_app.history_status() AS h)
     FROM hafd.contexts AS c
     LEFT JOIN hafd.blocks AS b ON b.num = c.current_block_num
     WHERE c.name = 'haf_fyp';

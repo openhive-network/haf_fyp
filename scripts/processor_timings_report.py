@@ -7,18 +7,20 @@
 
 DRIVER_LOG is haf_app_driver.py's output for a run with haf_fyp.processor_timings = on
 (db/process_block_range.sql): one `haf_fyp_processor_timing {...}` line per processor
-per batch and one `haf_fyp_operation_counts {...}` line per batch. Every other line is
-ignored. The batches must cover blocks N..M exactly, each with every processor and one
-operation count; anything else -- no timings at all, a line that is not JSON, a negative
-time, a missing or unknown processor, a gap or an overlap -- exits 1 naming the problem
-and writes no report.
+per batch, one `haf_fyp_operation_counts {...}` line per batch, and one
+`haf_fyp_backfill {...}` line for the batch that copied the history window from hivemind
+(db/hivemind_follow.sql). Every other line is ignored. The batches must cover blocks
+N..M exactly, each with every processor and one operation count; anything else -- no
+timings at all, a line that is not JSON, a negative time, a missing or unknown processor,
+a gap or an overlap, more than one backfill -- exits 1 naming the problem and writes no
+report.
 
 The report holds each processor's wall time over the whole run and per 1,000,000 blocks
 (a batch counts towards the million its first block is in), the rows each processor read
-from hive.operations_view by op type, the custom_json ids the reblog question turns on,
-and the run's wall time as measured by the caller. The indexes and foreign keys deferred
-during massive sync are rebuilt after the last batch, so their rebuild is not in the
-sync's wall time: the caller passes it separately, and the report adds the two.
+from hive.operations_view by op type, the custom_json ids of the run, the backfill, and
+the run's wall time as measured by the caller. The indexes deferred during massive sync
+are rebuilt after the last batch, so their rebuild is not in the sync's wall time: the
+caller passes it separately, and the report adds the two.
 """
 
 from __future__ import annotations
@@ -33,35 +35,34 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-#: The processors db/process_block_range.sql dispatches, in dispatch order.
+#: The processors db/process_block_range.sql dispatches, in dispatch order. The four
+#: hivemind_* ones read hivemind's tables, not operations: in the backfill's batch their
+#: time is the backfill's.
 PROCESSORS: tuple[str, ...] = (
     "stage_operations",
-    "process_posts",
-    "comments",
-    "reblogs",
-    "votes",
-    "engagement_metrics",
-    "payout_windows",
     "unsubscribe",
     "subscribe",
-    "process_interactions",
-    "resolve_hivemind_post_ids",
+    "hivemind_subscriptions",
+    "hivemind_posts",
+    "hivemind_interactions",
+    "hivemind_engagement",
+    "payout_windows",
 )
 
 BUCKET_BLOCKS = 1_000_000
 
-#: Below this many reblogs of both forms together the counts decide nothing.
-REBLOG_SAMPLE = 1000
-
 LIMITS: tuple[str, ...] = (
     "Blocks 1 to 5,000,000 hold little custom_json: the Splinterlands-era volume comes "
-    "later, so the custom_json processors' share here understates their share of a full replay.",
-    "The shared HAF has no hivemind: hive.app_add_dependency('haf_fyp','hivemind_app') is "
-    "skipped there and resolve_hivemind_post_ids finds nothing, so the wall time is haf_fyp's "
-    "own processing only.",
+    "later, so the community processors' share here understates their share of a full replay.",
+    "The shared HAF has no hivemind: the lane builds a stub of the hivemind tables haf_fyp "
+    "reads from the HAF's own operations (tests/hivemind_stub_from_haf.sql), so the hivemind_* "
+    "times are of reads from that stub, at 2016's volume, not from hivemind's tables at head.",
+    "The lane's run with the timings off backfills at block 5,000,000, while the timed run "
+    "backfills at 4,000,000 and follows the stub from there (.aidev/run-checks.sh): the two "
+    "wall times differ by path as well as by instrumentation.",
 )
 
-_LINE = re.compile(r"\b(haf_fyp_processor_timing|haf_fyp_operation_counts) (\{.*\})\s*$")
+_LINE = re.compile(r"\b(haf_fyp_processor_timing|haf_fyp_operation_counts|haf_fyp_backfill) (\{.*\})\s*$")
 
 
 class TimingsError(Exception):
@@ -142,10 +143,25 @@ def _counts(record: Mapping[str, Any], where: str) -> _Counts:
     return _Counts(first, last, _seconds(record, where), tuple(counts))
 
 
+def _backfill(record: Mapping[str, Any], where: str) -> dict[str, Any]:
+    out: dict[str, Any] = {"seconds": _seconds(record, where)}
+    for key in ("hivemind_block", "first_block", "history_days", "posts", "interactions", "commenters"):
+        out[key] = _field(record, key, int, where)
+    return out
+
+
 def parse_log(lines: Iterable[str]) -> tuple[list[_Timing], list[_Counts]]:
     """The timing and operation-count records in a driver log, validated one by one."""
+    timings, counts, _ = parse_log_with_backfills(lines)
+    return timings, counts
+
+
+def parse_log_with_backfills(
+        lines: Iterable[str]) -> tuple[list[_Timing], list[_Counts], list[dict[str, Any]]]:
+    """parse_log, and the backfill records as well."""
     timings: list[_Timing] = []
     counts: list[_Counts] = []
+    backfills: list[dict[str, Any]] = []
     for number, line in enumerate(lines, 1):
         m = _LINE.search(line)
         if m is None:
@@ -159,9 +175,11 @@ def parse_log(lines: Iterable[str]) -> tuple[list[_Timing], list[_Counts]]:
             raise TimingsError(f"{where}: not a JSON object")
         if m.group(1) == "haf_fyp_processor_timing":
             timings.append(_timing(record, where))
+        elif m.group(1) == "haf_fyp_backfill":
+            backfills.append(_backfill(record, where))
         else:
             counts.append(_counts(record, where))
-    return timings, counts
+    return timings, counts, backfills
 
 
 def _batches(timings: list[_Timing], counts: list[_Counts], first_block: int,
@@ -208,21 +226,24 @@ def _plus(a: float | None, b: float | None) -> float | None:
 def build_report(timings: list[_Timing], counts: list[_Counts], *, first_block: int, last_block: int,
                  sync_seconds: float, uninstrumented_sync_seconds: float | None = None,
                  index_restore_seconds: float | None = None,
-                 uninstrumented_index_restore_seconds: float | None = None) -> dict[str, Any]:
-    """The report for one run: totals, the per-million split, rows read and the reblog ids.
+                 uninstrumented_index_restore_seconds: float | None = None,
+                 backfills: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """The report for one run: totals, the per-million split, rows read and the backfill.
 
     :raises TimingsError: the records do not tile ``first_block..last_block`` with every
-        processor timed and the operations counted once per batch, or a wall time is negative.
+        processor timed and the operations counted once per batch, a wall time is negative,
+        or the run backfilled more than once.
     """
     walls = (sync_seconds, uninstrumented_sync_seconds, index_restore_seconds, uninstrumented_index_restore_seconds)
     if any(w is not None and w < 0 for w in walls):
         raise TimingsError("a wall time is negative")
+    if backfills and len(backfills) > 1:
+        raise TimingsError(f"the run backfilled {len(backfills)} times; a node backfills once")
     batches = _batches(timings, counts, first_block, last_block)
     totals: dict[str, float] = dict.fromkeys(PROCESSORS, 0.0)
     rows_read: dict[str, dict[str, int]] = {p: defaultdict(int) for p in PROCESSORS}
     operations: dict[str, int] = defaultdict(int)
     custom_json: dict[str, int] = defaultdict(int)
-    reblog_id = follow_reblog = 0
     instrumentation = 0.0
     buckets: dict[int, dict[str, Any]] = {}
     for (first, _last), by_processor, batch_counts in batches:
@@ -232,10 +253,6 @@ def build_report(timings: list[_Timing], counts: list[_Counts], *, first_block: 
             operations[c.op_type] += c.rows
             if c.custom_json_id is not None:
                 custom_json[c.custom_json_id] += c.rows
-            if c.custom_json_id == "reblog":
-                reblog_id += c.rows
-            if c.custom_json_id == "follow" and c.json_action == "reblog":
-                follow_reblog += c.rows
         instrumentation += batch_counts.seconds
         index = (first - 1) // BUCKET_BLOCKS
         bucket = buckets.setdefault(index, {
@@ -282,25 +299,10 @@ def build_report(timings: list[_Timing], counts: list[_Counts], *, first_block: 
         "rows_read": {p: dict(sorted(r.items())) for p, r in rows_read.items()},
         "operations": dict(sorted(operations.items())),
         "custom_json_by_id": dict(sorted(custom_json.items())),
-        "reblog_ids": {
-            "custom_json_id_reblog": reblog_id,
-            "custom_json_id_follow_payload_reblog": follow_reblog,
-            "finding": _reblog_finding(reblog_id, follow_reblog),
-        },
+        "backfill": backfills[0] if backfills else None,
         "limits": list(LIMITS),
     }
     return report
-
-
-def _reblog_finding(reblog_id: int, follow_reblog: int) -> str:
-    total = reblog_id + follow_reblog
-    if total < REBLOG_SAMPLE:
-        return (f"Only {total} reblogs of either form in this range: too few to say which form is "
-                "in use. Measure a later range.")
-    if follow_reblog > reblog_id:
-        return ("The follow/[\"reblog\", ...] form is the one in use: haf_fyp matches only "
-                "id='reblog', so it misses most reblogs in this range.")
-    return "id='reblog' is at least as common as the follow/[\"reblog\", ...] form in this range."
 
 
 def summary_table(report: Mapping[str, Any]) -> str:
@@ -326,10 +328,14 @@ def summary_table(report: Mapping[str, Any]) -> str:
     if report["uninstrumented_sync_plus_restore_wall_seconds"] is not None:
         lines.append(f"uninstrumented index restore {report['uninstrumented_index_restore_seconds']:.1f}s,"
                      f" sync plus restore {report['uninstrumented_sync_plus_restore_wall_seconds']:.1f}s")
-    ids = report["reblog_ids"]
-    lines.append(f"reblogs: id='reblog' {ids['custom_json_id_reblog']},"
-                 f" id='follow' with [\"reblog\", ...] {ids['custom_json_id_follow_payload_reblog']}."
-                 f" {ids['finding']}")
+    backfill = report["backfill"]
+    if backfill is None:
+        lines.append("no backfill in this run")
+    else:
+        lines.append(f"backfill {backfill['seconds']:.1f}s at hivemind block {backfill['hivemind_block']}"
+                     f" (window from block {backfill['first_block']}, {backfill['history_days']} days):"
+                     f" {backfill['posts']} posts, {backfill['interactions']} interactions,"
+                     f" {backfill['commenters']} commenters")
     return "\n".join(lines)
 
 
@@ -349,12 +355,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         with args.log.open(encoding="utf-8", errors="replace") as log:
-            timings, counts = parse_log(log)
+            timings, counts, backfills = parse_log_with_backfills(log)
         report = build_report(timings, counts, first_block=args.first_block, last_block=args.last_block,
                               sync_seconds=args.sync_seconds,
                               uninstrumented_sync_seconds=args.uninstrumented_sync_seconds,
                               index_restore_seconds=args.index_restore_seconds,
-                              uninstrumented_index_restore_seconds=args.uninstrumented_index_restore_seconds)
+                              uninstrumented_index_restore_seconds=args.uninstrumented_index_restore_seconds,
+                              backfills=backfills)
     except (OSError, TimingsError) as exc:
         print(f"no report: {exc}", file=sys.stderr)
         return 1

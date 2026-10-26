@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 
 from tests.unit.shell_harness import clean_env, require_bash, stub_bin, write_exec
+from pytest import MonkeyPatch
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 INSTALL = SCRIPTS / "install_app.sh"
@@ -48,7 +49,7 @@ def bash():
     return require_bash()
 
 
-def run(bash, tmp_path, script: Path, *args: str) -> subprocess.CompletedProcess:
+def run(bash, tmp_path: Path, script: Path, *args: str) -> subprocess.CompletedProcess:
     """Always with a stub pg_isready on PATH, even for paths expected to exit at the
     option loop.
 
@@ -71,13 +72,13 @@ def run(bash, tmp_path, script: Path, *args: str) -> subprocess.CompletedProcess
 
 @pytest.mark.parametrize("script", [INSTALL, UNINSTALL], ids=["install", "uninstall"])
 @pytest.mark.parametrize("flag", ["--help", "-h", "-?"])
-def test_help_exits_zero(bash, tmp_path, script, flag):
+def test_help_exits_zero(bash, tmp_path: Path, script, flag) -> None:
     r = run(bash, tmp_path, script, flag)
     assert r.returncode == 0
     assert "OPTIONS:" in r.stdout
 
 
-def test_install_help_lists_every_accepted_flag(bash, tmp_path):
+def test_install_help_lists_every_accepted_flag(bash, tmp_path: Path) -> None:
     """Asserting on ONE early flag is not coverage.
 
     An earlier revision rendered help with a hardcoded `sed -n '2,12p'`, which silently
@@ -91,13 +92,13 @@ def test_install_help_lists_every_accepted_flag(bash, tmp_path):
         assert flag in out, f"{flag} missing from install_app.sh --help"
 
 
-def test_uninstall_help_lists_every_accepted_flag(bash, tmp_path):
+def test_uninstall_help_lists_every_accepted_flag(bash, tmp_path: Path) -> None:
     out = run(bash, tmp_path, UNINSTALL, "--help").stdout
     for flag in ("--force", "--host", "--port", "--user", "--help"):
         assert flag in out, f"{flag} missing from uninstall_app.sh --help"
 
 
-def test_help_does_not_run_off_the_end_of_the_file(bash, tmp_path):
+def test_help_does_not_run_off_the_end_of_the_file(bash, tmp_path: Path) -> None:
     """The marker pattern must not match its own implementation.
 
     Written literally, `sed -n '/--- help-start ---/,...'` matches the line containing
@@ -122,7 +123,7 @@ def test_help_does_not_run_off_the_end_of_the_file(bash, tmp_path):
 # flag was simply ignored.
 
 
-def run_with_stub_db(bash, tmp_path, script, *args: str) -> str:
+def run_with_stub_db(bash, tmp_path: Path, script, *args: str) -> str:
     """Get past the option loop and wait_for_postgres, then die at the first statement."""
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
@@ -138,7 +139,7 @@ def run_with_stub_db(bash, tmp_path, script, *args: str) -> str:
 @pytest.mark.parametrize(
     "script", [INSTALL, UNINSTALL, PROCESS], ids=["install", "uninstall", "process_blocks"]
 )
-def test_a_foreign_schema_warns_but_does_not_exit(bash, tmp_path, script):
+def test_a_foreign_schema_warns_but_does_not_exit(bash, tmp_path: Path, script) -> None:
     out = run_with_stub_db(bash, tmp_path, script, "--schema=btracker_app")
     assert "WARNING: --schema" in out
     # The offending value is the one part an operator needs. Without this the message
@@ -151,7 +152,7 @@ def test_a_foreign_schema_warns_but_does_not_exit(bash, tmp_path, script):
 @pytest.mark.parametrize(
     "script", [INSTALL, UNINSTALL, PROCESS], ids=["install", "uninstall", "process_blocks"]
 )
-def test_the_apps_own_schema_is_accepted_quietly(bash, tmp_path, script):
+def test_the_apps_own_schema_is_accepted_quietly(bash, tmp_path: Path, script) -> None:
     """The one value the flag exists to carry. Asserting only that a FOREIGN schema is
     tolerated leaves re-targeting the accepted name green."""
     out = run_with_stub_db(bash, tmp_path, script, "--schema=haf_fyp_app")
@@ -162,7 +163,7 @@ def test_the_apps_own_schema_is_accepted_quietly(bash, tmp_path, script):
 @pytest.mark.parametrize(
     "script", [UNINSTALL, PROCESS], ids=["uninstall", "process_blocks"]
 )
-def test_is_forking_is_accepted_on_the_other_two_verbs(bash, tmp_path, script):
+def test_is_forking_is_accepted_on_the_other_two_verbs(bash, tmp_path: Path, script) -> None:
     """install_app alone accepted it; the module template passes it to all three."""
     out = run_with_stub_db(bash, tmp_path, script, "--is_forking=TRUE")
     assert "WARNING: --is_forking" in out
@@ -172,7 +173,7 @@ def test_is_forking_is_accepted_on_the_other_two_verbs(bash, tmp_path, script):
 @pytest.mark.parametrize(
     "script", [INSTALL, UNINSTALL, PROCESS], ids=["install", "uninstall", "process_blocks"]
 )
-def test_help_does_not_run_off_the_end_of_any_script(bash, tmp_path, script):
+def test_help_does_not_run_off_the_end_of_any_script(bash, tmp_path: Path, script) -> None:
     """The marker character class was pinned for install_app only. Without it the other
     two print the rest of their own file -- 289 lines for uninstall_app, including its
     DROP SCHEMA statements."""
@@ -185,7 +186,7 @@ def test_help_does_not_run_off_the_end_of_any_script(bash, tmp_path, script):
 # --- rejections -------------------------------------------------------------------
 
 @pytest.mark.parametrize("script", [INSTALL, UNINSTALL], ids=["install", "uninstall"])
-def test_an_unknown_option_is_rejected(bash, tmp_path, script):
+def test_an_unknown_option_is_rejected(bash, tmp_path: Path, script) -> None:
     """The behaviour change. A mistyped --swagger-url used to install silently with the
     localhost default, baking wrong example URLs into the published Swagger page with
     nothing in the log to say so."""
@@ -194,7 +195,7 @@ def test_an_unknown_option_is_rejected(bash, tmp_path, script):
     assert "is not a valid option" in r.stdout
 
 
-def test_uninstall_rejects_a_mistyped_force(bash, tmp_path):
+def test_uninstall_rejects_a_mistyped_force(bash, tmp_path: Path) -> None:
     """The specific typo that matters here: left to fall through, it would reach the
     confirmation prompt that a compose run cannot answer, and hang."""
     r = run(bash, tmp_path, UNINSTALL, "--forse")
@@ -213,7 +214,7 @@ def test_uninstall_rejects_a_mistyped_force(bash, tmp_path):
 # open long after the parent is killed, so communicate() hangs for minutes.
 
 
-def run_install_with_stub_db(bash, tmp_path, *args: str) -> str:
+def run_install_with_stub_db(bash, tmp_path: Path, *args: str) -> str:
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     write_exec(bindir / "pg_isready", "#!/bin/sh\nexit 0\n")
@@ -225,7 +226,7 @@ def run_install_with_stub_db(bash, tmp_path, *args: str) -> str:
     return proc.stdout + proc.stderr
 
 
-def test_is_forking_true_warns_and_continues(bash, tmp_path):
+def test_is_forking_true_warns_and_continues(bash, tmp_path: Path) -> None:
     """It must NOT exit at the option loop.
 
     haf-fyp-setup carries `restart: on-failure` while every other service waits on
@@ -244,7 +245,7 @@ def test_is_forking_true_warns_and_continues(bash, tmp_path):
 @pytest.mark.parametrize(
     "script", [INSTALL, UNINSTALL, PROCESS], ids=["install", "uninstall", "process_blocks"]
 )
-def test_is_forking_false_is_accepted_quietly(bash, tmp_path, script):
+def test_is_forking_false_is_accepted_quietly(bash, tmp_path: Path, script) -> None:
     """Parametrized in round three. Pinned on install_app only, deleting the
     FALSE|false|False arm from the other two made the flag's one CORRECT value emit a
     warning telling the operator it was ignored."""
@@ -253,7 +254,7 @@ def test_is_forking_false_is_accepted_quietly(bash, tmp_path, script):
     assert "Waiting for PostgreSQL" in out
 
 
-def test_connection_flags_are_honoured_not_rejected(bash, tmp_path):
+def test_connection_flags_are_honoured_not_rejected(bash, tmp_path: Path) -> None:
     """--host and --port must change where the script connects.
 
     Upstream's entrypoints forward --host/--user, so a module file or runbook copied
@@ -273,7 +274,8 @@ def test_connection_flags_are_honoured_not_rejected(bash, tmp_path):
 # entrypoint forwards to the destructive script.
 
 
-def run_install_full_stub(bash, tmp_path, *args: str, fail_on: str = "@@never@@"):
+def run_install_full_stub(bash, tmp_path: Path, *args: str, fail_on: str = "@@never@@",
+                          env: dict | None = None):
     """Run install_app.sh with a psql that succeeds at everything and records it all.
 
     argv.log has one line per call, its arguments joined by spaces. argv.exact.log has
@@ -303,12 +305,12 @@ def run_install_full_stub(bash, tmp_path, *args: str, fail_on: str = "@@never@@"
     )
     proc = subprocess.run(
         [bash, str(INSTALL), *args],
-        env=clean_env(bindir), capture_output=True, text=True, timeout=TIMEOUT,
+        env={**clean_env(bindir), **(env or {})}, capture_output=True, text=True, timeout=TIMEOUT,
     )
     return proc, sql_log, argv_log
 
 
-def test_the_preconditions_run_first(bash, tmp_path):
+def test_the_preconditions_run_first(bash, tmp_path: Path) -> None:
     """Step 0 is checked "before ANY mutation" (#75): it must be the first thing psql
     runs, as the connecting role -- a SET ROLE to a role outside hive_applications_group
     would read zero rows under HAF's RLS and pass every context."""
@@ -318,7 +320,7 @@ def test_the_preconditions_run_first(bash, tmp_path):
     assert "SET ROLE" not in first, first
 
 
-def test_nothing_runs_between_the_placeholder_and_the_dispatcher(bash, tmp_path):
+def test_nothing_runs_between_the_placeholder_and_the_dispatcher(bash, tmp_path: Path) -> None:
     """db/haf_fyp_app.sql leaves a placeholder where there is no block dispatcher, and
     db/process_block_range.sql installs the dispatcher (#83). Between the two the install
     may only load files: a statement that started block processing there, or created the
@@ -337,7 +339,7 @@ def test_nothing_runs_between_the_placeholder_and_the_dispatcher(bash, tmp_path)
             f"dispatcher: {call}")
 
 
-def test_a_precondition_refusal_stops_the_install(bash, tmp_path):
+def test_a_precondition_refusal_stops_the_install(bash, tmp_path: Path) -> None:
     """A refusal must end the install there -- nothing after it runs, and the script
     fails -- or "Nothing has been modified" is untrue."""
     bindir = stub_bin(tmp_path)
@@ -357,7 +359,7 @@ def test_a_precondition_refusal_stops_the_install(bash, tmp_path):
 
 # --- HAF's install lock (#67) -----------------------------------------------------------
 
-def make_lock_wrapper(tmp_path, mode: str) -> Path:
+def make_lock_wrapper(tmp_path: Path, mode: str) -> Path:
     """A stand-in for the psql image's install_with_app_lock.py (same argv contract:
     APP_NAME DSN CMD [ARG ...]). It records what it was given, then either runs CMD -- the
     lock acquired -- or, like the real one when a processor holds the lock, logs that it
@@ -383,7 +385,7 @@ def make_lock_wrapper(tmp_path, mode: str) -> Path:
     return wrapper
 
 
-def run_install_with_wrapper(bash, tmp_path, mode, *args, extra_env=None, psql_exit=0):
+def run_install_with_wrapper(bash, tmp_path: Path, mode, *args, extra_env=None, psql_exit=0):
     """install_app.sh with the full psql stub, and HAF_FYP_INSTALL_LOCK_WRAPPER pointing at
     a wrapper stand-in. The stand-in runs the script through bash; the real wrapper execs it
     directly, which needs the executable bit Dockerfile.sql's COPY --chmod=755 sets."""
@@ -417,7 +419,7 @@ def run_install_with_wrapper(bash, tmp_path, mode, *args, extra_env=None, psql_e
     return proc, calls, argv_log
 
 
-def test_the_install_runs_under_the_lock_wrapper_once(bash, tmp_path):
+def test_the_install_runs_under_the_lock_wrapper_once(bash, tmp_path: Path) -> None:
     """Once: the wrapper runs the script again as its child, and the child must go
     straight on rather than wrap itself forever."""
     proc, calls, argv_log = run_install_with_wrapper(bash, tmp_path, "run")
@@ -430,7 +432,7 @@ def test_the_install_runs_under_the_lock_wrapper_once(bash, tmp_path):
     assert argv_log.exists(), "the install never ran under the wrapper"
 
 
-def test_the_lock_is_taken_on_the_same_database_as_the_install(bash, tmp_path):
+def test_the_lock_is_taken_on_the_same_database_as_the_install(bash, tmp_path: Path) -> None:
     """--host/--port/--user reach the wrapper's connection. A lock taken on a different
     server than the one being installed protects nothing."""
     _, calls, _ = run_install_with_wrapper(bash, tmp_path, "run", "--host=elsewhere",
@@ -442,13 +444,13 @@ def test_the_lock_is_taken_on_the_same_database_as_the_install(bash, tmp_path):
         assert part in dsn.split(), dsn
 
 
-def test_the_original_arguments_reach_the_real_install(bash, tmp_path):
+def test_the_original_arguments_reach_the_real_install(bash, tmp_path: Path) -> None:
     _, calls, _ = run_install_with_wrapper(bash, tmp_path, "run", "--swagger-url=example.com")
     assert calls[0]["argv"][2].endswith("install_app.sh"), calls
     assert calls[0]["argv"][3:] == ["--swagger-url=example.com"], calls
 
 
-def test_a_held_lock_skips_the_install_and_succeeds(bash, tmp_path):
+def test_a_held_lock_skips_the_install_and_succeeds(bash, tmp_path: Path) -> None:
     """A live processor holds the lock: nothing is installed, and setup still completes --
     haf-fyp-setup's dependents wait on service_completed_successfully."""
     proc, _, argv_log = run_install_with_wrapper(bash, tmp_path, "skip")
@@ -457,7 +459,7 @@ def test_a_held_lock_skips_the_install_and_succeeds(bash, tmp_path):
     assert "Taking HAF's install lock on haf_fyp" in proc.stdout, proc.stdout
 
 
-def test_a_failed_install_under_the_wrapper_fails_setup(bash, tmp_path):
+def test_a_failed_install_under_the_wrapper_fails_setup(bash, tmp_path: Path) -> None:
     """The wrapper returns the install's exit code, and nothing after it may turn a failure
     into success: haf-fyp-setup's dependents start on service_completed_successfully."""
     proc, calls, _ = run_install_with_wrapper(bash, tmp_path, "run", psql_exit=3)
@@ -465,7 +467,7 @@ def test_a_failed_install_under_the_wrapper_fails_setup(bash, tmp_path):
     assert proc.returncode != 0, proc.stdout + proc.stderr
 
 
-def test_the_lock_connection_quotes_its_values(bash, tmp_path):
+def test_the_lock_connection_quotes_its_values(bash, tmp_path: Path) -> None:
     """A value with a quote or a backslash must reach libpq intact, not end the value early
     or change what the next key means -- parsed here by libpq itself."""
     from psycopg2.extensions import parse_dsn
@@ -474,7 +476,7 @@ def test_the_lock_connection_quotes_its_values(bash, tmp_path):
     assert parse_dsn(calls[0]["argv"][1])["dbname"] == "we'ird\\db x", calls[0]["argv"][1]
 
 
-def test_without_the_wrapper_the_install_runs_unlocked_and_says_so(bash, tmp_path):
+def test_without_the_wrapper_the_install_runs_unlocked_and_says_so(bash, tmp_path: Path) -> None:
     """A checkout run by hand, or CI: no wrapper, so no lock -- installed as before, but
     not silently."""
     proc, sql_log, _ = run_install_full_stub(bash, tmp_path)
@@ -492,13 +494,58 @@ def test_without_the_wrapper_the_install_runs_unlocked_and_says_so(bash, tmp_pat
 # value, is tested against a real PostgreSQL in tests/integration/test_swagger_base_url_db.py.
 
 SWAGGER_SQL = "/scripts/set_swagger_base_url.sql"
+HISTORY_SQL = "/scripts/set_history_config.sql"
+
+
+# --- the history window (#97): FYP_HISTORY_DAYS, FYP_HIVEMIND_MAX_LAG_BLOCKS ------------
+
+def _history_calls(argv_log) -> list:
+    return [c for c in argv_log.read_text().splitlines() if c.endswith(HISTORY_SQL)]
+
+
+def test_the_history_window_defaults_when_unset_or_empty(bash, tmp_path: Path) -> None:
+    for env in ({}, {"FYP_HISTORY_DAYS": "", "FYP_HIVEMIND_MAX_LAG_BLOCKS": ""}):
+        argv_log = tmp_path / "argv.log"
+        if argv_log.exists():
+            argv_log.unlink()
+        proc, _, _ = run_install_full_stub(bash, tmp_path, env=env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        calls = _history_calls(argv_log)
+        assert len(calls) == 1, calls
+        assert " -v history_days=365 -v hivemind_max_lag_blocks=1000 -f " in calls[0], calls[0]
+
+
+def test_the_history_window_is_handed_to_psql_as_variables(bash, tmp_path: Path) -> None:
+    proc, _, argv_log = run_install_full_stub(
+        bash, tmp_path, env={"FYP_HISTORY_DAYS": "90", "FYP_HIVEMIND_MAX_LAG_BLOCKS": "0"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    calls = _history_calls(argv_log)
+    assert len(calls) == 1 and " -v history_days=90 -v hivemind_max_lag_blocks=0 -f " in calls[0], calls
+
+
+@pytest.mark.parametrize("name, value", [
+    ("FYP_HISTORY_DAYS", "0"),
+    ("FYP_HISTORY_DAYS", "36501"),
+    ("FYP_HISTORY_DAYS", "1 year"),
+    ("FYP_HISTORY_DAYS", "365; DROP SCHEMA haf_fyp_app"),
+    ("FYP_HISTORY_DAYS", "-5"),
+    ("FYP_HIVEMIND_MAX_LAG_BLOCKS", "10000001"),
+    ("FYP_HIVEMIND_MAX_LAG_BLOCKS", "01"),
+    ("FYP_HIVEMIND_MAX_LAG_BLOCKS", "lots"),
+])
+def test_a_history_setting_that_cannot_be_meant_refuses_before_anything_is_installed(
+        bash, tmp_path: Path, name, value) -> None:
+    proc, _, argv_log = run_install_full_stub(bash, tmp_path, env={name: value})
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert name in proc.stdout + proc.stderr
+    assert not argv_log.exists() or argv_log.read_text() == "", argv_log.read_text()
 
 
 def _swagger_calls(argv_log) -> list:
     return [c for c in argv_log.read_text().splitlines() if "swagger_url=" in c]
 
 
-def test_swagger_url_is_handed_to_psql_as_a_variable(bash, tmp_path):
+def test_swagger_url_is_handed_to_psql_as_a_variable(bash, tmp_path: Path) -> None:
     _, sql_log, argv_log = run_install_full_stub(bash, tmp_path, "--swagger-url=/haf-fyp-api")
     calls = _swagger_calls(argv_log)
     assert len(calls) == 1, calls
@@ -506,14 +553,14 @@ def test_swagger_url_is_handed_to_psql_as_a_variable(bash, tmp_path):
     assert "custom.swagger_url" not in sql_log.read_text() + argv_log.read_text()
 
 
-def test_without_the_flag_psql_is_handed_an_empty_value(bash, tmp_path):
+def test_without_the_flag_psql_is_handed_an_empty_value(bash, tmp_path: Path) -> None:
     """Empty, which scripts/set_swagger_base_url.sql stores as NULL (tested there)."""
     _, _, argv_log = run_install_full_stub(bash, tmp_path)
     calls = _swagger_calls(argv_log)
     assert len(calls) == 1 and " -v swagger_url= -f " in calls[0] and calls[0].endswith(SWAGGER_SQL), calls
 
 
-def test_the_swagger_value_never_becomes_sql_text(bash, tmp_path):
+def test_the_swagger_value_never_becomes_sql_text(bash, tmp_path: Path) -> None:
     """The old line was `psql -c "SET custom.swagger_url = '<value>';"`: a value with an
     apostrophe closed the literal, and the rest ran as SQL."""
     hostile = "x'; DROP SCHEMA haf_fyp_app CASCADE; --"
@@ -525,7 +572,7 @@ def test_the_swagger_value_never_becomes_sql_text(bash, tmp_path):
     assert " -c " not in f" {carrying[0]} " and carrying[0].endswith(SWAGGER_SQL), carrying[0]
 
 
-def _exact_swagger_call(tmp_path) -> list:
+def _exact_swagger_call(tmp_path: Path) -> list:
     """The arguments of the one psql call that carries the value, one per element."""
     calls = (tmp_path / "argv.exact.log").read_text().split("\n--\n")
     carrying = [c.split("\n") for c in calls if "\nswagger_url=" in "\n" + c]
@@ -540,7 +587,7 @@ def _exact_swagger_call(tmp_path) -> list:
     "/*",                           # unquoted, a glob
     "",
 ])
-def test_the_value_reaches_psql_as_one_argument_exactly_as_given(bash, tmp_path, value):
+def test_the_value_reaches_psql_as_one_argument_exactly_as_given(bash, tmp_path: Path, value) -> None:
     proc, _, _ = run_install_full_stub(bash, tmp_path, f"--swagger-url={value}")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     argv = _exact_swagger_call(tmp_path)
@@ -551,7 +598,7 @@ def test_the_value_reaches_psql_as_one_argument_exactly_as_given(bash, tmp_path,
     assert "ON_ERROR_STOP=on" in argv and "-X" in argv, argv
 
 
-def test_a_failed_write_fails_the_install(bash, tmp_path):
+def test_a_failed_write_fails_the_install(bash, tmp_path: Path) -> None:
     """The table is there or the install is broken; carrying on would publish a
     document whose base URL is not the one the operator was just told it would be."""
     proc, _, argv_log = run_install_full_stub(
@@ -562,20 +609,20 @@ def test_a_failed_write_fails_the_install(bash, tmp_path):
     assert calls[-1].endswith(SWAGGER_SQL), "the install went on after the write failed"
 
 
-def test_the_last_swagger_url_wins(bash, tmp_path):
+def test_the_last_swagger_url_wins(bash, tmp_path: Path) -> None:
     """As for every other option here: a wrapper appends its own flag after the caller's."""
     run_install_full_stub(bash, tmp_path, "--swagger-url=/first", "--swagger-url=/second")
     assert "swagger_url=/second" in _exact_swagger_call(tmp_path)
 
 
-def test_the_warning_names_the_value_and_the_default_that_stands(bash, tmp_path):
+def test_the_warning_names_the_value_and_the_default_that_stands(bash, tmp_path: Path) -> None:
     proc, _, _ = run_install_full_stub(bash, tmp_path, "--swagger-url=api.example")
     out = " ".join((proc.stdout + proc.stderr).split())
     assert "WARNING: --swagger-url='api.example'" in out, out
     assert "default base URL '/haf-fyp-api' instead" in out, out
 
 
-def test_the_value_is_stored_after_its_table_is_created(bash, tmp_path):
+def test_the_value_is_stored_after_its_table_is_created(bash, tmp_path: Path) -> None:
     """app_config is created by db/haf_fyp_app.sql; writing before that fails the install."""
     _, _, argv_log = run_install_full_stub(bash, tmp_path, "--swagger-url=/")
     calls = argv_log.read_text().splitlines()
@@ -609,19 +656,19 @@ def test_the_value_is_stored_after_its_table_is_created(bash, tmp_path):
     ("https://user:secret@api.example/x", True),   # would publish a credential
     ("https://api.example:8443/x?y=1#z", False),   # all three are fine after the path starts
 ])
-def test_a_value_that_will_be_ignored_is_reported(bash, tmp_path, value, warns):
+def test_a_value_that_will_be_ignored_is_reported(bash, tmp_path: Path, value, warns) -> None:
     proc, _, _ = run_install_full_stub(bash, tmp_path, f"--swagger-url={value}")
     out = proc.stdout + proc.stderr
     assert proc.returncode == 0, out
     assert ("WARNING: --swagger-url=" in out) is warns, out
 
 
-def test_no_warning_when_the_flag_is_not_given(bash, tmp_path):
+def test_no_warning_when_the_flag_is_not_given(bash, tmp_path: Path) -> None:
     proc, _, _ = run_install_full_stub(bash, tmp_path)
     assert "--swagger-url" not in proc.stdout + proc.stderr
 
 
-def test_the_installer_and_the_endpoint_use_one_pattern():
+def test_the_installer_and_the_endpoint_use_one_pattern() -> None:
     """install_app.sh only REPORTS a value that will be ignored; root() is what ignores
     it. If the two patterns drift, the warning lies in one direction or the other."""
     shape, forbidden = "'^(/($|[^/])|https?://[^/?#@]+/)'", "'[[:space:][:cntrl:]\\\\]'"
@@ -635,13 +682,13 @@ def test_the_installer_and_the_endpoint_use_one_pattern():
     assert "grep" not in installer[installer.index("swagger_shape="):installer.index("set_swagger_base_url.sql")]
 
 
-def test_user_flag_reaches_the_connection(bash, tmp_path):
+def test_user_flag_reaches_the_connection(bash, tmp_path: Path) -> None:
     """Parsed-but-discarded is the exact failure mode this MR calls a bug elsewhere."""
     _, _, argv_log = run_install_full_stub(bash, tmp_path, "--user=someone_else")
     assert "-U someone_else" in argv_log.read_text()
 
 
-def test_postgres_host_is_accepted_as_a_synonym(bash, tmp_path):
+def test_postgres_host_is_accepted_as_a_synonym(bash, tmp_path: Path) -> None:
     """balance_tracker's install_app.sh takes --postgres-host and nothing else, so with
     the new unknown-option error a copied runbook would hard-fail -- and under
     haf-fyp-setup's restart: on-failure that is a crash-loop."""
@@ -652,7 +699,7 @@ def test_postgres_host_is_accepted_as_a_synonym(bash, tmp_path):
 @pytest.mark.parametrize(
     "script", [INSTALL, UNINSTALL, PROCESS], ids=["install", "uninstall", "process_blocks"]
 )
-def test_help_covers_every_option_the_loop_accepts(bash, tmp_path, script):
+def test_help_covers_every_option_the_loop_accepts(bash, tmp_path: Path, script) -> None:
     """Drift guard keyed on the CODE, not on the comment header.
 
     The earlier version of this test grepped the header for a fixed list, so drift in
@@ -700,7 +747,7 @@ def test_help_covers_every_option_the_loop_accepts(bash, tmp_path, script):
     "script", [INSTALL, UNINSTALL, PROCESS], ids=["install", "uninstall", "process_blocks"]
 )
 @pytest.mark.parametrize("flag", ["--postgres-url", "--url"])
-def test_postgres_url_is_refused_with_a_useful_message(bash, tmp_path, script, flag):
+def test_postgres_url_is_refused_with_a_useful_message(bash, tmp_path: Path, script, flag) -> None:
     r = run(bash, tmp_path, script, f"{flag}=postgresql://haf_admin@haf/db")
     assert r.returncode == 2
     # Not the generic fallthrough -- that would tell a module-file author nothing.
@@ -714,7 +761,7 @@ def test_postgres_url_is_refused_with_a_useful_message(bash, tmp_path, script, f
 @pytest.mark.parametrize(
     "script", [INSTALL, UNINSTALL, PROCESS], ids=["install", "uninstall", "process_blocks"]
 )
-def test_no_script_silently_honours_a_connection_uri(bash, tmp_path, script):
+def test_no_script_silently_honours_a_connection_uri(bash, tmp_path: Path, script) -> None:
     """The invariant that matters more than the message: nothing may reach the database
     on the strength of a URI while the rest of the script reasons about POSTGRES_HOST."""
     body = script.read_text()
@@ -725,7 +772,7 @@ def test_no_script_silently_honours_a_connection_uri(bash, tmp_path, script):
     )
 
 
-def test_no_shipped_shell_file_honours_a_connection_uri():
+def test_no_shipped_shell_file_honours_a_connection_uri() -> None:
     """Every shipped shell file, and by SHAPE rather than by one variable name.
 
     The earlier version grepped `common.sh` for POSTGRES_URL and the three verb scripts
@@ -780,7 +827,7 @@ def test_no_shipped_shell_file_honours_a_connection_uri():
 
 @pytest.mark.parametrize("value", ["btracker_app", "haf_fyp_endpoints", "haf_fyp", "public"],
                          ids=["foreign", "our-other-schema", "the-context-name", "public"])
-def test_install_emits_identical_sql_with_and_without_schema(bash, tmp_path, value):
+def test_install_emits_identical_sql_with_and_without_schema(bash, tmp_path: Path, value) -> None:
     a, b = tmp_path / "a", tmp_path / "b"
     a.mkdir()
     b.mkdir()
@@ -793,7 +840,7 @@ def test_install_emits_identical_sql_with_and_without_schema(bash, tmp_path, val
 
 @pytest.mark.parametrize("value", ["btracker_app", "haf_fyp_endpoints", "haf_fyp"],
                          ids=["foreign", "our-other-schema", "the-context-name"])
-def test_process_blocks_always_calls_the_same_main(bash, tmp_path, value):
+def test_process_blocks_always_calls_the_same_main(bash, tmp_path: Path, value) -> None:
     """CALL haf_fyp_app.main('haf_fyp') -- the schema-qualified callee AND the context
     argument must both be immune to the flag."""
     a, b = tmp_path / "a", tmp_path / "b"
@@ -811,7 +858,7 @@ def test_process_blocks_always_calls_the_same_main(bash, tmp_path, value):
 
 @pytest.mark.parametrize("value", ["btracker_app", "haf_fyp_endpoints", "haf_fyp", "public"],
                          ids=["foreign", "our-other-schema", "the-context-name", "public"])
-def test_the_apps_own_schema_name_is_matched_exactly(bash, tmp_path, value):
+def test_the_apps_own_schema_name_is_matched_exactly(bash, tmp_path: Path, value) -> None:
     """Not as a prefix. `[[ "${arg#*=}" != haf_fyp* ]]` silently accepts
     haf_fyp_endpoints, haf_fyp (the CONTEXT name) and haf_fyp_appXYZ -- the same
     prefix-vs-equality bug this repo has hit before. Only haf_fyp_app is quiet."""
@@ -857,7 +904,7 @@ _EMPTY_CASES = ([(INSTALL, f) for f in EMPTY_VALUE_FLAGS]
 
 @pytest.mark.parametrize("script,flag", _EMPTY_CASES,
                          ids=[f"{s.stem}{f}" for s, f in _EMPTY_CASES])
-def test_an_empty_connection_flag_value_is_refused(bash, tmp_path, script, flag):
+def test_an_empty_connection_flag_value_is_refused(bash, tmp_path: Path, script, flag) -> None:
     r = run(bash, tmp_path, script, flag)
     out = r.stdout + r.stderr
     assert r.returncode == 2, (
@@ -882,8 +929,8 @@ _WS_CASES = [(s, f, v)
 @pytest.mark.parametrize("script,flag,value", _WS_CASES,
                          ids=[f"{s.stem}{f}{'sp' if v == '   ' else 'tab'}"
                               for s, f, v in _WS_CASES])
-def test_a_whitespace_only_connection_flag_value_is_refused(bash, tmp_path, script,
-                                                            flag, value):
+def test_a_whitespace_only_connection_flag_value_is_refused(bash, tmp_path: Path, script,
+                                                            flag, value) -> None:
     """Covers all three flags, not just --user=. --host= and --port= happen to fail
     loudly on whitespace (pg_isready reports no response) while --user= is accepted
     silently, so a guard that special-cased --user would still be wrong -- and would
@@ -894,7 +941,7 @@ def test_a_whitespace_only_connection_flag_value_is_refused(bash, tmp_path, scri
     assert f"ERROR: {flag} was given a whitespace-only value." in out, out
 
 
-def test_a_newline_in_a_connection_flag_value_is_refused(bash, tmp_path):
+def test_a_newline_in_a_connection_flag_value_is_refused(bash, tmp_path: Path) -> None:
     """A newline makes every message that echoes the value print only its first line,
     so the log would name one target while libpq is handed another.
 
@@ -925,8 +972,8 @@ _REFUSAL_CASES = [(s, f) for s in (INSTALL, UNINSTALL, PROCESS)
 
 @pytest.mark.parametrize("script,flag", _REFUSAL_CASES,
                          ids=[f"{s.stem}{f}" for s, f in _REFUSAL_CASES])
-def test_the_refusal_happens_before_any_connection_is_attempted(bash, tmp_path,
-                                                                script, flag):
+def test_the_refusal_happens_before_any_connection_is_attempted(bash, tmp_path: Path,
+                                                                script, flag) -> None:
     """The point of the guard. A version that logged an error and carried on would pass
     a message-only assertion and still drop the schemas -- so assert that neither psql
     nor pg_isready was ever invoked.
@@ -969,7 +1016,7 @@ def test_the_refusal_happens_before_any_connection_is_attempted(bash, tmp_path,
 
 
 @pytest.mark.parametrize("script", [INSTALL, UNINSTALL, PROCESS], ids=lambda p: p.name)
-def test_a_valid_connection_flag_value_is_still_accepted(bash, tmp_path, script):
+def test_a_valid_connection_flag_value_is_still_accepted(bash, tmp_path: Path, script) -> None:
     """The guard must reject empty and whitespace-only values, not values in general.
 
     Covers all three verbs. process_blocks.sh matters most: docker_entrypoint.sh passes
@@ -1012,7 +1059,7 @@ _CONNECTION_ASSIGN = re.compile(
 )
 
 
-def test_every_connection_flag_arm_validates_its_value():
+def test_every_connection_flag_arm_validates_its_value() -> None:
     """Source-text, and honest about it: a completeness check, not a behavioural one.
     The behavioural tests can only cover flags and scripts someone remembered to list,
     and forgetting a neighbour is exactly how #40 arose -- twice.
@@ -1051,7 +1098,7 @@ def test_every_connection_flag_arm_validates_its_value():
     )
 
 
-def test_the_guard_is_reachable_from_every_script_that_uses_it():
+def test_the_guard_is_reachable_from_every_script_that_uses_it() -> None:
     """A script can call require_flag_value and still be broken if it never sourced the
     file defining it -- and three of the six do NOT source common.sh, deliberately:
     inheriting its POSTGRES_* defaults would change what they connect to."""
@@ -1079,7 +1126,7 @@ def test_the_guard_is_reachable_from_every_script_that_uses_it():
 # when the key is ABSENT -- so POSTGRES_HOST= in a compose file produced host="" and
 # libpq substituted the local socket, in a daemon that DELETEs and retries forever.
 
-def test_python_services_treat_an_empty_env_value_as_unset(monkeypatch):
+def test_python_services_treat_an_empty_env_value_as_unset(monkeypatch: MonkeyPatch) -> None:
     """The shell's `:=` semantics, restored for the Python overlay."""
     from haf_fyp.dbenv import env_or_default
 
@@ -1094,7 +1141,7 @@ def test_python_services_treat_an_empty_env_value_as_unset(monkeypatch):
 
 
 @pytest.mark.parametrize("bad", ["   ", "\t", "x dbname=other", "a'b"])
-def test_python_services_refuse_a_value_that_would_break_the_conninfo(monkeypatch, bad):
+def test_python_services_refuse_a_value_that_would_break_the_conninfo(monkeypatch: MonkeyPatch, bad) -> None:
     """ranker_daemon builds its DSN by f-string concatenation, so a space starts a new
     keyword: POSTGRES_HOST="x dbname=other" would silently change the database."""
     from haf_fyp.dbenv import ConnectionSettingError, env_or_default
@@ -1104,7 +1151,7 @@ def test_python_services_refuse_a_value_that_would_break_the_conninfo(monkeypatc
         env_or_default("POSTGRES_HOST", "haf")
 
 
-def test_both_python_services_route_through_the_same_helper(monkeypatch):
+def test_both_python_services_route_through_the_same_helper(monkeypatch: MonkeyPatch) -> None:
     """The API and the ranker must not disagree about what an empty value means -- they
     connect as different roles to the same database, and a split would point one of them
     somewhere else entirely."""
@@ -1123,7 +1170,7 @@ def test_both_python_services_route_through_the_same_helper(monkeypatch):
     assert "dbname=haf_block_log " in dsn
 
 
-def test_pgvector_is_checked_before_anything_is_created(bash, tmp_path):
+def test_pgvector_is_checked_before_anything_is_created(bash, tmp_path: Path) -> None:
     """#38: without pgvector the install reached step 3 and died on `type "vector" does
     not exist` -- after roles and the schema existed -- then crash-looped. The guard is
     only worth anything if it runs BEFORE the first mutation, so assert the ordering, not
@@ -1148,7 +1195,7 @@ def test_pgvector_is_checked_before_anything_is_created(bash, tmp_path):
         )
 
 
-def test_pgvector_guard_creates_it_when_superuser_and_refuses_otherwise(bash, tmp_path):
+def test_pgvector_guard_creates_it_when_superuser_and_refuses_otherwise(bash, tmp_path: Path) -> None:
     """The branch matters: an earlier revision refused unconditionally, on the false
     premise that haf_admin is not a superuser. HAF creates it as one, and hivesense's
     installer relies on that to create this very extension plus plpython3u.

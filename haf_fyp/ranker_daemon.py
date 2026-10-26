@@ -54,6 +54,7 @@ import redis as redis_lib
 from haf_fyp import visibility
 from haf_fyp.credibility import credibility_failure_message, fetch_author_credibility
 from haf_fyp.embeddings import fetch_post_vectors_safe, register_vector_type
+from haf_fyp.schema_version import IncompatibleSchemaError, check_schema_version
 from haf_fyp.scoring import (
     FEED_CACHE_RANK_TYPE,
     FEED_CACHE_SHAPE_SQL,
@@ -201,7 +202,7 @@ READ_REFRESH_MAX_PER_CYCLE = max(0, _tuning(
 READ_REFRESH_BATCH_SECONDS = max(0, _tuning("READ_REFRESH_BATCH_SECONDS", "30", int))
 # Opt-in (#84): honour a read only from an account that voted on or reblogged a post
 # haf_fyp tracks in the last this-many days (active_users.last_interaction_at, which
-# process_interactions writes from those two operations only), or that saved interests
+# block processing writes from those two actions only), or that saved interests
 # (a signed request: the new users FYP is for have often done neither). 0, the default,
 # honours every read. A forged read for any other account then takes no lane slot and
 # no early re-rank. It does NOT stop a flood: on testapi 12,888 accounts had voted or
@@ -440,6 +441,9 @@ def _connect() -> psycopg2.extensions.connection:
             log.info("connected to database")
             _current_conn = conn
             _take_app_locks(conn)
+            # After the lock: an install that holds it is waited out, and what it
+            # installed is what this checks.
+            _refuse_older_schema(conn)
             _listen_for_feed_reads(conn)
             # Before the first cycle as well: main() handles reads before it runs one.
             _refresh_read_filter(conn)
@@ -456,6 +460,19 @@ def _connect() -> psycopg2.extensions.connection:
         if conn is not None:
             conn.close()
         time.sleep(5)
+
+
+def _refuse_older_schema(conn) -> None:
+    """Exit, with one error naming both versions, when the installed SQL is older than
+    this ranker (#97). SystemExit, not an exception the loop handles: every handler in
+    main() would turn it into a retry, and retrying cannot make the schema newer."""
+    try:
+        version = check_schema_version(conn)
+    except IncompatibleSchemaError as exc:
+        log.error("%s", exc)
+        conn.close()
+        raise SystemExit(2) from None
+    log.info("installed schema version %d", version)
 
 
 def _warn_missing_read_column() -> None:
@@ -712,13 +729,14 @@ def _fetch_algorithm(conn) -> tuple[str, dict]:
 
 
 def _fetch_candidates(conn) -> pd.DataFrame:
+    # post_candidates holds only haf_fyp's own columns (#97): the author is hivemind's,
+    # and so is whether the post has since been deleted.
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             """
             SELECT
                 pc.post_id,
-                pc.author,
-                pc.permlink,
+                ha.name AS author,
                 pc.community_id,
                 pc.created_at,
                 COALESCE(em.unique_commenters, 0) AS unique_commenters,
@@ -726,6 +744,10 @@ def _fetch_candidates(conn) -> pd.DataFrame:
                 COALESCE(em.net_rshares,       0) AS net_rshares,
                 COALESCE(em.vote_count,        0) AS vote_count
             FROM haf_fyp_app.post_candidates pc
+            JOIN hivemind_app.hive_posts hp
+                   ON hp.id = pc.post_id AND hp.counter_deleted = 0
+            JOIN hivemind_app.hive_accounts ha
+                   ON ha.id = hp.author_id
             LEFT JOIN haf_fyp_app.engagement_metrics em
                    ON em.post_id = pc.post_id
             WHERE pc.payout_window = TRUE
@@ -1411,6 +1433,28 @@ def _run_embedding_coverage_maintenance(conn) -> None:
         log.exception("embedding-coverage maintenance failed — skipping")
 
 
+def _run_history_retention(conn) -> None:
+    """
+    Delete the posts and interactions that have aged out of the history window (#97):
+    haf_fyp_app.prune_history() (db/hivemind_follow.sql), on the hourly cadence.
+    Best-effort: a maintenance failure must never take down ranking.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT posts, interactions FROM haf_fyp_app.prune_history()")
+            posts, interactions = cur.fetchone()
+        conn.commit()
+        log.info(
+            "history retention: %d post(s) and %d interaction(s) older than the window deleted",
+            posts, interactions,
+        )
+    except psycopg2.OperationalError:
+        raise
+    except Exception:
+        conn.rollback()
+        log.exception("history retention failed — skipping")
+
+
 def _refresh_read_filter(conn) -> None:
     """Turn the #84 read filter on only while block processing is caught up; see
     _read_filter_days. Logs each change. A failed check leaves the filter off: every read
@@ -1773,6 +1817,7 @@ def main() -> None:
                 _run_unread_feed_maintenance(conn)
                 _run_feed_events_maintenance(conn)
                 _run_embedding_coverage_maintenance(conn)
+                _run_history_retention(conn)
             except (psycopg2.OperationalError, psycopg2.InterfaceError):
                 log.warning("database connection lost (maintenance) — reconnecting")
                 conn = _reconnect(conn)

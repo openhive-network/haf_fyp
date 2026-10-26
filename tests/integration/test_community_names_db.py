@@ -12,17 +12,15 @@ db/process_communities.sql and db/process_posts.sql used to cast that field to i
 The cast raised, the batch rolled back, and the driver retried the range holding that
 block forever.
 
-Nothing in the repo executed process_subscribe, process_unsubscribe or process_posts
-before this file, which is how a statement that cannot survive the real chain shipped.
-The operations are modelled here as rows in a stand-in hive.operations_view and the
-shipped SQL runs over them unchanged.
+Nothing in the repo executed process_subscribe or process_unsubscribe before this file,
+which is how a statement that cannot survive the real chain shipped. The operations are
+modelled here as rows in a stand-in hive.operations_view and the shipped SQL runs over
+them unchanged. Root posts are hivemind's now (#97): how their category becomes a
+community id is tested with the copy, in test_hivemind_follow_db.py.
 
 What this file does NOT prove: the constraints a wrong statement trips over here (NOT
-NULL, the primary keys, the unique index) are this file's own DDL. It is a SUBSET of
-db/create_tables.sql, not a copy: user_communities matches, but post_candidates has
-nullable author and permlink and a unique index where the real table has a constraint,
-and post_lookup and engagement_metrics carry no foreign keys or counters. Nothing holds
-the two together. The block times are invented.
+NULL, the primary key) are this file's own DDL, which for user_communities matches
+db/create_tables.sql; nothing holds the two together. The block times are invented.
 
 Runs in the fastapi-tests job, which already has a real postgres and already runs
 tests/integration/. Everything this file creates is rolled back.
@@ -40,15 +38,13 @@ POSTS_SQL = os.path.join(HERE, "..", "..", "db", "process_posts.sql")
 COMMUNITIES_SQL = os.path.join(HERE, "..", "..", "db", "process_communities.sql")
 DISPATCHER_SQL = os.path.join(HERE, "..", "..", "db", "process_block_range.sql")
 
-CUSTOM_JSON, COMMENT, VOTE = 18, 1, 0
+CUSTOM_JSON, VOTE = 18, 0
 BLOCK = 36467091
 
 # What the processors read, and nothing else. hive.operations_view is a view over HAF's
 # own tables on a real node; a table with the same three columns stage_operations
-# selects (plus the id, which process_posts uses as post_id and process_communities
-# orders by) is enough for the statements to run unchanged.
-# The haf_fyp_app tables are created IF NOT EXISTS and widened IF NOT EXISTS because the
-# fastapi lane (tests/ci_fastapi_setup.sql) already has a three-column post_candidates.
+# selects (plus the id, which process_communities orders by) is enough for the
+# statements to run unchanged.
 SCAFFOLD = """
 CREATE SCHEMA IF NOT EXISTS haf_fyp_app;
 CREATE TABLE IF NOT EXISTS hafd.operation_types (id INT PRIMARY KEY, name TEXT NOT NULL);
@@ -73,26 +69,6 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.user_communities (
     PRIMARY KEY (username, community_id)
 );
 DELETE FROM haf_fyp_app.user_communities;
-
-CREATE TABLE IF NOT EXISTS haf_fyp_app.post_candidates (
-    post_id BIGINT PRIMARY KEY, created_at TIMESTAMP NOT NULL, hive_post_id INT);
-ALTER TABLE haf_fyp_app.post_candidates
-    ADD COLUMN IF NOT EXISTS author varchar(16),
-    ADD COLUMN IF NOT EXISTS permlink varchar(256),
-    ADD COLUMN IF NOT EXISTS community_id int,
-    ADD COLUMN IF NOT EXISTS title text,
-    ADD COLUMN IF NOT EXISTS tags text [],
-    ADD COLUMN IF NOT EXISTS category varchar(256),
-    ADD COLUMN IF NOT EXISTS body_length int;
-CREATE UNIQUE INDEX IF NOT EXISTS ci_post_candidates_author_permlink
-    ON haf_fyp_app.post_candidates (author, permlink);
-CREATE TABLE IF NOT EXISTS haf_fyp_app.post_lookup (
-    post_id bigint PRIMARY KEY, author varchar(16) NOT NULL, permlink varchar(256) NOT NULL);
-CREATE TABLE IF NOT EXISTS haf_fyp_app.engagement_metrics (
-    post_id bigint PRIMARY KEY, updated_at timestamp);
-DELETE FROM haf_fyp_app.engagement_metrics;
-DELETE FROM haf_fyp_app.post_lookup;
-DELETE FROM haf_fyp_app.post_candidates;
 """
 
 
@@ -162,7 +138,7 @@ _next_id = iter(range(1, 100_000))
 
 
 def custom_json(cur, payload, *, posting=("mallory",), active=(), json_id="community",
-                block=BLOCK, op_type=CUSTOM_JSON, op_id=None):
+                block=BLOCK, op_type=CUSTOM_JSON, op_id=None) -> None:
     """A custom_json as the chain stores it: `json` is a STRING holding the payload.
 
     Ids rise in the order the helpers are called, as HAF's rise along the chain; op_id
@@ -174,18 +150,8 @@ def custom_json(cur, payload, *, posting=("mallory",), active=(), json_id="commu
                 (next(_next_id) if op_id is None else op_id, block, op_type, json.dumps(body)))
 
 
-def community_op(cur, user, action, community, **kwargs):
+def community_op(cur, user, action, community, **kwargs) -> None:
     custom_json(cur, json.dumps([action, {"community": community}]), posting=(user,), **kwargs)
-
-
-def comment(cur, author, permlink, parent_permlink, *, parent_author="", block=BLOCK,
-            json_metadata="{}", op_type=COMMENT):
-    body = {"type": "comment_operation",
-            "value": {"parent_author": parent_author, "parent_permlink": parent_permlink,
-                      "author": author, "permlink": permlink, "title": f"title of {permlink}",
-                      "body": "four", "json_metadata": json_metadata}}
-    cur.execute("INSERT INTO hive.operations_view VALUES (%s, %s, %s, %s)",
-                (next(_next_id), block, op_type, json.dumps(body)))
 
 
 def subscriptions(cur) -> set:
@@ -193,12 +159,7 @@ def subscriptions(cur) -> set:
     return set(cur.fetchall())
 
 
-def posts(cur) -> set:
-    cur.execute("SELECT author, permlink, community_id, category FROM haf_fyp_app.post_candidates")
-    return set(cur.fetchall())
-
-
-def run(cur, function, first=BLOCK, last=BLOCK):
+def run(cur, function, first=BLOCK, last=BLOCK) -> None:
     """Stage the range as process_block_range does, then run one processor over it."""
     cur.execute("SELECT haf_fyp_app.stage_operations(%s, %s)", (first, last))
     cur.execute(f"SELECT haf_fyp_app.{function}(%s, %s)", (first, last))
@@ -237,7 +198,7 @@ LENIENT_READINGS = [0, 12, 95, 12345, 123456, 1234567890]
     ("hive-123456", 123456),
     ("hive-999999999", 999999999),         # nine digits: the widest that always fits
 ])
-def test_a_well_formed_name_maps_to_its_number(conn, name, expected):
+def test_a_well_formed_name_maps_to_its_number(conn, name, expected) -> None:
     with conn.cursor() as cur:
         cur.execute("SELECT haf_fyp_app.community_id_from_name(%s)", (name,))
         assert cur.fetchone()[0] == expected
@@ -245,7 +206,7 @@ def test_a_well_formed_name_maps_to_its_number(conn, name, expected):
 
 @pytest.mark.parametrize(
     "value", [v for v in NOT_A_COMMUNITY_NAME if v is None or isinstance(v, str)], ids=repr)
-def test_anything_else_maps_to_null_and_never_raises(conn, value):
+def test_anything_else_maps_to_null_and_never_raises(conn, value) -> None:
     with conn.cursor() as cur:
         cur.execute("SELECT haf_fyp_app.community_id_from_name(%s)", (value,))
         assert cur.fetchone()[0] is None
@@ -253,7 +214,7 @@ def test_anything_else_maps_to_null_and_never_raises(conn, value):
 
 # --- subscribe ---------------------------------------------------------------------
 
-def test_subscribe_skips_malformed_names_and_keeps_the_rest_of_the_batch(conn):
+def test_subscribe_skips_malformed_names_and_keeps_the_rest_of_the_batch(conn) -> None:
     """One bad op must not cost the batch its good ones, and must not raise: a raise is
     what stalled the sync."""
     with conn.cursor() as cur:
@@ -267,7 +228,7 @@ def test_subscribe_skips_malformed_names_and_keeps_the_rest_of_the_batch(conn):
         assert subscriptions(cur) == {("alice", 123456), ("bob", 999999999)}
 
 
-def test_subscribing_again_is_not_an_error(conn):
+def test_subscribing_again_is_not_an_error(conn) -> None:
     """Twice in one range, and once more for a row an earlier range already wrote. A
     unique violation here stalls the sync exactly as the cast did."""
     with conn.cursor() as cur:
@@ -285,7 +246,7 @@ def test_subscribing_again_is_not_an_error(conn):
         assert dict(cur.fetchall()) == {"alice": True, "carol": False}
 
 
-def test_a_community_op_signed_with_the_active_key_is_skipped(conn):
+def test_a_community_op_signed_with_the_active_key_is_skipped(conn) -> None:
     """No posting auth, so no username: skipped, not inserted as NULL."""
     with conn.cursor() as cur:
         custom_json(cur, json.dumps(["subscribe", {"community": "hive-123456"}]),
@@ -297,7 +258,7 @@ def test_a_community_op_signed_with_the_active_key_is_skipped(conn):
         assert subscriptions(cur) == {("bob", 123456)}
 
 
-def test_only_subscribe_ops_of_the_community_protocol_in_range_subscribe(conn):
+def test_only_subscribe_ops_of_the_community_protocol_in_range_subscribe(conn) -> None:
     with conn.cursor() as cur:
         name = {"community": "hive-123456"}
         community_op(cur, "wrongid", "subscribe", "hive-123456", json_id="follow")
@@ -316,26 +277,23 @@ def test_only_subscribe_ops_of_the_community_protocol_in_range_subscribe(conn):
         assert subscriptions(cur) == {("alice", 123456)}
 
 
-def test_a_range_of_several_blocks_is_processed_whole(conn):
+def test_a_range_of_several_blocks_is_processed_whole(conn) -> None:
     with conn.cursor() as cur:
         cur.execute("INSERT INTO haf_fyp_app.user_communities VALUES "
                     "('x', 777, now()), ('y', 777, now()), ('z', 777, now())")
         for user, block in (("a", BLOCK - 1), ("b", BLOCK), ("c", BLOCK + 1)):
             community_op(cur, user, "subscribe", "hive-123456", block=block)
-            comment(cur, user, "post", "hive-123456", block=block)
         for user, block in (("x", BLOCK - 1), ("y", BLOCK), ("z", BLOCK + 1)):
             community_op(cur, user, "unsubscribe", "hive-777", block=block)
 
         run(cur, "process_communities", BLOCK - 1, BLOCK + 1)
-        run(cur, "process_posts", BLOCK - 1, BLOCK + 1)
 
         assert subscriptions(cur) == {("a", 123456), ("b", 123456), ("c", 123456)}
-        assert {p[0] for p in posts(cur)} == {"a", "b", "c"}
 
 
 # --- unsubscribe -------------------------------------------------------------------
 
-def test_unsubscribe_removes_only_what_a_well_formed_name_names(conn):
+def test_unsubscribe_removes_only_what_a_well_formed_name_names(conn) -> None:
     """mallory holds every community a lenient reading of the junk would arrive at. The
     junk must remove none of them; the one well-formed op removes exactly its own."""
     with conn.cursor() as cur:
@@ -352,7 +310,7 @@ def test_unsubscribe_removes_only_what_a_well_formed_name_names(conn):
         assert subscriptions(cur) == {("mallory", c) for c in LENIENT_READINGS} | {("bob", 777)}
 
 
-def test_only_unsubscribe_ops_of_the_community_protocol_in_range_unsubscribe(conn):
+def test_only_unsubscribe_ops_of_the_community_protocol_in_range_unsubscribe(conn) -> None:
     with conn.cursor() as cur:
         users = ("wrongid", "wrongop", "before", "after", "joining", "alice")
         for user in users:
@@ -377,7 +335,7 @@ def test_only_unsubscribe_ops_of_the_community_protocol_in_range_unsubscribe(con
 
 # --- the dispatcher process_block_range calls --------------------------------------
 
-def test_the_dispatcher_runs_both(conn):
+def test_the_dispatcher_runs_both(conn) -> None:
     with conn.cursor() as cur:
         cur.execute("INSERT INTO haf_fyp_app.user_communities VALUES ('bob', 123456, now())")
         community_op(cur, "alice", "subscribe", "hive-123456")
@@ -419,7 +377,7 @@ SEQUENCES = [
 
 @pytest.mark.parametrize("spread", ["one block", "several blocks"])
 @pytest.mark.parametrize("before, ops, after", SEQUENCES, ids=lambda v: str(v))
-def test_the_last_operation_in_the_range_decides(conn, before, ops, after, spread):
+def test_the_last_operation_in_the_range_decides(conn, before, ops, after, spread) -> None:
     """Until #82 every subscribe was applied and then every unsubscribe, so 'US' ended
     unsubscribed. One block or several: the range is one batch either way."""
     with conn.cursor() as cur:
@@ -449,7 +407,7 @@ def test_the_last_operation_in_the_range_decides(conn, before, ops, after, sprea
             assert rows == [BLOCK_TIMES[blocks[first]]]
 
 
-def test_last_means_last_on_the_chain_not_last_in_the_table(conn):
+def test_last_means_last_on_the_chain_not_last_in_the_table(conn) -> None:
     """The order is the operation id's. Rows are written here newest first, so a
     processor that took the order the table happens to return would get both wrong.
     (All four are in one block: that the id, not the block, breaks a tie is the 'USUS'
@@ -468,7 +426,7 @@ def test_last_means_last_on_the_chain_not_last_in_the_table(conn):
         assert subscriptions(cur) == {("alice", 123456)}
 
 
-def test_only_the_same_user_and_community_can_have_the_last_word(conn):
+def test_only_the_same_user_and_community_can_have_the_last_word(conn) -> None:
     """alice's final subscribe to 123456 is followed by things that are not about that
     pair: another user, another community, a name that is not one, an op with no posting
     auth, another protocol. None of them is her last operation on 123456."""
@@ -495,7 +453,7 @@ def joined(cur) -> dict:
     return {(u, c): at for u, c, at in cur.fetchall()}
 
 
-def test_each_pair_is_dated_by_its_own_operations(conn):
+def test_each_pair_is_dated_by_its_own_operations(conn) -> None:
     """Two users on one community and one user on two, interleaved across three blocks.
     Each row's time comes from that pair's own first subscribe after its own last
     unsubscribe, not from a neighbour's."""
@@ -520,7 +478,7 @@ def test_each_pair_is_dated_by_its_own_operations(conn):
         }
 
 
-def test_the_range_gives_each_pair_exactly_one_row(conn):
+def test_the_range_gives_each_pair_exactly_one_row(conn) -> None:
     """What both steps read: one row per pair is the function's contract. Compared as a
     list, not a set, so a second row for a pair shows."""
     with conn.cursor() as cur:
@@ -547,7 +505,7 @@ def test_the_range_gives_each_pair_exactly_one_row(conn):
         ]
 
 
-def test_the_account_is_the_first_posting_auth(conn):
+def test_the_account_is_the_first_posting_auth(conn) -> None:
     with conn.cursor() as cur:
         # First by position, not by name: "zed" sorts after "alice".
         custom_json(cur, json.dumps(["subscribe", {"community": "hive-123456"}]),
@@ -564,7 +522,7 @@ def test_the_account_is_the_first_posting_auth(conn):
     # removed. That is why the dispatcher's order is fixed, and what this pins.
     (("process_subscribe", "process_unsubscribe"), {("joiner", 123456)}),
 ], ids=["as the dispatcher calls them", "the other way round"])
-def test_the_two_steps_agree_on_every_pair_but_their_order_matters(conn, order, expected):
+def test_the_two_steps_agree_on_every_pair_but_their_order_matters(conn, order, expected) -> None:
     """Both steps read the pair's ONE outcome: leaver and passer end unsubscribed and
     only the unsubscribe step touches them, joiner ends subscribed and only the
     subscribe step does. The returning user needs both, in the dispatcher's order. The
@@ -602,7 +560,7 @@ def test_the_two_steps_agree_on_every_pair_but_their_order_matters(conn, order, 
     '{action} hive-123456',                 # not JSON at all
     '',
 ], ids=repr)
-def test_a_payload_of_the_wrong_shape_changes_nothing(conn, action, payload):
+def test_a_payload_of_the_wrong_shape_changes_nothing(conn, action, payload) -> None:
     """eve holds 777 and sends the junk. A lenient subscribe would add (eve, 123456); a
     lenient unsubscribe is tried against a row she does hold, below."""
     with conn.cursor() as cur:
@@ -615,87 +573,3 @@ def test_a_payload_of_the_wrong_shape_changes_nothing(conn, action, payload):
         run(cur, "process_communities")
 
         assert subscriptions(cur) == before
-
-
-# --- posts -------------------------------------------------------------------------
-
-def test_a_post_keeps_its_tag_when_the_tag_only_looks_like_a_community(conn):
-    """parent_permlink is any tag the author typed. `hive-<ten or more digits>` passed
-    the old `^hive-[0-9]+$` guard and overflowed the cast behind it."""
-    with conn.cursor() as cur:
-        comment(cur, "alice", "in-a-community", "hive-123456")
-        comment(cur, "bob", "a-tag", "photography")
-        comment(cur, "carol", "eleven-digits", "hive-99999999999")
-        comment(cur, "dave", "leading-zero", "hive-012345")
-        comment(cur, "erin", "int-max-plus-one", "hive-2147483648")
-        comment(cur, "frank", "ten-digits-that-fit", "hive-1234567890")
-        comment(cur, "grace", "upper", "HIVE-123456")
-
-        run(cur, "process_posts")
-
-        assert posts(cur) == {
-            ("alice", "in-a-community", 123456, "hive-123456"),
-            ("bob", "a-tag", None, "photography"),
-            ("carol", "eleven-digits", None, "hive-99999999999"),
-            ("dave", "leading-zero", None, "hive-012345"),
-            ("erin", "int-max-plus-one", None, "hive-2147483648"),
-            ("frank", "ten-digits-that-fit", None, "hive-1234567890"),
-            ("grace", "upper", None, "HIVE-123456"),
-        }
-
-
-def test_only_root_posts_in_range_become_candidates_and_an_edit_is_not_an_error(conn):
-    """An edit is the same (author, permlink) again: in one range, and for a post an
-    earlier range already wrote. Neither may raise, and what an earlier range wrote
-    stands (the two in one range are identical, so which of them wins is not checked)."""
-    with conn.cursor() as cur:
-        comment(cur, "early", "post", "hive-123456", block=BLOCK - 1)
-        run(cur, "process_posts", BLOCK - 1, BLOCK - 1)
-
-        comment(cur, "missed", "post", "hive-123456", block=BLOCK - 1)   # below this range
-        comment(cur, "early", "post", "hive-777")             # edited in a later range
-        comment(cur, "alice", "post", "hive-123456")
-        comment(cur, "alice", "post", "hive-123456")          # edited in the same range
-        comment(cur, "bob", "re-post", "post", parent_author="alice")   # a reply
-        comment(cur, "late", "post", "hive-123456", block=BLOCK + 1)
-        comment(cur, "notacomment", "post", "hive-123456", op_type=VOTE)
-
-        run(cur, "process_posts")
-
-        assert posts(cur) == {
-            ("early", "post", 123456, "hive-123456"),
-            ("alice", "post", 123456, "hive-123456"),
-        }
-
-
-def test_a_post_is_written_whole_whatever_its_metadata_holds(conn):
-    """json_metadata is as unvalidated as the community field. What cannot be parsed
-    costs the post its tags, not the batch."""
-    with conn.cursor() as cur:
-        comment(cur, "alice", "tagged", "hive-123456",
-                json_metadata=json.dumps({"tags": ["photo", "travel"]}))
-        comment(cur, "bob", "tags-not-a-list", "photography", json_metadata='{"tags": "photo"}')
-        comment(cur, "carol", "not-json", "photography", json_metadata='{"tags": ["photo"')
-        comment(cur, "dave", "empty", "photography", json_metadata="")
-
-        run(cur, "process_posts")
-
-        cur.execute("SELECT author, title, tags, body_length, created_at = '2019-09-20 12:00:00' "
-                    "FROM haf_fyp_app.post_candidates")
-        assert {(a, t, tuple(g), n, at) for a, t, g, n, at in cur.fetchall()} == {
-            ("alice", "title of tagged", ("photo", "travel"), 4, True),
-            ("bob", "title of tags-not-a-list", (), 4, True),
-            ("carol", "title of not-json", (), 4, True),
-            ("dave", "title of empty", (), 4, True),
-        }
-        # The two tables every later processor joins through.
-        cur.execute("SELECT pc.author, pl.author, pl.permlink, em.post_id IS NOT NULL "
-                    "FROM haf_fyp_app.post_candidates pc "
-                    "LEFT JOIN haf_fyp_app.post_lookup pl USING (post_id) "
-                    "LEFT JOIN haf_fyp_app.engagement_metrics em USING (post_id)")
-        assert set(cur.fetchall()) == {
-            ("alice", "alice", "tagged", True),
-            ("bob", "bob", "tags-not-a-list", True),
-            ("carol", "carol", "not-json", True),
-            ("dave", "dave", "empty", True),
-        }
