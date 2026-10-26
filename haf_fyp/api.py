@@ -530,7 +530,7 @@ class _Ceiling:
 
     __slots__ = ("limit", "error_message")
 
-    def __init__(self, item):
+    def __init__(self, item) -> None:
         self.limit = item
         self.error_message = None
 
@@ -595,7 +595,7 @@ class RateLimitBeforeValidationMiddleware:
     anyio task group and a streaming-response bridge in front of every request.
     """
 
-    def __init__(self, app, limiter=None, early=None):
+    def __init__(self, app, limiter=None, early=None) -> None:
         self.app = app
         # None = decide per request from TRUSTED_PROXY_IPS and the request's own
         # peer and X-Real-IP, so a test (or a reload) that changes the trust list is
@@ -722,7 +722,7 @@ class RateLimitBeforeValidationMiddleware:
         # after metering, so it still costs the sender its allowance; where it is not,
         # it costs nothing (see below). Content-Length is absent on a chunked
         # request, which this cannot pre-empt -- the per-IP limit is the bound there.
-        declared = self._declared_size(request.headers.get("content-length"))
+        declared: int = self._declared_size(request.headers.get("content-length"))
         too_large = declared is not None and declared > _MAX_BODY_BYTES
 
         if not self._early_charge_is_safe(request):
@@ -822,7 +822,7 @@ class RateLimitBeforeValidationMiddleware:
         return int(digits or "0") if len(digits) <= 18 else 10**18
 
     @staticmethod
-    async def _too_large(scope, receive, send, size: int):
+    async def _too_large(scope, receive, send, size: int) -> None:
         body = json.dumps({
             "detail": f"request body of {size} bytes exceeds the "
                       f"{_MAX_BODY_BYTES}-byte limit"
@@ -1303,7 +1303,7 @@ class _BoundedProbe:
     When it ends, the next caller starts a fresh one; a finished answer is never reused.
     """
 
-    def __init__(self, name: str, probe, no_answer: str = "unreachable"):
+    def __init__(self, name: str, probe, no_answer: str = "unreachable") -> None:
         self._name = name
         self._probe = probe
         self._no_answer = no_answer
@@ -1318,7 +1318,7 @@ class _BoundedProbe:
             if current is None or not current[0].is_alive():
                 answer: list[str] = []
 
-                def work():
+                def work() -> None:
                     try:
                         answer.append(self._probe())
                     except Exception:
