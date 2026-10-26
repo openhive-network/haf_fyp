@@ -21,6 +21,7 @@ import psycopg2.extras
 import pytest
 
 from haf_fyp import ranker_daemon as rd
+from pytest import LogCaptureFixture, MonkeyPatch
 
 REPO = os.path.join(os.path.dirname(__file__), "..", "..")
 ENDPOINT_SQL = os.path.join(REPO, "endpoints", "endpoint_schema.sql")
@@ -36,7 +37,7 @@ def _unreachable():
 
 
 @pytest.fixture(autouse=True)
-def _schema_has_the_read_column(monkeypatch):
+def _schema_has_the_read_column(monkeypatch: MonkeyPatch) -> None:
     # What _listen_for_feed_reads finds on this database. Set here so the tests that
     # never listen exercise the reader lane too, and restored after each test.
     monkeypatch.setattr(rd, "_reads_supported", True)
@@ -87,7 +88,7 @@ def other():
 
 # All times are SQL intervals against the DB clock, in the same naive-UTC form the
 # ranker writes, so neither a clock skew nor the server's TimeZone can flip a boundary.
-def _user(conn, name, *, scored=None, read=None, interacted=None):
+def _user(conn, name, *, scored=None, read=None, interacted=None) -> None:
     def ago(v):
         return "NULL" if v is None else f"(NOW() AT TIME ZONE 'utc') - INTERVAL '{v}'"
 
@@ -125,7 +126,7 @@ def _read_age_seconds(conn, name):
 # --------------------------------------------------------------------------
 
 
-def test_a_read_stamps_the_member_and_nobody_else(conn):
+def test_a_read_stamps_the_member_and_nobody_else(conn) -> None:
     _user(conn, "reader", scored="1 minute")
     _user(conn, "bystander", scored="1 minute")
 
@@ -140,7 +141,7 @@ def test_a_read_stamps_the_member_and_nobody_else(conn):
         assert cur.fetchone()[0] == 2
 
 
-def test_only_a_stale_feed_is_reranked_at_once(conn, monkeypatch):
+def test_only_a_stale_feed_is_reranked_at_once(conn, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
     _user(conn, "fresh", scored="5 minutes")
     _user(conn, "stale", scored="11 minutes")
@@ -154,7 +155,7 @@ def test_only_a_stale_feed_is_reranked_at_once(conn, monkeypatch):
         assert _read_age_seconds(conn, name) is not None
 
 
-def test_the_immediate_reranks_are_capped_and_take_the_stalest(conn, monkeypatch):
+def test_the_immediate_reranks_are_capped_and_take_the_stalest(conn, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
     _user(conn, "old1", scored="3 hours")
     _user(conn, "old2", scored="2 hours")
@@ -169,7 +170,7 @@ def test_the_immediate_reranks_are_capped_and_take_the_stalest(conn, monkeypatch
     assert _read_age_seconds(conn, "old3") is not None
 
 
-def test_a_later_read_moves_the_stamp_and_can_trigger_a_rerank(conn, monkeypatch):
+def test_a_later_read_moves_the_stamp_and_can_trigger_a_rerank(conn, monkeypatch: MonkeyPatch) -> None:
     # Without this the reader window never slides, and someone who comes back is never
     # re-ranked on read again.
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
@@ -181,7 +182,7 @@ def test_a_later_read_moves_the_stamp_and_can_trigger_a_rerank(conn, monkeypatch
     assert 0 <= _read_age_seconds(conn, "returning") < 60
 
 
-def test_a_spent_budget_still_stamps_every_reader(conn, monkeypatch):
+def test_a_spent_budget_still_stamps_every_reader(conn, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
     _user(conn, "old", scored="3 hours")
 
@@ -194,7 +195,7 @@ def interests(conn):
     """Saved interests for the given names, removed again after the test."""
     added = []
 
-    def add(name):
+    def add(name) -> None:
         # Rows left by a killed run, or another file, must not decide the result.
         with conn.cursor() as cur:
             cur.execute("DELETE FROM haf_fyp_app.user_interests WHERE username = %s", (name,))
@@ -215,7 +216,7 @@ def interests(conn):
 
 
 def test_with_the_activity_filter_only_an_active_or_opted_in_reader_is_reranked(
-        conn, monkeypatch, interests):
+        conn, monkeypatch: MonkeyPatch, interests) -> None:
     """#84: a forged read for an account that does not use Hive earns nothing."""
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
     monkeypatch.setattr(rd, "_read_filter_days", 30)
@@ -237,7 +238,7 @@ def test_with_the_activity_filter_only_an_active_or_opted_in_reader_is_reranked(
         assert _read_age_seconds(conn, name) is not None, name
 
 
-def test_reads_that_earn_nothing_do_not_spend_the_rerank_budget(conn, monkeypatch):
+def test_reads_that_earn_nothing_do_not_spend_the_rerank_budget(conn, monkeypatch: MonkeyPatch) -> None:
     """The point of the filter: forged reads for lapsed accounts, older than a real
     reader's, must not take the one early re-rank there is."""
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
@@ -255,7 +256,7 @@ def test_reads_that_earn_nothing_do_not_spend_the_rerank_budget(conn, monkeypatc
     ("29 days 23 hours", True),
     ("30 days 1 hour", False),
 ])
-def test_the_activity_window_is_the_days_it_says(conn, monkeypatch, interacted, earns):
+def test_the_activity_window_is_the_days_it_says(conn, monkeypatch: MonkeyPatch, interacted, earns) -> None:
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
     monkeypatch.setattr(rd, "_read_filter_days", 30)
     _user(conn, "edge", scored="1 hour", interacted=interacted)
@@ -263,7 +264,7 @@ def test_the_activity_window_is_the_days_it_says(conn, monkeypatch, interacted, 
     assert rd._note_feed_reads(conn, {"edge"}, 10) == ({"edge"} if earns else set())
 
 
-def test_with_the_activity_filter_off_every_read_counts(conn, monkeypatch):
+def test_with_the_activity_filter_off_every_read_counts(conn, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
     monkeypatch.setattr(rd, "_read_filter_days", 0)
     _user(conn, "lapsed", scored="1 hour", interacted="400 days")
@@ -273,7 +274,7 @@ def test_with_the_activity_filter_off_every_read_counts(conn, monkeypatch):
 
 
 def test_with_the_activity_filter_the_lane_takes_only_active_or_opted_in_readers(
-        conn, monkeypatch, interests):
+        conn, monkeypatch: MonkeyPatch, interests) -> None:
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
@@ -293,7 +294,7 @@ def test_with_the_activity_filter_the_lane_takes_only_active_or_opted_in_readers
     assert users[2:] == ["idle", "forged"]
 
 
-def test_with_the_activity_filter_off_the_lane_is_what_it_was(conn, monkeypatch):
+def test_with_the_activity_filter_off_the_lane_is_what_it_was(conn, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
@@ -304,7 +305,7 @@ def test_with_the_activity_filter_off_the_lane_is_what_it_was(conn, monkeypatch)
     assert rd._fetch_personalised_users(conn, 4)[:2] == ["forged", "active"]
 
 
-def test_a_row_locked_by_another_writer_is_skipped_not_waited_for(conn, other):
+def test_a_row_locked_by_another_writer_is_skipped_not_waited_for(conn, other) -> None:
     _user(conn, "busy", scored="2 hours")
     _user(conn, "free", scored="2 hours")
     with other.cursor() as cur:
@@ -325,7 +326,7 @@ def test_a_row_locked_by_another_writer_is_skipped_not_waited_for(conn, other):
     assert _read_age_seconds(conn, "free") is not None
 
 
-def test_the_stamp_is_committed(conn, other):
+def test_the_stamp_is_committed(conn, other) -> None:
     _user(conn, "reader", scored="1 minute")
 
     rd._note_feed_reads(conn, {"reader"}, 10)
@@ -338,7 +339,7 @@ def test_the_stamp_is_committed(conn, other):
 # --------------------------------------------------------------------------
 
 
-def test_recent_readers_are_ranked_ahead_of_a_staler_rotation(conn, monkeypatch):
+def test_recent_readers_are_ranked_ahead_of_a_staler_rotation(conn, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
     # The whole point of #81: this reader was ranked twenty minutes ago and would be
@@ -352,7 +353,7 @@ def test_recent_readers_are_ranked_ahead_of_a_staler_rotation(conn, monkeypatch)
     assert rd._fetch_personalised_users(conn, 2) == ["reader", "idle_a"]
 
 
-def test_a_read_outside_the_window_earns_no_priority(conn, monkeypatch):
+def test_a_read_outside_the_window_earns_no_priority(conn, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 3600)
     _user(conn, "lapsed", scored="1 minute", read="2 hours")
@@ -361,7 +362,7 @@ def test_a_read_outside_the_window_earns_no_priority(conn, monkeypatch):
     assert rd._fetch_personalised_users(conn, 2) == ["idle", "lapsed"]
 
 
-def test_readers_are_capped_and_the_stalest_reader_goes_first(conn, monkeypatch):
+def test_readers_are_capped_and_the_stalest_reader_goes_first(conn, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
@@ -376,7 +377,7 @@ def test_readers_are_capped_and_the_stalest_reader_goes_first(conn, monkeypatch)
     assert rd._fetch_personalised_users(conn, 4) == ["r_old", "r_mid", "idle_a", "idle_b"]
 
 
-def test_a_reader_is_returned_once_although_both_queries_could_take_it(conn, monkeypatch):
+def test_a_reader_is_returned_once_although_both_queries_could_take_it(conn, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
@@ -386,7 +387,7 @@ def test_a_reader_is_returned_once_although_both_queries_could_take_it(conn, mon
     assert rd._fetch_personalised_users(conn, 10) == ["reader", "idle"]
 
 
-def test_a_reader_ranked_a_moment_ago_does_not_take_a_lane_slot(conn, monkeypatch):
+def test_a_reader_ranked_a_moment_ago_does_not_take_a_lane_slot(conn, monkeypatch: MonkeyPatch) -> None:
     """The lane would otherwise re-rank the same accounts every cycle however fresh
     their feed, and a full lane holds everyone else at half speed for nothing."""
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
@@ -401,7 +402,7 @@ def test_a_reader_ranked_a_moment_ago_does_not_take_a_lane_slot(conn, monkeypatc
     assert (rd._lane_taken, rd._lane_slots) == (0, 1)
 
 
-def test_a_never_ranked_reader_takes_a_lane_slot_whatever_the_minimum_age(conn, monkeypatch):
+def test_a_never_ranked_reader_takes_a_lane_slot_whatever_the_minimum_age(conn, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
@@ -412,7 +413,7 @@ def test_a_never_ranked_reader_takes_a_lane_slot_whatever_the_minimum_age(conn, 
     assert (rd._lane_taken, rd._lane_slots) == (1, 1)
 
 
-def test_without_readers_the_rotation_is_exactly_what_it_was(conn, monkeypatch):
+def test_without_readers_the_rotation_is_exactly_what_it_was(conn, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     _user(conn, "never_scored", read=_IN_ROTATION)
     _user(conn, "stale", scored="20 hours", read=_IN_ROTATION)
@@ -422,7 +423,7 @@ def test_without_readers_the_rotation_is_exactly_what_it_was(conn, monkeypatch):
     assert rd._fetch_personalised_users(conn, 3) == ["never_scored", "stale", "tie_active"]
 
 
-def test_a_share_of_zero_ignores_readers(conn, monkeypatch):
+def test_a_share_of_zero_ignores_readers(conn, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.0)
     _user(conn, "reader", scored="1 minute", read="1 minute")
     _user(conn, "idle", scored="20 hours", read=_IN_ROTATION)
@@ -435,7 +436,7 @@ def test_a_share_of_zero_ignores_readers(conn, monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_a_notification_from_a_read_only_transaction_reaches_the_listener(conn, other):
+def test_a_notification_from_a_read_only_transaction_reaches_the_listener(conn, other) -> None:
     """get_personalized_feed is called by PostgREST on a GET, i.e. in a READ ONLY
     transaction, from a STABLE function. Everything #81 does rests on a notification
     sent from there being delivered; this pins that against the real server, using
@@ -477,12 +478,12 @@ def _drain_for(conn, seconds, until=None):
     return got
 
 
-def _notify(session, name):
+def _notify(session, name) -> None:
     with session.cursor() as cur:
         cur.execute("SELECT pg_notify(%s, %s)", (rd.FEED_READ_CHANNEL, name))
 
 
-def test_a_rolled_back_read_sends_nothing_and_the_next_committed_one_arrives(conn, other):
+def test_a_rolled_back_read_sends_nothing_and_the_next_committed_one_arrives(conn, other) -> None:
     rd._listen_for_feed_reads(conn)
 
     _notify(other, "alice")
@@ -494,7 +495,7 @@ def test_a_rolled_back_read_sends_nothing_and_the_next_committed_one_arrives(con
     assert _drain_for(conn, 2) == {"bobby"}
 
 
-def test_reads_are_heard_even_if_the_session_was_left_inside_a_transaction(conn, other):
+def test_reads_are_heard_even_if_the_session_was_left_inside_a_transaction(conn, other) -> None:
     """Postgres delivers a notification only to a session that is outside a transaction.
     run_cycle's "no candidates" return and _run_targeted_refresh's "no member left"
     return both leave the ranker's session with a SELECT's transaction open, through
@@ -509,7 +510,7 @@ def test_reads_are_heard_even_if_the_session_was_left_inside_a_transaction(conn,
     assert _drain_for(conn, 3, until={"alice"}) == {"alice"}
 
 
-def test_the_drain_works_on_a_session_using_the_stop_handlers_wait_callback(conn, other):
+def test_the_drain_works_on_a_session_using_the_stop_handlers_wait_callback(conn, other) -> None:
     # main() installs psycopg2's wait_select callback before it connects, so the session
     # that polls in production is a "green" one. Every other test polls a plain session.
     psycopg2.extensions.set_wait_callback(psycopg2.extras.wait_select)
@@ -523,7 +524,7 @@ def test_the_drain_works_on_a_session_using_the_stop_handlers_wait_callback(conn
         psycopg2.extensions.set_wait_callback(None)
 
 
-def test_the_connection_holds_a_bounded_backlog(conn, other, monkeypatch):
+def test_the_connection_holds_a_bounded_backlog(conn, other, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "_FEED_READ_BACKLOG_MAX", 3)
     rd._listen_for_feed_reads(conn)
 
@@ -557,7 +558,7 @@ def tokyo(conn):
     return conn
 
 
-def test_the_stamp_and_the_staleness_test_are_utc_on_a_server_that_is_not(tokyo, monkeypatch):
+def test_the_stamp_and_the_staleness_test_are_utc_on_a_server_that_is_not(tokyo, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
     _user(tokyo, "fresh", scored="5 minutes")
     _user(tokyo, "stale", scored="11 minutes")
@@ -572,7 +573,7 @@ def test_the_stamp_and_the_staleness_test_are_utc_on_a_server_that_is_not(tokyo,
     assert 0 <= _read_age_seconds(tokyo, "fresh") < 60
 
 
-def test_the_reader_window_is_utc_on_a_server_that_is_not(tokyo, monkeypatch):
+def test_the_reader_window_is_utc_on_a_server_that_is_not(tokyo, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 3600)
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
@@ -583,7 +584,7 @@ def test_the_reader_window_is_utc_on_a_server_that_is_not(tokyo, monkeypatch):
     assert rd._fetch_personalised_users(tokyo, 2) == ["reader", "idle"]
 
 
-def test_the_activity_filter_is_utc_on_a_server_that_is_not(tokyo, monkeypatch):
+def test_the_activity_filter_is_utc_on_a_server_that_is_not(tokyo, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
     monkeypatch.setattr(rd, "_read_filter_days", 1)
     _user(tokyo, "active", scored="1 hour", interacted="20 hours")
@@ -593,7 +594,7 @@ def test_the_activity_filter_is_utc_on_a_server_that_is_not(tokyo, monkeypatch):
     assert rd._note_feed_reads(tokyo, {"active"}, 10) == {"active"}
 
 
-def test_the_lanes_minimum_age_is_utc_on_a_server_that_is_not(tokyo, monkeypatch):
+def test_the_lanes_minimum_age_is_utc_on_a_server_that_is_not(tokyo, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
@@ -619,8 +620,8 @@ def test_the_lanes_minimum_age_is_utc_on_a_server_that_is_not(tokyo, monkeypatch
 
 
 def test_among_never_ranked_readers_the_latest_read_goes_first_and_ahead_of_ranked_ones(
-    conn, monkeypatch
-):
+    conn, monkeypatch: MonkeyPatch
+) -> None:
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 7 * 24 * 3600)
     _user(conn, "earlier", scored=None, read="3 days")
@@ -637,7 +638,7 @@ def test_among_never_ranked_readers_the_latest_read_goes_first_and_ahead_of_rank
 # --------------------------------------------------------------------------
 
 
-def test_a_schema_without_the_read_column_ranks_without_the_reader_lane(conn, other, caplog):
+def test_a_schema_without_the_read_column_ranks_without_the_reader_lane(conn, other, caplog: LogCaptureFixture) -> None:
     """An install run while the ranker holds HAF's lock installs nothing, and the two
     images are versioned separately, so this state happens. The reader query would
     raise UndefinedColumn on every scheduled cycle."""
@@ -733,7 +734,7 @@ def shipped_feed(other):
         other.commit()
 
 
-def _last_read(session, when):
+def _last_read(session, when) -> None:
     session.set_session(readonly=False)
     with session.cursor() as cur:
         cur.execute(
@@ -765,7 +766,7 @@ def _silent_then_control(conn, session):
     return _drain_for(conn, 2, until={"control"}) == {"control"}
 
 
-def test_the_shipped_function_notifies_the_ranker_on_a_page_one_read(conn, shipped_feed):
+def test_the_shipped_function_notifies_the_ranker_on_a_page_one_read(conn, shipped_feed) -> None:
     rd._listen_for_feed_reads(conn)
 
     posts = _get_feed(shipped_feed, "alice", 1)
@@ -776,7 +777,7 @@ def test_the_shipped_function_notifies_the_ranker_on_a_page_one_read(conn, shipp
 
 def test_the_shipped_function_is_silent_on_a_scroll_and_for_an_account_without_a_feed(
     conn, shipped_feed
-):
+) -> None:
     rd._listen_for_feed_reads(conn)
 
     _get_feed(shipped_feed, "alice", 2)  # page 2 of a cached feed
@@ -786,8 +787,8 @@ def test_the_shipped_function_is_silent_on_a_scroll_and_for_an_account_without_a
 
 
 def test_an_account_ranked_only_once_it_reads_gets_the_global_feed_until_then(
-    conn, shipped_feed, monkeypatch
-):
+    conn, shipped_feed, monkeypatch: MonkeyPatch
+) -> None:
     """#98, end to end. A drive-by voter (a rotation row from its votes, no read, no
     interests) gets no feed from the scheduled cycle. Its first read is served the
     global feed and reaches the ranker, and the next cycle ranks it in the reader lane."""
@@ -812,7 +813,7 @@ def test_an_account_ranked_only_once_it_reads_gets_the_global_feed_until_then(
 
     ranked_by_cycle = []
 
-    def _rank(c, username, *_a, **_k):
+    def _rank(c, username, *_a, **_k) -> None:
         # What write_feed_cache writes, against the CI database's reduced feed_cache.
         with c.cursor() as cur:
             cur.execute(
@@ -860,7 +861,7 @@ def test_an_account_ranked_only_once_it_reads_gets_the_global_feed_until_then(
     assert rd._lane_taken == 1
 
 
-def test_the_shipped_function_does_not_notify_again_within_ten_minutes(conn, shipped_feed):
+def test_the_shipped_function_does_not_notify_again_within_ten_minutes(conn, shipped_feed) -> None:
     rd._listen_for_feed_reads(conn)
     _last_read(shipped_feed, "9 minutes")
 
@@ -869,7 +870,7 @@ def test_the_shipped_function_does_not_notify_again_within_ten_minutes(conn, shi
     assert _silent_then_control(conn, shipped_feed)
 
 
-def test_the_shipped_function_notifies_again_once_ten_minutes_have_passed(conn, shipped_feed):
+def test_the_shipped_function_notifies_again_once_ten_minutes_have_passed(conn, shipped_feed) -> None:
     rd._listen_for_feed_reads(conn)
     _last_read(shipped_feed, "11 minutes")
 
@@ -878,7 +879,7 @@ def test_the_shipped_function_notifies_again_once_ten_minutes_have_passed(conn, 
     assert _drain_for(conn, 3, until={"alice"}) == {"alice"}
 
 
-def test_an_operator_can_switch_the_notify_off_without_reinstalling(conn, shipped_feed):
+def test_an_operator_can_switch_the_notify_off_without_reinstalling(conn, shipped_feed) -> None:
     rd._listen_for_feed_reads(conn)
 
     posts = _get_feed(shipped_feed, "alice", 1, switch="off")
@@ -888,7 +889,7 @@ def test_an_operator_can_switch_the_notify_off_without_reinstalling(conn, shippe
 
 
 @pytest.mark.parametrize("spelling", ["OFF", " off ", "false", "False", "no", "0"])
-def test_the_switch_is_off_however_an_operator_spells_it(conn, shipped_feed, spelling):
+def test_the_switch_is_off_however_an_operator_spells_it(conn, shipped_feed, spelling) -> None:
     # A switch that only understood lower-case "off" would fail open, silently, on the
     # day someone needed it.
     rd._listen_for_feed_reads(conn)
@@ -899,7 +900,7 @@ def test_the_switch_is_off_however_an_operator_spells_it(conn, shipped_feed, spe
 
 
 @pytest.mark.parametrize("value", ["on", "true", "", "anything"])
-def test_any_other_value_of_the_switch_leaves_the_notify_on(conn, shipped_feed, value):
+def test_any_other_value_of_the_switch_leaves_the_notify_on(conn, shipped_feed, value) -> None:
     rd._listen_for_feed_reads(conn)
 
     _get_feed(shipped_feed, "alice", 1, switch=value)
@@ -922,7 +923,7 @@ def _shipped_reader_ddl(schema):
     return [m.group(0).replace("haf_fyp_app.", f"{schema}.") for m in (alter, index)]
 
 
-def test_the_shipped_upgrade_adds_the_column_and_its_index_to_an_installed_table(other):
+def test_the_shipped_upgrade_adds_the_column_and_its_index_to_an_installed_table(other) -> None:
     s = "fyp81_upgrade"
     with other.cursor() as cur:  # one transaction, rolled back by the fixture
         cur.execute(f"CREATE SCHEMA {s}")
@@ -964,8 +965,8 @@ def test_the_shipped_upgrade_adds_the_column_and_its_index_to_an_installed_table
 
 
 def test_a_read_during_a_cycle_is_recorded_and_ranked_before_the_cycle_ends(
-    conn, other, monkeypatch
-):
+    conn, other, monkeypatch: MonkeyPatch
+) -> None:
     """The real session, the real LISTEN, the real stamping statement and membership
     query, and a cycle whose per-account step writes and commits as write_feed_cache
     does. What #85 rests on, and only a server can show: a notification committed by
@@ -988,7 +989,7 @@ def test_a_read_during_a_cycle_is_recorded_and_ranked_before_the_cycle_ends(
 
     order, zed_read_when_u2_ranked = [], []
 
-    def _rank(c, username, *_a, **_k):
+    def _rank(c, username, *_a, **_k) -> None:
         with c.cursor() as cur:
             cur.execute("SELECT count(*) FROM haf_fyp_app.active_users")  # opens the transaction
         if username == "u1":
@@ -1045,7 +1046,7 @@ def test_a_read_during_a_cycle_is_recorded_and_ranked_before_the_cycle_ends(
     other.commit()
 
 
-def test_a_fresh_feed_read_during_a_cycle_is_recorded_but_not_ranked_again(conn, other, monkeypatch):
+def test_a_fresh_feed_read_during_a_cycle_is_recorded_but_not_ranked_again(conn, other, monkeypatch: MonkeyPatch) -> None:
     import pandas as pd
 
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
@@ -1057,7 +1058,7 @@ def test_a_fresh_feed_read_during_a_cycle_is_recorded_but_not_ranked_again(conn,
     rd._listen_for_feed_reads(conn)
     order = []
 
-    def _rank(c, username, *_a, **_k):
+    def _rank(c, username, *_a, **_k) -> None:
         if username == "u1":
             _notify(other, "fresh")
             other.commit()
@@ -1101,8 +1102,8 @@ def test_a_fresh_feed_read_during_a_cycle_is_recorded_but_not_ranked_again(conn,
 
 
 def test_a_name_with_no_rotation_row_handed_to_a_cycle_is_not_ranked_into_one(
-    conn, other, monkeypatch
-):
+    conn, other, monkeypatch: MonkeyPatch
+) -> None:
     """The real membership query. main() hands the cycle whoever is still waiting, and
     such an account may have been evicted since it was stamped: ranking it would write
     its rotation row back (#10)."""
@@ -1115,7 +1116,7 @@ def test_a_name_with_no_rotation_row_handed_to_a_cycle_is_not_ranked_into_one(
     rd._listen_for_feed_reads(conn)
     order = []
 
-    def _rank(c, username, *_a, **_k):
+    def _rank(c, username, *_a, **_k) -> None:
         # What write_feed_cache does first: an upsert, which is how a non-member's
         # row comes back.
         with c.cursor() as cur:

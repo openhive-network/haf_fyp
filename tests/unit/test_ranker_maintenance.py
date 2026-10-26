@@ -8,6 +8,7 @@ import psycopg2
 import pytest
 
 from haf_fyp import ranker_daemon as rd
+from pytest import LogCaptureFixture, MonkeyPatch
 
 
 def _mock_conn(fetchone=(0,)):
@@ -25,7 +26,7 @@ def _sql_calls(cur):
     return [c.args[0] for c in cur.execute.call_args_list]
 
 
-def test_rolls_up_before_pruning_and_commits(monkeypatch):
+def test_rolls_up_before_pruning_and_commits(monkeypatch: MonkeyPatch) -> None:
     conn, cur = _mock_conn((123,))
     # Unusual values, so a literal default written at the call cannot pass by coincidence.
     monkeypatch.setattr(rd, "FEED_EVENTS_RETAIN_DAYS", 3)
@@ -44,7 +45,7 @@ def test_rolls_up_before_pruning_and_commits(monkeypatch):
     conn.rollback.assert_not_called()
 
 
-def test_best_effort_rolls_back_and_swallows_generic_error():
+def test_best_effort_rolls_back_and_swallows_generic_error() -> None:
     conn, cur = _mock_conn()
     cur.execute.side_effect = RuntimeError("boom")
 
@@ -54,7 +55,7 @@ def test_best_effort_rolls_back_and_swallows_generic_error():
     conn.commit.assert_not_called()
 
 
-def test_reraises_operational_error_for_reconnect():
+def test_reraises_operational_error_for_reconnect() -> None:
     conn, cur = _mock_conn()
     cur.execute.side_effect = psycopg2.OperationalError("connection lost")
 
@@ -68,7 +69,7 @@ def test_reraises_operational_error_for_reconnect():
 # --------------------------------------------------------------------------
 
 
-def test_sweeps_then_repairs_in_one_transaction(monkeypatch):
+def test_sweeps_then_repairs_in_one_transaction(monkeypatch: MonkeyPatch) -> None:
     conn, cur = _mock_conn()
     # (last_processed_block, chain head) for the sync gate, then the eviction
     # count, then the repair count.
@@ -92,7 +93,7 @@ def test_sweeps_then_repairs_in_one_transaction(monkeypatch):
     conn.rollback.assert_not_called()
 
 
-def test_eviction_is_skipped_while_block_processing_is_catching_up():
+def test_eviction_is_skipped_while_block_processing_is_catching_up() -> None:
     # last_interaction_at is meaningless mid-replay (the HAF context starts at
     # block 0), so most of the eventual interacted population still looks like a
     # never-interacted lurker. Evicting then reaps accounts about to prove active.
@@ -104,14 +105,14 @@ def test_eviction_is_skipped_while_block_processing_is_catching_up():
     conn.commit.assert_not_called()
 
 
-def test_eviction_fails_closed_when_the_chain_head_is_unknown():
+def test_eviction_fails_closed_when_the_chain_head_is_unknown() -> None:
     conn, cur = _mock_conn()
     cur.fetchone.side_effect = [None]
     rd._run_active_users_maintenance(conn)
     assert not any("evict_unproductive_users" in s for s in _sql_calls(cur))
 
 
-def test_active_users_maintenance_is_best_effort():
+def test_active_users_maintenance_is_best_effort() -> None:
     conn, cur = _mock_conn()
     cur.execute.side_effect = RuntimeError("boom")
 
@@ -121,7 +122,7 @@ def test_active_users_maintenance_is_best_effort():
     conn.commit.assert_not_called()
 
 
-def test_active_users_maintenance_reraises_operational_error():
+def test_active_users_maintenance_reraises_operational_error() -> None:
     conn, cur = _mock_conn()
     cur.execute.side_effect = psycopg2.OperationalError("connection lost")
 
@@ -129,7 +130,7 @@ def test_active_users_maintenance_reraises_operational_error():
         rd._run_active_users_maintenance(conn)
 
 
-def test_the_unread_feed_pass_repeats_until_a_batch_comes_back_short(monkeypatch):
+def test_the_unread_feed_pass_repeats_until_a_batch_comes_back_short(monkeypatch: MonkeyPatch) -> None:
     # #98: the first pass on an existing install has hundreds of thousands of unread
     # feeds; each batch is its own transaction, and the pass goes on until it is done.
     monkeypatch.setattr(rd, "FEED_CACHE_UNREAD_RETENTION_DAYS", 11)
@@ -146,7 +147,7 @@ def test_the_unread_feed_pass_repeats_until_a_batch_comes_back_short(monkeypatch
     conn.rollback.assert_not_called()
 
 
-def test_the_unread_feed_pass_is_best_effort():
+def test_the_unread_feed_pass_is_best_effort() -> None:
     conn, cur = _mock_conn()
     cur.execute.side_effect = RuntimeError("boom")
 
@@ -156,7 +157,7 @@ def test_the_unread_feed_pass_is_best_effort():
     conn.commit.assert_not_called()
 
 
-def test_the_unread_feed_pass_reraises_operational_error():
+def test_the_unread_feed_pass_reraises_operational_error() -> None:
     conn, cur = _mock_conn()
     cur.execute.side_effect = psycopg2.OperationalError("connection lost")
 
@@ -164,7 +165,7 @@ def test_the_unread_feed_pass_reraises_operational_error():
         rd._run_unread_feed_maintenance(conn)
 
 
-def test_sync_gate_measures_distance_to_the_chain_head_not_the_app_itself():
+def test_sync_gate_measures_distance_to_the_chain_head_not_the_app_itself() -> None:
     """hive.app_get_current_block_num('haf_fyp') returns THIS APP CONTEXT'S OWN
     position — the same quantity app_status.last_processed_block tracks — so
     comparing the two measures the app against itself, is ~0 even during a
@@ -187,7 +188,7 @@ def test_sync_gate_measures_distance_to_the_chain_head_not_the_app_itself():
 # --------------------------------------------------------------------------
 
 
-def test_targeted_refresh_does_not_rank_accounts_absent_from_the_rotation(monkeypatch):
+def test_targeted_refresh_does_not_rank_accounts_absent_from_the_rotation(monkeypatch: MonkeyPatch) -> None:
     """_evict_unsubscribed is rooted at active_users, so a username with NO row there
     is not "evicted" — it matches nothing and falls through to _rank_user, whose
     write_feed_cache upsert then INSERTS the row. That makes a repeated or replayed
@@ -205,7 +206,7 @@ def test_targeted_refresh_does_not_rank_accounts_absent_from_the_rotation(monkey
     assert ranked == [], "ranking a non-member re-creates its active_users row"
 
 
-def test_targeted_refresh_still_ranks_a_genuine_member(monkeypatch):
+def test_targeted_refresh_still_ranks_a_genuine_member(monkeypatch: MonkeyPatch) -> None:
     """The opt-in inserts its active_users row in the same transaction as the
     interests and publishes only after commit, so a legitimate opt-in refresh always
     finds its row — the filter must not break that path."""
@@ -225,7 +226,7 @@ def test_targeted_refresh_still_ranks_a_genuine_member(monkeypatch):
     assert ranked == ["alice"]
 
 
-def test_safe_rollback_clears_the_transaction_and_swallows_a_dead_connection():
+def test_safe_rollback_clears_the_transaction_and_swallows_a_dead_connection() -> None:
     """autocommit is False, so any error leaves the shared connection in "current
     transaction is aborted" — poisoning every later statement for up to an hour.
     And a rollback on an already-dead connection must not replace the real error."""
@@ -238,7 +239,7 @@ def test_safe_rollback_clears_the_transaction_and_swallows_a_dead_connection():
     rd._safe_rollback(dead)  # must not raise
 
 
-def test_reconciliation_runs_once_per_batch_not_once_per_user(monkeypatch):
+def test_reconciliation_runs_once_per_batch_not_once_per_user(monkeypatch: MonkeyPatch) -> None:
     """`[u for u in users if u not in _evict_unsubscribed(conn, users)]` re-invokes
     the reconcile for EVERY element. The first call evicts the batch; every later call
     returns an empty set, so all but the first user pass the filter and get ranked —
@@ -283,7 +284,7 @@ def test_reconciliation_runs_once_per_batch_not_once_per_user(monkeypatch):
     )
 
 
-def test_repair_runs_after_eviction_in_the_same_pass():
+def test_repair_runs_after_eviction_in_the_same_pass() -> None:
     """The repair must be able to fix stranding caused by the eviction that just ran,
     not only by earlier passes — so it runs LAST, inside the same transaction."""
     conn, cur = _mock_conn()
@@ -297,7 +298,7 @@ def test_repair_runs_after_eviction_in_the_same_pass():
     conn.commit.assert_called_once()   # one transaction: stamp + evict + repair
 
 
-def test_repair_runs_even_while_block_processing_is_catching_up():
+def test_repair_runs_even_while_block_processing_is_catching_up() -> None:
     """Only the SWEEP is gated on sync — it is destructive and reads
     user_interactions, which is incomplete mid-replay. The repair is additive and is
     the #9 backstop; a replay runs for days, and the un-opt-in reconcile can strand an
@@ -313,7 +314,7 @@ def test_repair_runs_even_while_block_processing_is_catching_up():
     conn.commit.assert_called_once()
 
 
-def test_cycle_is_topped_up_after_eviction_rather_than_running_short(monkeypatch):
+def test_cycle_is_topped_up_after_eviction_rather_than_running_short(monkeypatch: MonkeyPatch) -> None:
     """Deleting the refill loop must FAIL this. A backlog of cleared accounts sorts to
     the front (their last_scored_at is stalest), so "fetch N, evict, rank the rest"
     can rank almost nobody for many consecutive cycles while the backlog drains — the
@@ -364,12 +365,12 @@ def test_cycle_is_topped_up_after_eviction_rather_than_running_short(monkeypatch
 class _FakePgError(Exception):
     """Carries a settable pgcode; see tests/unit/test_sync_status.py."""
 
-    def __init__(self, pgcode, message):
+    def __init__(self, pgcode, message) -> None:
         super().__init__(message)
         self.pgcode = pgcode
 
 
-def test_lost_grant_logs_one_actionable_warning_not_a_traceback(monkeypatch, caplog):
+def test_lost_grant_logs_one_actionable_warning_not_a_traceback(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     # A misconfiguration with a known remedy repeats every cycle until someone
     # acts on it. A stack trace each time buries the one line that says what to do.
     conn = MagicMock()
@@ -387,7 +388,7 @@ def test_lost_grant_logs_one_actionable_warning_not_a_traceback(monkeypatch, cap
     conn.rollback.assert_called_once()
 
 
-def test_other_failures_keep_their_traceback(monkeypatch, caplog):
+def test_other_failures_keep_their_traceback(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     conn = MagicMock()
     monkeypatch.setattr(
         rd, "fetch_author_credibility", MagicMock(side_effect=RuntimeError("boom"))
@@ -400,7 +401,7 @@ def test_other_failures_keep_their_traceback(monkeypatch, caplog):
     conn.rollback.assert_called_once()
 
 
-def test_connection_loss_still_propagates_to_the_reconnect_path(monkeypatch):
+def test_connection_loss_still_propagates_to_the_reconnect_path(monkeypatch: MonkeyPatch) -> None:
     conn = MagicMock()
     monkeypatch.setattr(
         rd,
