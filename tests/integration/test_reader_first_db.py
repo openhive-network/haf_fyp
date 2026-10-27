@@ -190,6 +190,160 @@ def test_a_spent_budget_still_stamps_every_reader(conn, monkeypatch: MonkeyPatch
     assert _read_age_seconds(conn, "old") is not None
 
 
+# --------------------------------------------------------------------------
+# #104: read sessions
+# --------------------------------------------------------------------------
+
+
+def _session_left_seconds(conn, name):
+    """Seconds until `name`'s read session ends (negative: ended), None without one."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT EXTRACT(EPOCH FROM feed_session_until - (NOW() AT TIME ZONE 'utc')), "
+            "       EXTRACT(EPOCH FROM feed_session_until - feed_session_at) "
+            "FROM haf_fyp_app.active_users WHERE username = %s",
+            (name,),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return row
+
+
+def _end_session(conn, name) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE haf_fyp_app.active_users "
+            "SET feed_session_until = (NOW() AT TIME ZONE 'utc') - INTERVAL '1 second' "
+            "WHERE username = %s",
+            (name,),
+        )
+    conn.commit()
+
+
+@pytest.fixture()
+def targeted(monkeypatch: MonkeyPatch):
+    """_run_targeted_refresh with the real session and membership queries, and a
+    ranking step that only records whom it was asked to rank."""
+    import pandas as pd
+
+    ranked = []
+    monkeypatch.setattr(rd, "register_vector_type", lambda _c: None)
+    monkeypatch.setattr(rd, "_evict_unsubscribed", lambda _c, _u: set())
+    monkeypatch.setattr(rd, "_fetch_algorithm", lambda _c: ("1.0.0", {}))
+    monkeypatch.setattr(
+        rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
+    )
+    monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
+    monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
+    monkeypatch.setattr(rd, "_rank_user", lambda _c, username, *_a, **_k: ranked.append(username))
+    return ranked
+
+
+def test_a_read_opens_a_session_of_the_configured_length(conn, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setattr(rd, "FEED_SESSION_SECONDS", 900)
+    _user(conn, "reader", scored="2 hours")
+
+    rd._note_feed_reads(conn, {"reader"}, 10)
+
+    left, length = _session_left_seconds(conn, "reader")
+    assert 890 < left <= 900
+    assert length == 900
+
+
+def test_a_later_read_renews_the_session(conn, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setattr(rd, "FEED_SESSION_SECONDS", 900)
+    _user(conn, "reader", scored="2 hours")
+    rd._note_feed_reads(conn, {"reader"}, 10)
+    with conn.cursor() as cur:  # as if that was eight minutes ago
+        cur.execute(
+            "UPDATE haf_fyp_app.active_users SET "
+            "feed_session_at = feed_session_at - INTERVAL '8 minutes', "
+            "feed_session_until = feed_session_until - INTERVAL '8 minutes'"
+        )
+    conn.commit()
+
+    rd._note_feed_reads(conn, {"reader"}, 10)
+
+    left, length = _session_left_seconds(conn, "reader")
+    assert 890 < left <= 900 and length == 900
+
+
+def test_a_rerank_that_comes_due_in_a_session_waits_for_it_and_then_runs(
+    conn, targeted, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    _user(conn, "reader", scored="2 hours")
+
+    due = rd._note_feed_reads(conn, {"reader"}, 10)  # page 1 of a stale feed
+    assert due == {"reader"}
+
+    assert rd._run_targeted_refresh(conn, due) == {"reader"}
+    assert targeted == []
+    # Still held on the next pass, and not lost: main() keeps whatever comes back.
+    assert rd._run_targeted_refresh(conn, due) == {"reader"}
+    assert targeted == []
+
+    _end_session(conn, "reader")  # FEED_SESSION_SECONDS after the last renewal
+
+    assert rd._run_targeted_refresh(conn, due) == set()
+    assert targeted == ["reader"]
+
+
+def test_the_scheduled_cycle_does_not_choose_an_account_in_a_session(conn, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    _user(conn, "reading", scored="3 hours", read="1 hour")
+    _user(conn, "idle", scored="2 hours", read="1 hour")
+    rd._note_feed_reads(conn, {"reading"}, 0)
+
+    assert rd._fetch_personalised_users(conn, 4) == ["idle"]
+
+    _end_session(conn, "reading")
+    # The stalest feed again, at the front of the reader lane.
+    assert rd._fetch_personalised_users(conn, 4) == ["reading", "idle"]
+
+
+def test_a_warmup_reranks_a_stale_feed_without_opening_a_session(
+    conn, targeted, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    _user(conn, "signin", scored="2 hours")
+
+    due = rd._note_feed_reads(conn, set(), 10, warmups={"signin"})
+
+    assert due == {"signin"}
+    assert _read_age_seconds(conn, "signin") < 60  # stamped: that is its ration
+    assert _session_left_seconds(conn, "signin") == (None, None)
+    assert rd._run_targeted_refresh(conn, due) == set()
+    assert targeted == ["signin"]
+
+
+def test_a_warmup_of_a_fresh_feed_does_nothing(conn, monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    _user(conn, "signin", scored="2 minutes")
+
+    assert rd._note_feed_reads(conn, set(), 10, warmups={"signin"}) == set()
+
+
+def test_a_warmup_during_a_session_waits_for_it_and_does_not_extend_it(
+    conn, targeted, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 600)
+    _user(conn, "reader", scored="2 hours")
+    rd._note_feed_reads(conn, {"reader"}, 0)  # the session; no budget for its re-rank
+    before = _session_left_seconds(conn, "reader")[0]
+
+    due = rd._note_feed_reads(conn, set(), 10, warmups={"reader"})
+
+    assert due == {"reader"}
+    assert _session_left_seconds(conn, "reader")[0] <= before
+    assert rd._run_targeted_refresh(conn, due) == {"reader"}
+    assert targeted == []
+    _end_session(conn, "reader")
+    assert rd._run_targeted_refresh(conn, due) == set()
+    assert targeted == ["reader"]
+
+
 @pytest.fixture()
 def interests(conn):
     """Saved interests for the given names, removed again after the test."""
@@ -465,22 +619,23 @@ def test_a_notification_from_a_read_only_transaction_reaches_the_listener(conn, 
     got = set()
     deadline = time.monotonic() + 5
     while got != {"alice", "bob"} and time.monotonic() < deadline:
-        got |= rd._drain_feed_reads(conn)
+        got |= rd._drain_feed_reads(conn)[0]
         time.sleep(0.05)
     assert got == {"alice", "bob"}
 
 
-def _drain_for(conn, seconds, until=None):
+def _drain_for(conn, seconds, until=None, warmups=False):
+    """The reads heard within `seconds` (or the warm-ups, with `warmups`)."""
     got, deadline = set(), time.monotonic() + seconds
     while time.monotonic() < deadline and (until is None or got != until):
-        got |= rd._drain_feed_reads(conn)
+        got |= rd._drain_feed_reads(conn)[1 if warmups else 0]
         time.sleep(0.05)
     return got
 
 
-def _notify(session, name) -> None:
+def _notify(session, name, channel=rd.FEED_READ_CHANNEL) -> None:
     with session.cursor() as cur:
-        cur.execute("SELECT pg_notify(%s, %s)", (rd.FEED_READ_CHANNEL, name))
+        cur.execute("SELECT pg_notify(%s, %s)", (channel, name))
 
 
 def test_a_rolled_back_read_sends_nothing_and_the_next_committed_one_arrives(conn, other) -> None:
@@ -679,9 +834,9 @@ def test_a_schema_without_the_read_column_ranks_without_the_reader_lane(conn, ot
 _FEED_SCHEMA = "fyp81_shipped_feed"
 
 
-def _shipped_feed_function():
+def _shipped_feed_function(name="get_personalized_feed"):
     sql = open(ENDPOINT_SQL, encoding="utf-8").read()
-    start = sql.index("CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_personalized_feed(")
+    start = sql.index(f"CREATE OR REPLACE FUNCTION haf_fyp_endpoints.{name}(")
     ddl = sql[start : sql.index("\n$$;", start) + len("\n$$;")]
     for home in ("haf_fyp_endpoints.", "haf_fyp_app.", "hivemind_app."):
         ddl = ddl.replace(home, f"{_FEED_SCHEMA}.")
@@ -706,7 +861,8 @@ def shipped_feed(other):
             CREATE TABLE {s}.feed_cache_labels (code smallint, label varchar(16));
             CREATE TABLE {s}.active_users (
                 username varchar(16) PRIMARY KEY, last_scored_at timestamp,
-                last_read_at timestamp);
+                last_read_at timestamp, feed_session_at timestamp,
+                feed_session_until timestamp);
             CREATE TABLE {s}.global_feed_cache (
                 post_id bigint, rank int, final_score float, score_recency float,
                 score_engagement float, score_credibility float, algorithm_version text);
@@ -721,6 +877,7 @@ def shipped_feed(other):
             """
         )
         cur.execute(_shipped_feed_function())
+        cur.execute(_shipped_feed_function("warm_up_feed"))
     other.commit()
     try:
         yield other
@@ -740,6 +897,32 @@ def _last_read(session, when) -> None:
             f"SET last_read_at = (NOW() AT TIME ZONE 'utc') - INTERVAL '{when}'"
         )
     session.commit()
+
+
+def _session(session, started, ends) -> None:
+    """alice's read session, as the ranker stamps it: started `started` ago, ending in
+    `ends` (an interval; negative: it has ended)."""
+    session.set_session(readonly=False)
+    with session.cursor() as cur:
+        cur.execute(
+            f"UPDATE {_FEED_SCHEMA}.active_users "
+            f"SET feed_session_at = (NOW() AT TIME ZONE 'utc') - INTERVAL '{started}', "
+            f"    feed_session_until = (NOW() AT TIME ZONE 'utc') + INTERVAL '{ends}', "
+            f"    last_read_at = (NOW() AT TIME ZONE 'utc') - INTERVAL '{started}'"
+        )
+    session.commit()
+
+
+def _warm_up(session, username, *, switch=None):
+    """One GET of /v1/fyp/warmup/{username}: the shipped function, read only."""
+    session.set_session(readonly=True)
+    with session.cursor() as cur:
+        if switch is not None:
+            cur.execute("SELECT set_config('haf_fyp.feed_read_notify', %s, true)", (switch,))
+        cur.execute(f"SELECT {_FEED_SCHEMA}.warm_up_feed(%s)", (username,))
+        result = cur.fetchone()[0]
+    session.commit()
+    return result
 
 
 def _get_feed(session, username, page, *, switch=None):
@@ -854,27 +1037,112 @@ def test_an_account_ranked_only_once_it_reads_gets_the_global_feed_until_then(
     heard = _drain_for(conn, 3, until={"voter"})
     assert heard == {"voter"}
     rd._note_feed_reads(conn, heard, 0)  # stamped; no early re-rank, to see the lane
+    # It stays on the global feed while it reads (#104)...
+    assert "voter" not in rd._fetch_personalised_users(conn, 4)
+    _end_session(conn, "voter")
 
+    # ...and its own feed is built by the first cycle after the session.
     assert rd._fetch_personalised_users(conn, 4)[0] == "voter"
     assert rd._lane_taken == 1
 
 
-def test_the_shipped_function_does_not_notify_again_within_ten_minutes(conn, shipped_feed) -> None:
+def test_a_page_one_read_inside_a_session_does_not_notify_before_its_midpoint(conn, shipped_feed) -> None:
     rd._listen_for_feed_reads(conn)
-    _last_read(shipped_feed, "9 minutes")
+    _session(shipped_feed, "5 minutes", "10 minutes")
 
     _get_feed(shipped_feed, "alice", 1)
+    _get_feed(shipped_feed, "alice", 3)
 
     assert _silent_then_control(conn, shipped_feed)
 
 
-def test_the_shipped_function_notifies_again_once_ten_minutes_have_passed(conn, shipped_feed) -> None:
+@pytest.mark.parametrize("page", [1, 2, 5])
+def test_any_page_renews_a_session_past_its_midpoint(conn, shipped_feed, page) -> None:
+    # One signal per half window of scrolling: the renewal the ranker stamps moves the
+    # midpoint on, so the pages after it are silent again (the test above).
     rd._listen_for_feed_reads(conn)
-    _last_read(shipped_feed, "11 minutes")
+    _session(shipped_feed, "8 minutes", "7 minutes")
+
+    _get_feed(shipped_feed, "alice", page)
+
+    assert _drain_for(conn, 3, until={"alice"}) == {"alice"}
+
+
+def test_a_page_one_read_after_a_session_ended_starts_a_new_one(conn, shipped_feed) -> None:
+    rd._listen_for_feed_reads(conn)
+    _session(shipped_feed, "20 minutes", "-5 minutes")
 
     _get_feed(shipped_feed, "alice", 1)
 
     assert _drain_for(conn, 3, until={"alice"}) == {"alice"}
+
+
+def test_a_later_page_after_a_session_ended_does_not_notify(conn, shipped_feed) -> None:
+    rd._listen_for_feed_reads(conn)
+    _session(shipped_feed, "20 minutes", "-5 minutes")
+
+    _get_feed(shipped_feed, "alice", 2)
+
+    assert _silent_then_control(conn, shipped_feed)
+
+
+def test_a_recent_read_without_a_session_still_starts_one(conn, shipped_feed) -> None:
+    """A warm-up stamps last_read_at and opens no session; the read that follows it
+    within ten minutes has to open one, or the warm-up's re-rank could land between its
+    pages."""
+    rd._listen_for_feed_reads(conn)
+    _last_read(shipped_feed, "1 minute")
+
+    _get_feed(shipped_feed, "alice", 1)
+
+    assert _drain_for(conn, 3, until={"alice"}) == {"alice"}
+
+
+# ---- /v1/fyp/warmup/{username} ------------------------------------------------------
+
+
+def _silent_warmups_then_control(conn, session):
+    session.set_session(readonly=False)
+    _notify(session, "control", rd.FEED_WARMUP_CHANNEL)
+    session.commit()
+    return _drain_for(conn, 2, until={"control"}, warmups=True) == {"control"}
+
+
+def test_a_warmup_signals_on_its_own_channel_and_returns_nothing(conn, shipped_feed) -> None:
+    rd._listen_for_feed_reads(conn)
+
+    # void, which psycopg2 reads as an empty string, and PostgREST answers with 204
+    assert _warm_up(shipped_feed, "alice") == ""
+
+    assert _drain_for(conn, 3, until={"alice"}, warmups=True) == {"alice"}
+    assert _silent_then_control(conn, shipped_feed), "a warm-up is not a read"
+
+
+def test_a_warmup_is_rationed_by_the_last_stamp(conn, shipped_feed) -> None:
+    rd._listen_for_feed_reads(conn)
+    _last_read(shipped_feed, "9 minutes")
+
+    _warm_up(shipped_feed, "alice")
+
+    assert _silent_warmups_then_control(conn, shipped_feed)
+
+
+def test_a_warmup_signals_again_once_ten_minutes_have_passed(conn, shipped_feed) -> None:
+    rd._listen_for_feed_reads(conn)
+    _last_read(shipped_feed, "11 minutes")
+
+    _warm_up(shipped_feed, "alice")
+
+    assert _drain_for(conn, 3, until={"alice"}, warmups=True) == {"alice"}
+
+
+def test_a_warmup_for_an_account_outside_the_rotation_or_switched_off_is_silent(conn, shipped_feed) -> None:
+    rd._listen_for_feed_reads(conn)
+
+    _warm_up(shipped_feed, "nobody")
+    _warm_up(shipped_feed, "alice", switch="off")
+
+    assert _silent_warmups_then_control(conn, shipped_feed)
 
 
 def test_an_operator_can_switch_the_notify_off_without_reinstalling(conn, shipped_feed) -> None:
@@ -962,14 +1230,16 @@ def test_the_shipped_upgrade_adds_the_column_and_its_index_to_an_installed_table
 # --------------------------------------------------------------------------
 
 
-def test_a_read_during_a_cycle_is_recorded_and_ranked_before_the_cycle_ends(
+def test_a_read_during_a_cycle_is_recorded_and_its_feed_left_alone_for_the_session(
     conn, other, monkeypatch: MonkeyPatch
 ) -> None:
-    """The real session, the real LISTEN, the real stamping statement and membership
+    """The real session, the real LISTEN, the real stamping statement and session
     query, and a cycle whose per-account step writes and commits as write_feed_cache
     does. What #85 rests on, and only a server can show: a notification committed by
     another session while this one is inside an account's transaction is handed over
-    once that transaction ends, and is acted on before the next account.
+    once that transaction ends, and is acted on before the next account. Acted on, since
+    #104, by opening the reader's session: the cycle does not rewrite a feed being read,
+    though zed was due and in the cycle's queue.
 
     (That the drain's rollback loses none of the cycle's writes is NOT shown here: the
     step below commits for itself. It holds because write_user_vector, write_feed_cache
@@ -1029,18 +1299,19 @@ def test_a_read_during_a_cycle_is_recorded_and_ranked_before_the_cycle_ends(
 
     ranked = rd.run_cycle(conn, _reads)
 
-    assert order == ["u1", "zed", "u2", "u3"]
-    assert ranked == {"u1", "u2", "u3", "zed"}
+    assert order == ["u1", "u2", "u3"]
+    assert ranked == {"u1", "u2", "u3"}
     # Recorded while the cycle was still running: this is what arms the feed
-    # function's ten-minute ration.
+    # function's ration, and opens the session that kept zed out.
     assert zed_read_when_u2_ranked[0] is not None and zed_read_when_u2_ranked[0] < 30
-    # Every account's write is there (each committed before the next check).
+    assert rd._in_session(other, ["zed", "u1"]) == {"zed"}
+    # Every other account's write is there (each committed before the next check).
     with other.cursor() as cur:
         cur.execute(
-            "SELECT count(*) FROM haf_fyp_app.active_users "
+            "SELECT username FROM haf_fyp_app.active_users "
             "WHERE last_scored_at > (NOW() AT TIME ZONE 'utc') - INTERVAL '1 minute'"
         )
-        assert cur.fetchone()[0] == 4
+        assert sorted(r[0] for r in cur.fetchall()) == ["u1", "u2", "u3"]
     other.commit()
 
 

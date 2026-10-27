@@ -176,12 +176,13 @@ def db() -> Iterator[Connection]:
             f"""
             CREATE TABLE {S}.active_users (
                 username varchar(16) PRIMARY KEY, last_scored_at timestamp,
-                last_read_at timestamp);
+                last_read_at timestamp, feed_session_at timestamp,
+                feed_session_until timestamp);
             CREATE TABLE {S}.user_interests (
                 username varchar(16) NOT NULL, community_id int NOT NULL,
                 PRIMARY KEY (username, community_id));
-            -- Readers, so the upgrade keeps their feeds; read just now, so the feed
-            -- function does not notify for them.
+            -- Readers, so the upgrade keeps their feeds. No read session open, so
+            -- write_feed_cache may rewrite them (#104).
             INSERT INTO {S}.active_users (username, last_read_at)
             VALUES ('alice', NOW() AT TIME ZONE 'utc'), ('bob', NOW() AT TIME ZONE 'utc');
             CREATE TABLE {S}.global_feed_cache (post_id bigint, rank int);
@@ -568,3 +569,46 @@ def test_a_rewrite_registers_each_label_once(db: Connection, monkeypatch: pytest
         assert cur.fetchone()[0] == 2 * len(_SHORT)
     db.commit()
     assert [f["algorithm_version"] for f in _feed(db, "bob")] == ["1.2.0"] * len(_SHORT)
+
+
+# --------------------------------------------------------------------------
+# #104: a feed being read is not rewritten
+# --------------------------------------------------------------------------
+
+
+def _ranking(post_ids: list[int]) -> list[_Row]:
+    return [(p, 1.0 - i / 100, 0.5, 0.5, 0.5, 0.5, False, None) for i, p in enumerate(post_ids)]
+
+
+def _set_session(db: Connection, username: str, ends: str) -> None:
+    with db.cursor() as cur:
+        cur.execute(
+            f"UPDATE {S}.active_users SET feed_session_at = NOW() AT TIME ZONE 'utc', "
+            f"feed_session_until = (NOW() AT TIME ZONE 'utc') + INTERVAL '{ends}' "
+            "WHERE username = %s",
+            (username,),
+        )
+    db.commit()
+
+
+def test_pages_of_a_session_continue_each_other_while_the_rerank_waits(
+    db: Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _upgrade(db)
+    before = list(range(1, 46))
+    after = before[::-1]  # the ranking a re-rank would bring: every page would change
+    _write_compact(db, monkeypatch, "alice", _ranking(before))
+
+    page1 = _feed(db, "alice", 1)
+    _set_session(db, "alice", "15 minutes")  # what the ranker stamps on hearing page 1
+    with pytest.raises(scoring.FeedSessionOpen):
+        _write_compact(db, monkeypatch, "alice", _ranking(after))
+    pages = page1 + _feed(db, "alice", 2) + _feed(db, "alice", 3)
+
+    assert [p["rank"] for p in pages] == list(range(1, 46))
+    assert [int(p["post_id"]) for p in pages] == before
+
+    _set_session(db, "alice", "-1 second")  # the reader went idle
+    _write_compact(db, monkeypatch, "alice", _ranking(after))
+
+    assert [int(p["post_id"]) for p in _feed(db, "alice", 1)] == after[:20]

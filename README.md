@@ -475,7 +475,8 @@ below).
 | GET | `/version` | `/rpc/get_version` | Build version of the running app |
 | GET | `/v1/fyp/algorithm` | `/rpc/get_algorithm` | Active algorithm version and weights |
 | GET | `/v1/fyp/algorithms` | `/rpc/list_algorithm_versions` | All registered algorithm versions |
-| GET | `/v1/fyp/feed/{username}?page-size=20` | `/rpc/get_personalized_feed` | Ranked feed for a user |
+| GET | `/v1/fyp/feed/{username}?page-size=20` | `/rpc/get_personalized_feed` | Ranked feed for a user; pages of one read session are stable (see [Read sessions](#read-sessions-stable-pages)) |
+| GET | `/v1/fyp/warmup/{username}` | `/rpc/warm_up_feed` | Ask for a fresh feed before the user opens it; 204, no body (see [Read sessions](#read-sessions-stable-pages)) |
 | GET | `/v1/fyp/global?page-size=20` | `/rpc/get_global_feed` | Unauthenticated global feed |
 | GET | `/v1/fyp/profile/{username}` | `/rpc/get_user_profile` | User vector status and top communities |
 | GET | `/v1/fyp/explain/{username}/{post_id}` | `/rpc/get_score_explanation` | Per-signal score breakdown |
@@ -697,16 +698,61 @@ rest with the old table; its log names how many rows it copied and skipped.
 
 **Readers go first (#81).** Requesting the first page of a feed tells the ranker, which
 
-1. records the read (`active_users.last_read_at`);
+1. records the read (`active_users.last_read_at`) and opens a read session (below);
 2. re-ranks that account if its feed is older than `READ_REFRESH_MIN_AGE_SECONDS`, so
-   the *next* load is current, as long as there is budget left for the cycle
-   (`READ_REFRESH_MAX_PER_CYCLE`);
+   the *next* visit is current, as long as there is budget left for the cycle
+   (`READ_REFRESH_MAX_PER_CYCLE`). Since #104 that re-rank runs when the session ends,
+   not while the reader is scrolling;
 3. takes accounts that read within `READER_WINDOW_SECONDS`, and whose feed is older
    than `READ_REFRESH_MIN_AGE_SECONDS`, at the front of every scheduled cycle, stalest
-   first, in at most `READER_CYCLE_SHARE` of the cycle.
+   first, in at most `READER_CYCLE_SHARE` of the cycle (an account whose session is
+   open waits for it to end).
 
 The rest of each cycle goes to everyone else in the old order. The first request after
-a long absence is still served the old feed; it is the one that triggers the refresh.
+a long absence is still served the old feed; it is the one that triggers the refresh,
+unless the client warmed the feed up first (below).
+
+#### Read sessions: stable pages
+
+Pages are cut from the cached feed with `LIMIT`/`OFFSET`, and a re-rank replaces the
+account's whole feed. Before #104 a re-rank that landed between two page requests made
+the later pages come from a different ranking, so posts from page 1 came back further
+down. It happened in almost every visit: the read of page 1 was what triggered the
+re-rank, seconds later.
+
+So a read now opens a **read session**, and nothing rewrites that account's feed
+until it ends: not the scheduled rotation, not the reader lane, not a re-rank on read
+or on warm-up, not an interest save. A re-rank that comes due during the session is
+held, not dropped, and runs on the ranker's first pass after it ends (within about 5 s
+between cycles). The reader's next visit starts on the fresh ranking.
+
+* The session lasts `FEED_SESSION_SECONDS` (15 minutes) from the last renewal. The
+  first page opens it; while it is open, any page requested past its midpoint renews
+  it. A reader who keeps scrolling therefore costs one signal per half window (about
+  7 minutes), not one per page, and one who stops lets it end on its own. Nobody,
+  the reader or someone requesting their feed, can hold a feed still for longer than
+  one window past the last request that renewed it.
+* An account with no cached feed yet is served the global feed and stays on it for
+  the session; its own feed is built when the session ends. The global feed itself is
+  shared and is still re-ranked every cycle, so its pages can shift.
+* A page other than the first, requested after the session ended, does not open a
+  new one: its feed may already have been rewritten, and the reader should reload
+  from page 1.
+* A re-rank that was already running when the session opened (the ranker stamps the
+  session when it hears the read: up to 5 s later, longer during a targeted refresh)
+  can still land once.
+
+**Warm-up.** `GET /v1/fyp/warmup/{username}` asks for the read-triggered re-rank
+*without* opening a session. A client calls it when the user signs in or opens the
+app, before it requests the first page; the ranker re-ranks the feed at once if it is
+older than `READ_REFRESH_MIN_AGE_SECONDS` (about 8 s on a full node), so the visit
+that follows starts on a current ranking. It answers 204 with no body and never
+returns the feed. It is rationed like a read: one signal per account per ten minutes
+reaches the ranker, and it counts against `READ_REFRESH_MAX_PER_CYCLE` and the reader
+filter (`READER_ACTIVE_WITHIN_DAYS`) like a read does. A warm-up for an account whose
+session is open is held until the session ends, so warming up after the first page is
+too late for that visit. Like the feed itself it takes any username: it is a request,
+not an authenticated action.
 
 These are environment variables of the `haf-fyp-ranker` service.
 `docker/docker-compose.yml` passes each one to the ranker when it is set, so add the
@@ -740,12 +786,14 @@ start with a log line naming the variable. The others are held to their range.
 | `READ_REFRESH_MIN_AGE_SECONDS` | 600 | A feed younger than this is not re-ranked on read, and does not take a lane slot. |
 | `READ_REFRESH_MAX_PER_CYCLE` | `MAX_USERS_PER_CYCLE` x `READER_CYCLE_SHARE`, at most 300 | Re-ranks on read per cycle period: between two scheduled cycles, and ahead of their turn during one (a cycle grows by at most this many accounts). 0 turns them off. Between cycles they run in the 300 s the ranker waits: keep this times seconds-per-account well under `CYCLE_SECONDS`, or they start delaying the cycle. |
 | `READ_REFRESH_BATCH_SECONDS` | 30 | After one read-triggered re-rank, the next waits this long and takes everyone who became due meanwhile. Each one fetches the candidates before ranking anyone (about 8 s on a full node), so they are grouped. 0 turns the grouping off. |
+| `FEED_SESSION_SECONDS` | 900 | How long a read session keeps an account's feed from being rewritten after its last renewal (#104). At least 600: the feed function's signal is rationed to one per half window per account. Longer holds a reader's feed still longer, and delays the re-rank their read asked for by as much. |
 | `READER_ACTIVE_WITHIN_DAYS` | 0 | Off at 0; at most 36500. Otherwise a read earns a lane slot or an early re-rank only for an account that voted on or reblogged a post this app tracks within this many days (posting or commenting alone does not count), or that saved interests (interests do not lapse). A forged read for any other account then costs nothing; it is still recorded. It narrows a flood, it does not stop one: 12,888 accounts had voted or reblogged within 30 days on testapi. At 30 days it would have turned away at most 1 of the 16 readers seen there on 2026-10-12. Off by itself while block processing is more than `ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS` behind, when every account looks lapsed, or while that cannot be told; the ranker logs when it turns on and off, and how many reads earned nothing. |
 
 What to expect, and what this does not do:
 
-* **It is not immediate.** With the ranker between cycles, the refresh takes about 8 s
-  once the ranker looks, which is up to 5 s after the read (one measurement on a full
+* **It is not immediate.** A re-rank on read waits for the read session to end; the
+  times here count from then, or from a warm-up. With the ranker between cycles, the
+  refresh takes about 8 s once the ranker looks, which is up to 5 s after the read (one measurement on a full
   node: 9 s end to end), or up to `READ_REFRESH_BATCH_SECONDS` later if another reader
   was served just before. During a scheduled cycle the ranker looks every 5 s, between
   two accounts, and ranks a stale reader next: no candidates to fetch, so it is quicker
@@ -769,10 +817,12 @@ What to expect, and what this does not do:
   that many days or saved interests, so reading other accounts buys nothing. Accounts
   that vote are still far more than a lane holds. During a flood,
   `READER_CYCLE_SHARE=0` turns the lane off for everyone.
-* **Paging.** A feed rewritten while someone scrolls can repeat or skip a post between
-  page 1 and page 2. Readers' feeds are rewritten more often than others'.
+* **Paging.** A feed is not rewritten while someone scrolls it (see
+  [Read sessions](#read-sessions-stable-pages)), so pages of one visit do not repeat or
+  skip a post. The global feed, which an account without its own is served, is the
+  exception.
 * **The signal is visible inside the database.** It is a Postgres notification on the
-  channel `haf_fyp_feed_read` carrying the username. Any role with a session on the
+  channel `haf_fyp_feed_read` (a warm-up: `haf_fyp_feed_warmup`) carrying the username. Any role with a session on the
   database can listen to it, and can also send on it, which is one more way a read can
   be forged; what the ranker does with one is bounded the same either way.
   No endpoint exposes an account's `last_read_at`; `GET /metrics` reports only counts.
@@ -825,13 +875,16 @@ could not be read; the API log says why). The section never sets a `degraded` fl
 every threshold above depends on the node.
 
 **What a notifying request costs.** It takes a transaction id and a brief cluster-wide
-lock at commit, so the feed function rations it: first page only, and at most once per
-account per ten minutes *once the ranker has recorded the read*. The ranker records
+lock at commit, so the feed function rations it by the read session *once the ranker
+has recorded it*: the first page notifies when no session is open, any page notifies
+past the open session's midpoint, and nothing else does, so at most one signal per
+account per half `FEED_SESSION_SECONDS` (7.5 minutes at the default). The warm-up
+endpoint notifies at most once per account per ten minutes. The ranker records
 reads about every 5 s while it waits and while a cycle ranks accounts. It does not look
 while a cycle loads its candidates, during a targeted refresh, or during hourly
 maintenance; for those stretches, and for as long as the ranker is stopped or older
-than #81, every first-page request notifies. If the ranker is going to be down for
-longer than a deploy, switch the signal off:
+than #104, every first-page request notifies. If the ranker is going to be down for
+longer than a deploy, switch the signal off (it switches the warm-up off too):
 
 ```sql
 -- as a superuser (haf_admin)
@@ -885,6 +938,12 @@ those locks the ranker notices the column after its next cycle.
 The other way round, new SQL under an old or stopped ranker, nothing breaks,
 but nothing records the reads either, so every first-page request notifies: switch the
 signal off for the duration.
+
+Read sessions (#104) need schema version 4 (`active_users.feed_session_at` and
+`feed_session_until`, added in place by the install). A ranker of that release refuses
+to start on older SQL and says so; upgrade the SQL first, as above. Until the ranker is
+upgraded too, nothing stamps a session, so every first-page request notifies and pages
+are not protected; nothing else changes.
 
 ### Retention and maintenance
 

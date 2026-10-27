@@ -30,6 +30,15 @@ Readers first (#81):
   stamps active_users.last_read_at, re-ranks a reader whose feed is old through the
   same targeted cycle (grouped, a few seconds to half a minute later), and takes
   recent readers at the front of every scheduled cycle. The rest of the rotation is ranked as before, in what is left of the cycle.
+
+Read sessions (#104):
+  Feed pages are LIMIT/OFFSET over feed_cache, so a re-rank between two page requests
+  served later pages from another ranking. A read now opens (or renews) a session of
+  FEED_SESSION_SECONDS, and nothing rewrites that account's feed until it ends
+  (scoring.write_feed_cache refuses, whoever asks). A re-rank that comes due meanwhile
+  waits, and runs once the session is over. A warm-up (haf_fyp_feed_warmup) asks for
+  the read-triggered re-rank without opening a session, so a client can have the feed
+  refreshed before the reader opens it.
 """
 
 from __future__ import annotations
@@ -44,6 +53,7 @@ import signal
 import threading
 import time
 from collections.abc import Callable
+from collections.abc import Set as AbstractSet
 from typing import TypeVar
 
 import pandas as pd
@@ -58,6 +68,7 @@ from haf_fyp.schema_version import IncompatibleSchemaError, check_schema_version
 from haf_fyp.scoring import (
     FEED_CACHE_RANK_TYPE,
     FEED_CACHE_SHAPE_SQL,
+    FeedSessionOpen,
     bootstrap_vector_from_communities,
     build_user_profile_vector,
     compute_scores,
@@ -161,6 +172,15 @@ MAX_USERS_PER_CYCLE = _tuning("MAX_USERS_PER_CYCLE", "200", int, minimum=0)
 # costs everyone else at most the share. It cannot be prevented without knowing who
 # is asking; what these settings guarantee is that it buys nothing worse.
 FEED_READ_CHANNEL = "haf_fyp_feed_read"
+# #104: haf_fyp_endpoints.warm_up_feed. Handled like a read (stamped, re-ranked now if
+# stale and within the budget) except that it opens no session.
+FEED_WARMUP_CHANNEL = "haf_fyp_feed_warmup"
+# #104: how long a read keeps the account's feed from being rewritten. Each read renews
+# it, and the feed function sends one past the session's midpoint, so a reader who keeps
+# scrolling holds it with one signal per half window and one who stops lets it end a
+# window after their last renewal. Not shorter than ten minutes: the feed function
+# rations its signal by the session, so half of this is how often a reader may cost one.
+FEED_SESSION_SECONDS = _tuning("FEED_SESSION_SECONDS", "900", int, minimum=600)
 # A day, not a week: someone who comes back after longer still gets the immediate
 # re-rank on their first read, and a short window keeps the lane to people who are
 # actually around. A reader in the window is re-ranked whenever its feed is older than
@@ -237,6 +257,10 @@ _READ_EARNS_SQL = """COALESCE((
     OR au.last_interaction_at >= (NOW() AT TIME ZONE 'utc') - make_interval(days => %s)
     OR EXISTS (SELECT 1 FROM haf_fyp_app.user_interests ui WHERE ui.username = au.username)
 ), false)"""
+# #104: active_users row `au` has no read session open, so its feed may be rewritten.
+# The test write_feed_cache makes, in the queries that choose whom to rank.
+_NO_SESSION_SQL = """(au.feed_session_until IS NULL
+     OR au.feed_session_until <= (NOW() AT TIME ZONE 'utc'))"""
 # Notifications held on the connection between drains. psycopg2 appends to
 # conn.notifies whenever it reads the socket, i.e. during every query of a cycle, and
 # nothing else bounds that list; the oldest are discarded past this. It is also the
@@ -551,6 +575,7 @@ def _listen_for_feed_reads(conn) -> None:
         supported = bool(cur.fetchone()[0])
         if supported:
             cur.execute(f"LISTEN {FEED_READ_CHANNEL}")
+            cur.execute(f"LISTEN {FEED_WARMUP_CHANNEL}")
     conn.commit()
     # Only now: had the LISTEN failed, a flag already set would say "listening" for a
     # session that is not, and nothing would ever look again.
@@ -566,8 +591,9 @@ def _listen_for_feed_reads(conn) -> None:
     conn.notifies = collections.deque(maxlen=_FEED_READ_BACKLOG_MAX)
 
 
-def _drain_feed_reads(conn) -> set[str]:
-    """Usernames whose feed was requested since the last drain (#81)."""
+def _drain_feed_reads(conn) -> tuple[set[str], set[str]]:
+    """Usernames whose feed was requested since the last drain (#81), and those a
+    warm-up was asked for (#104), in that order."""
     # Postgres does not deliver a notification to a session that is inside a
     # transaction. Several paths end a pass with one open and nothing to commit (no
     # candidates, a refresh whose targets were all non-members), and the session would
@@ -577,18 +603,29 @@ def _drain_feed_reads(conn) -> set[str]:
     notes = list(conn.notifies)
     conn.notifies.clear()
     if not _reads_supported:
-        return set()
-    return {
-        note.payload for note in notes
-        if note.channel == FEED_READ_CHANNEL and _USERNAME_RE.fullmatch(note.payload or "")
-    }
+        return set(), set()
+
+    def _named(channel: str) -> set[str]:
+        return {
+            note.payload for note in notes
+            if note.channel == channel and _USERNAME_RE.fullmatch(note.payload or "")
+        }
+
+    return _named(FEED_READ_CHANNEL), _named(FEED_WARMUP_CHANNEL)
 
 
-def _note_feed_reads(conn, usernames: set[str], rerank_limit: int) -> set[str]:
+def _note_feed_reads(
+    conn, usernames: set[str], rerank_limit: int, warmups: AbstractSet[str] = frozenset()
+) -> set[str]:
     """
-    Stamp last_read_at for the rotation members among `usernames`, and return the ones
-    whose feed is old enough to re-rank now (at most `rerank_limit`, stalest first).
-    Everyone is stamped whatever the limit: a data-modifying CTE runs to completion.
+    Stamp last_read_at for the rotation members among `usernames` and `warmups`, and
+    return the ones whose feed is old enough to re-rank (at most `rerank_limit`,
+    stalest first). Everyone is stamped whatever the limit: a data-modifying CTE runs to
+    completion.
+
+    A read (`usernames`) also opens or renews the account's read session (#104), until
+    FEED_SESSION_SECONDS from now; a warm-up does not. So a read's re-rank, when it is
+    due, waits for the session it opened to end.
 
     Rows are taken FOR UPDATE SKIP LOCKED before they are updated. The block processor
     upserts many active_users rows per batch in its own order, and a second multi-row
@@ -599,19 +636,27 @@ def _note_feed_reads(conn, usernames: set[str], rerank_limit: int) -> set[str]:
     same rule _run_targeted_refresh applies.
     """
     global _reads_unearned
-    if not usernames:
+    if not usernames and not warmups:
         return set()
     with conn.cursor() as cur:
         cur.execute(
             f"""
             WITH picked AS (
-                SELECT au.username, au.last_scored_at, {_READ_EARNS_SQL} AS earns
+                SELECT au.username, au.last_scored_at, {_READ_EARNS_SQL} AS earns,
+                       au.username = ANY(%s) AS reading
                   FROM haf_fyp_app.active_users au
                  WHERE au.username = ANY(%s)
                    FOR UPDATE OF au SKIP LOCKED
             ), stamped AS (
                 UPDATE haf_fyp_app.active_users au
-                   SET last_read_at = (NOW() AT TIME ZONE 'utc')
+                   SET last_read_at = (NOW() AT TIME ZONE 'utc'),
+                       feed_session_at = CASE WHEN picked.reading
+                                              THEN (NOW() AT TIME ZONE 'utc')
+                                              ELSE au.feed_session_at END,
+                       feed_session_until = CASE WHEN picked.reading
+                                                 THEN (NOW() AT TIME ZONE 'utc')
+                                                      + make_interval(secs => %s)
+                                                 ELSE au.feed_session_until END
                   FROM picked
                  WHERE au.username = picked.username
              RETURNING au.username, picked.last_scored_at, picked.earns
@@ -629,6 +674,7 @@ def _note_feed_reads(conn, usernames: set[str], rerank_limit: int) -> set[str]:
             SELECT NULL, count(*) FROM stamped WHERE NOT earns
             """,
             (_read_filter_days, _read_filter_days, sorted(usernames),
+             sorted(set(usernames) | set(warmups)), FEED_SESSION_SECONDS,
              READ_REFRESH_MIN_AGE_SECONDS, max(0, rerank_limit)),
         )
         stale = set()
@@ -642,12 +688,13 @@ def _note_feed_reads(conn, usernames: set[str], rerank_limit: int) -> set[str]:
 
 
 def _handle_feed_reads(conn, rerank_budget: int) -> set[str]:
-    """One pass of #81: hear the reads, stamp them, and return the accounts whose feed
-    is old enough to re-rank ahead of the rotation (never more than `rerank_budget`)."""
+    """One pass of #81: hear the reads and warm-ups, stamp them, and return the accounts
+    whose feed is old enough to re-rank ahead of the rotation (never more than
+    `rerank_budget`). A read's account is in a session now (#104): its re-rank waits."""
     global _reads_heard, _reads_reranked
-    heard = _drain_feed_reads(conn)
-    stale = _note_feed_reads(conn, heard, rerank_budget)
-    _reads_heard += len(heard)
+    heard, warmups = _drain_feed_reads(conn)
+    stale = _note_feed_reads(conn, heard, rerank_budget, warmups)
+    _reads_heard += len(heard | warmups)
     _reads_reranked += len(stale)
     return stale
 
@@ -822,7 +869,9 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
     #81 puts recent readers ahead of that order, in at most READER_CYCLE_SHARE of the
     cycle; the remainder is filled in that order from everyone else who uses the app
     (#98): a read within FEED_CACHE_UNREAD_RETENTION_DAYS, or interests. An account
-    that has only voted is not ranked until it reads. The round-robin argument below
+    that has only voted is not ranked until it reads. Neither takes an account whose
+    read session is open (#104): write_feed_cache would refuse it, and the slot is
+    better spent; it sorts where it was once the session ends. The round-robin argument below
     therefore holds for the remainder, over that set, at a rate reduced by the share
     actually used.
 
@@ -858,6 +907,7 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
                    AND (last_scored_at IS NULL
                         OR last_scored_at < (NOW() AT TIME ZONE 'utc') - make_interval(secs => %s))
                    AND {_READ_EARNS_SQL}
+                   AND {_NO_SESSION_SQL}
                  ORDER BY last_scored_at ASC NULLS FIRST,
                           last_read_at DESC
                  LIMIT %s
@@ -886,13 +936,14 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
         # interests. The same test as the unread-feed pass, so the rotation never
         # rebuilds a feed that pass is about to drop.
         cur.execute(
-            """
+            f"""
             SELECT username
               FROM haf_fyp_app.active_users au
              WHERE NOT (username = ANY(%s))
                AND (au.last_read_at >= (NOW() AT TIME ZONE 'utc') - make_interval(days => %s)
                     OR EXISTS (SELECT 1 FROM haf_fyp_app.user_interests ui
                                 WHERE ui.username = au.username))
+               AND {_NO_SESSION_SQL}
              ORDER BY last_scored_at ASC NULLS FIRST,
                       last_interaction_at DESC NULLS LAST
              LIMIT %s
@@ -900,6 +951,22 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
             (readers, FEED_CACHE_UNREAD_RETENTION_DAYS, limit - len(readers)),
         )
         return readers + [r[0] for r in cur.fetchall()]
+
+
+def _in_session(conn, usernames) -> set[str]:
+    """Which of `usernames` have a read session open (#104): accounts whose feed must
+    not be rewritten, and whose re-rank therefore waits."""
+    if not usernames:
+        return set()
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT username FROM haf_fyp_app.active_users au
+             WHERE username = ANY(%s) AND NOT {_NO_SESSION_SQL}
+            """,
+            (sorted(usernames),),
+        )
+        return {row[0] for row in cur.fetchall()}
 
 
 def _rotation_members(conn, usernames: list[str]) -> set[str]:
@@ -1126,13 +1193,21 @@ def _readers_to_rank_now(
     every call (main() keeps handing over whoever is still waiting), so nobody is
     looked at twice: not an account the cycle has taken (`done`), and not one this
     function turned away (`skipped`, which it fills, and which run_cycle also keeps
-    out of the rest of its queue).
+    out of the rest of its queue). A reader whose session is open (#104) is turned away
+    too: this cycle must not rewrite that feed, and main() keeps the reader waiting.
 
     Best-effort, like the same step in main(): a check that fails must not cost the
     cycle. Only a session that is gone ends it, as it does anywhere else in the cycle.
     """
     try:
         early = sorted(u for u in reads(conn) if u not in done and u not in skipped)
+        if not early:
+            return []
+        # Before the reconcile, which may delete the feed of a reader who un-opted-in:
+        # that is a rewrite too, and waits for the session like any other.
+        reading = _in_session(conn, early)
+        skipped.update(reading)
+        early = [u for u in early if u not in reading]
         if not early:
             return []
         # Both halves of what _run_targeted_refresh does before it ranks anyone (#10).
@@ -1249,7 +1324,7 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
         if not survivors:
             continue
         users.extend(survivors[: MAX_USERS_PER_CYCLE - len(users)])
-    processed = failed = 0
+    processed = failed = held = 0
     ranked: set[str] = set()
     done: set[str] = set()      # attempted, ranked or not: nobody is taken twice
     skipped: set[str] = set()   # readers turned away: evicted, or not in the rotation
@@ -1279,6 +1354,10 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
             _rank_user(conn, username, candidates, post_vectors, author_credibility, algo_version, weights)
             processed += 1
             ranked.add(username)
+        except FeedSessionOpen:
+            # A session opened after this account was chosen (#104). Not ranked, so it
+            # keeps its place: the stalest feed sorts first again once the session ends.
+            held += 1
         except psycopg2.OperationalError:
             raise
         except Exception as exc:
@@ -1288,8 +1367,9 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
 
     if done:
         log.info(
-            "refreshed personalized feeds for %d/%d cached users (%d failed)",
+            "refreshed personalized feeds for %d/%d cached users (%d failed%s)",
             processed, len(done), failed,
+            f", {held} held for a read session" if held else "",
         )
         taken = ahead & done  # not one a later check turned away before its turn came
         if taken:
@@ -1304,19 +1384,30 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
     return ranked
 
 
-def _run_targeted_refresh(conn, usernames: set[str]) -> None:
+def _run_targeted_refresh(conn, usernames: set[str]) -> set[str]:
     """
     Score and write feed_cache for specific users only — no global feed update.
     Called when force-refresh signals arrive from the FastAPI overlay via Redis, and
-    when a feed read finds a stale feed (#81).
+    when a feed read or a warm-up finds a stale feed (#81, #104).
     Users who have un-opted-in are evicted from the rotation instead of ranked (#10).
+
+    Returns the users left alone because their read session is open (#104): neither
+    ranked nor reconciled, since both rewrite the feed. The caller asks again later.
     """
-    targets = sorted(usernames)
+    # Before anything is logged: main() asks again on every pass while all it holds is
+    # accounts in a session, and a line each time would be one every POLL_SECONDS.
+    held = _in_session(conn, usernames)
+    targets = sorted(u for u in usernames if u not in held)
+    if not targets:
+        log.debug("force-refresh: all %d user(s) in a read session, held", len(held))
+        return held
     quiet = len(targets) > _QUIET_REFRESH_ABOVE
     if quiet:
         log.info("force-refresh for %d user(s)", len(targets))
     else:
         log.info("force-refresh for %d user(s): %s", len(targets), targets)
+    if held:
+        log.info("force-refresh: %d more user(s) in a read session, held until it ends", len(held))
     register_vector_type(conn)
 
     # #10: the un-opt-in publishes the SAME signal as the opt-in, so membership is
@@ -1346,25 +1437,29 @@ def _run_targeted_refresh(conn, usernames: set[str]) -> None:
             )
         targets = [u for u in targets if u in members]
     if not targets:
-        return
+        return held
 
     algo_version, weights = _fetch_algorithm(conn)
     candidates = _fetch_candidates(conn)
     if candidates.empty:
         log.info("no candidates for targeted refresh")
-        return
+        return held
 
     post_ids = candidates["post_id"].tolist()
     post_vectors = fetch_post_vectors_safe(conn, post_ids, scope="candidates")
     authors = candidates["author"].unique().tolist()
     author_credibility = _fetch_author_credibility_safe(conn, authors)
 
-    failed = 0
+    failed = raced = 0
 
     for username in targets:
         try:
             _rank_user(conn, username, candidates, post_vectors, author_credibility, algo_version, weights)
             (log.debug if quiet else log.info)("force-refresh complete for %s", username)
+        except FeedSessionOpen:
+            # Its session opened while this refresh was fetching (#104).
+            held.add(username)
+            raced += 1
         except psycopg2.OperationalError:
             raise
         except Exception as exc:
@@ -1383,7 +1478,8 @@ def _run_targeted_refresh(conn, usernames: set[str]) -> None:
     if quiet:
         # The per-account lines are at DEBUG, so without this a large refresh has no
         # end in the log and its duration cannot be read from it.
-        log.info("force-refresh complete for %d/%d user(s)", len(targets) - failed, len(targets))
+        log.info("force-refresh complete for %d/%d user(s)", len(targets) - failed - raced, len(targets))
+    return held
 
 
 def _run_feed_events_maintenance(conn) -> None:
@@ -1679,7 +1775,9 @@ def main() -> None:
     conn = _connect()
     next_full_cycle = 0.0  # run immediately on startup
     read_budget = READ_REFRESH_MAX_PER_CYCLE  # #81: re-ranks on read left until the next cycle ends
-    read_pending: set[str] = set()  # #81: stale readers waiting for the next grouped re-rank
+    # #81: stale readers waiting for the next grouped re-rank; #104: and, held there until
+    # it ends, every re-rank (read, warm-up or opt-in) that came due during a session.
+    read_pending: set[str] = set()
     next_read_refresh = 0.0
     next_feed_maint = 0.0  # run feed_events rollup/prune immediately on startup
     handed: set[str] = set()  # #85: readers given to the cycle that is running
@@ -1748,14 +1846,23 @@ def main() -> None:
 
         # Stale readers ride along with a refresh that is running anyway (a Redis
         # request), and otherwise go together, READ_REFRESH_BATCH_SECONDS apart.
+        released: set[str] = set()
         if read_pending and (pending or time.monotonic() >= next_read_refresh):
+            released = read_pending
             pending |= read_pending
             read_pending = set()
             next_read_refresh = time.monotonic() + READ_REFRESH_BATCH_SECONDS
 
         if pending:
             try:
-                _run_targeted_refresh(conn, pending)
+                held = _run_targeted_refresh(conn, pending)
+                read_pending |= held
+                # #104: a refresh that held every account it was given returned before
+                # it fetched any candidates (bar a session opened during the fetch), so
+                # there is nothing to space out: look again on the next pass, and rank
+                # each one on the first pass after its session ends.
+                if released and pending <= held:
+                    next_read_refresh = 0.0
             except (psycopg2.OperationalError, psycopg2.InterfaceError):
                 log.warning("database connection lost (targeted refresh) — reconnecting")
                 conn = _reconnect(conn)

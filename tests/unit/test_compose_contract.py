@@ -1982,6 +1982,7 @@ TUNING = {
     "READ_REFRESH_MAX_PER_CYCLE",
     "READ_REFRESH_BATCH_SECONDS",
     "READER_ACTIVE_WITHIN_DAYS",
+    "FEED_SESSION_SECONDS",
     "FEED_EVENTS_MAINT_SECONDS",
     "FEED_EVENTS_RETAIN_DAYS",
     "FEED_EVENTS_MAX_ROWS",
@@ -2167,12 +2168,13 @@ def test_the_readme_table_shows_the_daemons_defaults() -> None:
         ("READ_REFRESH_MIN_AGE_SECONDS", "600"),
         ("READ_REFRESH_BATCH_SECONDS", "30"),
         ("READER_ACTIVE_WITHIN_DAYS", "0"),
+        ("FEED_SESSION_SECONDS", "900"),
     ):
         assert f"| `{name}` | {default} |" in readme, f"README's table: {name} is not shown as {default}"
     shown = dict(re.findall(r"(?m)^# ([A-Z_]+)=(\S*)$", ENV_FILE.read_text(encoding="utf-8")))
     for name in ("MAX_USERS_PER_CYCLE", "READER_CYCLE_SHARE", "READER_WINDOW_SECONDS",
                  "READ_REFRESH_MIN_AGE_SECONDS", "READ_REFRESH_BATCH_SECONDS",
-                 "READER_ACTIVE_WITHIN_DAYS"):
+                 "READER_ACTIVE_WITHIN_DAYS", "FEED_SESSION_SECONDS"):
         assert f"| `{name}` | {shown[name]} |" in readme, f"README and docker/.env disagree on {name}"
 
 

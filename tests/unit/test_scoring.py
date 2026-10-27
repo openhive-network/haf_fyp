@@ -341,6 +341,8 @@ class TestDiversityCap:
 class _CapturingCursor:
     """Captures execute_values' rows via the module-level psycopg2 shim."""
 
+    rowcount = 1  # the rotation-row upsert found no read session open
+
     def __init__(self, sink) -> None:
         self._sink = sink
 
@@ -596,6 +598,76 @@ class TestWriteGlobalFeedCacheStampsAlgorithmVersion:
         self._run(monkeypatch, "1.2.0", sink=sink)
         assert sink.get("deleted") is True
         assert sink.get("committed") is True
+
+
+class TestWriteFeedCacheLeavesAFeedBeingReadAlone:
+    """#104: the rotation-row upsert is also the check that the owner's read session
+    is over. When it updates no row the session is open, and nothing may be written."""
+
+    class _Cursor:
+        def __init__(self, sink: dict[str, Any], rowcount: int) -> None:
+            self._sink, self.rowcount = sink, rowcount
+
+        def __enter__(self) -> "TestWriteFeedCacheLeavesAFeedBeingReadAlone._Cursor":
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+        def execute(self, sql: str, params: Any = None) -> None:
+            self._sink.setdefault("sql", []).append(" ".join(sql.split()))
+
+    class _Conn:
+        def __init__(self, rowcount: int) -> None:
+            self.sink: dict[str, Any] = {}
+            self._rowcount = rowcount
+
+        def cursor(self) -> "TestWriteFeedCacheLeavesAFeedBeingReadAlone._Cursor":
+            return TestWriteFeedCacheLeavesAFeedBeingReadAlone._Cursor(self.sink, self._rowcount)
+
+        def commit(self) -> None:
+            self.sink["committed"] = True
+
+        def rollback(self) -> None:
+            self.sink["rolled_back"] = True
+
+    @staticmethod
+    def _scored() -> pd.DataFrame:
+        df = pd.DataFrame({
+            "post_id": [1000, 1001], "final_score": [0.5] * 2, "score_engagement": [0.5] * 2,
+            "score_recency": [0.5] * 2, "score_credibility": [0.5] * 2,
+            "score_relevance": [0.5] * 2,
+        })
+        df["community_boost_applied"] = False
+        df["boost_source"] = None
+        return df
+
+    def _write(self, monkeypatch: MonkeyPatch, rowcount: int) -> tuple["_Conn", list[Any]]:
+        inserted: list[Any] = []
+        monkeypatch.setattr(psycopg2.extras, "execute_values", lambda *a, **k: inserted.append(a))
+        monkeypatch.setattr(scoring, "render_bridge_for_posts", lambda *a: None)
+        conn = self._Conn(rowcount)
+        scoring.write_feed_cache(conn, "alice", self._scored(), "1.2.0")
+        return conn, inserted
+
+    def test_an_open_session_stops_before_the_feed_is_touched(self, monkeypatch: MonkeyPatch) -> None:
+        conn = self._Conn(rowcount=0)
+        monkeypatch.setattr(psycopg2.extras, "execute_values", lambda *a, **k: pytest.fail("inserted"))
+        monkeypatch.setattr(scoring, "render_bridge_for_posts", lambda *a: pytest.fail("rendered"))
+        with pytest.raises(scoring.FeedSessionOpen):
+            scoring.write_feed_cache(conn, "alice", self._scored(), "1.2.0")
+        (upsert,) = conn.sink["sql"]
+        assert "INSERT INTO haf_fyp_app.active_users" in upsert
+        assert "WHERE active_users.feed_session_until IS NULL" in upsert
+        assert conn.sink.get("rolled_back") is True
+        assert "committed" not in conn.sink
+
+    def test_a_closed_session_rewrites_the_feed(self, monkeypatch: MonkeyPatch) -> None:
+        conn, inserted = self._write(monkeypatch, rowcount=1)
+        assert any("DELETE FROM haf_fyp_app.feed_cache" in q for q in conn.sink["sql"])
+        assert len(inserted) == 1
+        assert conn.sink.get("committed") is True
+        assert "rolled_back" not in conn.sink
 
 
 class TestFeedWritersRenderThePostsTheyPlace:
