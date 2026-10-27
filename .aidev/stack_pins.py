@@ -12,7 +12,7 @@ Run in the runtime image. It fails, naming each mismatch, when
 * a stack service written out rather than extended no longer has the lane's
   command, environment and healthcheck;
 * a tool baked into the runtime image is not the version CI's job uses: PostgREST
-  (docker-compose-ci.yml's image tag), tavern (its `pip install tavern==`), the
+  (docker-compose-ci.yml's image tag), tavern and its pytest (constraints-test.txt), the
   openapi generator's common-ci-configuration ref (openapi-drift's COMMON_CI_REF),
   shellcheck and hadolint (their jobs' image tags), python (the python jobs' image),
   and the psql image install_with_app_lock.py comes from (Dockerfile.sql's FROM).
@@ -100,10 +100,12 @@ def main() -> int:
     # Tools in the runtime image.
     postgrest = tag(lanes["docker/docker-compose-ci.yml"]["haf-fyp-postgrest"]["image"]).lstrip("v")
     check("runtime postgrest", run("postgrest", "--version").replace("PostgREST", "").strip(), postgrest)
-    tavern_cmd = str(lanes["docker/docker-compose-ci.yml"]["tavern"]["command"])
-    m = re.search(r"tavern==([\w.]+)", tavern_cmd)
-    have = re.search(r"Version: (\S+)", run("/opt/tavern/bin/pip", "show", "tavern"))
-    check("runtime /opt/tavern tavern", have.group(1) if have else None, m.group(1) if m else None)
+    constraints = (REPO / "constraints-test.txt").read_text(encoding="utf-8")
+    for package in ("tavern", "pytest"):
+        m = re.search(rf"^{package}==([\w.]+)", constraints, re.M)
+        have = re.search(r"Version: (\S+)", run("/opt/tavern/bin/pip", "show", package))
+        check(f"runtime /opt/tavern {package} (constraints-test.txt)",
+              have.group(1) if have else None, m.group(1) if m else None)
     try:
         baked = (Path("/opt/openapi/COMMON_CI_REF")).read_text(encoding="utf-8").strip()
     except OSError:

@@ -174,11 +174,14 @@ services:
 
   tavern:
     image: python:3.12-slim
+    # tavern's and pytest's versions are constraints-test.txt's: pytest is held below
+    # 9.2 there, which tavern's own `pytest<10` requirement would not do.
     command: >
-      sh -c "pip install tavern==3.6.3 -q &&
+      sh -c "pip install -c /constraints-test.txt tavern pytest -q &&
              pytest /tests/tavern/test_endpoints.tavern.yaml /tests/tavern/rewriter/ --tb=short -v"
     volumes:
       - ../tests/tavern:/tests/tavern:ro
+      - ../constraints-test.txt:/constraints-test.txt:ro
     environment:
       API_URL: "http://haf-fyp-postgrest:3000"
       # The public path an operator (and HAProxy) actually requests.

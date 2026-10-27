@@ -5,7 +5,7 @@
 # .aidev/README.md.
 #
 # The tag is `aidev-<hash>`, the hash of the image inputs (its Dockerfile, every
-# FROM digest-pinned, and requirements.txt). When
+# FROM digest-pinned, requirements.txt and constraints-test.txt). When
 # <repository>:aidev-<hash> is already in the registry nothing is built: the script
 # prints that image's digest.
 #
@@ -32,10 +32,10 @@ done
 DOCKERFILE=.aidev/runtime/Dockerfile
 REPOSITORY="${AIDEV_RUNTIME_REPOSITORY:-registry.gitlab.syncad.com/hive/haf_fyp/aidev-tests}"
 
-# The inputs: the Dockerfile and requirements.txt, the one file it copies from the tree
-# (environment.inputs in .aidev/project.yaml names both).
+# The inputs: the Dockerfile and the two files it copies from the tree
+# (environment.inputs in .aidev/project.yaml names all three).
 input_hash() {
-    sha256sum "$DOCKERFILE" requirements.txt | sha256sum | cut -c1-16
+    sha256sum "$DOCKERFILE" requirements.txt constraints-test.txt | sha256sum | cut -c1-16
 }
 TAG="aidev-$(input_hash)"
 
@@ -58,10 +58,10 @@ if [ -n "$digest" ]; then
 fi
 echo "$REPOSITORY:$TAG is not in the registry; building it" >&2
 
-# The context holds requirements.txt alone.
+# The context holds requirements.txt and constraints-test.txt alone.
 context="$(mktemp -d)"
 trap 'rm -rf "$context"' EXIT
-cp requirements.txt "$context/"
+cp requirements.txt constraints-test.txt "$context/"
 
 # Optionally build through a pull-through registry cache near the build host, so FROM
 # stays canonical and the build doesn't compete for the uplink. Set

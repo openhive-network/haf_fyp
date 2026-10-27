@@ -16,8 +16,9 @@ What differs from the runner, and why:
   --env points the job at the stack's service (e.g. POSTGRES_HOST=fastapi-db);
 * lines that install tools (`apt-get`, `apk`, `pip install`) are not run: the runtime
   image has them. Each skipped `pip install` line is checked instead — every
-  `name==version` it pins must be the version the job's python has installed, and
-  every unpinned name must be installed — so a bumped pin fails here until the
+  `name==version` it pins, on the line or in a `-c` constraints file for a name it
+  lists, must be the version the job's python has installed, and every unpinned name
+  must be installed — so a bumped pin fails here until the
   runtime image is rebuilt (.aidev/README.md);
 * --path puts a runtime venv first on PATH (the lint tools, the openapi generator);
 * --compose-lane puts .aidev/compose_lane.py first on PATH as `docker`, for the jobs
@@ -96,22 +97,45 @@ def pin_gitlink(link: Path) -> None:
         link.write_text(f"gitdir: {(REPO / target).resolve()}\n", encoding="utf-8")
 
 
-def check_pip_line(line: str, env: dict[str, str]) -> list[str]:
-    """The problems with a skipped `pip install` line: pins the job's python lacks."""
+def canonical(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def pins(path: Path) -> dict[str, str]:
+    """name -> version of each `name==version` line of a constraints file."""
+    out = {}
+    for ln in path.read_text(encoding="utf-8").splitlines():
+        name, sep, version = ln.split("#", 1)[0].strip().partition("==")
+        if sep:
+            out[canonical(name)] = version.strip()
+    return out
+
+
+def check_pip_line(line: str, env: dict[str, str], workdir: Path) -> list[str]:
+    """The problems with a skipped `pip install` line: pins the job's python lacks.
+
+    A name the line leaves unpinned is held to its pin in the line's `-c` files, as pip
+    holds it."""
     problems = []
     words = line.split("&&")[0].split()
     words = words[words.index("install") + 1:]
-    skip_next = False
+    constrained: dict[str, str] = {}
+    names = []
+    flag = None
     for w in words:
-        if skip_next:
-            skip_next = False
+        if flag:
+            if flag in ("-c", "--constraint"):
+                constrained.update(pins(workdir / w))
+            flag = None  # requirements.txt is an input of the runtime image
             continue
         if w in ("-r", "--requirement", "-c", "--constraint"):
-            skip_next = True  # requirements.txt is an input of the runtime image
+            flag = w
             continue
-        if w.startswith("-"):
-            continue
+        if not w.startswith("-"):
+            names.append(w)
+    for w in names:
         name, _, want = re.sub(r"\[.*\]", "", w).partition("==")
+        want = want or constrained.get(canonical(name), "")
         shown = subprocess.run(["pip", "show", name], env=env, capture_output=True, text=True)
         have = next((ln.split(":", 1)[1].strip() for ln in shown.stdout.splitlines() if ln.startswith("Version:")), "")
         if not have:
@@ -204,7 +228,7 @@ def main() -> int:
         if INSTALL.match(line):
             print(f"ci_job: not run (the runtime image provides it): {line.strip()[:160]}")
             if re.match(r"^\s*pip3? install", line):
-                problems += check_pip_line(line, env)
+                problems += check_pip_line(line, env, workdir)
             continue
         if PYTEST.match(line):
             n += 1

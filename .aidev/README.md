@@ -146,22 +146,24 @@ Bring the stack up fresh for each run: the lanes expect empty databases.
 
 ## The test runtime image (`runtime/`)
 
-The checks run in a container with your uid, built from `runtime/Dockerfile` and
-`requirements.txt` (`environment.inputs`): `python:3.11-slim` (the python jobs' image) with
-`requirements.txt` and `pytest`/`pytest-cov`/`httpx`/`pyyaml`, git, curl and jq; the lint
-tools in `/opt/lint` (requirements.txt deliberately not there, as in `python-lint`); the
-openapi generator and validator in `/opt/openapi`; tavern 3.6.3 in `/opt/tavern`; psql 18;
+The checks run in a container with your uid, built from `runtime/Dockerfile`,
+`requirements.txt` and `constraints-test.txt` (`environment.inputs`): `python:3.11-slim`
+(the python jobs' image) with `requirements.txt` and `pytest`/`pytest-cov`/`httpx`/`pyyaml`/
+`tavern`, git, curl and jq; the lint tools in `/opt/lint` (requirements.txt deliberately not
+there, as in `python-lint`); the openapi generator and validator in `/opt/openapi`; tavern
+and its pytest in `/opt/tavern`; the test-only packages all at their `constraints-test.txt`
+versions, the file the CI jobs install them with; psql 18;
 ShellCheck 0.11.0, hadolint 2.12.0, the docker CLI with compose (for `config` only),
 PostgREST 12.2.3, and `install_with_app_lock.py` and `haf_app_driver.py` from
 `Dockerfile.sql`'s base image. Every base is pinned by digest.
 
-When `requirements.txt`, a CI tool pin or `runtime/Dockerfile` changes, rebuild and
-re-pin in the same commit:
+When `requirements.txt`, `constraints-test.txt`, a CI tool pin or `runtime/Dockerfile`
+changes, rebuild and re-pin in the same commit:
 
 ```bash
 .aidev/runtime/build.sh --push   # prints registry.gitlab.syncad.com/hive/haf_fyp/aidev-tests@sha256:<digest>
 ```
 
 and put the printed reference into `environment.image` in `project.yaml`. The tag is the
-hash of the two inputs; an existing tag is reused, not rebuilt. Pushing needs push access
+hash of the three inputs; an existing tag is reused, not rebuilt. Pushing needs push access
 to this project's registry.

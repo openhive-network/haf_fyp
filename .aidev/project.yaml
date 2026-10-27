@@ -27,9 +27,10 @@ branches:
 # How this project's suites execute (#13892): one kind, stated once.
 environment:
   kind: "container"
-  # Built by .aidev/runtime/build.sh from .aidev/runtime/Dockerfile and requirements.txt.
-  image: "registry.gitlab.syncad.com/hive/haf_fyp/aidev-tests@sha256:4a3ec24828cf2c126b663dd4ca07cc041573e50910b7a01d0832309d317a178c"
-  inputs: [".aidev/runtime/Dockerfile", "requirements.txt"]
+  # Built by .aidev/runtime/build.sh from .aidev/runtime/Dockerfile, requirements.txt and
+  # constraints-test.txt (the test-only packages' pins the CI jobs install with).
+  image: "registry.gitlab.syncad.com/hive/haf_fyp/aidev-tests@sha256:0e730de97e19d1906ae60fa716f09e0dafc26df291ba2f4cb3b6b9e2e1c76af0"
+  inputs: [".aidev/runtime/Dockerfile", "requirements.txt", "constraints-test.txt"]
 
 issues:
   intake_label: todo

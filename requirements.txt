@@ -25,4 +25,3 @@ anyio>=4.0,<5
 
 coincurve>=19.0
 base58>=2.1
-tavern>=2.9

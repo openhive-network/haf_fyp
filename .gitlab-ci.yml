@@ -404,8 +404,9 @@ python-tests:
     # would put the gate itself back to uncovered.
     # curl and jq: tests/unit/test_check_pinned_images.py runs the registry check against a
     # local fake registry, with the same tools the registry-resolution job installs.
+    # constraints-test.txt pins the test-only packages (pytest held below 9.2, see there).
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl jq >/dev/null
-    - pip install -r requirements.txt pytest pytest-cov httpx pyyaml -q
+    - pip install -c constraints-test.txt -r requirements.txt pytest pytest-cov httpx pyyaml -q
     - PYTHONPATH=. pytest tests/unit/ -v -rfEs --cov=haf_fyp --cov-report=term-missing --cov-fail-under=40
   rules: *standard_rules
 
@@ -451,7 +452,7 @@ fastapi-tests:
     # switching the bind to `::`.
     TRUSTED_PROXY_IPS: "127.0.0.1,::1"
   script:
-    - pip install -r requirements.txt pytest -q
+    - pip install -c constraints-test.txt -r requirements.txt pytest tavern -q
     - sleep 5
     - |
       python3 -c "

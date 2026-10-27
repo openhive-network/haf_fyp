@@ -1,0 +1,15 @@
+# The versions of the test-only packages every test environment installs: the CI jobs
+# (`pip install -c constraints-test.txt ...` in .gitlab-ci.yml), docker-compose-ci.yml's
+# tavern container, and AIDEV's runtime image (.aidev/runtime/Dockerfile). Constraints
+# only: each install line still names the packages it wants. None of them belong in
+# requirements.txt: nothing in haf_fyp imports them, and the python image installs it.
+#
+# pytest is held below 9.2: pytest 9.2.0 removed _pytest.python_api, which tavern's
+# pytest11 plugin imports (tavern/_core/loader.py, still in tavern 3.7.1), so pytest
+# fails to start wherever tavern is installed. Lift this pin, and move tavern's with
+# it, once a tavern release works on pytest 9.2+.
+pytest==9.1.1
+tavern==3.6.3
+pytest-cov==7.0.0
+httpx==0.28.1
+pyyaml==6.0.3

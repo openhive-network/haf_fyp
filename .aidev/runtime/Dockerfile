@@ -5,8 +5,9 @@
 # environment so one job's packages cannot change another job's verdict:
 #
 #   python:3.11-slim (python-lint / python-tests / fastapi-tests' image) with
-#     requirements.txt + pytest, pytest-cov, httpx, pyyaml (python-tests) in the
-#     system site-packages, and git, curl, jq, bash
+#     requirements.txt + pytest, pytest-cov, httpx, pyyaml (python-tests) and tavern
+#     (fastapi-tests) in the system site-packages, and git, curl, jq, bash; every
+#     test-only package at its constraints-test.txt version, as the CI jobs install it
 #   /opt/lint        ruff + mypy and their pinned set (python-lint; requirements.txt is
 #                    deliberately NOT installed there, as in CI) and sqlfluff 3.3.0 (sql-lint)
 #   /opt/openapi     openapi_rewrite.sh's deepmerge/jsonpointer/pyyaml and
@@ -14,7 +15,8 @@
 #                    /opt/openapi/process_openapi.py: the generator at common-ci-configuration
 #                    96889a65 (openapi-drift's COMMON_CI_REF), checksum-verified, so the
 #                    check runs offline (COMMON_CI_OFFLINE=1)
-#   /opt/tavern      tavern 3.6.3 (postgrest-tests' tavern container)
+#   /opt/tavern      tavern and pytest at their constraints-test.txt versions
+#                    (postgrest-tests' tavern container)
 #   psql 18 (PGDG; the install lanes' verify client is postgres:18-alpine)
 #   shellcheck 0.11.0, hadolint 2.12.0, the docker CLI + compose plugin (compose-validate's
 #   `docker compose config`, which needs no daemon), postgrest 12.2.3 (postgrest-tests)
@@ -28,7 +30,8 @@
 #   block-processing driver scripts/process_blocks.sh execs there. Off PATH for the
 #   same reason; the replay steps put that directory on PATH.
 #
-# Inputs: this file and requirements.txt (the only file in the build context). Every
+# Inputs: this file, requirements.txt and constraints-test.txt (the only files in the
+# build context). Every
 # FROM is digest-pinned. Build and pin it with .aidev/runtime/build.sh; see
 # .aidev/README.md.
 FROM koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d AS shellcheck
@@ -59,9 +62,9 @@ COPY --from=postgrest /bin/postgrest /usr/local/bin/postgrest
 COPY --from=psql /usr/local/bin/install_with_app_lock.py /opt/psql-image/usr/local/bin/install_with_app_lock.py
 COPY --from=psql /usr/local/bin/haf_app_driver.py /opt/psql-image/usr/local/bin/haf_app_driver.py
 
-COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -q -r /tmp/requirements.txt \
-        pytest==9.1.1 pytest-cov==7.0.0 httpx==0.28.1 pyyaml==6.0.3 \
+COPY requirements.txt constraints-test.txt /tmp/
+RUN pip install --no-cache-dir -q -c /tmp/constraints-test.txt -r /tmp/requirements.txt \
+        pytest pytest-cov httpx pyyaml tavern \
     && rm /tmp/requirements.txt \
     && python -m venv /opt/lint \
     && /opt/lint/bin/pip install --no-cache-dir -q ruff==0.15.12 \
@@ -76,7 +79,8 @@ RUN pip install --no-cache-dir -q -r /tmp/requirements.txt \
     && echo "292e8825e36117357983f8d669ba5d9805a33127ace28869feaa29731ecb6f0a  /opt/openapi/process_openapi.py" | sha256sum -c - \
     && echo 96889a650b3f45244cecc4bb3f250af439a71900 > /opt/openapi/COMMON_CI_REF \
     && python -m venv /opt/tavern \
-    && /opt/tavern/bin/pip install --no-cache-dir -q tavern==3.6.3
+    && /opt/tavern/bin/pip install --no-cache-dir -q -c /tmp/constraints-test.txt tavern pytest \
+    && rm /tmp/constraints-test.txt
 
 ENV HOME=/tmp PYTHONDONTWRITEBYTECODE=1
 ENTRYPOINT []
