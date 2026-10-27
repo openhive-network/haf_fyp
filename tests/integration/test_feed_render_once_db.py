@@ -90,9 +90,13 @@ def db() -> Iterator[Connection]:
             cur.execute(
                 f"""
                 CREATE TABLE {S}.active_users (
-                    username varchar(16) PRIMARY KEY, last_read_at timestamp);
-                -- Read just now, so the feed function does not notify.
-                INSERT INTO {S}.active_users VALUES ('alice', NOW() AT TIME ZONE 'utc');
+                    username varchar(16) PRIMARY KEY, last_read_at timestamp,
+                    feed_session_at timestamp, feed_session_until timestamp);
+                -- In a read session that has just started, so the feed function does
+                -- not notify.
+                INSERT INTO {S}.active_users VALUES (
+                    'alice', NOW() AT TIME ZONE 'utc', NOW() AT TIME ZONE 'utc',
+                    (NOW() AT TIME ZONE 'utc') + INTERVAL '15 minutes');
                 CREATE TABLE {S}.feed_cache_labels (code smallint PRIMARY KEY, label text);
                 INSERT INTO {S}.feed_cache_labels VALUES (1, 'subscribed'), (2, '1.1.0');
                 CREATE TABLE {S}.feed_cache (

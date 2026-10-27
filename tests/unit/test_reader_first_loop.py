@@ -37,6 +37,7 @@ def _raiser(error, calls=None, times=1):
         if left[0] > 0:
             left[0] -= 1
             raise error
+        return set()
 
     return _fn
 

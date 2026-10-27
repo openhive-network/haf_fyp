@@ -507,10 +507,18 @@ SELECT COALESCE(r.rank_type = '{FEED_CACHE_RANK_TYPE}' AND l.present, FALSE), r.
 """
 
 
+class FeedSessionOpen(Exception):
+    """The account's read session is open: its feed was left as it is (#104)."""
+
+
 def write_feed_cache(
     conn, username: str, scored_df: pd.DataFrame, algo_version: str
 ) -> None:
-    """Write top 200 scored posts to haf_fyp_app.feed_cache in a single transaction."""
+    """Write top 200 scored posts to haf_fyp_app.feed_cache in a single transaction.
+
+    Raises FeedSessionOpen, with the transaction rolled back and nothing written, when
+    the account's read session (active_users.feed_session_until) has not ended.
+    """
     top = scored_df.head(200)
     now = datetime.utcnow()
     rows = [
@@ -551,14 +559,26 @@ def write_feed_cache(
         # their feed froze at onboarding (#9). last_interaction_at / last_block stay NULL
         # until a first interaction. Same transaction as the cache write below, so the
         # stamp and the feed it describes still commit together.
+        #
+        # #104: and the one place that decides whether this feed may be rewritten at
+        # all. Pages are LIMIT/OFFSET over feed_cache, so a rewrite while the owner
+        # scrolls serves the next page from another ranking. The WHERE is evaluated
+        # on the row this statement locks, so a session the ranker stamped before it
+        # got here is seen, whichever path (rotation, reader lane, read or opt-in
+        # refresh) is writing. A row it does not update is a session that is open.
         cur.execute(
             """
             INSERT INTO haf_fyp_app.active_users (username, last_scored_at)
             VALUES (%s, %s)
             ON CONFLICT (username) DO UPDATE SET last_scored_at = EXCLUDED.last_scored_at
+             WHERE active_users.feed_session_until IS NULL
+                OR active_users.feed_session_until <= (NOW() AT TIME ZONE 'utc')
             """,
             (username, now),
         )
+        if cur.rowcount == 0:
+            conn.rollback()
+            raise FeedSessionOpen(username)
         # feed_cache stores algorithm_version and boost_source as feed_cache_labels
         # codes. Register a label the first time it is written. NOT EXISTS before the
         # insert, not ON CONFLICT alone: a conflicting insert still draws a value from
