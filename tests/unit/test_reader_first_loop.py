@@ -14,15 +14,16 @@ import pytest
 from haf_fyp import ranker_daemon as rd
 
 from .test_reader_first import _Clock, _drive_main, _mock_conn, _reader_state  # noqa: F401
+from pytest import LogCaptureFixture, MonkeyPatch
 
 
 class _Keep:
     """A monkeypatch that leaves the named ranker attributes as the test set them."""
 
-    def __init__(self, monkeypatch, *names):
+    def __init__(self, monkeypatch: MonkeyPatch, *names) -> None:
         self._mp, self._names = monkeypatch, names
 
-    def setattr(self, target, name, value):
+    def setattr(self, target, name, value) -> None:
         if target is rd and name in self._names:
             return
         self._mp.setattr(target, name, value)
@@ -48,7 +49,7 @@ LOST = [psycopg2.OperationalError("gone"), psycopg2.InterfaceError("connection a
 # ---- grouping --------------------------------------------------------------------
 
 
-def test_a_read_after_a_quiet_spell_goes_at_once_not_only_the_first_after_start(monkeypatch):
+def test_a_read_after_a_quiet_spell_goes_at_once_not_only_the_first_after_start(monkeypatch: MonkeyPatch) -> None:
     # test_the_first_read_after_a_quiet_spell_is_not_held_back runs one pass, where the
     # wait has never been started. Here a group has gone, 40 s pass with nobody reading,
     # and the next read must not find a wait that was restarted behind its back.
@@ -69,7 +70,7 @@ def test_a_read_after_a_quiet_spell_goes_at_once_not_only_the_first_after_start(
     ],
     ids=["reconnect", "failed-stamp"],
 )
-def test_readers_waiting_for_their_group_survive_a_pass_that_fails(monkeypatch, drain, note):
+def test_readers_waiting_for_their_group_survive_a_pass_that_fails(monkeypatch: MonkeyPatch, drain, note) -> None:
     # b1 is stamped, so the feed function will not notify for it again for ten minutes:
     # dropped here, nothing would bring it back before the next cycle.
     monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 30)
@@ -82,7 +83,7 @@ def test_readers_waiting_for_their_group_survive_a_pass_that_fails(monkeypatch, 
 
 
 @pytest.mark.parametrize("error", LOST, ids=["operational", "interface"])
-def test_a_connection_lost_in_a_targeted_refresh_is_replaced_before_the_cycle(monkeypatch, error):
+def test_a_connection_lost_in_a_targeted_refresh_is_replaced_before_the_cycle(monkeypatch: MonkeyPatch, error) -> None:
     monkeypatch.setattr(rd, "_run_targeted_refresh", _raiser(error))
     seen = _drive_main(
         _Keep(monkeypatch, "_run_targeted_refresh"), drain=[{"alice"}], note=[{"alice"}]
@@ -94,7 +95,7 @@ def test_a_connection_lost_in_a_targeted_refresh_is_replaced_before_the_cycle(mo
 
 
 @pytest.mark.parametrize("error", LOST, ids=["operational", "interface"])
-def test_the_pass_after_a_connection_lost_in_the_cycle_uses_the_new_one(monkeypatch, error):
+def test_the_pass_after_a_connection_lost_in_the_cycle_uses_the_new_one(monkeypatch: MonkeyPatch, error) -> None:
     seen = _drive_main(
         monkeypatch, passes=2, drain=[set(), {"alice"}], note=[set(), set()], cycle=[error]
     )
@@ -104,7 +105,7 @@ def test_the_pass_after_a_connection_lost_in_the_cycle_uses_the_new_one(monkeypa
 
 
 @pytest.mark.parametrize("error", LOST, ids=["operational", "interface"])
-def test_a_connection_lost_in_maintenance_is_replaced_and_does_not_end_the_ranker(monkeypatch, error):
+def test_a_connection_lost_in_maintenance_is_replaced_and_does_not_end_the_ranker(monkeypatch: MonkeyPatch, error) -> None:
     # This block has no catch-all: what it does not name leaves main().
     monkeypatch.setattr(rd, "_run_active_users_maintenance", _raiser(error))
     seen = _drive_main(
@@ -117,7 +118,7 @@ def test_a_connection_lost_in_maintenance_is_replaced_and_does_not_end_the_ranke
 
 
 @pytest.mark.parametrize("error", LOST, ids=["operational", "interface"])
-def test_a_connection_lost_in_the_schema_check_is_replaced(monkeypatch, error):
+def test_a_connection_lost_in_the_schema_check_is_replaced(monkeypatch: MonkeyPatch, error) -> None:
     monkeypatch.setattr(rd, "_reads_supported", False)
     monkeypatch.setattr(rd, "_listen_for_feed_reads", _raiser(error))
     seen = _drive_main(
@@ -130,7 +131,7 @@ def test_a_connection_lost_in_the_schema_check_is_replaced(monkeypatch, error):
     assert seen.note[1] == (seen.second, {"alice"})
 
 
-def test_any_other_failure_of_the_schema_check_is_rolled_back_and_the_ranker_goes_on(monkeypatch):
+def test_any_other_failure_of_the_schema_check_is_rolled_back_and_the_ranker_goes_on(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "_reads_supported", False)
     monkeypatch.setattr(rd, "_listen_for_feed_reads", _raiser(RuntimeError("boom")))
     seen = _drive_main(
@@ -144,13 +145,13 @@ def test_any_other_failure_of_the_schema_check_is_rolled_back_and_the_ranker_goe
 # ---- a failed block leaves the session usable --------------------------------------
 
 
-def test_a_failed_cycle_is_rolled_back(monkeypatch):
+def test_a_failed_cycle_is_rolled_back(monkeypatch: MonkeyPatch) -> None:
     seen = _drive_main(monkeypatch, drain=[set()], note=[], cycle=[RuntimeError("boom")])
 
     assert seen.rollback == [seen.first]
 
 
-def test_a_failed_targeted_refresh_is_rolled_back_and_the_cycle_still_runs(monkeypatch):
+def test_a_failed_targeted_refresh_is_rolled_back_and_the_cycle_still_runs(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "_run_targeted_refresh", _raiser(RuntimeError("boom")))
     seen = _drive_main(
         _Keep(monkeypatch, "_run_targeted_refresh"), drain=[{"alice"}], note=[{"alice"}]
@@ -163,14 +164,14 @@ def test_a_failed_targeted_refresh_is_rolled_back_and_the_cycle_still_runs(monke
 # ---- the wait between cycles ---------------------------------------------------------
 
 
-def test_the_wait_between_cycles_starts_when_a_cycle_ends(monkeypatch):
+def test_the_wait_between_cycles_starts_when_a_cycle_ends(monkeypatch: MonkeyPatch) -> None:
     # README: "ranks MAX_USERS_PER_CYCLE of them, then waits CYCLE_SECONDS". Counted from
     # the start, a cycle longer than the wait (20 minutes was seen on a node) would be
     # followed by the next at once, and READ_REFRESH_MAX_PER_CYCLE's "these run in the
     # wait" would have no wait to run in.
     clock, started = _Clock(), []
 
-    def _long_cycle(_conn, _reads=None):
+    def _long_cycle(_conn, _reads=None) -> None:
         started.append(clock.now)
         clock.now += rd.CYCLE_SECONDS + 100
 
@@ -183,7 +184,7 @@ def test_the_wait_between_cycles_starts_when_a_cycle_ends(monkeypatch):
 # ---- logging a targeted refresh --------------------------------------------------------
 
 
-def _refresh(monkeypatch, names, rank=lambda *a, **k: None):
+def _refresh(monkeypatch: MonkeyPatch, names, rank=lambda *a, **k: None) -> None:
     conn, _ = _mock_conn([])
     monkeypatch.setattr(rd, "register_vector_type", lambda _c: None)
     monkeypatch.setattr(rd, "_evict_unsubscribed", lambda _c, _u: set())
@@ -199,7 +200,7 @@ def _refresh(monkeypatch, names, rank=lambda *a, **k: None):
     rd._run_targeted_refresh(conn, set(names))
 
 
-def test_a_refresh_of_exactly_the_threshold_is_still_logged_by_name(monkeypatch, caplog):
+def test_a_refresh_of_exactly_the_threshold_is_still_logged_by_name(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     # "More than 20": the two existing tests use 2 and 21, so any threshold from 2 to 20,
     # and >= for >, pass them.
     assert rd._QUIET_REFRESH_ABOVE == 20
@@ -211,7 +212,7 @@ def test_a_refresh_of_exactly_the_threshold_is_still_logged_by_name(monkeypatch,
     assert caplog.text.count("force-refresh complete for user") == 20
 
 
-def test_a_large_refresh_keeps_the_per_account_line_at_debug(monkeypatch, caplog):
+def test_a_large_refresh_keeps_the_per_account_line_at_debug(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     names = [f"user{i:03d}" for i in range(21)]
     with caplog.at_level(logging.DEBUG):
         _refresh(monkeypatch, names)
@@ -225,7 +226,7 @@ def test_a_large_refresh_keeps_the_per_account_line_at_debug(monkeypatch, caplog
     assert summary.getMessage() == "force-refresh complete for 21/21 user(s)"
 
 
-def test_a_large_refresh_still_says_how_many_failed(monkeypatch, caplog):
+def test_a_large_refresh_still_says_how_many_failed(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     def _fail(*_a, **_k):
         raise RuntimeError("boom")
 
@@ -240,7 +241,7 @@ def test_a_large_refresh_still_says_how_many_failed(monkeypatch, caplog):
 # ---- the column appearing ----------------------------------------------------------------
 
 
-def test_the_reader_lane_is_announced_once_not_on_every_later_connection(caplog):
+def test_the_reader_lane_is_announced_once_not_on_every_later_connection(caplog: LogCaptureFixture) -> None:
     old, _ = _mock_conn([], fetchone=(False,))
     new, _ = _mock_conn([], fetchone=(True,))
 
@@ -255,7 +256,7 @@ def test_the_reader_lane_is_announced_once_not_on_every_later_connection(caplog)
 # ---- what a cycle reports back ------------------------------------------------------------
 
 
-def _cycle(monkeypatch, users, *, candidates=None, rank=lambda *a, **k: None):
+def _cycle(monkeypatch: MonkeyPatch, users, *, candidates=None, rank=lambda *a, **k: None):
     conn, _ = _mock_conn([])
     if candidates is None:
         candidates = pd.DataFrame({"post_id": [1], "author": ["a"]})
@@ -273,7 +274,7 @@ def _cycle(monkeypatch, users, *, candidates=None, rank=lambda *a, **k: None):
     return rd.run_cycle(conn)
 
 
-def test_a_cycle_reports_the_accounts_it_ranked_and_not_the_ones_that_failed(monkeypatch):
+def test_a_cycle_reports_the_accounts_it_ranked_and_not_the_ones_that_failed(monkeypatch: MonkeyPatch) -> None:
     # main() takes these out of the queue of readers waiting for a re-rank. An account
     # the cycle tried and failed must stay in it.
     def _rank(_conn, username, *_a, **_k):
@@ -283,7 +284,7 @@ def test_a_cycle_reports_the_accounts_it_ranked_and_not_the_ones_that_failed(mon
     assert _cycle(monkeypatch, ["alice", "bobby", "carol"], rank=_rank) == {"alice", "carol"}
 
 
-def test_a_cycle_with_no_candidates_ranked_nobody_and_took_no_lane(monkeypatch):
+def test_a_cycle_with_no_candidates_ranked_nobody_and_took_no_lane(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "_lane_taken", 7)
     monkeypatch.setattr(rd, "_lane_slots", 100)
 
@@ -292,14 +293,14 @@ def test_a_cycle_with_no_candidates_ranked_nobody_and_took_no_lane(monkeypatch):
     assert (rd._lane_taken, rd._lane_slots) == (0, 0)
 
 
-def test_a_small_refresh_has_no_summary_line_of_its_own(monkeypatch, caplog):
+def test_a_small_refresh_has_no_summary_line_of_its_own(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     with caplog.at_level(logging.INFO):
         _refresh(monkeypatch, ["alice", "bobby"])
 
     assert "user(s)" not in caplog.text.split("force-refresh for 2 user(s)", 1)[1]
 
 
-def test_a_schema_check_that_fails_says_so(monkeypatch, caplog):
+def test_a_schema_check_that_fails_says_so(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     monkeypatch.setattr(rd, "_reads_supported", False)
     monkeypatch.setattr(rd, "_listen_for_feed_reads", _raiser(RuntimeError("boom")))
     with caplog.at_level(logging.ERROR):

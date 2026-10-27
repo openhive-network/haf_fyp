@@ -18,6 +18,7 @@ from haf_fyp import ranker_daemon as rd
 from haf_fyp.scoring import FeedSessionOpen
 
 from .test_reader_first import _Clock, _drive_main, _mock_conn, _reader_state  # noqa: F401
+from pytest import LogCaptureFixture, MonkeyPatch
 
 
 def _note(payload, channel):
@@ -60,7 +61,7 @@ def test_a_warmup_alone_is_stamped() -> None:
     conn.commit.assert_called_once()
 
 
-def test_listening_covers_the_warmup_channel(monkeypatch) -> None:
+def test_listening_covers_the_warmup_channel(monkeypatch: MonkeyPatch) -> None:
     conn, cur = _mock_conn([], fetchone=(True,))
 
     rd._listen_for_feed_reads(conn)
@@ -73,7 +74,7 @@ def test_listening_covers_the_warmup_channel(monkeypatch) -> None:
 # ---- the main loop keeps what was held ---------------------------------------------
 
 
-def test_a_rerank_held_for_a_session_is_asked_about_on_every_pass_until_it_runs(monkeypatch) -> None:
+def test_a_rerank_held_for_a_session_is_asked_about_on_every_pass_until_it_runs(monkeypatch: MonkeyPatch) -> None:
     # The refresh that held it fetched no candidates, so the 30 s that space refreshes
     # out are not waited: it runs on the first pass after the session ends.
     monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 30)
@@ -86,7 +87,7 @@ def test_a_rerank_held_for_a_session_is_asked_about_on_every_pass_until_it_runs(
     assert [names for _conn, names in seen.targeted] == [{"a"}, {"a"}, {"a"}]
 
 
-def test_an_opt_in_held_for_a_session_is_not_dropped(monkeypatch) -> None:
+def test_an_opt_in_held_for_a_session_is_not_dropped(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 30)
     seen = _drive_main(
         monkeypatch, clock=_Clock(), passes=2, drain=[set(), set()], note=[],
@@ -96,7 +97,7 @@ def test_an_opt_in_held_for_a_session_is_not_dropped(monkeypatch) -> None:
     assert [names for _conn, names in seen.targeted] == [{"carol"}, {"carol"}]
 
 
-def test_a_refresh_that_ranked_someone_still_spaces_the_next_one_out(monkeypatch) -> None:
+def test_a_refresh_that_ranked_someone_still_spaces_the_next_one_out(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READ_REFRESH_BATCH_SECONDS", 30)
     seen = _drive_main(
         monkeypatch, clock=_Clock(), passes=3,
@@ -110,11 +111,11 @@ def test_a_refresh_that_ranked_someone_still_spaces_the_next_one_out(monkeypatch
 # ---- the targeted refresh ----------------------------------------------------------
 
 
-def _refresh(monkeypatch, names, *, in_session=(), rank=None):
+def _refresh(monkeypatch: MonkeyPatch, names, *, in_session=(), rank=None):
     conn, _ = _mock_conn([])
     ranked, reconciled = [], []
 
-    def _rank(_c, username, *_a, **_k):
+    def _rank(_c, username, *_a, **_k) -> None:
         if rank is not None:
             rank(username)
         ranked.append(username)
@@ -138,7 +139,7 @@ def _refresh(monkeypatch, names, *, in_session=(), rank=None):
     return held, ranked, reconciled
 
 
-def test_a_refresh_leaves_an_account_in_a_session_alone_and_says_so(monkeypatch) -> None:
+def test_a_refresh_leaves_an_account_in_a_session_alone_and_says_so(monkeypatch: MonkeyPatch) -> None:
     held, ranked, reconciled = _refresh(monkeypatch, {"alice", "bobby"}, in_session={"alice"})
 
     assert held == {"alice"}
@@ -147,7 +148,7 @@ def test_a_refresh_leaves_an_account_in_a_session_alone_and_says_so(monkeypatch)
     assert reconciled == ["bobby"]
 
 
-def test_a_refresh_with_everyone_in_a_session_fetches_nothing(monkeypatch) -> None:
+def test_a_refresh_with_everyone_in_a_session_fetches_nothing(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "_fetch_candidates", lambda _c: (_ for _ in ()).throw(AssertionError))
     conn, _ = _mock_conn([])
     monkeypatch.setattr(rd, "_in_session", lambda _c, users: set(users))
@@ -156,7 +157,7 @@ def test_a_refresh_with_everyone_in_a_session_fetches_nothing(monkeypatch) -> No
     assert rd._run_targeted_refresh(conn, {"alice"}) == {"alice"}
 
 
-def test_a_session_opened_during_the_refresh_is_held_not_failed(monkeypatch, caplog) -> None:
+def test_a_session_opened_during_the_refresh_is_held_not_failed(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     def _rank(username):
         if username == "alice":
             raise FeedSessionOpen(username)
@@ -173,7 +174,7 @@ def test_a_session_opened_during_the_refresh_is_held_not_failed(monkeypatch, cap
 # ---- the scheduled cycle -----------------------------------------------------------
 
 
-def _cycle(monkeypatch, users, rank, reads=None):
+def _cycle(monkeypatch: MonkeyPatch, users, rank, reads=None):
     conn, _ = _mock_conn([])
     monkeypatch.setattr(rd, "register_vector_type", lambda _c: None)
     monkeypatch.setattr(rd, "_evict_unsubscribed", lambda _c, _u: set())
@@ -191,7 +192,7 @@ def _cycle(monkeypatch, users, rank, reads=None):
     return rd.run_cycle(conn, reads)
 
 
-def test_a_cycle_holds_an_account_whose_session_opened_after_it_was_chosen(monkeypatch, caplog) -> None:
+def test_a_cycle_holds_an_account_whose_session_opened_after_it_was_chosen(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     def _rank(_c, username, *_a, **_k):
         if username == "bobby":
             raise FeedSessionOpen(username)
@@ -205,7 +206,7 @@ def test_a_cycle_holds_an_account_whose_session_opened_after_it_was_chosen(monke
     assert "refreshed personalized feeds for 2/3 cached users (0 failed, 1 held for a read session)" in caplog.text
 
 
-def test_a_cycle_does_not_take_a_reader_in_a_session_ahead_of_its_turn(monkeypatch) -> None:
+def test_a_cycle_does_not_take_a_reader_in_a_session_ahead_of_its_turn(monkeypatch: MonkeyPatch) -> None:
     order = []
     monkeypatch.setattr(rd, "_in_session", lambda _c, users: {"zed"} & set(users))
     monkeypatch.setattr(rd, "POLL_SECONDS", 0)
