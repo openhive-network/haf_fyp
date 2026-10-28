@@ -24,7 +24,11 @@ limits>=3.0,<6
 anyio>=4.0,<5
 
 # Recovers the signer's key in auth.recover_pubkey. Exact, as hive's own consumers pin
-# it (clive): auth.py calls wax.cython_modules_crypto and reads its python_result, a
-# surface wax does not version, and an image rebuild must not pick up a new one.
-# 2.0.1 is the latest release on PyPI and ships cp312/cp314 wheels.
-hiveio-wax==2.0.1
+# it (clive): wax versions follow its last git tag, not its API, so an image rebuild
+# must not pick up a new one. Bump with tests/unit/test_auth.py's vector green.
+# A wax develop build (cf6608b9, cp312/cp314 wheels), on the 1.28.x line the rest of the
+# hive stack uses; PyPI's 2.0.x is older code. It and the hiveio-api it pins exactly
+# exist only in the hive group registry, which serves them without credentials. An extra
+# index, so every other package still resolves from PyPI. Move to 1.28.9 once tagged.
+--extra-index-url https://gitlab.syncad.com/api/v4/groups/136/-/packages/pypi/simple
+hiveio-wax==1.28.8.post20261028191145
