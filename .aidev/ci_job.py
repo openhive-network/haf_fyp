@@ -54,9 +54,11 @@ def resolve(ci: dict, name: str) -> dict:
     merged: dict = {}
     for parent in [parents] if isinstance(parents, str) else parents:
         base = resolve(ci, parent)
+        # GitLab merges `variables:` across every parent, a later one winning per key.
+        variables = {**(merged.get("variables") or {}), **(base.get("variables") or {})}
         merged.update(base)
-        if "variables" in base:
-            merged["variables"] = dict(base["variables"])
+        if variables:
+            merged["variables"] = variables
     for k, v in job.items():
         if k == "variables" and "variables" in merged:
             merged["variables"] = {**merged["variables"], **(v or {})}
