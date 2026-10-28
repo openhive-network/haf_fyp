@@ -172,11 +172,13 @@ services:
     depends_on:
       - haf-fyp-postgrest
 
+  # tavern and its pytest as common-ci-configuration's python-test-tools image has them,
+  # installed nothing on top (#105). postgrest-tests passes PYTHON_TEST_TOOLS_IMAGE from
+  # .gitlab-ci.yml; the default is the same reference, for a run without it
+  # (scripts/run_tests.sh, registry-resolution).
   tavern:
-    image: python:3.12-slim
-    command: >
-      sh -c "pip install tavern==3.6.3 -q &&
-             pytest /tests/tavern/test_endpoints.tavern.yaml /tests/tavern/rewriter/ --tb=short -v"
+    image: ${PYTHON_TEST_TOOLS_IMAGE:-registry.gitlab.syncad.com/hive/common-ci-configuration/python-test-tools:develop}
+    command: pytest /tests/tavern/test_endpoints.tavern.yaml /tests/tavern/rewriter/ --tb=short -v
     volumes:
       - ../tests/tavern:/tests/tavern:ro
     environment:

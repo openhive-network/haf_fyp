@@ -685,7 +685,7 @@ DECLARE
           "Feed"
         ],
         "summary": "Personalized feed",
-        "description": "Returns a ranked list of posts for the given user, ordered by final score. Each post is returned in the same shape as Hivemind's bridge.get_ranked_posts (the structure front ends already render for trending / hot / new), plus a nested \"fyp\" object carrying this app's ranking data, so the feed is a drop-in alternative content source. Falls back to the global feed until the ranker has cached a feed for the user.",
+        "description": "Returns a ranked list of posts for the given user, ordered by final score. Each post is returned in the same shape as Hivemind's bridge.get_ranked_posts (the structure front ends already render for trending / hot / new), plus a nested \"fyp\" object carrying this app's ranking data, so the feed is a drop-in alternative content source. Falls back to the global feed until the ranker has cached a feed for the user. Pages of one read session are stable: the first page opens a session, and the ranker does not rewrite the feed until the reader has requested no page for its session window (15 minutes by default), so page N+1 continues page N without repeating or skipping a post. The feed is re-ranked after the session ends; a reader who stays away longer than that starts the next session on a fresh ranking. An account that reads the global fallback stays on it for the session.",
         "operationId": "haf_fyp_endpoints.get_personalized_feed",
         "parameters": [
           {
@@ -742,6 +742,42 @@ DECLARE
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/v1/fyp/warmup/{username}": {
+      "get": {
+        "tags": [
+          "Feed"
+        ],
+        "summary": "Ask for a fresh feed before it is read",
+        "description": "Asks the ranker to re-rank this account's feed now if it is older than the ranker's minimum age (10 minutes by default), so that the reader's next visit starts on a fresh ranking. Meant for a client to call when the user signs in or opens the app, before it requests the first page of the feed: reading the feed opens a read session, during which the feed is not rewritten, so a re-rank asked for by the read itself only happens after the session. A warm-up does not open a session. One that arrives while a session is open is carried out after the session ends. It is rationed like the feed read: at most one signal per account per ten minutes reaches the ranker, and the ranker's per-cycle ceilings apply. Answers 204 with no body whether or not anything was asked of the ranker; it never returns the feed.",
+        "operationId": "haf_fyp_endpoints.warm_up_feed",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "username",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Hive account name"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Never sent: the function returns nothing, which PostgREST answers with 204. Listed because the code generator takes the return type from it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "x-sql-datatype": "void"
+                }
+              }
+            }
+          },
+          "204": {
+            "description": "Heard, or nothing to do. No body either way."
           }
         }
       }
@@ -1594,6 +1630,13 @@ GRANT EXECUTE ON FUNCTION haf_fyp_app.hivemind_post_identity(int) TO haf_fyp_use
       trending / hot / new), plus a nested "fyp" object carrying this app's
       ranking data, so the feed is a drop-in alternative content source.
       Falls back to the global feed until the ranker has cached a feed for the user.
+      Pages of one read session are stable: the first page opens a session, and
+      the ranker does not rewrite the feed until the reader has requested no page
+      for its session window (15 minutes by default), so page N+1 continues page N
+      without repeating or skipping a post. The feed is re-ranked after the session
+      ends; a reader who stays away longer than that starts the next session on a
+      fresh ranking. An account that reads the global fallback stays on it for the
+      session.
     operationId: haf_fyp_endpoints.get_personalized_feed
     parameters:
       - in: path
@@ -1662,14 +1705,24 @@ BEGIN
     -- spite of that side effect: PostgREST keeps a STABLE function read-only on
     -- POST as well, which is what this endpoint should be.
     --
+    -- #104: the same signal opens and renews the account's read session. Pages are
+    -- LIMIT/OFFSET over feed_cache, so a re-rank between two page requests served
+    -- later pages from another ranking. The ranker hears this, stamps the session
+    -- (feed_session_at, feed_session_until = then + its FEED_SESSION_SECONDS) and
+    -- rewrites nothing of this account's feed before feed_session_until.
+    --
     -- A notifying commit is not free (it takes a transaction id and a brief
-    -- cluster-wide lock), so this is rationed:
-    --   * first page only: one signal per visit, not one per scroll;
-    --   * only when the last read the ranker recorded is over ten minutes old.
-    --     The ranker stamps last_read_at when it hears, so once it has, a client
-    --     that reloads costs one signal per ten minutes, not one per request.
-    --     Until it has (a few seconds normally, a whole cycle if one is running,
-    --     and for as long as the ranker is stopped) every first-page read notifies;
+    -- cluster-wide lock), so this is rationed by the session the ranker recorded:
+    --   * with no session open, the first page notifies (it starts one) and later
+    --     pages do not: a page 2 after the session ran out is served whatever the
+    --     feed is now, and starting a session there would not undo that;
+    --   * with a session open, any page notifies once the session is past its
+    --     midpoint, to renew it: one signal per half window of scrolling (about
+    --     seven minutes at the default), not one per page, and none at all for a
+    --     reader who stops;
+    --   * until the ranker has stamped the session (a few seconds normally, a whole
+    --     cycle if one is running, and for as long as the ranker is stopped) every
+    --     first-page read notifies;
     --   * never on a standby, where NOTIFY is an error and would fail the read;
     --   * not at all when an operator sets haf_fyp.feed_read_notify to off
     --     (ALTER ROLE haf_fyp_user SET haf_fyp.feed_read_notify = 'off'), which is
@@ -1678,15 +1731,19 @@ BEGIN
     -- the only accounts the ranker stamps. Ahead of the cached-feed test, not inside
     -- it (#98): the ranker builds no feed for an account until it reads, so the first
     -- read of an account without one is the read that has to reach the ranker.
-    IF _offset = 0
-       AND NOT pg_is_in_recovery()
+    IF NOT pg_is_in_recovery()
        AND lower(btrim(COALESCE(current_setting('haf_fyp.feed_read_notify', true), 'on')))
            NOT IN ('off', 'false', 'no', '0')
        AND EXISTS (
            SELECT 1 FROM haf_fyp_app.active_users au
            WHERE au.username = get_personalized_feed.username
-             AND (au.last_read_at IS NULL
-                  OR au.last_read_at < (NOW() AT TIME ZONE 'utc') - INTERVAL '10 minutes')
+             AND CASE
+                     WHEN au.feed_session_until IS NULL
+                          OR au.feed_session_until <= (NOW() AT TIME ZONE 'utc')
+                     THEN _offset = 0
+                     ELSE (NOW() AT TIME ZONE 'utc')
+                          >= au.feed_session_at + (au.feed_session_until - au.feed_session_at) / 2
+                 END
        )
     THEN
         PERFORM pg_notify('haf_fyp_feed_read', get_personalized_feed.username);
@@ -1848,6 +1905,78 @@ BEGIN
     END IF;
 
     RETURN '[]'::jsonb;
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Feed warm-up (#104)
+-- ---------------------------------------------------------------------------
+
+/** openapi:paths
+/v1/fyp/warmup/{username}:
+  get:
+    tags:
+      - Feed
+    summary: Ask for a fresh feed before it is read
+    description: >-
+      Asks the ranker to re-rank this account's feed now if it is older than the
+      ranker's minimum age (10 minutes by default), so that the reader's next visit
+      starts on a fresh ranking. Meant for a client to call when the user signs in
+      or opens the app, before it requests the first page of the feed: reading the
+      feed opens a read session, during which the feed is not rewritten, so a
+      re-rank asked for by the read itself only happens after the session.
+      A warm-up does not open a session. One that arrives while a session is open
+      is carried out after the session ends. It is rationed like the feed read:
+      at most one signal per account per ten minutes reaches the ranker, and the
+      ranker's per-cycle ceilings apply. Answers 204 with no body whether or not
+      anything was asked of the ranker; it never returns the feed.
+    operationId: haf_fyp_endpoints.warm_up_feed
+    parameters:
+      - in: path
+        name: username
+        required: true
+        schema:
+          type: string
+        description: Hive account name
+    responses:
+      '200':
+        description: >-
+          Never sent: the function returns nothing, which PostgREST answers with
+          204. Listed because the code generator takes the return type from it.
+        content:
+          application/json:
+            schema:
+              x-sql-datatype: "void"
+      '204':
+        description: Heard, or nothing to do. No body either way.
+ */
+-- openapi-generated-code-begin
+DROP FUNCTION IF EXISTS haf_fyp_endpoints.warm_up_feed;
+CREATE OR REPLACE FUNCTION haf_fyp_endpoints.warm_up_feed(
+    "username" TEXT
+)
+RETURNS void
+-- openapi-generated-code-end
+LANGUAGE plpgsql STABLE
+AS $$
+BEGIN
+    -- A signal on its own channel, not a read: it must not open a read session, which
+    -- would hold back the very re-rank it asks for. Rationed, like the read, by a stamp
+    -- the ranker writes when it hears one (last_read_at: a warm-up is a reader who is
+    -- around), so a client that repeats it costs one signal per ten minutes. The same
+    -- standby and operator switch as get_personalized_feed.
+    IF NOT pg_is_in_recovery()
+       AND lower(btrim(COALESCE(current_setting('haf_fyp.feed_read_notify', true), 'on')))
+           NOT IN ('off', 'false', 'no', '0')
+       AND EXISTS (
+           SELECT 1 FROM haf_fyp_app.active_users au
+           WHERE au.username = warm_up_feed.username
+             AND (au.last_read_at IS NULL
+                  OR au.last_read_at < (NOW() AT TIME ZONE 'utc') - INTERVAL '10 minutes')
+       )
+    THEN
+        PERFORM pg_notify('haf_fyp_feed_warmup', warm_up_feed.username);
+    END IF;
 END;
 $$;
 

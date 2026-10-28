@@ -79,7 +79,7 @@ def _sql(call):
 def test_drain_polls_the_connection_and_empties_the_queue() -> None:
     conn = _conn_with_notifies([_note("alice"), _note("bob"), _note("alice")])
 
-    assert rd._drain_feed_reads(conn) == {"alice", "bob"}
+    assert rd._drain_feed_reads(conn)[0] == {"alice", "bob"}
 
     conn.poll.assert_called_once()
     assert len(conn.notifies) == 0, "a drained notification must not be handled twice"
@@ -102,14 +102,14 @@ def test_drain_works_on_a_plain_list_too() -> None:
     conn = MagicMock()
     conn.notifies = [_note("alice")]
 
-    assert rd._drain_feed_reads(conn) == {"alice"}
+    assert rd._drain_feed_reads(conn)[0] == {"alice"}
     assert conn.notifies == []
 
 
 def test_drain_ignores_other_channels() -> None:
     conn = _conn_with_notifies([_note("alice", channel="pgrst"), _note("bob")])
 
-    assert rd._drain_feed_reads(conn) == {"bob"}
+    assert rd._drain_feed_reads(conn)[0] == {"bob"}
 
 
 @pytest.mark.parametrize(
@@ -129,12 +129,12 @@ def test_drain_ignores_other_channels() -> None:
 def test_drain_drops_payloads_that_are_not_account_names(payload) -> None:
     conn = _conn_with_notifies([_note(payload), _note("carol")])
 
-    assert rd._drain_feed_reads(conn) == {"carol"}
+    assert rd._drain_feed_reads(conn)[0] == {"carol"}
 
 
 @pytest.mark.parametrize("name", ["abc", "a-b.c", "user.name-1", "a" * 16])
 def test_drain_keeps_real_shaped_account_names(name) -> None:
-    assert rd._drain_feed_reads(_conn_with_notifies([_note(name)])) == {name}
+    assert rd._drain_feed_reads(_conn_with_notifies([_note(name)]))[0] == {name}
 
 
 def test_drain_lets_a_dead_connection_propagate() -> None:
@@ -149,7 +149,7 @@ def test_drain_discards_everything_when_the_schema_has_no_read_column(monkeypatc
     monkeypatch.setattr(rd, "_reads_supported", False)
     conn = _conn_with_notifies([_note("alice")])
 
-    assert rd._drain_feed_reads(conn) == set()
+    assert rd._drain_feed_reads(conn)[0] == set()
     assert len(conn.notifies) == 0
 
 
@@ -169,6 +169,7 @@ def test_note_does_nothing_without_reads() -> None:
 
 def test_note_stamps_in_one_statement_and_commits(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 123)
+    monkeypatch.setattr(rd, "FEED_SESSION_SECONDS", 900)
     monkeypatch.setattr(rd, "_read_filter_days", 30)
     monkeypatch.setattr(rd, "_reads_unearned", 0)
     # The statement's last row has no name and counts the reads that earned nothing.
@@ -178,8 +179,8 @@ def test_note_stamps_in_one_statement_and_commits(monkeypatch: MonkeyPatch) -> N
     assert rd._reads_unearned == 4
 
     (call,) = cur.execute.call_args_list
-    # (the filter's days twice, the names, min age, limit)
-    assert call.args[1] == (30, 30, ["alice", "bob"], 123, 7)
+    # (the filter's days twice, the readers, everyone heard, session, min age, limit)
+    assert call.args[1] == (30, 30, ["alice", "bob"], ["alice", "bob"], 900, 123, 7)
     assert "last_read_at" in call.args[0]
     conn.commit.assert_called_once()
 
@@ -369,7 +370,8 @@ def test_listen_names_the_channel_the_feed_notifies_and_commits(monkeypatch: Mon
 
     rd._listen_for_feed_reads(conn)
 
-    assert cur.execute.call_args_list[-1].args[0] == f"LISTEN {rd.FEED_READ_CHANNEL}"
+    assert [c.args[0] for c in cur.execute.call_args_list[-2:]] == [
+        f"LISTEN {rd.FEED_READ_CHANNEL}", f"LISTEN {rd.FEED_WARMUP_CHANNEL}"]
     conn.commit.assert_called_once()
     assert rd._reads_supported is True
 
@@ -438,7 +440,8 @@ def test_the_reader_lane_is_announced_when_the_column_appears(caplog: LogCapture
         rd._listen_for_feed_reads(new)
 
     assert rd._reads_supported is True
-    assert cur.execute.call_args_list[-1].args[0] == f"LISTEN {rd.FEED_READ_CHANNEL}"
+    assert [c.args[0] for c in cur.execute.call_args_list[-2:]] == [
+        f"LISTEN {rd.FEED_READ_CHANNEL}", f"LISTEN {rd.FEED_WARMUP_CHANNEL}"]
     assert "reader lane enabled" in caplog.text
 
 
@@ -487,11 +490,12 @@ class _Clock:
 
 def _drive_main(
     monkeypatch: MonkeyPatch, *, passes=1, drain, note, queued=(), first_closed=0,
-    cycle_every_pass=False, cycle=(), clock=None, queue_after=None,
+    cycle_every_pass=False, cycle=(), clock=None, queue_after=None, held=(),
 ):
     """Run main() for `passes` passes with everything but the feed-read block stubbed.
     `drain` and `note` are lists of per-pass results; an exception instance is raised.
-    `queued` is what the Redis subscriber has put on the refresh queue."""
+    `queued` is what the Redis subscriber has put on the refresh queue. `held` is what
+    each targeted refresh reports it left alone for a read session (#104)."""
     first, second = MagicMock(name="first-conn"), MagicMock(name="second-conn")
     first.closed, second.closed = first_closed, 0
     seen = SimpleNamespace(
@@ -499,6 +503,7 @@ def _drive_main(
         cycle_reads=[], reconnect=[], rollback=[], listened=[],
     )
     cycle = list(cycle)
+    held = list(held)
 
     def _next(results):
         value = results.pop(0) if results else set()
@@ -506,7 +511,7 @@ def _drive_main(
             raise value
         return value
 
-    def _note_reads(conn, names, limit):
+    def _note_reads(conn, names, limit, warmups=frozenset()):
         seen.note.append((conn, set(names)))
         seen.limits.append(limit)
         return _next(note)
@@ -551,12 +556,14 @@ def _drive_main(
     monkeypatch.setattr(rd, "_reconnect", _reconnect)
     # What _connect, stubbed above, decides on a schema that matches this ranker.
     monkeypatch.setattr(rd, "_feed_cache_compact", True)
-    monkeypatch.setattr(rd, "_drain_feed_reads", lambda conn: _next(drain))
+    monkeypatch.setattr(rd, "_drain_feed_reads", lambda conn: (_next(drain), set()))
     monkeypatch.setattr(rd, "_note_feed_reads", _note_reads)
     monkeypatch.setattr(rd, "_safe_rollback", lambda conn: seen.rollback.append(conn))
-    monkeypatch.setattr(
-        rd, "_run_targeted_refresh", lambda conn, names: seen.targeted.append((conn, set(names)))
-    )
+    def _targeted(conn, names):
+        seen.targeted.append((conn, set(names)))
+        return set(held.pop(0)) if held else set()
+
+    monkeypatch.setattr(rd, "_run_targeted_refresh", _targeted)
     monkeypatch.setattr(rd, "run_cycle", _run_cycle)
     monkeypatch.setattr(rd, "_listen_for_feed_reads", lambda conn: seen.listened.append(conn))
     if clock is not None:
@@ -951,6 +958,7 @@ _NAMES = (
     "READER_ACTIVE_WITHIN_DAYS",
     "_READ_REFRESH_DEFAULT_CEILING",
     "_FEED_READ_BACKLOG_MAX",
+    "FEED_SESSION_SECONDS",
     *RETENTION,
 )
 _PROBE = f"""
@@ -963,7 +971,7 @@ for env in envs:
     for key in list(os.environ):
         if key.startswith(("READER_", "READ_REFRESH_", "MAX_USERS_PER_CYCLE",
                            "FEED_EVENTS_", "EMBEDDING_COVERAGE_", "ACTIVE_USERS_",
-                           "FEED_CACHE_")):
+                           "FEED_CACHE_", "FEED_SESSION_")):
             del os.environ[key]
     os.environ.update(env)
     rd = importlib.reload(rd)
@@ -1006,6 +1014,7 @@ def settings():
             "ACTIVE_USERS_MAX_EVICTIONS": "1",
             "ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS": "0",
             "FEED_CACHE_UNREAD_RETENTION_DAYS": "1",
+            "FEED_SESSION_SECONDS": "600",
         },
         "cycle_only_rest_empty": {
             "MAX_USERS_PER_CYCLE": "3000",
@@ -1047,6 +1056,7 @@ def test_the_reader_defaults_are_the_documented_ones(settings) -> None:
         "READER_ACTIVE_WITHIN_DAYS": 0,  # off: every read counts (#84)
         "_READ_REFRESH_DEFAULT_CEILING": 300,
         "_FEED_READ_BACKLOG_MAX": 20000,
+        "FEED_SESSION_SECONDS": 15 * 60,  # #104
         **RETENTION,
     }
 
@@ -1106,6 +1116,7 @@ def test_a_setting_at_its_minimum_is_taken(settings) -> None:
     assert got["READ_REFRESH_MAX_PER_CYCLE"] == 0  # its default follows the cycle size
     assert got["FEED_EVENTS_MAINT_SECONDS"] == 60
     assert got["ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS"] == 0
+    assert got["FEED_SESSION_SECONDS"] == 600
     for name in ("FEED_EVENTS_RETAIN_DAYS", "FEED_EVENTS_MAX_ROWS", "EMBEDDING_COVERAGE_DAYS",
                  "ACTIVE_USERS_MAX_EVICTIONS", "FEED_CACHE_UNREAD_RETENTION_DAYS"):
         assert got[name] == 1, name
@@ -1128,11 +1139,14 @@ def test_a_setting_at_its_minimum_is_taken(settings) -> None:
     ("READER_ACTIVE_WITHIN_DAYS", "-1"),
     # Every cached feed but an opt-in's dropped on each pass.
     ("FEED_CACHE_UNREAD_RETENTION_DAYS", "0"),
+    # A session shorter than ten minutes lets a reader cost a signal more often than
+    # the feed function's ten-minute ration did before sessions (#104).
+    ("FEED_SESSION_SECONDS", "599"),
 ])
 def test_a_setting_below_its_minimum_stops_the_ranker_and_says_which(name, value) -> None:
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("MAX_USERS_PER_CYCLE", "FEED_EVENTS_", "EMBEDDING_COVERAGE_",
-                                "ACTIVE_USERS_", "FEED_CACHE_"))}
+                                "ACTIVE_USERS_", "FEED_CACHE_", "FEED_SESSION_"))}
     out = subprocess.run(
         [sys.executable, "-c", "import haf_fyp.ranker_daemon"],
         cwd=REPO,
@@ -1359,7 +1373,7 @@ def _notify_guard():
     notify = f"PERFORM pg_notify('{rd.FEED_READ_CHANNEL}', get_personalized_feed.username); END IF;"
     assert code.count("pg_notify(") == 1
     end = code.index(notify)
-    start = code.rindex("IF _offset = 0", 0, end)
+    start = code.rindex("IF NOT pg_is_in_recovery()", 0, end)
     return code, code[start:end]
 
 
@@ -1387,18 +1401,21 @@ def test_the_notify_comes_before_the_cached_feed_test() -> None:
 @pytest.mark.parametrize(
     "condition",
     [
-        # one signal per visit, not one per page scrolled
-        "IF _offset = 0 AND",
         # NOTIFY is an error on a standby, and would fail the read
-        "AND NOT pg_is_in_recovery()",
+        "IF NOT pg_is_in_recovery() AND",
         # the operator's switch, which needs no reinstall
         "AND lower(btrim(COALESCE(current_setting('haf_fyp.feed_read_notify', true), 'on'))) "
         "NOT IN ('off', 'false', 'no', '0')",
-        # one signal per ten minutes per account, not one per request
+        # #104: with no session open, page 1 starts one and later pages stay silent;
+        # with one open, any page renews it past its midpoint, and only then: one
+        # signal per half window per account, not one per request or per page
         "AND EXISTS ( SELECT 1 FROM haf_fyp_app.active_users au "
         "WHERE au.username = get_personalized_feed.username "
-        "AND (au.last_read_at IS NULL "
-        "OR au.last_read_at < (NOW() AT TIME ZONE 'utc') - INTERVAL '10 minutes') )",
+        "AND CASE WHEN au.feed_session_until IS NULL "
+        "OR au.feed_session_until <= (NOW() AT TIME ZONE 'utc') "
+        "THEN _offset = 0 "
+        "ELSE (NOW() AT TIME ZONE 'utc') "
+        ">= au.feed_session_at + (au.feed_session_until - au.feed_session_at) / 2 END )",
     ],
 )
 def test_the_notify_is_rationed(condition) -> None:
@@ -1410,7 +1427,9 @@ def test_the_notify_is_rationed(condition) -> None:
 def test_every_condition_must_hold_for_a_notify() -> None:
     _code, guard = _notify_guard()
 
-    assert " OR " not in guard.replace("au.last_read_at IS NULL OR au.last_read_at <", "")
+    assert " OR " not in guard.replace(
+        "au.feed_session_until IS NULL OR au.feed_session_until <=", ""
+    )
 
 
 def test_the_feed_function_is_still_stable() -> None:

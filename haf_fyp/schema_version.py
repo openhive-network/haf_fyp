@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 #: The schema version this ranker's queries are written for.
-REQUIRED_SCHEMA_VERSION = 3
+REQUIRED_SCHEMA_VERSION = 4
 
 # Asked in two statements: a call to a function that does not exist fails when the
 # statement is parsed, before any CASE around it could decide not to make it.

@@ -284,6 +284,8 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.active_users (
     last_block int,                  -- NULL = opted in but never interacted
     last_scored_at timestamp,        -- when the ranker last built this user's feed (NULL = never)
     last_read_at timestamp,          -- when this user's feed was last requested (NULL = never), UTC
+    feed_session_at timestamp,       -- when the open read session was last started or renewed, UTC
+    feed_session_until timestamp,    -- the feed is not rewritten before this (NULL = no session), UTC
     PRIMARY KEY (username)
 );
 
@@ -307,6 +309,19 @@ ADD COLUMN IF NOT EXISTS last_read_at timestamp;
 CREATE INDEX IF NOT EXISTS idx_active_users_last_read_at
 ON haf_fyp_app.active_users (last_read_at)
 WHERE last_read_at IS NOT NULL;
+
+-- #104: read sessions. The ranker deletes and re-inserts an account's feed when it
+-- re-ranks it, and the feed is paged with LIMIT/OFFSET, so a re-rank between two page
+-- requests served later pages from a different ranking. A read opens (or renews) a
+-- session; nothing rewrites the account's feed_cache before feed_session_until, and a
+-- re-rank that comes due meanwhile runs after it. The ranker stamps both columns when
+-- it hears the read: get_personalized_feed runs read-only and can only notify. It
+-- renews past the midpoint (feed_session_at + half the window), which is why the start
+-- is kept and not only the end: the window is the ranker's FEED_SESSION_SECONDS, which
+-- the feed function cannot read. Looked up by username only, so no index.
+ALTER TABLE haf_fyp_app.active_users
+ADD COLUMN IF NOT EXISTS feed_session_at timestamp,
+ADD COLUMN IF NOT EXISTS feed_session_until timestamp;
 
 -- #10: rows LEAVE the rotation now. Until then a row could only ever be added, so a
 -- cleared or abandoned interest-picker opt-in held one of the shared
@@ -720,7 +735,8 @@ REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.feed_metrics_daily   FROM haf_fyp_u
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.embedding_coverage_daily FROM haf_fyp_user;
 REVOKE UPDATE               ON haf_fyp_app.feed_events_rollup_state FROM haf_fyp_user;
 REVOKE DELETE               ON haf_fyp_app.feed_events            FROM haf_fyp_user;
--- active_users: UPDATE is the ranker's (last_scored_at and last_read_at, as owner);
+-- active_users: UPDATE is the ranker's (last_scored_at, last_read_at and the read
+-- session, as owner);
 -- DELETE is the #10 rotation eviction, also owner-only. Both are REVOKEd rather
 -- than merely left ungranted, so an older deployment that ever received a blanket
 -- grant is narrowed too and the un-opt-in endpoint cannot quietly acquire them.
@@ -737,6 +753,7 @@ REVOKE UPDATE, DELETE       ON haf_fyp_app.active_users           FROM haf_fyp_u
 --   1  (implicit: no function) the replayed history
 --   2  history copied from hivemind, keyed by hivemind ids (#97)
 --   3  post_bridge_cache keyed by hivemind ids, which the feed writers render into
+--   4  active_users.feed_session_at / feed_session_until: read sessions (#104)
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION haf_fyp_app.schema_version()
@@ -744,5 +761,5 @@ RETURNS int
 LANGUAGE sql
 IMMUTABLE
 AS $$
-    SELECT 3;
+    SELECT 4;
 $$;

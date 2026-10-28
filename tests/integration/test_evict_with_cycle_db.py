@@ -136,6 +136,10 @@ def _ranker_settings(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)   # one lane slot of three
     monkeypatch.setattr(rd, "MAX_USERS_PER_CYCLE", 3)
     monkeypatch.setattr(rd, "POLL_SECONDS", 0)  # the cycle asks after every account
+    # #104: a read opens a session that ends as it is stamped. These tests are about
+    # eviction during a cycle, which a session holds back until it ends; the one test
+    # below that keeps a session open is about exactly that.
+    monkeypatch.setattr(rd, "FEED_SESSION_SECONDS", 0)
     # What a cycle and a check leave behind in the module, put back after each test.
     for name, value in (("_reads_heard", 0), ("_reads_reranked", 0), ("_lane_taken", 0),
                         ("_lane_slots", 0), ("_feed_read_failure_logged_at", 0.0)):
@@ -206,16 +210,17 @@ def _clear_interests(session, name) -> None:
 def _read_feed(session, *names) -> None:
     """What a first-page read of get_personalized_feed sends, in one transaction.
 
-    Refuses to notify where the shipped function would not: it notifies only for an
-    account with a cached feed and a rotation row whose last read is unset or more
-    than ten minutes old (endpoints/endpoint_schema.sql)."""
+    Refuses to notify where the shipped function would not: it notifies for page 1
+    only for an account with a rotation row and no read session open
+    (endpoints/endpoint_schema.sql). And only for one with a cached feed, which is this
+    file's own condition: every account here has one."""
     with session.cursor() as cur:
         for name in names:
             cur.execute(
                 "SELECT EXISTS (SELECT 1 FROM haf_fyp_app.feed_cache WHERE username = %s) "
                 "AND EXISTS (SELECT 1 FROM haf_fyp_app.active_users WHERE username = %s "
-                "AND (last_read_at IS NULL "
-                "OR last_read_at < (NOW() AT TIME ZONE 'utc') - INTERVAL '10 minutes'))",
+                "AND (feed_session_until IS NULL "
+                "OR feed_session_until <= (NOW() AT TIME ZONE 'utc')))",
                 (name, name),
             )
             assert cur.fetchone()[0], f"get_personalized_feed would not notify for {name}"
@@ -502,6 +507,42 @@ def test_a_reader_in_good_standing_is_taken_ahead_and_loses_nothing(conn, other,
     assert cycle.order == ["acct1", "zed", "acct2", "acct3"] and "zed" in ranked
     assert ["zed"] in cycle.reconciled and feed_when_spared == [[1]]
     assert _state(other, "zed") == {"row": True, "feed": [2], "vector": True, "read": True}
+
+
+def test_a_read_mid_cycle_holds_the_feed_for_its_session_opt_out_or_not(
+    conn, other, monkeypatch: MonkeyPatch
+) -> None:
+    """#104, with a session that stays open. zed (in good standing) and acct3 (which
+    clears its interests) are read while acct1 is being ranked. Neither is taken ahead,
+    reconciled or ranked from the queue: either would rewrite or delete a feed that is
+    being read. acct3's eviction waits for the session, like its re-rank would."""
+    monkeypatch.setattr(rd, "FEED_SESSION_SECONDS", 900)
+    _three_in_the_queue(conn)
+    _member(conn, "zed", scored="30 minutes", vector=True)
+
+    def _both_are_read() -> None:
+        _clear_interests(other, "acct3")
+        _read_feed(other, "acct3", "zed")
+
+    cycle = _Cycle(monkeypatch, conn, during={"acct1": _both_are_read}, expect="zed")
+    ranked = cycle.run()
+
+    assert {"acct3", "zed"} <= cycle.heard
+    assert cycle.order == ["acct1", "acct2"] and ranked == {"acct1", "acct2"}
+    assert cycle.reconciled == [["acct1", "acct2", "acct3"]]
+    assert _state(other, "zed") == {"row": True, "feed": [1], "vector": True, "read": True}
+    assert _state(other, "acct3") == {"row": True, "feed": [1], "vector": False, "read": True}
+
+    assert rd._run_targeted_refresh(conn, {"acct3"}) == {"acct3"}  # its opt-out's refresh
+    assert _state(other, "acct3")["row"]
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE haf_fyp_app.active_users SET feed_session_until = "
+            "(NOW() AT TIME ZONE 'utc') - INTERVAL '1 second' WHERE username = 'acct3'"
+        )
+    conn.commit()
+    assert rd._run_targeted_refresh(conn, {"acct3"}) == set()
+    assert _state(other, "acct3") == GONE
 
 
 def test_an_opt_out_that_nobody_reads_is_left_for_after_the_cycle(conn, other, monkeypatch: MonkeyPatch) -> None:

@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.active_users (
     last_block INT,
     last_scored_at TIMESTAMP,
     last_read_at TIMESTAMP,
+    feed_session_at TIMESTAMP,
+    feed_session_until TIMESTAMP,
     PRIMARY KEY (username)
 );
 

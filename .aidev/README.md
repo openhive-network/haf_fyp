@@ -34,9 +34,9 @@ instead, and a pin the image does not carry fails the step (rebuild the image, b
 | `aidev-scripts` | — | ShellCheck and a byte-compile over `.aidev/`'s own scripts |
 | `sql-lint`, `shell-lint`, `python-lint`, `hadolint`, `compose-validate` | the same | verbatim |
 | `openapi-drift` | `openapi-drift` | in a scratch copy of the tree (it regenerates `endpoints/`), offline: the image carries `process_openapi.py` at the job's `COMMON_CI_REF` |
-| `unit` | `python-tests` | `pytest tests/unit` with its coverage floor; `coverage.xml` beside the junit |
-| `fastapi` | `fastapi-tests` | against the stack's `fastapi-db`: `tests/integration`, then uvicorn and the FastAPI tavern file |
-| `postgrest` | `postgrest-tests` | `docker/docker-compose-ci.yml`'s `setup` and `tavern` against the stack's database, PostgREST and rewriter |
+| `unit` | `python-tests` | `pytest tests/unit` with its coverage floor; `coverage.xml` beside the junit; pytest/tavern pins read offline from the base image (`PYTHON_TEST_TOOLS_PYTHON`) |
+| `fastapi` | `fastapi-tests` | against the stack's `fastapi-db`: `tests/integration`, then uvicorn and the FastAPI tavern file; pins as `unit` |
+| `postgrest` | `postgrest-tests` | `docker/docker-compose-ci.yml`'s `setup` and `tavern` against the stack's database, PostgREST and rewriter; tavern from the base image's `/python_venv` |
 | `install` | `install-test` | `docker/docker-compose-ci-install.yml`: install, install under a held lock, reinstall, uninstall, each verified, over the model of HAF |
 | `install-haf` | `install-test-haf` | the same chain over the stack's HAF |
 | `replay-install` | — | two copy-on-write clones of the shared 5M-block HAF, a stub of the hivemind tables haf_fyp reads built in each from its own operations (`tests/hivemind_stub_from_haf.sql`), `scripts/install_app.sh` into each as `haf_shared_consumer` |
@@ -147,16 +147,23 @@ Bring the stack up fresh for each run: the lanes expect empty databases.
 ## The test runtime image (`runtime/`)
 
 The checks run in a container with your uid, built from `runtime/Dockerfile` and
-`requirements.txt` (`environment.inputs`): `python:3.11-slim` (the python jobs' image) with
-`requirements.txt` and `pytest`/`pytest-cov`/`httpx`/`pyyaml`, git, curl and jq; the lint
-tools in `/opt/lint` (requirements.txt deliberately not there, as in `python-lint`); the
-openapi generator and validator in `/opt/openapi`; tavern 3.6.3 in `/opt/tavern`; psql 18;
-ShellCheck 0.11.0, hadolint 2.12.0, the docker CLI with compose (for `config` only),
-PostgREST 12.2.3, and `install_with_app_lock.py` and `haf_app_driver.py` from
-`Dockerfile.sql`'s base image. Every base is pinned by digest.
+`requirements.txt` (`environment.inputs`) on common-ci-configuration's `python-test-tools`
+(`.gitlab-ci.yml`'s `PYTHON_TEST_TOOLS_IMAGE`, the tavern container's image), whose
+`/python_venv` is left as it is, with git, curl, jq and psql 18 from it. Beside it,
+python:3.11-slim's interpreter (the python jobs' image) carries the python jobs'
+environment in `/opt/python-tests`, first on PATH: `requirements.txt` and
+`pytest`/`pytest-cov`/`httpx`/`pyyaml`/`tavern`, pytest and tavern at `/python_venv`'s
+versions, as CI holds them to common-ci-configuration's; the lint tools in `/opt/lint`
+(requirements.txt deliberately not there, as in `python-lint`); and the openapi generator
+and validator in `/opt/openapi`. Then ShellCheck 0.11.0, hadolint 2.12.0, the docker CLI
+with compose (for `config` only), PostgREST 12.2.3, and `install_with_app_lock.py` and
+`haf_app_driver.py` from `Dockerfile.sql`'s base image. Every base is pinned by digest.
 
 When `requirements.txt`, a CI tool pin or `runtime/Dockerfile` changes, rebuild and
-re-pin in the same commit:
+re-pin in the same commit. CI follows `python-test-tools:develop`, and the runtime the
+digest it was built from, so when common-ci-configuration moves a tool, re-pin
+`runtime/Dockerfile`'s base to the tag's new digest and rebuild: `stack-pins` runs offline
+and cannot see that move.
 
 ```bash
 .aidev/runtime/build.sh --push   # prints registry.gitlab.syncad.com/hive/haf_fyp/aidev-tests@sha256:<digest>

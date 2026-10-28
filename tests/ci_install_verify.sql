@@ -388,7 +388,8 @@ DECLARE
         'haf_fyp_endpoints.get_user_profile(text)',
         'haf_fyp_endpoints.get_version()',
         'haf_fyp_endpoints.list_algorithm_versions()',
-        'haf_fyp_endpoints.root()'
+        'haf_fyp_endpoints.root()',
+        'haf_fyp_endpoints.warm_up_feed(text)'
     ];
     -- name, table, and whether it enforces anything.
     _want_indexes TEXT [] := ARRAY[
@@ -461,7 +462,7 @@ DECLARE
     -- every name right and installs identically twice. Changing a table means changing
     -- its line, and the failure prints what the table is now.
     _want_shapes TEXT [] := ARRAY[
-        'active_users:5753072c3d3cdbcc07c251941e0a84c3',
+        'active_users:d75e81f35cb9fbe37d1c316e24e7d6cc',
         'algorithm_versions:a01274e565cd6eb78c8410fc84be412b',
         'app_config:d0277929a62a23aef5f559b1dadaff32',
         'app_status:a43c6b774c56f4685914098c50a2d10b',
@@ -546,7 +547,8 @@ DECLARE
         'haf_fyp_endpoints.get_user_profile(text) = b753d667674c709140999f0816726c27',
         'haf_fyp_endpoints.get_version() = 97abad59258ae3306fb7bded42a0a63c',
         'haf_fyp_endpoints.list_algorithm_versions() = d5c54520b9e29c1281b33ada867a53bc',
-        'haf_fyp_endpoints.root() = 33dba2c778f9e4a5d74e1fbd237c944d'
+        'haf_fyp_endpoints.root() = 33dba2c778f9e4a5d74e1fbd237c944d',
+        'haf_fyp_endpoints.warm_up_feed(text) = 48ea23d5dda6be06d7a9531c4e9aed47'
     ];
     _shapes TEXT [];
     _has TEXT [];
