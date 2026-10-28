@@ -865,7 +865,7 @@ DEVELOP_JOB_KEYS = {"stage", "image", "interruptible", "timeout", "retry", "scri
 
 def _check_common(ci, job):
     assert job["stage"] in ci["stages"], "a stage that does not exist makes the pipeline invalid"
-    assert job["image"] == "python:3.11-slim", "the Python the rest of CI and the image run"
+    assert job["image"] == "python:3.14-slim", "the Python the rest of CI and the image run"
 
 
 def _check_pin_job(ci):

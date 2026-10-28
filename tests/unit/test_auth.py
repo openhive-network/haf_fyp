@@ -11,24 +11,92 @@ the fan-out cap, and the depth-1 bound assertable rather than aspirational.
 """
 
 import hashlib
+import secrets
 import time
 
-import coincurve
 import pytest
+from wax.cython_modules_crypto import calculate_public_key, generate_private_key
 
 from haf_fyp import auth
 
+# secp256k1. wax recovers keys but does not sign a buffer, so the tests sign with a
+# textbook ECDSA over the curve, shaped the way Keychain/dhive shapes it. The known
+# vector below pins it to a signature Hive's own signer made.
+_P = 2**256 - 2**32 - 977
+_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+_G = (
+    0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+    0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8,
+)
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
-def _sign(priv: coincurve.PrivateKey, message: str) -> str:
-    """Produce a Keychain/dhive-style compact signature hex for `message`."""
-    rec = priv.sign_recoverable(message.encode(), hasher=lambda m: hashlib.sha256(m).digest())
-    return (bytes([rec[64] + 31]) + rec[:64]).hex()
+# A signature beekeeper (Hive's signer, beekeepy 1.28.6) made with the posting key wax
+# derives from ("alice", "posting", "haf_fyp test vector"). libsecp256k1 (coincurve 21)
+# recovers the same key from it.
+_VECTOR_MESSAGE = "hivefy:interests:v1:alice:1750000000:141359,146620"
+_VECTOR_KEY = "STM5S5mZyFsyG5vAcZxd9ZEcgqTQz7XV9twkHw9bFY5fRTiN4dXfi"
+_VECTOR_SIGNATURE = (
+    "1fab28024c5283dfb550a6915c1901829703f2804f8e2608e5f8f5d4bf1af931"
+    "781d33c206ae9a5ca41e6e559f19363cbf9c7f94030e0d8b38649aa633a213efd2"
+)
 
 
-def _key() -> tuple[coincurve.PrivateKey, str]:
-    """A fresh private key and its Hive STM public key."""
-    priv = coincurve.PrivateKey()
-    return priv, auth._encode_pubkey(priv.public_key.format(compressed=True))
+def _add(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if a[0] == b[0] and (a[1] + b[1]) % _P == 0:
+        return None
+    if a == b:
+        slope = 3 * a[0] * a[0] * pow(2 * a[1], -1, _P) % _P
+    else:
+        slope = (b[1] - a[1]) * pow(b[0] - a[0], -1, _P) % _P
+    x = (slope * slope - a[0] - b[0]) % _P
+    return x, (slope * (a[0] - x) - a[1]) % _P
+
+
+def _mul(k: int):
+    out, point = None, _G
+    while k:
+        if k & 1:
+            out = _add(out, point)
+        point = _add(point, point)
+        k >>= 1
+    return out
+
+
+def _canonical(half: bytes) -> bool:
+    """fc's is_canonical for one of r, s: below 2^255 and not short enough to need padding."""
+    return not half[0] & 0x80 and not (half[0] == 0 and not half[1] & 0x80)
+
+
+def _sign(priv: int, message: str) -> str:
+    """Produce a Keychain/dhive-style compact signature hex for `message`: low-S and
+    canonical, [recovery id + 31][r][s] over sha256(message)."""
+    z = int.from_bytes(hashlib.sha256(message.encode()).digest(), "big")
+    while True:
+        k = secrets.randbelow(_N - 1) + 1
+        x, y = _mul(k)
+        r = x % _N
+        s = pow(k, -1, _N) * (z + r * priv) % _N
+        recid = (y & 1) | (2 if x >= _N else 0)
+        if s > _N // 2:
+            s, recid = _N - s, recid ^ 1
+        rb, sb = r.to_bytes(32, "big"), s.to_bytes(32, "big")
+        if r and s and _canonical(rb) and _canonical(sb):
+            return (bytes([recid + 31]) + rb + sb).hex()
+
+
+def _key() -> tuple[int, str]:
+    """A fresh private key (the secret scalar of a wax-generated WIF) and its Hive STM
+    public key."""
+    wif = generate_private_key().result.decode()
+    raw = 0
+    for ch in wif:
+        raw = raw * 58 + _B58.index(ch)
+    payload = raw.to_bytes(37, "big")  # 0x80 || secret || 4-byte checksum
+    return int.from_bytes(payload[1:33], "big"), calculate_public_key(wif.encode()).result.decode()
 
 
 def _pa(*, keys, accounts, threshold):
@@ -82,10 +150,65 @@ def test_build_message_is_canonical():
 
 
 def test_recover_pubkey_roundtrip():
-    priv = coincurve.PrivateKey()
-    expected = auth._encode_pubkey(priv.public_key.format(compressed=True))
+    priv, expected = _key()
     msg = "hivefy:interests:v1:alice:1750000000:1,2,3"
     assert auth.recover_pubkey(msg, _sign(priv, msg)) == expected
+
+
+def test_recover_pubkey_known_vector():
+    assert auth.recover_pubkey(_VECTOR_MESSAGE, _VECTOR_SIGNATURE) == _VECTOR_KEY
+    assert auth.recover_pubkey(_VECTOR_MESSAGE, _VECTOR_SIGNATURE.upper()) == _VECTOR_KEY
+
+
+def test_recover_pubkey_tampered_message_gives_another_key():
+    recovered = auth.recover_pubkey(_VECTOR_MESSAGE.replace("alice", "alicf"), _VECTOR_SIGNATURE)
+    assert recovered.startswith("STM")
+    assert recovered != _VECTOR_KEY
+
+
+@pytest.mark.parametrize("offset", [2, 40, 66, 128])  # in r (2, 40) and in s (66, 128)
+def test_recover_pubkey_tampered_signature_gives_another_key_or_fails(offset):
+    flipped = "1" if _VECTOR_SIGNATURE[offset] == "0" else "0"
+    tampered = _VECTOR_SIGNATURE[:offset] + flipped + _VECTOR_SIGNATURE[offset + 1 :]
+    try:
+        recovered = auth.recover_pubkey(_VECTOR_MESSAGE, tampered)
+    except ValueError:
+        return
+    assert recovered != _VECTOR_KEY
+
+
+@pytest.mark.parametrize(
+    ("signature", "error"),
+    [
+        (_VECTOR_SIGNATURE[:-2], "65 bytes"),
+        (_VECTOR_SIGNATURE + "00", "65 bytes"),
+        ("", "65 bytes"),
+        # 27-30 are fc's uncompressed-key headers, which wax would accept.
+        ("1b" + _VECTOR_SIGNATURE[2:], "invalid recovery id"),
+        ("1e" + _VECTOR_SIGNATURE[2:], "invalid recovery id"),
+        ("23" + _VECTOR_SIGNATURE[2:], "invalid recovery id"),
+        ("ff" + _VECTOR_SIGNATURE[2:], "invalid recovery id"),
+    ],
+    ids=["64-bytes", "66-bytes", "empty", "header-27", "header-30", "header-35", "header-255"],
+)
+def test_recover_pubkey_rejects_bad_length_and_recovery_id(signature, error):
+    with pytest.raises(ValueError, match=error):
+        auth.recover_pubkey(_VECTOR_MESSAGE, signature)
+
+
+def test_recover_pubkey_rejects_non_hex():
+    with pytest.raises(ValueError):
+        auth.recover_pubkey(_VECTOR_MESSAGE, "zz" + _VECTOR_SIGNATURE[2:])
+
+
+def test_recover_pubkey_rejects_high_s():
+    # (r, n - s) with the recovery id's parity flipped verifies for the same key, but it
+    # is not canonical: the chain rejects it, and Keychain never produces it.
+    raw = bytes.fromhex(_VECTOR_SIGNATURE)
+    high_s = (_N - int.from_bytes(raw[33:], "big")).to_bytes(32, "big")
+    malleated = (bytes([((raw[0] - 31) ^ 1) + 31]) + raw[1:33] + high_s).hex()
+    with pytest.raises(ValueError, match="canonical"):
+        auth.recover_pubkey(_VECTOR_MESSAGE, malleated)
 
 
 def test_valid_signature_accepted(keypair):
@@ -133,7 +256,7 @@ def test_malformed_signature_rejected(keypair):
 
 
 def test_wrong_account_key_rejected(chain):
-    priv = coincurve.PrivateKey()
+    priv, _ = _key()
     ts = int(time.time())
     comms = [146620]
     sig = _sign(priv, auth.build_message("alice", ts, comms))
@@ -167,7 +290,7 @@ def test_account_absent_from_chain_rejected(chain):
 def test_key_lookup_unavailable_propagates(monkeypatch):
     # Infra failure (RPC down / unconfigured) must surface as KeyLookupUnavailable
     # (→ 503), distinct from an auth failure (→ 401).
-    priv = coincurve.PrivateKey()
+    priv, _ = _key()
     ts = int(time.time())
     comms = [146620]
     sig = _sign(priv, auth.build_message("alice", ts, comms))
@@ -351,7 +474,7 @@ def test_delegated_posting_authority_accepted(chain):
     ts = int(time.time())
     comms = [146620]
     sig = _sign(priv, auth.build_message("alice", ts, comms))
-    other = auth._encode_pubkey(coincurve.PrivateKey().public_key.format(compressed=True))
+    other = _key()[1]
     chain["alice"] = _pa(keys=[(other, 1)], accounts=[("bob", 1)], threshold=1)
     chain["bob"] = _pa(keys=[(stm, 1)], accounts=[], threshold=1)
     auth.verify_interests("alice", ts, comms, sig)  # must not raise
@@ -671,7 +794,7 @@ def test_delete_honours_delegated_posting_authority(chain):
     priv, stm = _key()
     ts = int(time.time())
     sig = _sign(priv, auth.build_delete_message("alice", ts))
-    other = auth._encode_pubkey(coincurve.PrivateKey().public_key.format(compressed=True))
+    other = _key()[1]
     chain["alice"] = _pa(keys=[(other, 1)], accounts=[("bob", 1)], threshold=1)
     chain["bob"] = _pa(keys=[(stm, 1)], accounts=[], threshold=1)
     auth.verify_interests_delete("alice", ts, sig)

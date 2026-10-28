@@ -1,9 +1,16 @@
-FROM python:3.11-slim
+# Python 3.14: common-ci-configuration's PYTHON_RUNTIME_VERSION, the Python of the
+# python-test-tools image the python jobs test in. Not its python_runtime image: that is a
+# chiseled Ubuntu without libstdc++, which numpy and pandas load, and with no package
+# manager to add it.
+FROM python:3.14-slim
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# wax's wheel cannot carry the module symlinks its package needs; its first import makes
+# them in site-packages. Done here, so a container running as another user, or on a
+# read-only filesystem, can still import it.
+RUN pip install --no-cache-dir -r requirements.txt && python3 -c "import wax"
 
 COPY haf_fyp/ /app/haf_fyp/
 

@@ -29,7 +29,7 @@ node.
 
 Signature format (Keychain requestSignBuffer / dhive Signature.toString):
   65 bytes hex = [recovery+31][r(32)][s(32)], signed over sha256(message).
-Public keys use Hive's "STM" + base58(compressed_pubkey || ripemd160(...)[:4]).
+wax recovers the key and encodes it as Hive's "STM..." public key.
 
 Two actions are authenticated here, each with its OWN canonical challenge:
 
@@ -84,8 +84,8 @@ import urllib.error
 import urllib.request
 from typing import NamedTuple
 
-import base58
-import coincurve
+from wax.cython_modules_crypto import get_public_key_from_signature
+from wax.wax_result import python_error_code
 
 log = logging.getLogger(__name__)
 
@@ -122,32 +122,26 @@ class PostingAuthority(NamedTuple):
     threshold: int
 
 
-def _sha256(data: bytes) -> bytes:
-    return hashlib.sha256(data).digest()
-
-
-def _ripemd160(data: bytes) -> bytes:
-    h = hashlib.new("ripemd160")
-    h.update(data)
-    return h.digest()
-
-
-def _encode_pubkey(compressed: bytes) -> str:
-    """Encode a 33-byte compressed secp256k1 pubkey as a Hive 'STM...' key."""
-    return "STM" + base58.b58encode(compressed + _ripemd160(compressed)[:4]).decode()
-
-
 def recover_pubkey(message: str, signature_hex: str) -> str:
-    """Recover the signer's Hive public key from a Keychain-style signature."""
+    """Recover the signer's Hive public key from a Keychain-style signature.
+
+    Returns the "STM..." key. Raises ValueError when the signature is not 65 bytes
+    of hex, its header is not a compressed-key recovery id, or wax cannot recover
+    a key from it (e.g. a non-canonical, high-S signature).
+    """
     sig = bytes.fromhex(signature_hex)
     if len(sig) != 65:
         raise ValueError("signature must be 65 bytes")
-    recid = sig[0] - 31  # graphene header = recovery_id + 31 (compressed keys)
+    # graphene header = recovery_id + 31 (compressed keys). wax would also take the
+    # uncompressed-key headers 27-30, which no Keychain signature carries.
+    recid = sig[0] - 31
     if recid < 0 or recid > 3:
         raise ValueError("invalid recovery id")
-    compact = sig[1:65] + bytes([recid])  # coincurve wants r||s||recid
-    pub = coincurve.PublicKey.from_signature_and_message(compact, message.encode(), hasher=_sha256)
-    return _encode_pubkey(pub.format(compressed=True))
+    digest = hashlib.sha256(message.encode()).hexdigest()
+    result = get_public_key_from_signature(digest.encode(), sig.hex().encode())
+    if result.status != python_error_code.ok:
+        raise ValueError(f"cannot recover a public key: {result.exception_message.decode(errors='replace')}")
+    return result.result.decode()
 
 
 def _rpc_get_accounts(usernames: list[str]) -> list[dict]:

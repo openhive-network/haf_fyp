@@ -180,7 +180,7 @@ def _peer_is_trusted(peer: str) -> bool:
     # A dual-stack listener presents an IPv4 edge as ::ffff:10.0.0.5, which is never
     # `in` a v4 network -- the trust would silently never match and the app would
     # degrade to peer keying. client_ip_key already unwraps; this must agree with it.
-    if addr.version == 6 and addr.ipv4_mapped:
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
         addr = addr.ipv4_mapped
     return any(addr in net for net in _TRUSTED_NETS)
 
@@ -195,7 +195,7 @@ def _peer_address(request: Request):
         addr = ipaddress.ip_address(get_remote_address(request))
     except ValueError:
         return None
-    if addr.version == 6 and addr.ipv4_mapped:
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
         addr = addr.ipv4_mapped
     return addr
 
@@ -228,7 +228,7 @@ def _vouched_client_key(request: Request) -> Optional[str]:
         # ::ffff:203.0.113.7 is an IPv4 client in v6 clothing. Without this it takes
         # the /64 branch below and masks to '::', collapsing EVERY mapped address
         # into one bucket -- this MR's own bug, recreated in a corner.
-        if ip.version == 6 and ip.ipv4_mapped:
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
             ip = ip.ipv4_mapped
         # The peer cannot vouch for itself. An edge that forwards a client-supplied
         # header untouched would otherwise let any sender write the edge's own

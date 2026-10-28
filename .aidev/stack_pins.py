@@ -14,11 +14,11 @@ Run in the runtime image. It fails, naming each mismatch, when
 * a tool baked into the runtime image is not the version CI's job uses: PostgREST
   (docker-compose-ci.yml's image tag), the image the tavern container runs in
   (docker-compose-ci.yml's tavern image, .gitlab-ci.yml's PYTHON_TEST_TOOLS_IMAGE: the
-  runtime's base), the pytest and tavern python-tests and fastapi-tests install (that
-  image's, as scripts/python_test_tools_pins.py holds them to), the openapi generator's
+  runtime's base), the pytest and tavern of the python-tests environment (that image's, as
+  scripts/python_test_tools_pins.py holds CI's to), the openapi generator's
   common-ci-configuration ref (openapi-drift's COMMON_CI_REF), shellcheck and hadolint
-  (their jobs' image tags), python (the python jobs' image), and the psql image
-  install_with_app_lock.py comes from (Dockerfile.sql's FROM).
+  (their jobs' image tags), python (the python jobs run in PYTHON_TEST_TOOLS_IMAGE, so its
+  Python), and the psql image install_with_app_lock.py comes from (Dockerfile.sql's FROM).
 
 What it cannot see offline: common-ci-configuration moving PYTHON_TEST_TOOLS_TAG's image
 past the digest the runtime is built FROM. CI follows that tag; the runtime follows it
@@ -138,9 +138,11 @@ def main() -> int:
     check("runtime shellcheck", have.group(1) if have else None, tag(ci["shell-lint"]["image"]).lstrip("v"))
     have = re.search(r"Linter (\S+)", run("hadolint", "--version"))
     check("runtime hadolint", have.group(1) if have else None, tag(ci["hadolint"]["image"]).lstrip("v").split("-")[0])
-    py = ".".join(map(str, sys.version_info[:2]))
     for job in ("python-lint", "python-tests", "fastapi-tests"):
-        check(f"runtime python ({job})", py, re.match(r"python:(\d+\.\d+)", ci[job]["image"]).group(1))
+        check(f"{job} image", ci[job]["image"], "${PYTHON_TEST_TOOLS_IMAGE}")
+    py = ".".join(map(str, sys.version_info[:2]))
+    base_py = run("/python_venv/bin/python3", "-c", "import sys; print('%d.%d' % sys.version_info[:2])").strip()
+    check("runtime python (CI: the python jobs' PYTHON_TEST_TOOLS_IMAGE)", py, base_py)
     dockerfile_sql = (REPO / "Dockerfile.sql").read_text(encoding="utf-8")
     sql_base = re.search(r"^FROM\s+(\S+)", dockerfile_sql, re.MULTILINE).group(1)
     m = re.search(r"^FROM\s+(\S+?)@sha256:[0-9a-f]{64}\s+AS psql$", runtime, re.MULTILINE)
