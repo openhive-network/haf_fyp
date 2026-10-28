@@ -111,7 +111,7 @@ def main() -> int:
     postgrest = tag(lanes["docker/docker-compose-ci.yml"]["haf-fyp-postgrest"]["image"]).lstrip("v")
     check("runtime postgrest", run("postgrest", "--version").replace("PostgREST", "").strip(), postgrest)
     runtime = (REPO / ".aidev/runtime/Dockerfile").read_text(encoding="utf-8")
-    bases = re.findall(r"^FROM\s+(\S+?)@sha256:[0-9a-f]{64}\s*$", runtime, re.M)
+    bases = re.findall(r"^FROM\s+(\S+?)@sha256:[0-9a-f]{64}\s*$", runtime, re.MULTILINE)
     base = bases[-1] if bases else None
     tools_vars = ci[".python-test-tools-image"]["variables"]
     check("runtime base image (CI: .gitlab-ci.yml PYTHON_TEST_TOOLS_IMAGE)", base,
@@ -142,8 +142,8 @@ def main() -> int:
     for job in ("python-lint", "python-tests", "fastapi-tests"):
         check(f"runtime python ({job})", py, re.match(r"python:(\d+\.\d+)", ci[job]["image"]).group(1))
     dockerfile_sql = (REPO / "Dockerfile.sql").read_text(encoding="utf-8")
-    sql_base = re.search(r"^FROM\s+(\S+)", dockerfile_sql, re.M).group(1)
-    m = re.search(r"^FROM\s+(\S+?)@sha256:[0-9a-f]{64}\s+AS psql$", runtime, re.M)
+    sql_base = re.search(r"^FROM\s+(\S+)", dockerfile_sql, re.MULTILINE).group(1)
+    m = re.search(r"^FROM\s+(\S+?)@sha256:[0-9a-f]{64}\s+AS psql$", runtime, re.MULTILINE)
     check("runtime install_with_app_lock.py source image (Dockerfile.sql FROM)", m.group(1) if m else None, sql_base)
 
     for p in problems:
