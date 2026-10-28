@@ -12,15 +12,23 @@ Run in the runtime image. It fails, naming each mismatch, when
 * a stack service written out rather than extended no longer has the lane's
   command, environment and healthcheck;
 * a tool baked into the runtime image is not the version CI's job uses: PostgREST
-  (docker-compose-ci.yml's image tag), tavern (its `pip install tavern==`), the
-  openapi generator's common-ci-configuration ref (openapi-drift's COMMON_CI_REF),
-  shellcheck and hadolint (their jobs' image tags), python (the python jobs' image),
-  and the psql image install_with_app_lock.py comes from (Dockerfile.sql's FROM).
+  (docker-compose-ci.yml's image tag), the image the tavern container runs in
+  (docker-compose-ci.yml's tavern image, .gitlab-ci.yml's PYTHON_TEST_TOOLS_IMAGE: the
+  runtime's base), the pytest and tavern python-tests and fastapi-tests install (that
+  image's, as scripts/python_test_tools_pins.py holds them to), the openapi generator's
+  common-ci-configuration ref (openapi-drift's COMMON_CI_REF), shellcheck and hadolint
+  (their jobs' image tags), python (the python jobs' image), and the psql image
+  install_with_app_lock.py comes from (Dockerfile.sql's FROM).
+
+What it cannot see offline: common-ci-configuration moving PYTHON_TEST_TOOLS_TAG's image
+past the digest the runtime is built FROM. CI follows that tag; the runtime follows it
+when it is rebuilt (.aidev/README.md).
 
 Pins of `pip install` lines are checked by ci_job.py when it runs those jobs.
 """
 from __future__ import annotations
 
+import importlib.metadata
 import re
 import subprocess
 import sys
@@ -29,7 +37,9 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from compose_lane import dotenv, interpolate, walk  # noqa: E402
+from python_test_tools_pins import PinsError, installed_versions
 
 REPO = Path(__file__).resolve().parent.parent
 DIGEST = re.compile(r"^(?P<ref>[^@]+)@sha256:[0-9a-f]{64}$")
@@ -100,10 +110,25 @@ def main() -> int:
     # Tools in the runtime image.
     postgrest = tag(lanes["docker/docker-compose-ci.yml"]["haf-fyp-postgrest"]["image"]).lstrip("v")
     check("runtime postgrest", run("postgrest", "--version").replace("PostgREST", "").strip(), postgrest)
-    tavern_cmd = str(lanes["docker/docker-compose-ci.yml"]["tavern"]["command"])
-    m = re.search(r"tavern==([\w.]+)", tavern_cmd)
-    have = re.search(r"Version: (\S+)", run("/opt/tavern/bin/pip", "show", "tavern"))
-    check("runtime /opt/tavern tavern", have.group(1) if have else None, m.group(1) if m else None)
+    runtime = (REPO / ".aidev/runtime/Dockerfile").read_text(encoding="utf-8")
+    bases = re.findall(r"^FROM\s+(\S+?)@sha256:[0-9a-f]{64}\s*$", runtime, re.MULTILINE)
+    base = bases[-1] if bases else None
+    tools_vars = ci[".python-test-tools-image"]["variables"]
+    check("runtime base image (CI: .gitlab-ci.yml PYTHON_TEST_TOOLS_IMAGE)", base,
+          interpolate(tools_vars["PYTHON_TEST_TOOLS_IMAGE"], tools_vars))
+    check("runtime base image (CI: docker/docker-compose-ci.yml tavern)", base,
+          lanes["docker/docker-compose-ci.yml"]["tavern"]["image"])
+    try:
+        tools = installed_versions("/python_venv/bin/python3")
+    except PinsError as exc:
+        problems.append(f"runtime /python_venv: {exc}")
+        tools = {}
+    for name, want in tools.items():
+        try:
+            have = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            continue  # a constraint only: neither python job installs it
+        check(f"runtime python-tests {name} (CI: common-ci-configuration's, /python_venv here)", have, want)
     try:
         baked = (Path("/opt/openapi/COMMON_CI_REF")).read_text(encoding="utf-8").strip()
     except OSError:
@@ -117,9 +142,8 @@ def main() -> int:
     for job in ("python-lint", "python-tests", "fastapi-tests"):
         check(f"runtime python ({job})", py, re.match(r"python:(\d+\.\d+)", ci[job]["image"]).group(1))
     dockerfile_sql = (REPO / "Dockerfile.sql").read_text(encoding="utf-8")
-    sql_base = re.search(r"^FROM\s+(\S+)", dockerfile_sql, re.M).group(1)
-    runtime = (REPO / ".aidev/runtime/Dockerfile").read_text(encoding="utf-8")
-    m = re.search(r"^FROM\s+(\S+?)@sha256:[0-9a-f]{64}\s+AS psql$", runtime, re.M)
+    sql_base = re.search(r"^FROM\s+(\S+)", dockerfile_sql, re.MULTILINE).group(1)
+    m = re.search(r"^FROM\s+(\S+?)@sha256:[0-9a-f]{64}\s+AS psql$", runtime, re.MULTILINE)
     check("runtime install_with_app_lock.py source image (Dockerfile.sql FROM)", m.group(1) if m else None, sql_base)
 
     for p in problems:

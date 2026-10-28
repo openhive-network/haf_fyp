@@ -373,10 +373,16 @@ for s in "$@"; do
         openapi-drift)
             step openapi-drift job openapi-drift --path /opt/openapi/bin --copy-tree \
                 --env COMMON_CI_OFFLINE=1 --seed /opt/openapi/process_openapi.py=scripts/process_openapi.py ;;
-        unit) step unit job python-tests --coverage-xml "$out/coverage.xml" --env "COVERAGE_FILE=$PWD/$out/.coverage" ;;
-        fastapi) step fastapi job fastapi-tests --env "POSTGRES_HOST=${HAF_FYP_TEST_FASTAPI_DB:-fastapi-db}" ;;
+        # The python jobs' pytest/tavern pins come from the runtime's base image, offline,
+        # rather than from common-ci-configuration over the network
+        # (scripts/python_test_tools_pins.py).
+        unit) step unit job python-tests --coverage-xml "$out/coverage.xml" --env "COVERAGE_FILE=$PWD/$out/.coverage" \
+                --env PYTHON_TEST_TOOLS_PYTHON=/python_venv/bin/python3 ;;
+        fastapi) step fastapi job fastapi-tests --env "POSTGRES_HOST=${HAF_FYP_TEST_FASTAPI_DB:-fastapi-db}" \
+                --env PYTHON_TEST_TOOLS_PYTHON=/python_venv/bin/python3 ;;
+        # The tavern container's image is the runtime's base: its /python_venv, untouched.
         postgrest)
-            step postgrest job postgrest-tests --compose-lane --path /opt/tavern/bin \
+            step postgrest job postgrest-tests --compose-lane --path /python_venv/bin \
                 --env "PYTEST_ADDOPTS=--junitxml=$PWD/$out/postgrest-tavern.xml" ;;
         install) step install job install-test --compose-lane ;;
         install-haf) step install-haf job install-test-haf --compose-lane ;;

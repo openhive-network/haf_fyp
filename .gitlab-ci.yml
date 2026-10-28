@@ -383,8 +383,39 @@ haf-shim-drift-develop:
     - if: $RUN_REGISTRY_RESOLUTION == "true"
     - when: never
 
+# pytest and tavern come from common-ci-configuration, which defines their versions once
+# for every hive repo (its docker-bake.hcl) and publishes them in its python-test-tools
+# image -- not from an unpinned `pip install` here: that is how pytest 9.2.0 stopped every
+# pytest job at plugin loading, through a tavern that does not support it (#105).
+#
+# The two variables are common-ci-configuration's own (templates/base.gitlab-ci.yml), with
+# its values. They are set here rather than included: an `include:` of that file brings its
+# pipeline-wide `variables:` and `default:` with it, which tests/unit/test_install_lane.py
+# forbids and .aidev/ci_job.py does not model. `develop` is the moving tag
+# common-ci-configuration republishes, so these jobs follow a tool bump there on their next
+# pipeline. Override PYTHON_TEST_TOOLS_TAG only for a deliberate exception, and to a tag
+# that is also a ref of that repository (a commit SHA): .python-test-tools-pins reads its
+# docker-bake.hcl at it.
+.python-test-tools-image:
+  variables:
+    PYTHON_TEST_TOOLS_TAG: "develop"
+    PYTHON_TEST_TOOLS_IMAGE: "registry.gitlab.syncad.com/hive/common-ci-configuration/python-test-tools:${PYTHON_TEST_TOOLS_TAG}"
+
+# The python jobs cannot run in that image: it is Python 3.14 with no compiler, and
+# coincurve (requirements.txt) publishes no 3.14 wheel, so `pip install -r
+# requirements.txt` fails there building it. They stay on the Python the python image
+# runs (Dockerfile.python) and take the image's versions instead:
+# scripts/python_test_tools_pins.py prints them, from common-ci-configuration's
+# docker-bake.hcl at PYTHON_TEST_TOOLS_TAG, and every `pip install` the job runs is held
+# to them (`-c`) -- requirements.txt included, so nothing it pulls in can move pytest or
+# tavern: a requirement that would is a resolution error naming both.
+.python-test-tools-pins:
+  extends: .python-test-tools-image
+  before_script:
+    - python3 scripts/python_test_tools_pins.py > /tmp/python-test-tools.txt
+
 python-tests:
-  extends: .python-cache
+  extends: [.python-cache, .python-test-tools-pins]
   stage: test
   image: python:3.11-slim
   script:
@@ -404,13 +435,15 @@ python-tests:
     # would put the gate itself back to uncovered.
     # curl and jq: tests/unit/test_check_pinned_images.py runs the registry check against a
     # local fake registry, with the same tools the registry-resolution job installs.
+    # pytest-cov and httpx have no version in common-ci-configuration yet, so they are not
+    # held to one: common-ci-configuration#52 adds them.
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl jq >/dev/null
-    - pip install -r requirements.txt pytest pytest-cov httpx pyyaml -q
+    - pip install -c /tmp/python-test-tools.txt -r requirements.txt pytest pytest-cov httpx pyyaml -q
     - PYTHONPATH=. pytest tests/unit/ -v -rfEs --cov=haf_fyp --cov-report=term-missing --cov-fail-under=40
   rules: *standard_rules
 
 fastapi-tests:
-  extends: .python-cache
+  extends: [.python-cache, .python-test-tools-pins]
   stage: test
   image: python:3.11-slim
   services:
@@ -451,7 +484,8 @@ fastapi-tests:
     # switching the bind to `::`.
     TRUSTED_PROXY_IPS: "127.0.0.1,::1"
   script:
-    - pip install -r requirements.txt pytest -q
+    # tavern: the FastAPI tavern file below. Test-only, so not in requirements.txt.
+    - pip install -c /tmp/python-test-tools.txt -r requirements.txt pytest tavern -q
     - sleep 5
     - |
       python3 -c "
@@ -480,6 +514,8 @@ fastapi-tests:
   rules: *standard_rules
 
 postgrest-tests:
+  # PYTHON_TEST_TOOLS_IMAGE, for docker/docker-compose-ci.yml's tavern container.
+  extends: .python-test-tools-image
   stage: test
   image: docker:24
   services:
