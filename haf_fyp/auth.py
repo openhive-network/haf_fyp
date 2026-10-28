@@ -84,10 +84,14 @@ import urllib.error
 import urllib.request
 from typing import NamedTuple
 
-from wax.cython_modules_crypto import get_public_key_from_signature
-from wax.wax_result import python_error_code
+from wax import create_wax_foundation
+from wax.exceptions import WaxError
 
 log = logging.getLogger(__name__)
+
+# wax's documented interface, not its cython_modules_* bridge: the bridge changed its
+# argument types and failure reporting between releases without a version signal.
+_WAX = create_wax_foundation()
 
 # Trusted Hive RPC used to read the account's posting authority. No default on
 # purpose (see module docstring): must be an operator-configured trusted node.
@@ -138,10 +142,11 @@ def recover_pubkey(message: str, signature_hex: str) -> str:
     if recid < 0 or recid > 3:
         raise ValueError("invalid recovery id")
     digest = hashlib.sha256(message.encode()).hexdigest()
-    result = get_public_key_from_signature(digest.encode(), sig.hex().encode())
-    if result.status != python_error_code.ok:
-        raise ValueError(f"cannot recover a public key: {result.exception_message.decode(errors='replace')}")
-    return result.result.decode()
+    try:
+        key: str = _WAX.get_public_key_from_signature(digest, sig.hex())
+    except WaxError as exc:
+        raise ValueError(f"cannot recover a public key: {exc}") from exc
+    return key
 
 
 def _rpc_get_accounts(usernames: list[str]) -> list[dict]:

@@ -15,7 +15,7 @@ import secrets
 import time
 
 import pytest
-from wax.cython_modules_crypto import calculate_public_key, generate_private_key
+from wax import create_wax_foundation
 
 from haf_fyp import auth
 from pytest import MonkeyPatch
@@ -92,12 +92,13 @@ def _sign(priv: int, message: str) -> str:
 def _key() -> tuple[int, str]:
     """A fresh private key (the secret scalar of a wax-generated WIF) and its Hive STM
     public key."""
-    wif = generate_private_key().result.decode()
+    key = create_wax_foundation().suggest_brain_key()
+    wif = key.wif_private_key
     raw = 0
     for ch in wif:
         raw = raw * 58 + _B58.index(ch)
     payload = raw.to_bytes(37, "big")  # 0x80 || secret || 4-byte checksum
-    return int.from_bytes(payload[1:33], "big"), calculate_public_key(wif.encode()).result.decode()
+    return int.from_bytes(payload[1:33], "big"), key.associated_public_key
 
 
 def _pa(*, keys, accounts, threshold):
