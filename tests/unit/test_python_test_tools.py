@@ -24,6 +24,7 @@ import pytest
 import yaml
 
 from tests.unit.shell_harness import write_exec
+from pytest import CaptureFixture, MonkeyPatch
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "python_test_tools_pins.py"
@@ -68,7 +69,7 @@ pins_script = _load()
 
 
 @pytest.fixture
-def bake_server(monkeypatch):
+def bake_server(monkeypatch: MonkeyPatch):
     """Serve `served["text"]` as docker-bake.hcl, recording each URL asked for."""
     served: dict = {"text": BAKE, "urls": []}
 
@@ -84,14 +85,14 @@ def bake_server(monkeypatch):
     return served
 
 
-def test_the_bake_file_s_versions_at_the_image_tag_are_printed_as_constraints(bake_server, capsys) -> None:
+def test_the_bake_file_s_versions_at_the_image_tag_are_printed_as_constraints(bake_server, capsys: CaptureFixture) -> None:
     assert pins_script.main() == 0
     assert capsys.readouterr().out == PINS
     assert bake_server["urls"] == [
         "https://gitlab.syncad.com/hive/common-ci-configuration/-/raw/develop/docker-bake.hcl"]
 
 
-def test_a_bake_file_without_a_tool_fails_naming_it_and_prints_nothing(bake_server, capsys) -> None:
+def test_a_bake_file_without_a_tool_fails_naming_it_and_prints_nothing(bake_server, capsys: CaptureFixture) -> None:
     bake_server["text"] = BAKE.replace("TAVERN_VERSION", "TAVERN_RELEASE")
     assert pins_script.main() == 1
     out, err = capsys.readouterr()
@@ -103,7 +104,7 @@ def test_a_bake_file_without_a_tool_fails_naming_it_and_prints_nothing(bake_serv
     urllib.error.URLError("unreachable"),
     TimeoutError("timed out"),
 ])
-def test_a_bake_file_that_cannot_be_read_fails_and_prints_nothing(bake_server, capsys, failure) -> None:
+def test_a_bake_file_that_cannot_be_read_fails_and_prints_nothing(bake_server, capsys: CaptureFixture, failure) -> None:
     """The job must stop rather than install whatever pip resolves."""
     bake_server["text"] = failure
     assert pins_script.main() == 1
@@ -111,7 +112,7 @@ def test_a_bake_file_that_cannot_be_read_fails_and_prints_nothing(bake_server, c
     assert out == "" and "common-ci-configuration/-/raw/develop/docker-bake.hcl" in err
 
 
-def test_no_image_tag_fails(bake_server, monkeypatch, capsys) -> None:
+def test_no_image_tag_fails(bake_server, monkeypatch: MonkeyPatch, capsys: CaptureFixture) -> None:
     monkeypatch.delenv("PYTHON_TEST_TOOLS_TAG")
     assert pins_script.main() == 1
     assert capsys.readouterr().out == ""
@@ -122,7 +123,7 @@ def _run(env: dict[str, str]) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60)
 
 
-def test_an_interpreter_s_installed_versions_are_printed_instead(tmp_path) -> None:
+def test_an_interpreter_s_installed_versions_are_printed_instead(tmp_path: Path) -> None:
     """AIDEV's offline runtime reads them from the image's own environment."""
     python = tmp_path / "python3"
     write_exec(python, '#!/bin/sh\n[ "$1" = -c ] || exit 9\nshift 2\n'
@@ -132,7 +133,7 @@ def test_an_interpreter_s_installed_versions_are_printed_instead(tmp_path) -> No
     assert (r.returncode, r.stdout) == (0, PINS), r.stderr
 
 
-def test_an_interpreter_missing_a_tool_fails_and_prints_nothing(tmp_path) -> None:
+def test_an_interpreter_missing_a_tool_fails_and_prints_nothing(tmp_path: Path) -> None:
     python = tmp_path / "python3"
     write_exec(python, "#!/bin/sh\necho \"PackageNotFoundError: tavern\" >&2\nexit 1\n")
     r = _run({"PATH": "/usr/bin:/bin", "PYTHON_TEST_TOOLS_PYTHON": str(python)})
