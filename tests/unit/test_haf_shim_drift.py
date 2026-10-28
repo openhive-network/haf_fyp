@@ -40,6 +40,7 @@ import pytest
 from . import test_haf_canonical_names as canon
 from .shim_ledger import LEDGER as REAL
 from .shim_ledger import drift
+from pytest import CaptureFixture, MonkeyPatch
 
 try:
     import yaml
@@ -102,7 +103,7 @@ def _raw():
     return json.loads(LEDGER_JSON.read_text(encoding="utf-8"))
 
 
-def _ledger_variant(tmp_path, name="ledger.json", text=None, **overrides):
+def _ledger_variant(tmp_path: Path, name="ledger.json", text=None, **overrides):
     """A copy of the real ledger file with some keys replaced (or `text` verbatim)."""
     if text is None:
         raw = _raw()
@@ -114,12 +115,12 @@ def _ledger_variant(tmp_path, name="ledger.json", text=None, **overrides):
 
 
 @pytest.fixture
-def ledger(tmp_path, good):
+def ledger(tmp_path: Path, good):
     """The real ledger with shim_sha256 = hash of the synthetic shim and a known pin."""
     return _ledger_variant(tmp_path, shim_sha256=hashlib.sha256(good).hexdigest(), haf_shim_ref=PIN)
 
 
-def _file(tmp_path, data: bytes, name="shim.sql"):
+def _file(tmp_path: Path, data: bytes, name="shim.sql"):
     path = tmp_path / name
     path.write_bytes(data)
     return path
@@ -135,7 +136,7 @@ def _main(ledger, *sources):
 # --- the real ledger -------------------------------------------------------------------
 
 
-def test_the_guard_and_the_drift_script_share_one_ledger_object():
+def test_the_guard_and_the_drift_script_share_one_ledger_object() -> None:
     """One source of truth by construction: the guard's LEDGER is the very object the drift
     tests use, loaded once by the drift script's own load_ledger() from the ledger file.
     `canon` is imported relatively, so it is the module pytest collected -- not a second
@@ -144,7 +145,7 @@ def test_the_guard_and_the_drift_script_share_one_ledger_object():
     assert REAL == drift.load_ledger(), "the shared ledger is not what the file says"
 
 
-def test_the_script_is_loaded_once_under_one_name():
+def test_the_script_is_loaded_once_under_one_name() -> None:
     """By design rather than by luck: the loader is registered in sys.modules, so a second
     load returns the same module -- and with it the same Ledger class and load_ledger."""
     from . import shim_ledger
@@ -154,7 +155,7 @@ def test_the_script_is_loaded_once_under_one_name():
     assert type(canon.LEDGER) is drift.Ledger
 
 
-def test_the_ledger_is_read_only():
+def test_the_ledger_is_read_only() -> None:
     """Nothing that receives the ledger can change it in place."""
     with pytest.raises(TypeError):
         REAL.compat_aliases["x"] = "y"  # type: ignore[index]
@@ -165,7 +166,7 @@ def test_the_ledger_is_read_only():
         REAL.sha256 = "0" * 64  # type: ignore[misc]
 
 
-def test_the_ledger_file_holds_exact_built_in_types():
+def test_the_ledger_file_holds_exact_built_in_types() -> None:
     raw = _raw()
     assert type(raw["compat_aliases"]) is dict
     assert all(type(k) is str and type(v) is str for k, v in raw["compat_aliases"].items())
@@ -181,11 +182,11 @@ def _vendored():
     return copies[0]
 
 
-def test_the_pin_is_a_full_commit_sha():
+def test_the_pin_is_a_full_commit_sha() -> None:
     assert re.fullmatch(r"[0-9a-f]{40}", REAL.ref), "pin a full commit SHA, not a branch"
 
 
-def test_the_vendored_copy_is_the_pinned_file():
+def test_the_vendored_copy_is_the_pinned_file() -> None:
     """Offline, blocking: a mistyped hash, or a ref bumped without renaming the copy.
 
     It ties copy, ref and hash to each other, not to upstream: a copy renamed to a new ref
@@ -200,7 +201,7 @@ def test_the_vendored_copy_is_the_pinned_file():
     )
 
 
-def test_the_ledger_names_every_symbol_the_vendored_copy_creates():
+def test_the_ledger_names_every_symbol_the_vendored_copy_creates() -> None:
     """Offline, blocking: the hash ties the ledger to the vendored copy's bytes, this ties its
     names to them. A bump that refreshes the copy, ref and hash but not the symbols -- upstream
     adds a fifth alias, nobody adds it to the ledger -- leaves the new alias unenforced, the
@@ -220,7 +221,7 @@ def _unlisted(data: bytes, ledger_symbols) -> set:
     return drift.apparent_symbols(data) - set(ledger_symbols)
 
 
-def test_the_names_check_is_one_way(symbols):
+def test_the_names_check_is_one_way(symbols) -> None:
     """The real shim equals the ledger today, so the real test cannot tell `-` from `^`."""
     names = sorted(symbols)
     extra = _fresh_name(symbols, "brand_new")
@@ -228,7 +229,7 @@ def test_the_names_check_is_one_way(symbols):
     assert _unlisted(_shim([*names, extra]), names) == {extra}, "a new one must be caught"
 
 
-def test_a_symbol_upstream_removed_may_stay_in_the_ledger(tmp_path, capsys, good):
+def test_a_symbol_upstream_removed_may_stay_in_the_ledger(tmp_path: Path, capsys: CaptureFixture, good) -> None:
     """The one-way policy, pinned: a ledger naming more than the shim creates still loads and
     passes, so a removed symbol can stay enforced while older HAF releases still have it."""
     extra = _fresh_name(REAL.symbols, "removed_upstream")
@@ -242,19 +243,19 @@ def test_a_symbol_upstream_removed_may_stay_in_the_ledger(tmp_path, capsys, good
     assert extra in drift.load_ledger(bad).symbols
 
 
-def test_the_script_passes_the_vendored_copy_against_the_real_ledger(capsys):
+def test_the_script_passes_the_vendored_copy_against_the_real_ledger(capsys: CaptureFixture) -> None:
     """The real ledger, unmodified, end to end: what the pin job sees when the network works."""
     assert drift.main(["--file", str(_vendored())]) == drift.EXIT_OK
     assert "byte-identical" in capsys.readouterr().out
 
 
-def test_the_canonical_names_scan_skips_the_real_vendored_copy():
+def test_the_canonical_names_scan_skips_the_real_vendored_copy() -> None:
     scanned = {p.resolve() for p in canon._sql_bearing_files()}
     assert _vendored().resolve() not in scanned
     assert (ROOT / "tests" / "unit" / "test_haf_shim_drift.py").resolve() in scanned, "the scan ran"
 
 
-def test_the_canonical_names_scan_exempts_only_the_vendored_copy(tmp_path, monkeypatch):
+def test_the_canonical_names_scan_exempts_only_the_vendored_copy(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     """Run the real scan over a tree with look-alikes: only the exact copy is skipped."""
     data = tmp_path / "tests" / "unit" / "data"
     files = {
@@ -279,7 +280,7 @@ def test_the_canonical_names_scan_exempts_only_the_vendored_copy(tmp_path, monke
 # --- the verdict is the hash -----------------------------------------------------------
 
 
-def test_identical_bytes_pass(tmp_path, capsys, ledger, good):
+def test_identical_bytes_pass(tmp_path: Path, capsys: CaptureFixture, ledger, good) -> None:
     assert _main(ledger, _file(tmp_path, good)) == drift.EXIT_OK
     out = capsys.readouterr()
     assert "OK [" in out.out and "byte-identical" in out.out and not out.err
@@ -288,7 +289,7 @@ def test_identical_bytes_pass(tmp_path, capsys, ledger, good):
 _DRIFT_NAMES = (f"drifted{i}.sql" for i in itertools.count())
 
 
-def _drifted(tmp_path, capsys, ledger, data):
+def _drifted(tmp_path: Path, capsys: CaptureFixture, ledger, data):
     """Drift, reported against THIS source -- not merely some "DRIFT [" somewhere."""
     path = _file(tmp_path, data, next(_DRIFT_NAMES))
     rc = _main(ledger, path)
@@ -300,13 +301,13 @@ def _drifted(tmp_path, capsys, ledger, data):
     return out.err
 
 
-def test_a_fifth_symbol_is_drift_and_named(tmp_path, capsys, ledger, symbols):
+def test_a_fifth_symbol_is_drift_and_named(tmp_path: Path, capsys: CaptureFixture, ledger, symbols) -> None:
     new = _fresh_name(symbols)
     err = _drifted(tmp_path, capsys, ledger, _shim(symbols | {new}))
     assert f"+ {HIVE}.{new} appears to be new" in err
 
 
-def test_a_removed_symbol_is_drift_and_named(tmp_path, capsys, ledger, symbols):
+def test_a_removed_symbol_is_drift_and_named(tmp_path: Path, capsys: CaptureFixture, ledger, symbols) -> None:
     gone = sorted(symbols)[0]
     err = _drifted(tmp_path, capsys, ledger, _shim(symbols - {gone}))
     assert f"- {HIVE}.{gone} no longer appears to be created" in err
@@ -323,31 +324,31 @@ def test_a_removed_symbol_is_drift_and_named(tmp_path, capsys, ledger, symbols):
     "SELECT 1 INTO {h}.copied;\n",
     "CREATE OPERATOR CLASS {h}.opc FOR TYPE int USING btree AS OPERATOR 1 <;\n",
 ])
-def test_changes_a_parser_would_miss_are_still_drift(tmp_path, capsys, ledger, good, extra):
+def test_changes_a_parser_would_miss_are_still_drift(tmp_path: Path, capsys: CaptureFixture, ledger, good, extra) -> None:
     """Every one of these slipped past the earlier parsing design, or false-alarmed on it."""
     err = _drifted(tmp_path, capsys, ledger, good + extra.format(h=HIVE).encode())
     assert "symbols now (best effort)" in err
 
 
-def test_a_local_file_that_is_not_the_shim_is_drift_with_a_hint(tmp_path, capsys, ledger):
+def test_a_local_file_that_is_not_the_shim_is_drift_with_a_hint(tmp_path: Path, capsys: CaptureFixture, ledger) -> None:
     """A FETCHED sign-in page is an error (see the server tests); a local file is what it is."""
     err = _drifted(tmp_path, capsys, ledger, b"<html><body>Sign in</body></html>")
     assert "none found -- is this the shim file?" in err
 
 
-def test_an_empty_file_is_an_error_not_drift(tmp_path, capsys, ledger):
+def test_an_empty_file_is_an_error_not_drift(tmp_path: Path, capsys: CaptureFixture, ledger) -> None:
     assert _main(ledger, _file(tmp_path, b"")) == drift.EXIT_ERROR
     assert "the file is empty" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("variant", ["crlf", "bom"])
-def test_bytes_are_hashed_exactly(tmp_path, capsys, ledger, good, variant):
+def test_bytes_are_hashed_exactly(tmp_path: Path, capsys: CaptureFixture, ledger, good, variant) -> None:
     """No normalisation: CRLF line endings and a BOM are changes, and are drift."""
     data = good.replace(b"\n", b"\r\n") if variant == "crlf" else b"\xef\xbb\xbf" + good
     _drifted(tmp_path, capsys, ledger, data)
 
 
-def test_stripping_carriage_returns_is_drift(tmp_path, capsys, symbols):
+def test_stripping_carriage_returns_is_drift(tmp_path: Path, capsys: CaptureFixture, symbols) -> None:
     """The other direction: a ledger hashed over CRLF bytes rejects the LF version."""
     crlf = _shim(symbols).replace(b"\n", b"\r\n")
     ledger = _ledger_variant(tmp_path, shim_sha256=hashlib.sha256(crlf).hexdigest())
@@ -357,7 +358,7 @@ def test_stripping_carriage_returns_is_drift(tmp_path, capsys, symbols):
 
 
 @pytest.mark.parametrize("position", [16, 63])
-def test_the_whole_digest_is_compared(tmp_path, capsys, good, position):
+def test_the_whole_digest_is_compared(tmp_path: Path, capsys: CaptureFixture, good, position) -> None:
     """A recorded hash that differs from the real one in a single hex digit is not a match."""
     real = hashlib.sha256(good).hexdigest()
     near = real[:position] + ("0" if real[position] != "0" else "1") + real[position + 1:]
@@ -365,19 +366,19 @@ def test_the_whole_digest_is_compared(tmp_path, capsys, good, position):
     _drifted(tmp_path, capsys, ledger, good)
 
 
-def test_the_hint_never_decides_a_mismatch(tmp_path, capsys, ledger, symbols, monkeypatch):
+def test_the_hint_never_decides_a_mismatch(tmp_path: Path, capsys: CaptureFixture, ledger, symbols, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(drift, "apparent_symbols", lambda data: set(symbols))
     err = _drifted(tmp_path, capsys, ledger, _shim(symbols) + b"\n")
     assert "looks unchanged" in err
 
 
-def test_the_hint_never_decides_a_match(tmp_path, capsys, ledger, good, monkeypatch):
+def test_the_hint_never_decides_a_match(tmp_path: Path, capsys: CaptureFixture, ledger, good, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(drift, "apparent_symbols", lambda data: {"something_else"})
     assert _main(ledger, _file(tmp_path, good)) == drift.EXIT_OK
     assert "OK [" in capsys.readouterr().out
 
 
-def test_a_crashing_hint_still_reports_drift(tmp_path, capsys, ledger, good, monkeypatch):
+def test_a_crashing_hint_still_reports_drift(tmp_path: Path, capsys: CaptureFixture, ledger, good, monkeypatch: MonkeyPatch) -> None:
     def boom(data):
         raise RuntimeError("hint broke")
 
@@ -388,7 +389,7 @@ def test_a_crashing_hint_still_reports_drift(tmp_path, capsys, ledger, good, mon
     assert "symbol hint unavailable: RuntimeError: hint broke" in err
 
 
-def test_the_hint_skips_comments_strings_and_bodies():
+def test_the_hint_skips_comments_strings_and_bodies() -> None:
     text = (
         f"-- CREATE DOMAIN {HIVE}.c1 AS int;\n/* CREATE DOMAIN {HIVE}.c2 AS int; */\n"
         f"COMMENT ON DOMAIN x IS 'CREATE DOMAIN {HIVE}.c3 AS int';\n"
@@ -402,14 +403,14 @@ def test_the_hint_skips_comments_strings_and_bodies():
     assert drift.apparent_symbols(text) == {"real", "mv", "ine"}
 
 
-def test_a_missing_file_is_an_error(tmp_path, capsys, ledger):
+def test_a_missing_file_is_an_error(tmp_path: Path, capsys: CaptureFixture, ledger) -> None:
     missing = tmp_path / "nope.sql"
     rc = _main(ledger, missing)
     assert rc == drift.EXIT_ERROR
     assert f"ERROR [{missing}]" in capsys.readouterr().err
 
 
-def test_a_whitespace_only_file_is_drift(tmp_path, capsys, ledger):
+def test_a_whitespace_only_file_is_drift(tmp_path: Path, capsys: CaptureFixture, ledger) -> None:
     """As on the fetch path: present, and not the file -- drift, not "empty"."""
     _drifted(tmp_path, capsys, ledger, b" \n\t\n")
 
@@ -418,7 +419,7 @@ def test_a_whitespace_only_file_is_drift(tmp_path, capsys, ledger):
 
 
 @pytest.mark.parametrize("bad_first", [True, False])
-def test_drift_in_one_source_survives_a_match_in_another(tmp_path, capsys, ledger, good, bad_first):
+def test_drift_in_one_source_survives_a_match_in_another(tmp_path: Path, capsys: CaptureFixture, ledger, good, bad_first) -> None:
     bad, ok = _file(tmp_path, good + b"x", "bad.sql"), _file(tmp_path, good, "ok.sql")
     rc = _main(ledger, *([bad, ok] if bad_first else [ok, bad]))
     out = capsys.readouterr()
@@ -428,7 +429,7 @@ def test_drift_in_one_source_survives_a_match_in_another(tmp_path, capsys, ledge
 
 
 @pytest.mark.parametrize("error_first", [True, False])
-def test_an_error_outranks_drift_in_either_order(tmp_path, capsys, ledger, good, error_first):
+def test_an_error_outranks_drift_in_either_order(tmp_path: Path, capsys: CaptureFixture, ledger, good, error_first) -> None:
     drifted, broken = _file(tmp_path, good + b"x", "drift.sql"), tmp_path / "missing.sql"
     rc = _main(ledger, *([broken, drifted] if error_first else [drifted, broken]))
     out = capsys.readouterr()
@@ -436,7 +437,7 @@ def test_an_error_outranks_drift_in_either_order(tmp_path, capsys, ledger, good,
     assert f"DRIFT [{drifted}]" in out.err and f"ERROR [{broken}]" in out.err, "both must be reported"
 
 
-def test_sources_are_reported_in_the_order_given(tmp_path, capsys, ledger, good):
+def test_sources_are_reported_in_the_order_given(tmp_path: Path, capsys: CaptureFixture, ledger, good) -> None:
     a, b = _file(tmp_path, good, "a.sql"), _file(tmp_path, good, "b.sql")
     assert _main(ledger, b, a) == drift.EXIT_OK
     out = capsys.readouterr().out
@@ -482,7 +483,7 @@ _A_NAME = sorted(REAL.symbols)[0]
     ({"shim_sha256": REAL.sha256.upper()}, "not a lowercase sha256"),
     ({"extra": 1}, "must have exactly the keys"),
 ])
-def test_a_malformed_ledger_makes_main_exit_2(tmp_path, capsys, good, overrides, message):
+def test_a_malformed_ledger_makes_main_exit_2(tmp_path: Path, capsys: CaptureFixture, good, overrides, message) -> None:
     bad = _ledger_variant(tmp_path, **overrides)
     rc = _main(bad, _file(tmp_path, good))
     out = capsys.readouterr()
@@ -492,7 +493,7 @@ def test_a_malformed_ledger_makes_main_exit_2(tmp_path, capsys, good, overrides,
 
 
 @pytest.mark.parametrize("missing", sorted(drift.LEDGER_KEYS))
-def test_a_ledger_missing_any_key_is_refused(tmp_path, capsys, good, missing):
+def test_a_ledger_missing_any_key_is_refused(tmp_path: Path, capsys: CaptureFixture, good, missing) -> None:
     raw = _raw()
     del raw[missing]
     bad = _ledger_variant(tmp_path, text=json.dumps(raw))
@@ -505,13 +506,13 @@ def test_a_ledger_missing_any_key_is_refused(tmp_path, capsys, good, missing):
     ("{", "cannot read the ledger"),
     ("[]", "must have exactly the keys"),
 ])
-def test_an_unparseable_or_ambiguous_ledger_is_refused(tmp_path, capsys, good, text, message):
+def test_an_unparseable_or_ambiguous_ledger_is_refused(tmp_path: Path, capsys: CaptureFixture, good, text, message) -> None:
     bad = _ledger_variant(tmp_path, text=text)
     assert _main(bad, _file(tmp_path, good)) == drift.EXIT_ERROR
     assert message in capsys.readouterr().err
 
 
-def test_a_duplicate_key_inside_the_aliases_is_refused(tmp_path, capsys, good):
+def test_a_duplicate_key_inside_the_aliases_is_refused(tmp_path: Path, capsys: CaptureFixture, good) -> None:
     """json would silently keep the last one; the loader refuses."""
     text = json.dumps(_raw()).replace(
         '"compat_aliases": {', f'"compat_aliases": {{"{_A_NAME}": "x", "{_A_NAME}": "y", ', 1)
@@ -524,7 +525,7 @@ def test_a_duplicate_key_inside_the_aliases_is_refused(tmp_path, capsys, good):
 
 
 @pytest.mark.parametrize("exc_type", [TypeError, RuntimeError, KeyError, AttributeError])
-def test_an_unexpected_exception_exits_2_not_1(tmp_path, capsys, ledger, good, monkeypatch, exc_type):
+def test_an_unexpected_exception_exits_2_not_1(tmp_path: Path, capsys: CaptureFixture, ledger, good, monkeypatch: MonkeyPatch, exc_type) -> None:
     """An uncaught exception exits 1, which is the drift code. It must never mean drift."""
     def boom(*_a, **_k):
         raise exc_type("surprise")
@@ -535,12 +536,12 @@ def test_an_unexpected_exception_exits_2_not_1(tmp_path, capsys, ledger, good, m
     assert "internal failure" in err and "surprise" in err
 
 
-def test_no_source_is_an_error_not_a_pass(capsys, ledger):
+def test_no_source_is_an_error_not_a_pass(capsys: CaptureFixture, ledger) -> None:
     assert _main(ledger) == drift.EXIT_ERROR
     assert "nothing was checked" in capsys.readouterr().err
 
 
-def test_no_source_exits_2_as_a_process():
+def test_no_source_exits_2_as_a_process() -> None:
     """The exit code the runner sees, not main()'s return value."""
     proc = subprocess.run([sys.executable, "-I", str(SCRIPT)], capture_output=True, text=True,
                           timeout=60, check=False)
@@ -548,7 +549,7 @@ def test_no_source_exits_2_as_a_process():
     assert "nothing was checked" in proc.stderr
 
 
-def test_drift_exits_1_as_a_process(tmp_path, ledger, good):
+def test_drift_exits_1_as_a_process(tmp_path: Path, ledger, good) -> None:
     proc = subprocess.run([sys.executable, "-I", str(SCRIPT), "--ledger", str(ledger),
                            "--file", str(_file(tmp_path, good + b"x"))],
                           capture_output=True, text=True, timeout=60, check=False)
@@ -557,7 +558,7 @@ def test_drift_exits_1_as_a_process(tmp_path, ledger, good):
 
 
 @pytest.mark.parametrize("ref", ["bad ref", "", "-x", "a\nb"])
-def test_an_invalid_ref_is_an_error(capsys, ledger, ref):
+def test_an_invalid_ref_is_an_error(capsys: CaptureFixture, ledger, ref) -> None:
     assert _main(ledger, [f"--ref={ref}"]) == drift.EXIT_ERROR
     assert "not a valid git ref" in capsys.readouterr().err
 
@@ -566,7 +567,7 @@ def test_an_invalid_ref_is_an_error(capsys, ledger, ref):
 
 
 @pytest.fixture
-def no_proxy(monkeypatch):
+def no_proxy(monkeypatch: MonkeyPatch) -> None:
     for var in ("NO_PROXY", "no_proxy"):
         monkeypatch.setenv(var, "127.0.0.1,localhost")
 
@@ -575,7 +576,7 @@ class _QuietServer(http.server.ThreadingHTTPServer):
     daemon_threads = False      # server_close() joins handler threads: none outlive the test
     block_on_close = True
 
-    def handle_error(self, request, client_address):
+    def handle_error(self, request, client_address) -> None:
         pass                    # a client that timed out and left is the point of one test
 
 
@@ -583,14 +584,14 @@ REDIRECTS = (301, 302, 303, 307, 308)
 
 
 @pytest.fixture
-def server(good, monkeypatch, no_proxy):
+def server(good, monkeypatch: MonkeyPatch, no_proxy):
     """Serves the synthetic shim at /<ref>/<SHIM_PATH> for a few refs, each failing its own way."""
     stop = threading.Event()
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
-        def do_GET(self):  # noqa: N802 - stdlib name
+        def do_GET(self) -> None:  # noqa: N802 - stdlib name
             ref = self.path.split("/")[1]
             try:
                 if self.path != f"/{ref}/{UPSTREAM_PATH}" or ref not in (
@@ -647,7 +648,7 @@ def server(good, monkeypatch, no_proxy):
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 self.close_connection = True
 
-        def _send(self, body, ctype="text/plain; charset=utf-8"):
+        def _send(self, body, ctype="text/plain; charset=utf-8") -> None:
             self.send_response(200)
             if ctype:
                 self.send_header("Content-Type", ctype)
@@ -655,7 +656,7 @@ def server(good, monkeypatch, no_proxy):
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, *args):
+        def log_message(self, *args) -> None:
             pass
 
     httpd = _QuietServer(("127.0.0.1", 0), Handler)
@@ -669,17 +670,17 @@ def server(good, monkeypatch, no_proxy):
     thread.join(5)
 
 
-def test_fetch_of_a_good_ref_passes(server, capsys, ledger):
+def test_fetch_of_a_good_ref_passes(server, capsys: CaptureFixture, ledger) -> None:
     assert _main(ledger, ["--ref", "good"]) == drift.EXIT_OK
     assert "OK [hive/haf@good]" in capsys.readouterr().out
 
 
-def test_pinned_fetches_the_ledgers_own_ref(server, capsys, ledger):
+def test_pinned_fetches_the_ledgers_own_ref(server, capsys: CaptureFixture, ledger) -> None:
     assert _main(ledger, ["--pinned"]) == drift.EXIT_OK
     assert f"OK [hive/haf@{PIN}]" in capsys.readouterr().out
 
 
-def test_a_pinned_ref_that_404s_is_drift_not_a_network_error(server, tmp_path, capsys, good):
+def test_a_pinned_ref_that_404s_is_drift_not_a_network_error(server, tmp_path: Path, capsys: CaptureFixture, good) -> None:
     """A mistyped SHA, consistent in the copy's name and the ledger, passes python-tests and
     the develop job; only the pin job sees it, and as exit 2 it would merge orange."""
     wrong = PIN[:-1] + ("0" if PIN[-1] != "0" else "1")
@@ -692,7 +693,7 @@ def test_a_pinned_ref_that_404s_is_drift_not_a_network_error(server, tmp_path, c
 
 
 @pytest.mark.parametrize("order", [("good", "no-such-ref"), ("no-such-ref", "good")])
-def test_fetch_of_a_bad_ref_fails_loudly(server, capsys, ledger, order):
+def test_fetch_of_a_bad_ref_fails_loudly(server, capsys: CaptureFixture, ledger, order) -> None:
     """Both orders: a failure in either must survive the other succeeding."""
     rc = _main(ledger, ["--ref", order[0]], ["--ref", order[1]])
     out = capsys.readouterr()
@@ -702,7 +703,7 @@ def test_fetch_of_a_bad_ref_fails_loudly(server, capsys, ledger, order):
     assert "OK [hive/haf@good]" in out.out
 
 
-def test_a_truncated_body_is_a_per_source_error(server, capsys, ledger):
+def test_a_truncated_body_is_a_per_source_error(server, capsys: CaptureFixture, ledger) -> None:
     rc = _main(ledger, ["--ref", "truncated"], ["--ref", "good"])
     out = capsys.readouterr()
     assert rc == drift.EXIT_ERROR
@@ -718,7 +719,7 @@ def test_a_truncated_body_is_a_per_source_error(server, capsys, ledger):
     ("plainx", "Content-Type is 'text/plainx; charset=utf-8', not text/plain"),
     ("empty", "the response body is empty"),
 ])
-def test_not_getting_the_file_is_an_error_not_drift(server, capsys, ledger, ref, marker):
+def test_not_getting_the_file_is_an_error_not_drift(server, capsys: CaptureFixture, ledger, ref, marker) -> None:
     """A sign-in page, a redirect or an empty 200 means we did not get the file."""
     rc = _main(ledger, ["--ref", ref])
     err = capsys.readouterr().err
@@ -733,8 +734,8 @@ def test_not_getting_the_file_is_an_error_not_drift(server, capsys, ledger, ref,
     (["--ref", "good"], 0, "OK [hive/haf@good]"),
 ])
 @pytest.mark.parametrize("pinned_first", [True, False])
-def test_pinned_mixed_with_other_sources_reports_the_worst(server, capsys, ledger, extra, want, label,
-                                                           pinned_first):
+def test_pinned_mixed_with_other_sources_reports_the_worst(server, capsys: CaptureFixture, ledger, extra, want, label,
+                                                           pinned_first) -> None:
     argv = (["--pinned"], extra) if pinned_first else (extra, ["--pinned"])
     rc = _main(ledger, *argv)
     out = capsys.readouterr()
@@ -743,24 +744,24 @@ def test_pinned_mixed_with_other_sources_reports_the_worst(server, capsys, ledge
     assert label in (out.out + out.err)
 
 
-def test_pinned_mixed_with_a_drifted_file_is_drift(server, tmp_path, capsys, ledger, good):
+def test_pinned_mixed_with_a_drifted_file_is_drift(server, tmp_path: Path, capsys: CaptureFixture, ledger, good) -> None:
     drifted = _file(tmp_path, good + b"x", "drifted.sql")
     assert _main(ledger, ["--pinned"], drifted) == drift.EXIT_DRIFT
     out = capsys.readouterr()
     assert f"DRIFT [{drifted}]" in out.err and f"OK [hive/haf@{PIN}]" in out.out
 
 
-def test_the_scripts_upstream_path_is_the_real_one():
+def test_the_scripts_upstream_path_is_the_real_one() -> None:
     assert drift.SHIM_PATH == UPSTREAM_PATH
 
 
-def test_content_type_is_matched_case_insensitively(server, capsys, ledger):
+def test_content_type_is_matched_case_insensitively(server, capsys: CaptureFixture, ledger) -> None:
     assert _main(ledger, ["--ref", "upper"]) == drift.EXIT_OK
     assert "OK [hive/haf@upper]" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("ref", ["drifted", "crlf", "whitespace"])
-def test_fetched_bytes_that_differ_are_drift(server, capsys, ledger, ref):
+def test_fetched_bytes_that_differ_are_drift(server, capsys: CaptureFixture, ledger, ref) -> None:
     """Through the real fetch path: the bytes served are the bytes hashed. A whitespace-only
     body is drift, not "no body" -- it is present, and it is not the file."""
     rc = _main(ledger, ["--ref", ref])
@@ -769,7 +770,7 @@ def test_fetched_bytes_that_differ_are_drift(server, capsys, ledger, ref):
     assert f"DRIFT [hive/haf@{ref}]" in out.err and "ERROR" not in out.err
 
 
-def test_a_hung_server_times_out(server, capsys, ledger, monkeypatch):
+def test_a_hung_server_times_out(server, capsys: CaptureFixture, ledger, monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(drift, "FETCH_TIMEOUT", 0.5)
     started = time.monotonic()
     rc = _main(ledger, ["--ref", "slow"])
@@ -788,7 +789,7 @@ def _closed_port():
         return s.getsockname()[1]
 
 
-def test_an_unreachable_host_fails_loudly(monkeypatch, capsys, ledger, no_proxy):
+def test_an_unreachable_host_fails_loudly(monkeypatch: MonkeyPatch, capsys: CaptureFixture, ledger, no_proxy) -> None:
     monkeypatch.setattr(drift, "RAW_BASE", f"http://127.0.0.1:{_closed_port()}")
     assert _main(ledger, ["--ref", "anything"]) == drift.EXIT_ERROR
     assert "ERROR [hive/haf@anything]: could not fetch" in capsys.readouterr().err
@@ -796,7 +797,7 @@ def test_an_unreachable_host_fails_loudly(monkeypatch, capsys, ledger, no_proxy)
 
 @pytest.mark.parametrize("pin,marker", [(PIN_REDIRECT, "redirected"), (PIN_5XX, "500"),
                                         (PIN_403, "403"), (PIN_429, "429")])
-def test_a_pinned_failure_other_than_404_is_not_drift(server, tmp_path, capsys, good, pin, marker):
+def test_a_pinned_failure_other_than_404_is_not_drift(server, tmp_path: Path, capsys: CaptureFixture, good, pin, marker) -> None:
     """Only a 404 at a fixed commit is our own bump; anything else on --pinned is the network
     or GitLab, which allow_failure (exit 2 only) must keep from blocking an MR."""
     bad = _ledger_variant(tmp_path, haf_shim_ref=pin, shim_sha256=hashlib.sha256(good).hexdigest())
@@ -806,20 +807,20 @@ def test_a_pinned_failure_other_than_404_is_not_drift(server, tmp_path, capsys, 
     assert f"ERROR [hive/haf@{pin}]" in err and marker in err and "DRIFT" not in err
 
 
-def test_an_unreachable_host_on_pinned_is_not_drift(monkeypatch, capsys, ledger, no_proxy):
+def test_an_unreachable_host_on_pinned_is_not_drift(monkeypatch: MonkeyPatch, capsys: CaptureFixture, ledger, no_proxy) -> None:
     monkeypatch.setattr(drift, "RAW_BASE", f"http://127.0.0.1:{_closed_port()}")
     assert _main(ledger, ["--pinned"]) == drift.EXIT_ERROR
     err = capsys.readouterr().err
     assert f"ERROR [hive/haf@{PIN}]: could not fetch" in err and "DRIFT" not in err
 
 
-def test_an_out_of_range_port_is_a_fetch_error(monkeypatch, capsys, ledger, no_proxy):
+def test_an_out_of_range_port_is_a_fetch_error(monkeypatch: MonkeyPatch, capsys: CaptureFixture, ledger, no_proxy) -> None:
     monkeypatch.setattr(drift, "RAW_BASE", "http://127.0.0.1:99999")
     assert _main(ledger, ["--ref", "anything"]) == drift.EXIT_ERROR
     assert "ERROR [hive/haf@anything]: could not fetch" in capsys.readouterr().err
 
 
-def test_a_value_error_from_the_fetch_is_a_labelled_fetch_error(monkeypatch, capsys, ledger, no_proxy):
+def test_a_value_error_from_the_fetch_is_a_labelled_fetch_error(monkeypatch: MonkeyPatch, capsys: CaptureFixture, ledger, no_proxy) -> None:
     """A URL with no scheme makes urllib raise a genuine ValueError ("unknown url type")."""
     monkeypatch.setattr(drift, "RAW_BASE", "gitlab.invalid/no-scheme")
     assert _main(ledger, ["--ref", "anything"]) == drift.EXIT_ERROR
@@ -838,7 +839,7 @@ def _ci():
     return yaml.safe_load((ROOT / ".gitlab-ci.yml").read_text(encoding="utf-8"))
 
 
-def _exact_script(job, command):
+def _exact_script(job, command) -> None:
     """The whole script is the one command: nothing can swallow its exit code (no `||`,
     `; true`, `set +e`, `exit 0`) and nothing runs before or after it -- including a
     file-wide `default:` or legacy top-level before_script/after_script, which every job
@@ -863,12 +864,12 @@ PIN_JOB_KEYS = {"stage", "image", "allow_failure", "timeout", "script", "rules"}
 DEVELOP_JOB_KEYS = {"stage", "image", "interruptible", "timeout", "retry", "script", "rules"}
 
 
-def _check_common(ci, job):
+def _check_common(ci, job) -> None:
     assert job["stage"] in ci["stages"], "a stage that does not exist makes the pipeline invalid"
-    assert job["image"] == "python:3.11-slim", "the Python the rest of CI and the image run"
+    assert job["image"] == "python:3.14-slim", "the Python the rest of CI and the image run"
 
 
-def _check_pin_job(ci):
+def _check_pin_job(ci) -> None:
     job = ci["haf-shim-drift"]
     assert set(job) == PIN_JOB_KEYS, f"haf-shim-drift keys changed: {sorted(set(job) ^ PIN_JOB_KEYS)}"
     # A pinned commit cannot change upstream, so drift (1) is our own bad bump and must
@@ -881,7 +882,7 @@ def _check_pin_job(ci):
     assert job["rules"] is ci[".standard-rules"], "MR and default-branch pipelines, like every lane"
 
 
-def _check_develop_job(ci):
+def _check_develop_job(ci) -> None:
     job = ci["haf-shim-drift-develop"]
     assert set(job) == DEVELOP_JOB_KEYS, (
         f"haf-shim-drift-develop keys changed: {sorted(set(job) ^ DEVELOP_JOB_KEYS)}")
@@ -901,7 +902,7 @@ def _check_develop_job(ci):
     {"before_script": ["true"]},
     {"when": "manual"},
 ])
-def test_a_job_cannot_be_changed_through_a_key_nobody_checks(job, check, smuggled):
+def test_a_job_cannot_be_changed_through_a_key_nobody_checks(job, check, smuggled) -> None:
     """The review's case: `.drift-base: {allow_failure: true}` plus `extends:` turned the
     develop job orange while every assertion on its own keys stayed green."""
     ci = _ci()
@@ -911,11 +912,11 @@ def test_a_job_cannot_be_changed_through_a_key_nobody_checks(job, check, smuggle
         globals()[check](ci)
 
 
-def test_the_pin_job_checks_the_pin_only_and_blocks_only_on_drift():
+def test_the_pin_job_checks_the_pin_only_and_blocks_only_on_drift() -> None:
     _check_pin_job(_ci())
 
 
-def test_the_develop_job_runs_on_the_schedule_only_and_fails_red():
+def test_the_develop_job_runs_on_the_schedule_only_and_fails_red() -> None:
     from .test_registry_resolution_lane import (
         _mr_pipeline, _outcome_of, _push_pipeline, _running, _schedule_pipeline,
     )

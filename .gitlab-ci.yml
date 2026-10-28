@@ -80,9 +80,11 @@ shell-lint:
   rules: *standard_rules
 
 python-lint:
-  extends: .python-cache
+  extends: [.python-cache, .python-test-tools-image]
   stage: lint
-  image: python:3.11-slim
+  # The Python the python test jobs and the image run. The image has a ruff and a mypy of
+  # its own; the pinned ones below are installed over them.
+  image: ${PYTHON_TEST_TOOLS_IMAGE}
   script:
     # ruff is pinned: an unpinned `pip install ruff` is non-deterministic — a
     # drifting build silently widens the enforced ruleset and fails on unchanged
@@ -94,14 +96,14 @@ python-lint:
     # dependencies: ast-serialize and librt are compiled parts of mypy 2.x that move on
     # their own (ast-serialize 0.13.0 -> 0.13.1 on 2026-10-17), so pinning mypy alone
     # would not hold its behaviour still. These are the versions pip resolved for this
-    # job on python:3.11-slim on 2026-10-21. Left floating: cryptography/cffi/pycparser
-    # and types-cffi/types-setuptools, which types-redis drags in and our code never
-    # touches.
+    # job on python:3.11-slim on 2026-10-21; each has a wheel for the image's Python 3.14.
+    # Left floating: cryptography/cffi/pycparser and types-cffi/types-setuptools, which
+    # types-redis drags in and our code never touches.
     #
     # What this mypy step checks: requirements.txt is NOT installed, so with
     # --ignore-missing-imports every third-party import except redis (fastapi,
     # starlette, pydantic, slowapi, limits, anyio, psycopg2, pandas, numpy, pgvector,
-    # coincurve, base58) is Any and unchecked. It is a self-consistency pass over
+    # wax) is Any and unchecked. It is a self-consistency pass over
     # our own annotations, not type coverage of the framework code. The redis types come
     # from types-redis 4.6, which predates requirements.txt's redis>=5.0; the redis it
     # resolves today (8.x) ships its own py.typed, so once requirements.txt is installed
@@ -352,7 +354,7 @@ openapi-drift:
 # main shell, not in a $(...) substitution, so its exit code is what the runner sees.
 haf-shim-drift:
   stage: lint
-  image: python:3.11-slim
+  image: python:3.14-slim
   allow_failure:
     exit_codes: [2]
   # One fetch with a 30s timeout; without this a hung job would hold a runner for the
@@ -364,7 +366,7 @@ haf-shim-drift:
 
 haf-shim-drift-develop:
   stage: lint
-  image: python:3.11-slim
+  image: python:3.14-slim
   # NOT interruptible, as registry-resolution: auto-cancel-redundant-pipelines would otherwise
   # let a push to develop just after the cron tick cancel the check -- no answer, no red.
   interruptible: false
@@ -393,22 +395,18 @@ haf-shim-drift-develop:
 # pipeline-wide `variables:` and `default:` with it, which tests/unit/test_install_lane.py
 # forbids and .aidev/ci_job.py does not model. `develop` is the moving tag
 # common-ci-configuration republishes, so these jobs follow a tool bump there on their next
-# pipeline. Override PYTHON_TEST_TOOLS_TAG only for a deliberate exception, and to a tag
-# that is also a ref of that repository (a commit SHA): .python-test-tools-pins reads its
-# docker-bake.hcl at it.
+# pipeline. Override PYTHON_TEST_TOOLS_TAG only for a deliberate exception.
 .python-test-tools-image:
   variables:
     PYTHON_TEST_TOOLS_TAG: "develop"
     PYTHON_TEST_TOOLS_IMAGE: "registry.gitlab.syncad.com/hive/common-ci-configuration/python-test-tools:${PYTHON_TEST_TOOLS_TAG}"
 
-# The python jobs cannot run in that image: it is Python 3.14 with no compiler, and
-# coincurve (requirements.txt) publishes no 3.14 wheel, so `pip install -r
-# requirements.txt` fails there building it. They stay on the Python the python image
-# runs (Dockerfile.python) and take the image's versions instead:
-# scripts/python_test_tools_pins.py prints them, from common-ci-configuration's
-# docker-bake.hcl at PYTHON_TEST_TOOLS_TAG, and every `pip install` the job runs is held
-# to them (`-c`) -- requirements.txt included, so nothing it pulls in can move pytest or
-# tavern: a requirement that would is a resolution error naming both.
+# The python jobs run in that image, on its Python 3.14, the Python the python image runs
+# (Dockerfile.python, python:3.14-slim). They install requirements.txt
+# and what they add into its environment, next to its pytest and tavern, held to the versions
+# it has (`-c`): scripts/python_test_tools_pins.py prints them, so nothing requirements.txt
+# pulls in can move pytest or tavern -- a requirement that would is a resolution error naming
+# both.
 .python-test-tools-pins:
   extends: .python-test-tools-image
   before_script:
@@ -417,7 +415,7 @@ haf-shim-drift-develop:
 python-tests:
   extends: [.python-cache, .python-test-tools-pins]
   stage: test
-  image: python:3.11-slim
+  image: ${PYTHON_TEST_TOOLS_IMAGE}
   script:
     # httpx: required by starlette.testclient, which tests/unit/test_ratelimit_key.py
     # uses to assert rate-limit bucketing end-to-end through slowapi. Test-only, so
@@ -426,26 +424,21 @@ python-tests:
     # module FAILS rather than skips when it is missing under CI, for the same reason
     # the bash harness does -- a silent skip would put the compose file, and the
     # profile that keeps the destructive teardown from running on `up`, back to
-    # uncovered.
-    # git: tests/unit/test_openapi_drift_gate.py drives the openapi-drift job's real
-    # drift check against throwaway repositories, so it needs a real git -- the whole
-    # point is that the gate's pass/fail is exercised rather than paraphrased.
-    # python:3.11-slim does not ship one. That module FAILS rather than skips when git
-    # is missing under CI, for the same reason the bash harness does: a silent skip
-    # would put the gate itself back to uncovered.
-    # curl and jq: tests/unit/test_check_pinned_images.py runs the registry check against a
-    # local fake registry, with the same tools the registry-resolution job installs.
+    # uncovered. The image has it (tavern needs it); named so that stays true.
+    # The image also has the git tests/unit/test_openapi_drift_gate.py drives the
+    # openapi-drift job's real drift check with, and the curl and jq
+    # tests/unit/test_check_pinned_images.py runs the registry check with. Both modules
+    # FAIL rather than skip when a tool is missing under CI.
     # pytest-cov and httpx have no version in common-ci-configuration yet, so they are not
     # held to one: common-ci-configuration#52 adds them.
-    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl jq >/dev/null
-    - pip install -c /tmp/python-test-tools.txt -r requirements.txt pytest pytest-cov httpx pyyaml -q
+    - pip install -c /tmp/python-test-tools.txt -r requirements.txt pytest-cov httpx pyyaml -q
     - PYTHONPATH=. pytest tests/unit/ -v -rfEs --cov=haf_fyp --cov-report=term-missing --cov-fail-under=40
   rules: *standard_rules
 
 fastapi-tests:
   extends: [.python-cache, .python-test-tools-pins]
   stage: test
-  image: python:3.11-slim
+  image: ${PYTHON_TEST_TOOLS_IMAGE}
   services:
     - name: postgres:14-alpine
       alias: haf
@@ -484,8 +477,8 @@ fastapi-tests:
     # switching the bind to `::`.
     TRUSTED_PROXY_IPS: "127.0.0.1,::1"
   script:
-    # tavern: the FastAPI tavern file below. Test-only, so not in requirements.txt.
-    - pip install -c /tmp/python-test-tools.txt -r requirements.txt pytest tavern -q
+    # pytest and tavern, for the FastAPI tavern file below, are the image's.
+    - pip install -c /tmp/python-test-tools.txt -r requirements.txt -q
     - sleep 5
     - |
       python3 -c "

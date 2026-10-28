@@ -149,11 +149,11 @@ Bring the stack up fresh for each run: the lanes expect empty databases.
 The checks run in a container with your uid, built from `runtime/Dockerfile` and
 `requirements.txt` (`environment.inputs`) on common-ci-configuration's `python-test-tools`
 (`.gitlab-ci.yml`'s `PYTHON_TEST_TOOLS_IMAGE`, the tavern container's image), whose
-`/python_venv` is left as it is, with git, curl, jq and psql 18 from it. Beside it,
-python:3.11-slim's interpreter (the python jobs' image) carries the python jobs'
-environment in `/opt/python-tests`, first on PATH: `requirements.txt` and
+`/python_venv` is left as it is, with git, curl, jq and psql 18 from it. The python jobs
+run in that image in CI, so its Python 3.14 is theirs, and beside `/python_venv` it carries
+the python jobs' environment in `/opt/python-tests`, first on PATH: `requirements.txt` and
 `pytest`/`pytest-cov`/`httpx`/`pyyaml`/`tavern`, pytest and tavern at `/python_venv`'s
-versions, as CI holds them to common-ci-configuration's; the lint tools in `/opt/lint`
+versions, as CI holds what it installs to them; the lint tools in `/opt/lint`
 (requirements.txt deliberately not there, as in `python-lint`); and the openapi generator
 and validator in `/opt/openapi`. Then ShellCheck 0.11.0, hadolint 2.12.0, the docker CLI
 with compose (for `config` only), PostgREST 12.2.3, and `install_with_app_lock.py` and

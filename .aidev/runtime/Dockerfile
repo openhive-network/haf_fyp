@@ -7,14 +7,15 @@
 #   common-ci-configuration's python-test-tools (docker-compose-ci.yml's tavern
 #     container): Python 3.14 with pytest, tavern and the other tools in /python_venv,
 #     left as the image has them, and git, curl, jq, bash and psql 18 (PGDG; the install
-#     lanes' verify client is postgres:18-alpine)
-#   /opt/python3.11  the interpreter of python:3.11-slim (the python jobs' image), off
-#                    PATH, for the three environments below
+#     lanes' verify client is postgres:18-alpine). Its Python 3.14 is the python jobs'
+#     (they run in this image) and the one the three environments below are made from
 #   /opt/python-tests  python-tests' and fastapi-tests' environment, first on PATH:
 #                    requirements.txt + pytest, pytest-cov, httpx, pyyaml (python-tests)
 #                    and tavern (fastapi-tests), with pytest and tavern held to the
-#                    versions /python_venv has, as those jobs hold them to
-#                    common-ci-configuration's (scripts/python_test_tools_pins.py)
+#                    versions /python_venv has, as those jobs hold what they install
+#                    to them (scripts/python_test_tools_pins.py). Beside /python_venv
+#                    rather than in it, so the tavern container's environment stays the
+#                    image's
 #   /opt/lint        ruff + mypy and their pinned set (python-lint; requirements.txt is
 #                    deliberately NOT installed there, as in CI) and sqlfluff 3.3.0 (sql-lint)
 #   /opt/openapi     openapi_rewrite.sh's deepmerge/jsonpointer/pyyaml and
@@ -29,7 +30,7 @@
 #   Dockerfile.sql is built FROM (common-ci-configuration/psql:14-3): in that image
 #   scripts/install_app.sh takes HAF's install lock through it, and the install lanes
 #   check that it does. It is not at /usr/local/bin, where the unit tests (CI's
-#   python:3.11-slim has no wrapper) would find it; .aidev/compose-lanes.yaml points
+#   python-test-tools has no wrapper) would find it; .aidev/compose-lanes.yaml points
 #   the lanes' Dockerfile.sql services at it. psycopg2 comes from requirements.txt.
 #   /opt/psql-image/usr/local/bin/haf_app_driver.py, from the same image: the HAF
 #   block-processing driver scripts/process_blocks.sh execs there. Off PATH for the
@@ -44,7 +45,6 @@ FROM hadolint/hadolint:v2.12.0@sha256:30a8fd2e785ab6176eed53f74769e04f125afb2f74
 FROM docker:24-cli@sha256:2b62f89aaab9e4df0ff843f0d9a7bbd17340a9ba7c660ba6f40b1f00b38c2a4d AS docker
 FROM postgrest/postgrest:v12.2.3@sha256:729bf65c733b73f5b52777f0e4b853f22ed73aa67a22d38269d289779b0a8401 AS postgrest
 FROM registry.gitlab.syncad.com/hive/common-ci-configuration/psql:14-3@sha256:6a3794d9fdc4e0590789fc01e48539bcd73273715e3b69dd1f45d3ecde8b1cde AS psql
-FROM python:3.11-slim@sha256:b7a9e5f6a93d6d4a31f129bbd4bdee69efccb6ded0fb230d78aafaf37af98377 AS python311
 
 FROM registry.gitlab.syncad.com/hive/common-ci-configuration/python-test-tools:develop@sha256:6c8fd2223bb119ab10c6354349472b58e60a530ef4e13530671eac0237aa7080
 
@@ -55,26 +55,26 @@ COPY --from=docker /usr/local/libexec/docker/cli-plugins/docker-compose /usr/loc
 COPY --from=postgrest /bin/postgrest /usr/local/bin/postgrest
 COPY --from=psql /usr/local/bin/install_with_app_lock.py /opt/psql-image/usr/local/bin/install_with_app_lock.py
 COPY --from=psql /usr/local/bin/haf_app_driver.py /opt/psql-image/usr/local/bin/haf_app_driver.py
-# Relocatable: the interpreter finds libpython3.11 and its stdlib relative to itself.
-COPY --from=python311 /usr/local/bin/ /opt/python3.11/bin/
-COPY --from=python311 /usr/local/lib/ /opt/python3.11/lib/
 
 COPY requirements.txt /tmp/requirements.txt
 # The constraints are the TOOLS of scripts/python_test_tools_pins.py (not in the build
 # context), at /python_venv's versions; .aidev/stack_pins.py compares the two environments.
+# wax is imported once as root: its first import makes the module symlinks its wheel cannot
+# carry, in site-packages, which the checks (run as the caller's uid) cannot write.
 RUN /python_venv/bin/pip freeze | grep -iE '^(pytest|pytest-xdist|pytest-timeout|tavern)==' \
         > /tmp/python-test-tools.txt \
-    && /opt/python3.11/bin/python3.11 -m venv /opt/python-tests \
+    && /usr/bin/python3.14 -m venv /opt/python-tests \
     && /opt/python-tests/bin/pip install --no-cache-dir -q -c /tmp/python-test-tools.txt \
         -r /tmp/requirements.txt pytest pytest-cov httpx pyyaml tavern \
+    && /opt/python-tests/bin/python -c "import wax" \
     && rm /tmp/requirements.txt /tmp/python-test-tools.txt \
-    && /opt/python3.11/bin/python3.11 -m venv /opt/lint \
+    && /usr/bin/python3.14 -m venv /opt/lint \
     && /opt/lint/bin/pip install --no-cache-dir -q ruff==0.15.12 \
         mypy==2.4.0 ast-serialize==0.13.1 librt==0.16.0 pathspec==1.1.1 \
         typing_extensions==4.16.0 mypy_extensions==1.1.0 \
         types-redis==4.6.0.20241004 types-pyOpenSSL==24.1.0.20240722 \
         sqlfluff==3.3.0 \
-    && /opt/python3.11/bin/python3.11 -m venv /opt/openapi \
+    && /usr/bin/python3.14 -m venv /opt/openapi \
     && /opt/openapi/bin/pip install --no-cache-dir -q deepmerge jsonpointer pyyaml openapi-spec-validator==0.9.0 \
     && curl -fsSL https://gitlab.syncad.com/hive/common-ci-configuration/-/raw/96889a650b3f45244cecc4bb3f250af439a71900/haf-app-tools/python/process_openapi.py \
         -o /opt/openapi/process_openapi.py \

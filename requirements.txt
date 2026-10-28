@@ -23,5 +23,8 @@ limits>=3.0,<6
 # major bump is free to move.
 anyio>=4.0,<5
 
-coincurve>=19.0
-base58>=2.1
+# Recovers the signer's key in auth.recover_pubkey. Exact, as hive's own consumers pin
+# it (clive): auth.py calls wax.cython_modules_crypto and reads its python_result, a
+# surface wax does not version, and an image rebuild must not pick up a new one.
+# 2.0.1 is the latest release on PyPI and ships cp312/cp314 wheels.
+hiveio-wax==2.0.1
