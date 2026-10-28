@@ -1608,13 +1608,17 @@ API_URL=http://localhost:3000 tavern-ci tests/tavern/test_endpoints.tavern.yaml
 
 pytest and tavern are not in `requirements.txt`. CI takes them from
 common-ci-configuration, which defines their versions once for every hive repo: the tavern
-container runs in its `python-test-tools` image, and the python jobs install them held to
-its versions (`scripts/python_test_tools_pins.py`, `.gitlab-ci.yml`'s
-`.python-test-tools-pins`). To match CI locally:
+container and the python jobs run in its `python-test-tools` image (Python 3.14), and the
+python jobs install `requirements.txt` next to its tools, held to its versions
+(`scripts/python_test_tools_pins.py`, `.gitlab-ci.yml`'s `.python-test-tools-pins`). To
+match CI locally:
 
 ```bash
-PYTHON_TEST_TOOLS_TAG=develop python3 scripts/python_test_tools_pins.py > /tmp/python-test-tools.txt
-pip install -c /tmp/python-test-tools.txt -r requirements.txt pytest tavern
+docker run --rm -it -v "$PWD:/w" -w /w \
+    registry.gitlab.syncad.com/hive/common-ci-configuration/python-test-tools:develop bash
+# then, inside it:
+python3 scripts/python_test_tools_pins.py > /tmp/python-test-tools.txt
+pip install -c /tmp/python-test-tools.txt -r requirements.txt pytest-cov httpx
 ```
 
 ### The install lanes

@@ -373,8 +373,8 @@ for s in "$@"; do
         openapi-drift)
             step openapi-drift job openapi-drift --path /opt/openapi/bin --copy-tree \
                 --env COMMON_CI_OFFLINE=1 --seed /opt/openapi/process_openapi.py=scripts/process_openapi.py ;;
-        # The python jobs' pytest/tavern pins come from the runtime's base image, offline,
-        # rather than from common-ci-configuration over the network
+        # The python jobs run in /opt/python-tests here, not in the base image's /python_venv
+        # as in CI, so their pytest/tavern pins are read from the latter
         # (scripts/python_test_tools_pins.py).
         unit) step unit job python-tests --coverage-xml "$out/coverage.xml" --env "COVERAGE_FILE=$PWD/$out/.coverage" \
                 --env PYTHON_TEST_TOOLS_PYTHON=/python_venv/bin/python3 ;;
