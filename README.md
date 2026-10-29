@@ -253,7 +253,7 @@ own sync takes.
 |-------|---------|
 | `state` | `waiting_for_hivemind` until block processing has backfilled the window, then `following_hivemind`; `unknown` when the installed SQL predates it |
 | `history_days` | the window, `FYP_HISTORY_DAYS` |
-| `hivemind_block`, `hivemind_behind_head` | where hivemind is, and how far behind the irreversible head; `null` when it is absent or unreadable to haf_fyp |
+| `hivemind_block`, `hivemind_behind_head` | where hivemind is, and how far behind the irreversible head; `null` when it is absent or unreadable to haf_fyp. On a node `hivemind_behind_head` is always `null` here: `/metrics` reads as `haf_fyp_user`, which may not ask HAF for the head (block processing, as `haf_fyp_owner`, does) |
 | `followed_through_block`, `behind_hivemind_blocks` | where the copy is current to, and how far it trails hivemind. A few batches is normal (the dependency gate); growing without end means the copy stopped |
 | `backfill_seconds` | how long the backfill took |
 | `live_to_backfilled_seconds` | from the first batch that found hivemind live to the end of the backfill: a fresh install's time from hivemind live to having a window to rank. The ranker's next cycle turns it into feeds |

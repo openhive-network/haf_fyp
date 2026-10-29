@@ -706,6 +706,15 @@ def test_an_unknown_head_does_not_hold_the_backfill_back(conn: connection) -> No
         assert state(cur)["backfilled"] is True
 
 
+def test_an_unknown_hivemind_block_is_not_reported_as_caught_up(conn: connection) -> None:
+    """The other half of #109's second bug: with the head known but hivemind's block not
+    (hive_state has no row), behind_head is unknown too, not 0."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM hivemind_app.hive_state")
+        cur.execute("SELECT * FROM haf_fyp_app.hivemind_reach()")
+        assert cur.fetchone() == (None, None, True)
+
+
 def _report_module() -> ModuleType:
     spec = importlib.util.spec_from_file_location(
         "processor_timings_report", os.path.join(ROOT, "scripts", "processor_timings_report.py"))
