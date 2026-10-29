@@ -689,7 +689,9 @@ accounts whose read earns a lane slot, and only then, with what the cycle has le
 readers that have not voted on or reblogged a tracked post within that many days and
 hold no interests. Reading other accounts' feeds therefore cannot slow the rotation for
 the accounts that earn a slot, and a real reader who has stopped voting is still ranked
-when the cycle has room.
+when the cycle has room. While accounts that earn a slot fill every cycle (a flood of
+reads for accounts that vote can do that), such a reader is not ranked at all, and is
+served the feed it last got for as long as that lasts.
 
 The SQL and the ranker image of this change go together: the ranker writes a compact
 `feed_cache` row (smallint `rank`, labels as codes into `feed_cache_labels`). A ranker
@@ -872,7 +874,8 @@ node that changed either setting, do not apply the rules above to those three: w
 shorter window they count accounts the ranker no longer treats as readers, and read as
 trouble when there is none. The same goes for `READER_ACTIVE_WITHIN_DAYS`: with it set,
 the three still count every recorded read, including those that earned no slot, whose
-feeds age at rotation speed. Read the ranker's two cycle lines instead, which give the
+feeds are ranked only with what each cycle leaves, so `rotation_age_seconds` can rise
+without bound on a healthy node. Read the ranker's two cycle lines instead, which give the
 lane it took and how many reads earned nothing.
 
 `state` is `ok`, `unsupported` (the installed SQL has no `last_read_at`: re-run the

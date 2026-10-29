@@ -877,7 +877,10 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
     read session is open (#104): write_feed_cache would refuse it, and the slot is
     better spent; it sorts where it was once the session ends. The round-robin argument below
     therefore holds for the remainder, over that set, at a rate reduced by the share
-    actually used.
+    actually used -- with the read filter on, over the accounts that earn a slot only.
+    The others are reached only in cycles those leave room in, and while they fill
+    every cycle (a flood of forged reads for accounts that vote does), not at all: the
+    price of keeping a flood from slowing the accounts that earn one.
 
     The remainder stays a single ORDER BY on purpose. #10 considered reserving a share of
     each cycle for never-interacted opt-ins, but the ordering above is ALREADY a
