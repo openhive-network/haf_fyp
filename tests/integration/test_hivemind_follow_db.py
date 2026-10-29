@@ -670,6 +670,53 @@ def test_history_status_and_sync_status_report_waiting_then_following(conn: conn
         assert cur.fetchone() == ("following_hivemind", 1000, True, True)
 
 
+def test_history_status_answers_a_role_without_usage_on_hive(conn: connection) -> None:
+    """GET /metrics calls history_status() as haf_fyp_user, which has no USAGE on HAF's
+    hive schema on a node. The head is then unknown, not an error: to_regprocedure()
+    raised `permission denied for schema hive` there, and /metrics reported the
+    history as unknown (#109)."""
+    with conn.cursor() as cur:
+        hm = Hivemind(cur)
+        seed_window(hm)
+        batch(cur, 1, 100)
+        cur.execute("CREATE ROLE ci_metrics_reader NOLOGIN")
+        cur.execute("GRANT USAGE ON SCHEMA haf_fyp_app, hivemind_app TO ci_metrics_reader")
+        cur.execute("GRANT SELECT ON ALL TABLES IN SCHEMA haf_fyp_app, hivemind_app TO ci_metrics_reader")
+        cur.execute("SET LOCAL ROLE ci_metrics_reader")
+        cur.execute("SELECT has_schema_privilege('hive', 'USAGE')")
+        assert not cur.fetchone()[0], "the role can see into hive; the test proves nothing"
+        cur.execute("SELECT * FROM haf_fyp_app.hivemind_reach()")
+        assert cur.fetchone() == (1000, None, True)
+        cur.execute("SELECT state, hivemind_block, hivemind_behind_head, followed_through_block "
+                    "FROM haf_fyp_app.history_status()")
+        assert cur.fetchone() == ("following_hivemind", 1000, None, 1000)
+
+
+def test_an_unknown_head_does_not_hold_the_backfill_back(conn: connection) -> None:
+    """hivemind_reach() reports a head it cannot ask for as unknown (NULL), not as 0
+    blocks behind (#109). Block processing keeps deciding as it did when that read 0:
+    an unknown head does not keep the backfill waiting."""
+    with conn.cursor() as cur:
+        hm = Hivemind(cur)
+        seed_window(hm)
+        cur.execute("DROP FUNCTION hive.app_get_irreversible_block()")
+        cur.execute("SELECT behind_head FROM haf_fyp_app.hivemind_reach()")
+        assert cur.fetchone() == (None,)
+        batch(cur, 1, 100)
+        assert state(cur)["backfilled"] is True
+
+
+def test_an_unknown_hivemind_block_is_not_reported_as_caught_up(conn: connection) -> None:
+    """The other half of #109's second bug: with the head known but hivemind's block not
+    (hive_state has no row), behind_head is unknown too, not 0."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT hive.app_get_irreversible_block()")
+        assert cur.fetchone() == (1000,), "the head is unknown too; the test proves nothing"
+        cur.execute("DELETE FROM hivemind_app.hive_state")
+        cur.execute("SELECT * FROM haf_fyp_app.hivemind_reach()")
+        assert cur.fetchone() == (None, None, True)
+
+
 def _report_module() -> ModuleType:
     spec = importlib.util.spec_from_file_location(
         "processor_timings_report", os.path.join(ROOT, "scripts", "processor_timings_report.py"))
