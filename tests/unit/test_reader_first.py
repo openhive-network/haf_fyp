@@ -224,8 +224,9 @@ def test_readers_come_first_and_the_rest_fills_the_cycle(monkeypatch: MonkeyPatc
     assert reader_call.args[1] == (3600, 77, 30, 30, 5), "readers may take at most the share"
     # The remainder excludes the readers already taken and fills what is left of the
     # cycle, so two readers leave eight slots, not five; it reaches back over the
-    # feed-retention window (#98), not the reader window.
-    assert rest_call.args[1] == (["r1", "r2"], rd.FEED_CACHE_UNREAD_RETENTION_DAYS, 8)
+    # feed-retention window (#98), not the reader window, and applies the same read
+    # filter as the lane (#84).
+    assert rest_call.args[1] == (["r1", "r2"], rd.FEED_CACHE_UNREAD_RETENTION_DAYS, 30, 30, 8)
     assert "last_read_at" in reader_call.args[0]
 
 
@@ -236,7 +237,8 @@ def test_a_share_of_zero_turns_the_reader_lane_off(monkeypatch: MonkeyPatch) -> 
     assert rd._fetch_personalised_users(conn, 10) == ["s1"]
 
     (only_call,) = cur.execute.call_args_list
-    assert only_call.args[1] == ([], rd.FEED_CACHE_UNREAD_RETENTION_DAYS, 10)
+    assert only_call.args[1] == ([], rd.FEED_CACHE_UNREAD_RETENTION_DAYS, rd._read_filter_days,
+                                 rd._read_filter_days, 10)
 
 
 def test_a_schema_without_the_read_column_is_never_asked_for_readers(monkeypatch: MonkeyPatch) -> None:
@@ -328,10 +330,23 @@ def test_the_remainder_takes_only_accounts_that_read_or_opted_in() -> None:
 
     rest = _sql(cur.execute.call_args_list[-1])
     assert (
-        "AND (au.last_read_at >= (NOW() AT TIME ZONE 'utc') - make_interval(days => %s) "
+        "AND ((au.last_read_at >= (NOW() AT TIME ZONE 'utc') - make_interval(days => %s) "
+        f"AND {' '.join(rd._READ_EARNS_SQL.split())}) "
         "OR EXISTS (SELECT 1 FROM haf_fyp_app.user_interests ui "
         "WHERE ui.username = au.username))" in rest
     )
+
+
+def test_the_remainder_applies_the_read_filter_it_is_given(monkeypatch: MonkeyPatch) -> None:
+    # #84: with the filter on, a read buys a place in the remainder only if it earns a
+    # lane slot. The filter's days go in after the retention window.
+    monkeypatch.setattr(rd, "_read_filter_days", 30)
+    monkeypatch.setattr(rd, "FEED_CACHE_UNREAD_RETENTION_DAYS", 30)
+    conn, cur = _mock_conn([[], []])
+
+    rd._fetch_personalised_users(conn, 10)
+
+    assert cur.execute.call_args_list[-1].args[1][1:4] == (30, 30, 30)
 
 
 def test_the_reader_lane_takes_the_stalest_feed_first() -> None:

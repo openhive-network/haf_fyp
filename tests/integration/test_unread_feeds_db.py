@@ -197,6 +197,27 @@ def test_with_the_reader_lane_on_a_cycle_still_takes_no_one_else(conn: Connectio
     assert (rd._lane_taken, rd._lane_slots) == (1, 5)
 
 
+@pytest.mark.parametrize("filter_days", [30, 0])
+def test_with_the_read_filter_a_read_that_earns_nothing_buys_no_place_in_the_rotation(
+        conn: Connection, monkeypatch: pytest.MonkeyPatch, filter_days: int) -> None:
+    """#84: a read for an account that has not voted or reblogged within
+    READER_ACTIVE_WITHIN_DAYS, and holds no interests, does not put it in the rotation's
+    remainder, which since #98 is how a read keeps an account ranked. Off, every read
+    counts, as before."""
+    monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.0)  # the rotation lane alone
+    monkeypatch.setattr(rd, "_read_filter_days", filter_days)
+    _account(conn, "forged", read="3 days", scored="9 hours", interacted="300 days")
+    _account(conn, "no_votes", read="3 days", scored="8 hours", interacted=None)
+    _account(conn, "active", read="3 days", scored="7 hours", interacted="1 day")
+    _account(conn, "picker", read="3 days", scored="6 hours", interacted="300 days", interests=True)
+    _account(conn, "opt_in", scored="5 hours", interacted=None, interests=True)
+
+    picked = rd._fetch_personalised_users(conn, 50)
+
+    earned = ["active", "picker", "opt_in"]
+    assert picked == (earned if filter_days else ["forged", "no_votes", *earned])
+
+
 # --------------------------------------------------------------------------
 # drop_unread_feeds: what goes
 # --------------------------------------------------------------------------
