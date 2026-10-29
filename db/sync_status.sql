@@ -82,10 +82,16 @@ BEGIN
 
     EXECUTE 'SELECT last_completed_block_num FROM hivemind_app.hive_state LIMIT 1' INTO _block;
     -- The head is HAF's to tell, and a role outside its application groups may not ask:
-    -- then behind_head is unknown rather than an error.
-    IF to_regprocedure('hive.app_get_irreversible_block()') IS NOT NULL THEN
-        IF has_function_privilege('hive.app_get_irreversible_block()', 'EXECUTE') THEN
-            EXECUTE 'SELECT hive.app_get_irreversible_block()' INTO _head;
+    -- then behind_head is unknown rather than an error. The schema is asked first, for
+    -- the reason above: to_regprocedure() also raises for a role without USAGE on hive,
+    -- which haf_fyp_user is when GET /metrics calls history_status() (#109).
+    IF to_regnamespace('hive') IS NOT NULL THEN
+        IF has_schema_privilege('hive', 'USAGE') THEN
+            IF to_regprocedure('hive.app_get_irreversible_block()') IS NOT NULL THEN
+                IF has_function_privilege('hive.app_get_irreversible_block()', 'EXECUTE') THEN
+                    EXECUTE 'SELECT hive.app_get_irreversible_block()' INTO _head;
+                END IF;
+            END IF;
         END IF;
     END IF;
 
@@ -104,7 +110,11 @@ BEGIN
           AND i.indisvalid
     );
 
-    RETURN QUERY SELECT _block, greatest(_head - _block, 0), _indexed;
+    -- CASE, not greatest() alone: greatest() skips a NULL, so an unknown head read as 0
+    -- blocks behind -- "caught up" -- instead of unknown.
+    RETURN QUERY SELECT _block,
+        CASE WHEN _head IS NULL OR _block IS NULL THEN NULL ELSE greatest(_head - _block, 0) END,
+        _indexed;
 END;
 $$;
 
