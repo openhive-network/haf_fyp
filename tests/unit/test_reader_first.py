@@ -214,19 +214,19 @@ def test_readers_come_first_and_the_rest_fills_the_cycle(monkeypatch: MonkeyPatc
     monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.5)
     monkeypatch.setattr(rd, "READER_WINDOW_SECONDS", 3600)
     monkeypatch.setattr(rd, "READ_REFRESH_MIN_AGE_SECONDS", 77)
-    monkeypatch.setattr(rd, "_read_filter_days", 30)
+    monkeypatch.setattr(rd, "_read_filter_days", 7)
     conn, cur = _mock_conn([[("r1",), ("r2",)], [("s1",), ("s2",), ("s3",)]])
 
     assert rd._fetch_personalised_users(conn, 10) == ["r1", "r2", "s1", "s2", "s3"]
 
     reader_call, rest_call = cur.execute.call_args_list
     # (window, min age, the filter's days twice, slots)
-    assert reader_call.args[1] == (3600, 77, 30, 30, 5), "readers may take at most the share"
+    assert reader_call.args[1] == (3600, 77, 7, 7, 5), "readers may take at most the share"
     # The remainder excludes the readers already taken and fills what is left of the
     # cycle, so two readers leave eight slots, not five; it reaches back over the
-    # feed-retention window (#98), not the reader window, and applies the same read
-    # filter as the lane (#84).
-    assert rest_call.args[1] == (["r1", "r2"], rd.FEED_CACHE_UNREAD_RETENTION_DAYS, 30, 30, 8)
+    # feed-retention window (#98), not the reader window, and orders by the lane's
+    # read filter (#84).
+    assert rest_call.args[1] == (["r1", "r2"], rd.FEED_CACHE_UNREAD_RETENTION_DAYS, 7, 7, 8)
     assert "last_read_at" in reader_call.args[0]
 
 
@@ -314,8 +314,10 @@ def test_the_remainder_keeps_the_rotation_order() -> None:
 
     rd._fetch_personalised_users(conn, 10)
 
+    # #84: the accounts whose read earns a slot first, then the rotation's own order.
     assert (
-        "ORDER BY last_scored_at ASC NULLS FIRST, last_interaction_at DESC NULLS LAST"
+        f"ORDER BY {' '.join(rd._READ_EARNS_SQL.split())} DESC, "
+        "last_scored_at ASC NULLS FIRST, last_interaction_at DESC NULLS LAST"
         in _sql(cur.execute.call_args_list[-1])
     )
 
@@ -330,23 +332,22 @@ def test_the_remainder_takes_only_accounts_that_read_or_opted_in() -> None:
 
     rest = _sql(cur.execute.call_args_list[-1])
     assert (
-        "AND ((au.last_read_at >= (NOW() AT TIME ZONE 'utc') - make_interval(days => %s) "
-        f"AND {' '.join(rd._READ_EARNS_SQL.split())}) "
+        "AND (au.last_read_at >= (NOW() AT TIME ZONE 'utc') - make_interval(days => %s) "
         "OR EXISTS (SELECT 1 FROM haf_fyp_app.user_interests ui "
         "WHERE ui.username = au.username))" in rest
     )
 
 
-def test_the_remainder_applies_the_read_filter_it_is_given(monkeypatch: MonkeyPatch) -> None:
-    # #84: with the filter on, a read buys a place in the remainder only if it earns a
-    # lane slot. The filter's days go in after the retention window.
-    monkeypatch.setattr(rd, "_read_filter_days", 30)
+def test_the_remainder_orders_by_the_read_filter_it_is_given(monkeypatch: MonkeyPatch) -> None:
+    # #84: the remainder orders by the filter the lane uses. Distinct values, so a
+    # swap of the retention window and the filter's days shows.
+    monkeypatch.setattr(rd, "_read_filter_days", 7)
     monkeypatch.setattr(rd, "FEED_CACHE_UNREAD_RETENTION_DAYS", 30)
     conn, cur = _mock_conn([[], []])
 
     rd._fetch_personalised_users(conn, 10)
 
-    assert cur.execute.call_args_list[-1].args[1][1:4] == (30, 30, 30)
+    assert cur.execute.call_args_list[-1].args[1][1:4] == (30, 7, 7)
 
 
 def test_the_reader_lane_takes_the_stalest_feed_first() -> None:

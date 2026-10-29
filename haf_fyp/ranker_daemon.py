@@ -224,11 +224,12 @@ READ_REFRESH_BATCH_SECONDS = max(0, _tuning("READ_REFRESH_BATCH_SECONDS", "30", 
 # haf_fyp tracks in the last this-many days (active_users.last_interaction_at, which
 # block processing writes from those two actions only), or that saved interests
 # (a signed request: the new users FYP is for have often done neither). 0, the default,
-# honours every read. A forged read for any other account then takes no lane slot, no
-# early re-rank and no place in the rotation's remainder (#98). It does NOT stop a
-# flood: on testapi 12,888 accounts had voted or reblogged within 30 days, far more
-# than a lane holds. It keeps the lane to accounts worth ranking anyway; at 30 days it
-# would have turned away at most 1 of the 16 readers seen on testapi on 2026-10-12.
+# honours every read. A forged read for any other account then takes no lane slot and
+# no early re-rank, and in the rotation's remainder (#98) it ranks behind every account
+# whose read earns one. It does NOT stop a flood: on testapi 12,888 accounts had voted
+# or reblogged within 30 days, far more than a lane holds. It keeps the lane to accounts
+# worth ranking anyway; at 30 days it would have turned away at most 1 of the 16 readers
+# seen on testapi on 2026-10-12.
 #
 # Such a read is still stamped (last_read_at): the feed function notifies at most once
 # per ten minutes per account BECAUSE the read is stamped, so not stamping would let a
@@ -248,7 +249,8 @@ _read_filter_days = 0
 # Reads stamped since the last cycle that did not earn a slot, for the cycle line.
 _reads_unearned = 0
 # Whether a read from active_users row `au` earns a slot: the condition, and its two
-# parameters (both _read_filter_days). Shared by the early re-rank and the lane.
+# parameters (both _read_filter_days). Shared by the early re-rank, the lane and the
+# remainder's order.
 # COALESCE: last_interaction_at is NULL for an account that never voted or reblogged,
 # which would make the whole condition NULL rather than false -- no slot either way, but
 # NOT NULL is NULL too, and the count of reads that earned nothing would miss it.
@@ -869,8 +871,9 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
     #81 puts recent readers ahead of that order, in at most READER_CYCLE_SHARE of the
     cycle; the remainder is filled in that order from everyone else who uses the app
     (#98): a read within FEED_CACHE_UNREAD_RETENTION_DAYS, or interests. An account
-    that has only voted is not ranked until it reads; with the read filter on (#84),
-    until it makes a read that earns a slot. Neither takes an account whose
+    that has only voted is not ranked until it reads. With the read filter on (#84),
+    the accounts whose read earns a slot come first in the remainder, and the rest
+    take what is left. Neither takes an account whose
     read session is open (#104): write_feed_cache would refuse it, and the slot is
     better spent; it sorts where it was once the session ends. The round-robin argument below
     therefore holds for the remainder, over that set, at a rate reduced by the share
@@ -934,21 +937,26 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
             )
             return readers + [r[0] for r in cur.fetchall()]
         # #98: only accounts that use the app -- a read within the retention window, or
-        # interests. Never more than the unread-feed pass keeps, so the rotation never
-        # rebuilds a feed that pass is about to drop. With the read filter on (#84), a
-        # read counts here only if it earns a slot, as in the lane: otherwise one forged
-        # read would keep a lapsed voter ranked for the whole retention window.
+        # interests. The same test as the unread-feed pass, so the rotation never
+        # rebuilds a feed that pass is about to drop.
+        #
+        # With the read filter on (#84), accounts whose read earns a slot come first,
+        # and the others get only what the cycle has left: a flood of forged reads
+        # cannot slow the rotation of the accounts that earn one. They are put last,
+        # not left out, because the unread-feed pass keeps a feed that is read: a real
+        # reader who has not voted lately would otherwise be served a feed no one
+        # rebuilds for as long as they keep reading.
         cur.execute(
             f"""
             SELECT username
               FROM haf_fyp_app.active_users au
              WHERE NOT (username = ANY(%s))
-               AND ((au.last_read_at >= (NOW() AT TIME ZONE 'utc') - make_interval(days => %s)
-                     AND {_READ_EARNS_SQL})
+               AND (au.last_read_at >= (NOW() AT TIME ZONE 'utc') - make_interval(days => %s)
                     OR EXISTS (SELECT 1 FROM haf_fyp_app.user_interests ui
                                 WHERE ui.username = au.username))
                AND {_NO_SESSION_SQL}
-             ORDER BY last_scored_at ASC NULLS FIRST,
+             ORDER BY {_READ_EARNS_SQL} DESC,
+                      last_scored_at ASC NULLS FIRST,
                       last_interaction_at DESC NULLS LAST
              LIMIT %s
             """,

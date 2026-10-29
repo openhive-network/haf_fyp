@@ -443,10 +443,10 @@ def test_with_the_activity_filter_the_lane_takes_only_active_or_opted_in_readers
     users = rd._fetch_personalised_users(conn, 4)
 
     # Lane of two: the two readers that earn it, stalest first; then the rest of the
-    # rotation in its own order. Since #98 the rest takes only accounts that read or
-    # opted in, so the forged read must not buy the account a place there either.
+    # rotation, where the forged reader comes after every account that earns a slot
+    # (#84; the order itself is pinned in test_unread_feeds_db.py).
     assert users[:2] == ["picker", "active"]
-    assert users[2:] == ["idle"]
+    assert users[2:] == ["idle", "forged"]
 
 
 def test_with_the_activity_filter_off_the_lane_is_what_it_was(conn, monkeypatch: MonkeyPatch) -> None:

@@ -684,9 +684,12 @@ account only once it has read its feed within `FEED_CACHE_UNREAD_RETENTION_DAYS`
 or saved interests, and the hourly maintenance pass drops the cached feed of every
 other. Such an account keeps its rotation row and its votes; its first read is served
 the global feed, puts it in the reader lane below, and its own feed follows within a
-cycle. With `READER_ACTIVE_WITHIN_DAYS` set, only a read that earns a lane slot counts
-here too: a read for an account that has not voted or reblogged within that many days,
-and holds no interests, does not put it in the scheduled cycle.
+cycle. With `READER_ACTIVE_WITHIN_DAYS` set, the scheduled cycle first ranks the
+accounts whose read earns a lane slot, and only then, with what the cycle has left, the
+readers that have not voted on or reblogged a tracked post within that many days and
+hold no interests. Reading other accounts' feeds therefore cannot slow the rotation for
+the accounts that earn a slot, and a real reader who has stopped voting is still ranked
+when the cycle has room.
 
 The SQL and the ranker image of this change go together: the ranker writes a compact
 `feed_cache` row (smallint `rank`, labels as codes into `feed_cache_labels`). A ranker
@@ -789,7 +792,7 @@ start with a log line naming the variable. The others are held to their range.
 | `READ_REFRESH_MAX_PER_CYCLE` | `MAX_USERS_PER_CYCLE` x `READER_CYCLE_SHARE`, at most 300 | Re-ranks on read per cycle period: between two scheduled cycles, and ahead of their turn during one (a cycle grows by at most this many accounts). 0 turns them off. Between cycles they run in the 300 s the ranker waits: keep this times seconds-per-account well under `CYCLE_SECONDS`, or they start delaying the cycle. |
 | `READ_REFRESH_BATCH_SECONDS` | 30 | After one read-triggered re-rank, the next waits this long and takes everyone who became due meanwhile. Each one fetches the candidates before ranking anyone (about 8 s on a full node), so they are grouped. 0 turns the grouping off. |
 | `FEED_SESSION_SECONDS` | 900 | How long a read session keeps an account's feed from being rewritten after its last renewal (#104). At least 600: the feed function's signal is rationed to one per half window per account. Longer holds a reader's feed still longer, and delays the re-rank their read asked for by as much. |
-| `READER_ACTIVE_WITHIN_DAYS` | 0 | Off at 0; at most 36500. Otherwise a read earns a lane slot, an early re-rank or a place in the scheduled cycle only for an account that voted on or reblogged a post this app tracks within this many days (posting or commenting alone does not count), or that saved interests (interests do not lapse). A forged read for any other account then costs nothing; it is still recorded. It narrows a flood, it does not stop one: 12,888 accounts had voted or reblogged within 30 days on testapi. At 30 days it would have turned away at most 1 of the 16 readers seen there on 2026-10-12. Off by itself while block processing is more than `ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS` behind, when every account looks lapsed, or while that cannot be told; the ranker logs when it turns on and off, and how many reads earned nothing. |
+| `READER_ACTIVE_WITHIN_DAYS` | 0 | Off at 0; at most 36500. Otherwise a read earns a lane slot, an early re-rank or a place ahead of other readers in the scheduled cycle only for an account that voted on or reblogged a post this app tracks within this many days (posting or commenting alone does not count), or that saved interests (interests do not lapse). A forged read for any other account then gets ranked only with what a cycle has left; it is still recorded. It narrows a flood, it does not stop one: 12,888 accounts had voted or reblogged within 30 days on testapi. At 30 days it would have turned away at most 1 of the 16 readers seen there on 2026-10-12. Off by itself while block processing is more than `ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS` behind, when every account looks lapsed, or while that cannot be told; the ranker logs when it turns on and off, and how many reads earned nothing. |
 
 What to expect, and what this does not do:
 
@@ -816,9 +819,9 @@ What to expect, and what this does not do:
   as it is kept up. That is the worst this can do. Telling a reader from a crawler
   needs an authenticated read, which this app does not have. `READER_ACTIVE_WITHIN_DAYS`
   narrows it: set, a read counts only for an account that voted or reblogged within
-  that many days or saved interests, so reading other accounts buys nothing: no lane
-  slot, no early re-rank, no place in the scheduled cycle. Accounts that vote are still
-  far more than a lane holds. During a flood,
+  that many days or saved interests, so reading other accounts buys no lane slot and no
+  early re-rank, and in the scheduled cycle those accounts come after every account that
+  earns one. Accounts that vote are still far more than a lane holds. During a flood,
   `READER_CYCLE_SHARE=0` turns the lane off for everyone.
 * **Paging.** A feed is not rewritten while someone scrolls it (see
   [Read sessions](#read-sessions-stable-pages)), so pages of one visit do not repeat or
