@@ -692,6 +692,20 @@ def test_history_status_answers_a_role_without_usage_on_hive(conn: connection) -
         assert cur.fetchone() == ("following_hivemind", 1000, None, 1000)
 
 
+def test_an_unknown_head_does_not_hold_the_backfill_back(conn: connection) -> None:
+    """hivemind_reach() reports a head it cannot ask for as unknown (NULL), not as 0
+    blocks behind (#109). Block processing keeps deciding as it did when that read 0:
+    an unknown head does not keep the backfill waiting."""
+    with conn.cursor() as cur:
+        hm = Hivemind(cur)
+        seed_window(hm)
+        cur.execute("DROP FUNCTION hive.app_get_irreversible_block()")
+        cur.execute("SELECT behind_head FROM haf_fyp_app.hivemind_reach()")
+        assert cur.fetchone() == (None,)
+        batch(cur, 1, 100)
+        assert state(cur)["backfilled"] is True
+
+
 def _report_module() -> ModuleType:
     spec = importlib.util.spec_from_file_location(
         "processor_timings_report", os.path.join(ROOT, "scripts", "processor_timings_report.py"))

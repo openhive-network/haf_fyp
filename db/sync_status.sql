@@ -110,7 +110,11 @@ BEGIN
           AND i.indisvalid
     );
 
-    RETURN QUERY SELECT _block, greatest(_head - _block, 0), _indexed;
+    -- CASE, not greatest() alone: greatest() skips a NULL, so an unknown head read as 0
+    -- blocks behind -- "caught up" -- instead of unknown.
+    RETURN QUERY SELECT _block,
+        CASE WHEN _head IS NULL OR _block IS NULL THEN NULL ELSE greatest(_head - _block, 0) END,
+        _indexed;
 END;
 $$;
 
