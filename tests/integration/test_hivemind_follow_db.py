@@ -710,6 +710,8 @@ def test_an_unknown_hivemind_block_is_not_reported_as_caught_up(conn: connection
     """The other half of #109's second bug: with the head known but hivemind's block not
     (hive_state has no row), behind_head is unknown too, not 0."""
     with conn.cursor() as cur:
+        cur.execute("SELECT hive.app_get_irreversible_block()")
+        assert cur.fetchone() == (1000,), "the head is unknown too; the test proves nothing"
         cur.execute("DELETE FROM hivemind_app.hive_state")
         cur.execute("SELECT * FROM haf_fyp_app.hivemind_reach()")
         assert cur.fetchone() == (None, None, True)
