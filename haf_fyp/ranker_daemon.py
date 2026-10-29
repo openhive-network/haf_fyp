@@ -955,7 +955,7 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
                     OR EXISTS (SELECT 1 FROM haf_fyp_app.user_interests ui
                                 WHERE ui.username = au.username))
                AND {_NO_SESSION_SQL}
-             ORDER BY {_READ_EARNS_SQL} DESC,
+             ORDER BY (%s = %s) DESC,
                       last_scored_at ASC NULLS FIRST,
                       last_interaction_at DESC NULLS LAST
              LIMIT %s
