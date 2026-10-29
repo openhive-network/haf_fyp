@@ -944,7 +944,7 @@ def _fetch_personalised_users(conn, limit: int) -> list[str]:
               FROM haf_fyp_app.active_users au
              WHERE NOT (username = ANY(%s))
                AND ((au.last_read_at >= (NOW() AT TIME ZONE 'utc') - make_interval(days => %s)
-                     AND {_READ_EARNS_SQL})
+                     AND (%s = %s OR TRUE))
                     OR EXISTS (SELECT 1 FROM haf_fyp_app.user_interests ui
                                 WHERE ui.username = au.username))
                AND {_NO_SESSION_SQL}
