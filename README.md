@@ -637,9 +637,11 @@ All weights are stored in `haf_fyp_app.algorithm_versions` and activated via `PO
 **Left out before scoring (#89).** Posts their community muted, and posts by authors the
 community muted (all feeds, the global one included); and, for each account, posts by
 authors it muted directly or through a mute list it follows. hivemind's own ranked lists
-return such posts greyed; a recommendation leaves them out. Not filtered: blacklists
-(front ends show them as a badge), authors hivemind greys for a low reputation, the
-account's own posts. The filter takes effect when an account is next ranked (see "How
+return such posts greyed; a recommendation leaves them out. Also left out of every feed
+(#111, #112): posts by authors hivemind greys for a low reputation, posts whose net
+rshares are below zero, and posts by the accounts in the ranker's `EXCLUDED_AUTHORS`.
+Not filtered: blacklists (front ends show them as a badge), the account's own posts.
+The filter takes effect when an account is next ranked (see "How
 fresh a feed is"), and an account still on the cold-start global feed gets the community
 filters but not its own mutes. Read from hivemind; on a node where hivemind cannot be read
 the ranker writes feeds unfiltered and logs a warning until it can.
@@ -795,6 +797,7 @@ start with a log line naming the variable. The others are held to their range.
 | `READ_REFRESH_MAX_PER_CYCLE` | `MAX_USERS_PER_CYCLE` x `READER_CYCLE_SHARE`, at most 300 | Re-ranks on read per cycle period: between two scheduled cycles, and ahead of their turn during one (a cycle grows by at most this many accounts). 0 turns them off. Between cycles they run in the 300 s the ranker waits: keep this times seconds-per-account well under `CYCLE_SECONDS`, or they start delaying the cycle. |
 | `READ_REFRESH_BATCH_SECONDS` | 30 | After one read-triggered re-rank, the next waits this long and takes everyone who became due meanwhile. Each one fetches the candidates before ranking anyone (about 8 s on a full node), so they are grouped. 0 turns the grouping off. |
 | `FEED_SESSION_SECONDS` | 900 | How long a read session keeps an account's feed from being rewritten after its last renewal (#104). At least 600: the feed function's signal is rationed to one per half window per account. Longer holds a reader's feed still longer, and delays the re-rank their read asked for by as much. |
+| `EXCLUDED_AUTHORS` | ecency.waves,hscr-isrc,leothreads,liketu.moments,peak.snaps,slothbuzz.hangs | Authors no feed recommends (#111): comma-separated account names. The default is the accounts that post only Snaps/Waves/Threads-style containers, roots that short posts reply to, which score like hits on their reply count. Setting it replaces the list, so copy the default to add to it. A name that cannot be a Hive account stops the ranker at start. |
 | `READER_ACTIVE_WITHIN_DAYS` | 0 | Off at 0; at most 36500. Otherwise a read earns a lane slot, an early re-rank or a place ahead of other readers in the scheduled cycle only for an account that voted on or reblogged a post this app tracks within this many days (posting or commenting alone does not count), or that saved interests (interests do not lapse). A forged read for any other account then gets ranked only with what a cycle has left; it is still recorded. It narrows a flood, it does not stop one: 12,888 accounts had voted or reblogged within 30 days on testapi. At 30 days it would have turned away at most 1 of the 16 readers seen there on 2026-10-12. Off by itself while block processing is more than `ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS` behind, when every account looks lapsed, or while that cannot be told; the ranker logs when it turns on and off, and how many reads earned nothing. |
 
 What to expect, and what this does not do:

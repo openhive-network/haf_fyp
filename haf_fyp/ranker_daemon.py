@@ -88,11 +88,11 @@ CYCLE_SECONDS = 300
 POLL_SECONDS = 5
 
 
-_Number = TypeVar("_Number", int, float)
+_Setting = TypeVar("_Setting", int, float, tuple[str, ...])
 
 
-def _tuning(key: str, default: str, convert: Callable[[str], _Number],
-            minimum: _Number | None = None, maximum: _Number | None = None) -> _Number:
+def _tuning(key: str, default: str, convert: Callable[[str], _Setting],
+            minimum: _Setting | None = None, maximum: _Setting | None = None) -> _Setting:
     """A tuning variable, with unset and empty meaning the same thing: the default (#87).
 
     docker/docker-compose.yml passes these to the ranker by name, so `NAME=` left blank
@@ -142,6 +142,29 @@ FEED_EVENTS_MAX_ROWS = _tuning("FEED_EVENTS_MAX_ROWS", "20000000", int, minimum=
 # the background rather than inline in the endpoint.
 EMBEDDING_COVERAGE_DAYS = _tuning("EMBEDDING_COVERAGE_DAYS", "14", int, minimum=1)
 CANDIDATE_LIMIT = 5000
+
+_ACCOUNT_NAME_RE = re.compile(r"[a-z][a-z0-9.-]{2,15}")
+
+
+def account_names(raw: str) -> tuple[str, ...]:
+    """Comma-separated Hive account names; a name that cannot be one is refused."""
+    names = tuple(sorted({name.strip() for name in raw.split(",") if name.strip()}))
+    if not all(_ACCOUNT_NAME_RE.fullmatch(name) for name in names):
+        raise ValueError(raw)
+    return names
+
+
+# Authors whose posts are never recommended (#111): accounts that post only containers,
+# a daily or hourly root that short posts (Snaps, Waves, Threads) are replies to. The
+# container is a thread to post into, not something to read, and with hundreds of
+# replies it scores like a hit. Each of these posted nothing but containers in the 60
+# days to 2026-10-30 on testapi; liketu.moments is the same kind, quiet since. Setting
+# the variable replaces the list, so copy it to add to it.
+EXCLUDED_AUTHORS = _tuning(
+    "EXCLUDED_AUTHORS",
+    "ecency.waves,hscr-isrc,leothreads,liketu.moments,peak.snaps,slothbuzz.hangs",
+    account_names,
+)
 
 # Personalized feeds are computed on demand, not bulk-precomputed for every
 # account that ever subscribed to a community (there can be tens of thousands,
@@ -799,12 +822,16 @@ def _fetch_candidates(conn) -> pd.DataFrame:
                    ON ha.id = hp.author_id
             LEFT JOIN haf_fyp_app.engagement_metrics em
                    ON em.post_id = pc.post_id
-            WHERE pc.payout_window = TRUE
-               OR pc.created_at >= NOW() - INTERVAL '30 days'
+            WHERE (pc.payout_window = TRUE
+                   OR pc.created_at >= NOW() - INTERVAL '30 days')
+              -- #112: downvoted below zero, which hivemind's lists grey. The engagement
+              -- signal clips it to 0, so it would otherwise score like an unvoted post.
+              AND COALESCE(em.net_rshares, 0) >= 0
+              AND ha.name <> ALL(%s::text[])  -- #111: EXCLUDED_AUTHORS
             ORDER BY pc.created_at DESC
             LIMIT %s
             """,
-            (CANDIDATE_LIMIT,),
+            (list(EXCLUDED_AUTHORS), CANDIDATE_LIMIT),
         )
         rows = cur.fetchall()
     if not rows:
@@ -813,10 +840,15 @@ def _fetch_candidates(conn) -> pd.DataFrame:
     # #89: a post its community has muted goes into nobody's feed, the global one
     # included. Here rather than in the query so that a node whose hivemind cannot
     # be read still gets candidates (see haf_fyp/visibility.py).
-    muted = visibility.community_muted_post_ids(conn, candidates["post_id"].tolist())
+    post_ids = candidates["post_id"].tolist()
+    muted = visibility.community_muted_post_ids(conn, post_ids)
     if muted:
         log.info("%d candidate(s) left out: muted by their community", len(muted))
-    return visibility.without(candidates, post_ids=muted)
+    # #112: and one whose author hivemind greys for a low reputation, from everyone's.
+    greyed = visibility.greyed_author_post_ids(conn, post_ids)
+    if greyed:
+        log.info("%d candidate(s) left out: author greyed for a low reputation", len(greyed))
+    return visibility.without(candidates, post_ids=muted | greyed)
 
 
 def _fetch_author_credibility_safe(conn, authors: list[str]) -> dict:

@@ -1,5 +1,6 @@
 """
-haf_fyp.visibility's two queries against a real database (#89).
+haf_fyp.visibility's queries against a real database (#89, #112), and the ranker's
+candidate read with every filter it applies (#111, #112).
 
 Runs in the fastapi-tests CI job. Skipped when no DB is reachable, except in CI.
 
@@ -18,7 +19,9 @@ import os
 import psycopg2
 import pytest
 
+from haf_fyp import ranker_daemon as rd
 from haf_fyp import visibility
+from .shipped_schema import ddl
 
 SETUP = """
 CREATE SCHEMA IF NOT EXISTS hivemind_app;
@@ -30,7 +33,11 @@ CREATE TABLE hivemind_app.follow_muted (follower INT NOT NULL, following INT NOT
 CREATE TABLE hivemind_app.blacklisted (follower INT NOT NULL, following INT NOT NULL, block_num INT NOT NULL,
                                        PRIMARY KEY (follower, following));
 CREATE TABLE hivemind_app.hive_posts (id INT PRIMARY KEY, is_muted BOOLEAN NOT NULL DEFAULT FALSE,
-                                      author_id INT NOT NULL, community_id INT);
+                                      author_id INT NOT NULL, community_id INT,
+                                      counter_deleted INT NOT NULL DEFAULT 0);
+-- hivemind's is a view over hive_accounts and reptracker_app's reputations; the read
+-- uses only these two of its columns.
+CREATE TABLE hivemind_app.hive_accounts_view (id INT PRIMARY KEY, is_grayed BOOLEAN NOT NULL);
 -- role_id -2 is "muted in this community"; 2 is an ordinary member.
 CREATE TABLE hivemind_app.hive_roles (account_id INT NOT NULL, community_id INT NOT NULL, role_id SMALLINT NOT NULL,
                                       PRIMARY KEY (account_id, community_id));
@@ -116,6 +123,44 @@ def test_only_posts_and_authors_their_community_muted_are_left_out(conn) -> None
     # 505 is no post hivemind has: nothing to filter.
     assert visibility.community_muted_post_ids(conn, [501, 502, 503, 504, 505]) == {502, 503}
     assert visibility.community_muted_post_ids(conn, [501, 504]) == set()
+
+
+def test_only_posts_by_greyed_authors_are_reported(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO hivemind_app.hive_accounts_view VALUES (11, FALSE), (12, TRUE)")
+        # 513 by an author the view does not have: nothing to say about it.
+        cur.execute("INSERT INTO hivemind_app.hive_posts VALUES "
+                    "(511, FALSE, 11, NULL), (512, FALSE, 12, NULL), (513, FALSE, 99, NULL)")
+    assert visibility.greyed_author_post_ids(conn, [511, 512, 513, 514]) == {512}
+    assert visibility.greyed_author_post_ids(conn, [511]) == set()
+
+
+def _candidates(conn, monkeypatch, excluded):
+    """The ranker's own candidate read, over the shipped post_candidates and
+    engagement_metrics, of one post per case."""
+    with conn.cursor() as cur:
+        cur.execute(ddl("post_candidates", "engagement_metrics"))
+        cur.execute("INSERT INTO hivemind_app.hive_accounts VALUES "
+                    "(30, 'ordinary'), (31, 'grey.author'), (32, 'peak.snaps')")
+        cur.execute("INSERT INTO hivemind_app.hive_accounts_view VALUES (30, FALSE), (31, TRUE), (32, FALSE)")
+        cur.execute("INSERT INTO hivemind_app.hive_posts (id, author_id, counter_deleted) VALUES "
+                    "(601, 30, 0), (602, 31, 0), (603, 30, 0), (604, 32, 0), (605, 30, 0), (606, 30, 1)")
+        cur.execute("INSERT INTO haf_fyp_app.post_candidates (post_id, created_at) "
+                    "SELECT id, NOW() - INTERVAL '1 hour' FROM hivemind_app.hive_posts")
+        # 601 upvoted, 603 downvoted below zero, 604 at exactly zero; 605 has no row.
+        cur.execute("INSERT INTO haf_fyp_app.engagement_metrics (post_id, net_rshares) VALUES "
+                    "(601, 5), (602, 5), (603, -10), (604, 0)")
+    monkeypatch.setattr(rd, "EXCLUDED_AUTHORS", excluded)
+    return sorted(rd._fetch_candidates(conn)["post_id"].tolist())
+
+
+def test_the_candidates_leave_out_greyed_downvoted_and_excluded_authors(conn, monkeypatch) -> None:
+    # 602 greyed author, 603 below zero, 604 excluded, 606 deleted (as before).
+    assert _candidates(conn, monkeypatch, ("leothreads", "peak.snaps")) == [601, 605]
+
+
+def test_an_empty_exclusion_list_excludes_nobody(conn, monkeypatch) -> None:
+    assert _candidates(conn, monkeypatch, ()) == [601, 604, 605]
 
 
 def test_without_hivemind_the_reads_filter_nothing_and_the_session_carries_on(conn) -> None:

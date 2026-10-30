@@ -210,27 +210,71 @@ def test_rank_user_scores_only_what_the_reader_can_be_shown(monkeypatch):
     assert seen["candidates"]["post_id"].tolist() == [1, 2, 3, 4]
 
 
-def test_the_cycle_candidates_leave_out_community_muted_posts(monkeypatch):
+def test_the_cycle_candidates_leave_out_community_muted_posts_and_greyed_authors(monkeypatch):
     conn = MagicMock()
     cur = conn.cursor.return_value.__enter__.return_value
     cur.fetchall.return_value = [
-        {"post_id": 1, "author": "alice"}, {"post_id": 2, "author": "bob"}, {"post_id": 3, "author": "carol"},
+        {"post_id": 1, "author": "alice"}, {"post_id": 2, "author": "bob"},
+        {"post_id": 3, "author": "carol"}, {"post_id": 4, "author": "dave"},
     ]
     asked = {}
 
     def _muted(_c, post_ids):
-        asked["post_ids"] = post_ids
+        asked["muted"] = post_ids
         return {2}
 
+    def _greyed(_c, post_ids):
+        asked["greyed"] = post_ids
+        return {3}
+
     monkeypatch.setattr(rd.visibility, "community_muted_post_ids", _muted)
+    monkeypatch.setattr(rd.visibility, "greyed_author_post_ids", _greyed)
     out = rd._fetch_candidates(conn)
-    assert asked["post_ids"] == [1, 2, 3]
-    assert out["post_id"].tolist() == [1, 3]
+    assert asked == {"muted": [1, 2, 3, 4], "greyed": [1, 2, 3, 4]}
+    assert out["post_id"].tolist() == [1, 4]
+
+
+def test_the_candidate_query_is_given_the_excluded_authors(monkeypatch):
+    conn = MagicMock()
+    cur = conn.cursor.return_value.__enter__.return_value
+    cur.fetchall.return_value = []
+    monkeypatch.setattr(rd, "EXCLUDED_AUTHORS", ("leothreads", "peak.snaps"))
+    rd._fetch_candidates(conn)
+    # A list, which psycopg2 sends as an array; a tuple would go as a row.
+    assert cur.execute.call_args.args[1] == (["leothreads", "peak.snaps"], rd.CANDIDATE_LIMIT)
 
 
 def test_no_candidates_asks_nothing(monkeypatch):
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value.fetchall.return_value = []
-    monkeypatch.setattr(rd.visibility, "community_muted_post_ids",
-                        lambda *_a: pytest.fail("asked about no posts"))
+    for name in ("community_muted_post_ids", "greyed_author_post_ids"):
+        monkeypatch.setattr(rd.visibility, name, lambda *_a: pytest.fail("asked about no posts"))
     assert rd._fetch_candidates(conn).empty
+
+
+def test_no_post_ids_reads_no_reputations():
+    conn, cur = _conn()
+    assert visibility.greyed_author_post_ids(conn, []) == set()
+    cur.execute.assert_not_called()
+
+
+# ---- EXCLUDED_AUTHORS (#111)
+
+def test_account_names_are_trimmed_deduplicated_and_sorted():
+    assert rd.account_names(" peak.snaps,leothreads , peak.snaps,,") == ("leothreads", "peak.snaps")
+
+
+@pytest.mark.parametrize("raw", ["Peak.Snaps", "peak snaps", "ab", "a" * 17, "1abc", "peak.snaps;drop"])
+def test_a_name_that_cannot_be_an_account_is_refused(raw):
+    with pytest.raises(ValueError):
+        rd.account_names(raw)
+
+
+def test_the_setting_replaces_the_default_and_blank_keeps_it(monkeypatch):
+    monkeypatch.setenv("EXCLUDED_AUTHORS", "alice")
+    assert rd._tuning("EXCLUDED_AUTHORS", "peak.snaps", rd.account_names) == ("alice",)
+    monkeypatch.setenv("EXCLUDED_AUTHORS", "  ")
+    assert rd._tuning("EXCLUDED_AUTHORS", "peak.snaps", rd.account_names) == ("peak.snaps",)
+    monkeypatch.setenv("EXCLUDED_AUTHORS", "Alice")
+    with pytest.raises(ValueError, match="EXCLUDED_AUTHORS='Alice' is not a valid account_names"):
+        rd._tuning("EXCLUDED_AUTHORS", "peak.snaps", rd.account_names)

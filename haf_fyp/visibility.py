@@ -1,6 +1,7 @@
 """
 What a reader must not be shown (#89): posts their community has muted, posts by authors
-their community has muted, and posts by authors the reader has muted.
+their community has muted, and posts by authors the reader has muted. And, since #112,
+posts by authors hivemind greys for a low reputation.
 
 Applied when the ranker WRITES a feed, not when it is served. Dropping posts from a served
 page would make it shorter than its page-size, and front ends read a short page as the end
@@ -17,6 +18,9 @@ Read from hivemind (the same sources its bridge API uses for an observer):
     muted (follower, following)        -- `follower` has muted `following`
     follow_muted (follower, following) -- `follower` follows `following`'s mute list (one
                                           level: hivemind_app.muted_accounts_by_id_view)
+    hive_accounts_view.is_grayed -- the author's reputation is at or below hivemind's grey
+                                    line (read from reptracker_app through the view, so
+                                    the line and the schema stay hivemind's to change)
 Account columns are hive_accounts ids. haf_fyp_owner, which the ranker connects as, can
 read them once scripts/grant_cross_schema.sh has run since hivemind was installed: the same
 grant the feed endpoints depend on.
@@ -25,8 +29,9 @@ Stricter than hivemind, on purpose: its ranked lists return these posts GREYED; 
 recommendation leaves them out.
 
 NOT done here: blacklists (`blacklisted`, `follow_blacklisted`), which front ends show as
-a badge rather than by hiding the post; authors hivemind greys for a low reputation; the
-reader's own posts and posts they already voted on.
+a badge rather than by hiding the post; the reader's own posts and posts they already
+voted on. Posts downvoted below zero (#112) and authors excluded by setting (#111) are
+left out by the candidate query itself, in ranker_daemon: both are haf_fyp's own data.
 
 When hivemind is not there to read (no schema or table, no grant) the ranker writes feeds
 without these filters, warns once, and says when they work again. Any other failure (a
@@ -52,6 +57,15 @@ COMMUNITY_MUTED_SQL = """
                       WHERE role.account_id = hp.author_id
                         AND role.community_id = hp.community_id
                         AND role.role_id = -2))
+"""
+
+# 88 ms for 5,000 candidates on testapi (2026-10-30), 437 of them greyed.
+GREYED_AUTHOR_SQL = """
+    SELECT hp.id
+    FROM hivemind_app.hive_posts AS hp
+    JOIN hivemind_app.hive_accounts_view AS author ON author.id = hp.author_id
+    WHERE hp.id = ANY(%(post_ids)s::int[])
+      AND author.is_grayed
 """
 
 # One range read of the reader's mutes (muted_pkey leads with `follower`), plus one per
@@ -117,6 +131,13 @@ def community_muted_post_ids(conn, post_ids: list[int]) -> set[int]:
     if not post_ids:
         return set()
     return _read(conn, "community mutes", COMMUNITY_MUTED_SQL, {"post_ids": list(post_ids)})
+
+
+def greyed_author_post_ids(conn, post_ids: list[int]) -> set[int]:
+    """Post ids among `post_ids` whose author hivemind greys for a low reputation."""
+    if not post_ids:
+        return set()
+    return _read(conn, "author reputations", GREYED_AUTHOR_SQL, {"post_ids": list(post_ids)})
 
 
 def muted_authors(conn, username: str) -> set[str]:
