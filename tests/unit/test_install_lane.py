@@ -422,8 +422,10 @@ def test_the_job_is_defined_once_and_nothing_global_runs_inside_it(ci, flavour) 
     # YAML keeps the LAST of two equal keys without a word, so a second definition
     # further down the file would replace the one a reader finds first.
     assert len(re.findall(rf"^{re.escape(flavour.job)}:", text, re.M)) == 1
-    # Pipeline-wide settings that would run in, or apply to, this job unseen.
-    assert not {"default", "before_script", "after_script", "image", "services"} & set(ci), set(ci)
+    # Pipeline-wide settings that would run in, or apply to, this job unseen. A `default:`
+    # may only pick the runner (`tags`), which changes where the job runs, not what it runs.
+    assert not {"before_script", "after_script", "image", "services"} & set(ci), set(ci)
+    assert set(ci.get("default") or {}) <= {"tags"}, ci["default"]
 
 
 def test_the_standard_rules_are_what_this_file_says_they_are(ci) -> None:
