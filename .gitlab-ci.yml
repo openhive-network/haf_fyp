@@ -5,6 +5,11 @@ stages:
   - release
   - publish
 
+# Every job needs a runner tag: no runner left runs untagged jobs, so a job without one
+# stays pending forever. A job's own `tags:` replaces this one.
+default:
+  tags: [public-runner-docker]
+
 .python-cache:
   variables:
     PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
