@@ -1023,7 +1023,10 @@ app = FastAPI(
     openapi_url="/openapi.json" if _DOCS_ENABLED else None,
 )
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+# The ignore: Starlette types every handler as taking Exception, because it cannot tie a
+# handler to the class it is registered for; slowapi's takes RateLimitExceeded, which is
+# all it is ever given here. slowapi documents exactly this registration.
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
 app.add_middleware(RateLimitBeforeValidationMiddleware)
 
 

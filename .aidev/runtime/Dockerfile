@@ -16,8 +16,8 @@
 #                    to them (scripts/python_test_tools_pins.py). Beside /python_venv
 #                    rather than in it, so the tavern container's environment stays the
 #                    image's
-#   /opt/lint        ruff + mypy and their pinned set (python-lint; requirements.txt is
-#                    deliberately NOT installed there, as in CI) and sqlfluff 3.3.0 (sql-lint)
+#   /opt/lint        ruff + mypy, requirements.txt and the pinned set mypy reads, as
+#                    python-lint installs them (#42), and sqlfluff 3.3.0 (sql-lint)
 #   /opt/openapi     openapi_rewrite.sh's deepmerge/jsonpointer/pyyaml and
 #                    openapi-spec-validator 0.9.0 (openapi-drift), plus
 #                    /opt/openapi/process_openapi.py: the generator at common-ci-configuration
@@ -67,13 +67,21 @@ RUN /python_venv/bin/pip freeze | grep -iE '^(pytest|pytest-xdist|pytest-timeout
     && /opt/python-tests/bin/pip install --no-cache-dir -q -c /tmp/python-test-tools.txt \
         -r /tmp/requirements.txt pytest pytest-cov httpx pyyaml tavern \
     && /opt/python-tests/bin/python -c "import wax" \
-    && rm /tmp/requirements.txt /tmp/python-test-tools.txt \
+    && rm /tmp/python-test-tools.txt \
     && /usr/bin/python3.14 -m venv /opt/lint \
     && /opt/lint/bin/pip install --no-cache-dir -q ruff==0.15.12 \
         mypy==2.4.0 ast-serialize==0.13.1 librt==0.16.0 pathspec==1.1.1 \
         typing_extensions==4.16.0 mypy_extensions==1.1.0 \
-        types-redis==4.6.0.20241004 types-pyOpenSSL==24.1.0.20240722 \
+        -r /tmp/requirements.txt pandas-stubs==3.1.0.261029 types-psycopg2==2.9.21.20261008 \
+        annotated-doc==0.0.5 annotated-types==0.8.0 anyio==4.15.1 Deprecated==3.0.0 \
+        fastapi==0.162.0 hiveio-api==1.28.8rc3.post20261021191856 \
+        hiveio-beekeepy==1.28.6.post20261028200530 hiveio-schemas==1.28.2.post20261005092508 \
+        Jinja2==3.1.6 limits==5.8.0 loguru==0.7.3 MarkupSafe==3.0.4 msgspec==0.20.0 \
+        numpy==2.5.4 opentelemetry-api==1.45.2 packaging==26.3 pgvector==0.5.1 \
+        pydantic==2.14.1 pydantic_core==2.50.1 PyJWT==2.15.1 redis==8.1.0 slowapi==0.1.10 \
+        starlette==1.10.0 typing-inspection==0.4.4 wrapt==2.5.1 \
         sqlfluff==3.3.0 \
+    && rm /tmp/requirements.txt \
     && /usr/bin/python3.14 -m venv /opt/openapi \
     && /opt/openapi/bin/pip install --no-cache-dir -q deepmerge jsonpointer pyyaml openapi-spec-validator==0.9.0 \
     && curl -fsSL https://gitlab.syncad.com/hive/common-ci-configuration/-/raw/96889a650b3f45244cecc4bb3f250af439a71900/haf-app-tools/python/process_openapi.py \
