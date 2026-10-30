@@ -92,29 +92,37 @@ python-lint:
     # pre-existing UP045/BLE001/DTZ003 across files the MR never touched). Pin so
     # the lint result is reproducible; bump deliberately, cleaning findings in the
     # same commit.
-    # mypy and types-redis are pinned for the same reason, and so are mypy's own runtime
-    # dependencies: ast-serialize and librt are compiled parts of mypy 2.x that move on
-    # their own (ast-serialize 0.13.0 -> 0.13.1 on 2026-10-17), so pinning mypy alone
-    # would not hold its behaviour still. These are the versions pip resolved for this
-    # job on python:3.11-slim on 2026-10-21; each has a wheel for the image's Python 3.14.
-    # Left floating: cryptography/cffi/pycparser and types-cffi/types-setuptools, which
-    # types-redis drags in and our code never touches.
+    # mypy is pinned for the same reason, and so are mypy's own runtime dependencies:
+    # ast-serialize and librt are compiled parts of mypy 2.x that move on their own
+    # (ast-serialize 0.13.0 -> 0.13.1 on 2026-10-17), so pinning mypy alone would not hold
+    # its behaviour still.
     #
-    # What this mypy step checks: requirements.txt is NOT installed, so with
-    # --ignore-missing-imports every third-party import except redis (fastapi,
-    # starlette, pydantic, slowapi, limits, anyio, psycopg2, pandas, numpy, pgvector,
-    # wax) is Any and unchecked. It is a self-consistency pass over
-    # our own annotations, not type coverage of the framework code. The redis types come
-    # from types-redis 4.6, which predates requirements.txt's redis>=5.0; the redis it
-    # resolves today (8.x) ships its own py.typed, so once requirements.txt is installed
-    # here types-redis must be dropped. Sizing and remaining steps: #42.
+    # mypy type-checks against the real dependencies (#42): requirements.txt is installed,
+    # with stubs for the two that ship no types (pandas-stubs, types-psycopg2), and
+    # --ignore-missing-imports is gone, so an import mypy cannot type is an error rather
+    # than a silent Any. requirements.txt has floors only, so every package mypy reads is
+    # pinned here too, or a new fastapi or stub release would change the verdict on
+    # unchanged code (pandas-stubs went from 3.0.5 on 2026-10-21 to 3.1.0 on 10-29). That set
+    # is what `mypy -v` parsed from site-packages on 2026-10-29, in this image: the rest
+    # of what requirements.txt pulls in (uvicorn, aiohttp, uvloop...) is never read. Some
+    # come with the image rather than requirements.txt (pydantic, Jinja2, PyJWT...); they
+    # are pinned all the same, since the image follows a moving tag. A requirements.txt
+    # change that adds an import adds its package to that set: re-run `mypy -v` and pin.
+    # .aidev/runtime/Dockerfile's /opt/lint installs the same line.
     - >-
       pip install -q ruff==0.15.12
       mypy==2.4.0 ast-serialize==0.13.1 librt==0.16.0 pathspec==1.1.1
       typing_extensions==4.16.0 mypy_extensions==1.1.0
-      types-redis==4.6.0.20241004 types-pyOpenSSL==24.1.0.20240722
+      -r requirements.txt pandas-stubs==3.1.0.261029 types-psycopg2==2.9.21.20261008
+      annotated-doc==0.0.5 annotated-types==0.8.0 anyio==4.15.1 Deprecated==3.0.0
+      fastapi==0.162.0 hiveio-api==1.28.8rc3.post20261021191856
+      hiveio-beekeepy==1.28.6.post20261028200530 hiveio-schemas==1.28.2.post20261005092508
+      Jinja2==3.1.6 limits==5.8.0 loguru==0.7.3 MarkupSafe==3.0.4 msgspec==0.20.0
+      numpy==2.5.4 opentelemetry-api==1.45.2 packaging==26.3 pgvector==0.5.1
+      pydantic==2.14.1 pydantic_core==2.50.1 PyJWT==2.15.1 redis==8.1.0 slowapi==0.1.10
+      starlette==1.10.0 typing-inspection==0.4.4 wrapt==2.5.1
     - ruff check haf_fyp/
-    - mypy haf_fyp/ --ignore-missing-imports
+    - mypy haf_fyp/
   rules: *standard_rules
 
 hadolint:
