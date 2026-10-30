@@ -141,10 +141,11 @@ def main() -> int:
         print(f"ci_job: .gitlab-ci.yml has no job {a.job!r}", file=sys.stderr)
         return 2
     # What this runner does not model it refuses, rather than running something else: a
-    # file-wide `default:` / `include:` would change every job (the project's own
-    # tests/unit/test_install_lane.py forbids both today), and so would a job keyword
-    # outside the set below.
-    unmodelled = {"default", "include"} & set(ci)
+    # file-wide `include:`, or a `default:` that sets more than the runner `tags`, would
+    # change every job (the project's own tests/unit/test_install_lane.py forbids both
+    # today), and so would a job keyword outside the set below.
+    unmodelled = {"include"} & set(ci)
+    unmodelled |= {f"default: {k}" for k in set(ci.get("default") or {}) - {"tags"}}
     job = resolve(ci, a.job)
     unmodelled |= set(job) - {
         "stage", "image", "services", "variables", "before_script", "script", "after_script",
