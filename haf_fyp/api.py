@@ -8,7 +8,7 @@ Handles write operations and admin actions that PostgREST cannot serve:
   POST   /v1/fyp/admin/algorithm   — activate an algorithm version (API-key gated)
   GET    /health                   — can this container serve: 503 on the database pool; Redis reported, never gated (#61, #78)
   GET    /metrics                  — embedding coverage (#15) + credibility sources (#8) + ranking sources (#36)
-                                    + reader-first figures (#86)
+                                    + reader-first figures (#86) + refresh-signal Redis (#51)
   GET    /sync-status              — uniform HAF-app sync freshness (#16)
 
 The rewriter (port 3001) serves the read endpoints, proxying to PostgREST (port 3000,
@@ -30,7 +30,7 @@ import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Annotated, Literal, Optional, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Optional, cast
 
 import anyio
 import anyio.to_thread
@@ -64,6 +64,7 @@ from .metrics import (
     build_history_report,
     build_ranking_sources_report,
     build_reader_first_report,
+    build_redis_report,
     fetch_coverage_rows,
     fetch_credibility_sources,
     fetch_feed_cache_shape,
@@ -1219,21 +1220,26 @@ class SyncStatusResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+# The ranker subscribes to the same literal (ranker_daemon._redis_subscriber).
+_REFRESH_CHANNEL = "haf_fyp:refresh"
+
+
+def _redis_host_port() -> tuple[str, str]:
+    """REDIS_HOST / REDIS_PORT: the Redis the refresh signal is published to."""
+    return os.environ.get("REDIS_HOST", "haf-fyp-redis"), os.environ.get("REDIS_PORT", "6379")
+
+
 def _redis_client(**options) -> redis_lib.Redis:
     """The Redis the refresh signal is published to (REDIS_HOST / REDIS_PORT)."""
-    return redis_lib.Redis(
-        host=os.environ.get("REDIS_HOST", "haf-fyp-redis"),
-        port=int(os.environ.get("REDIS_PORT", "6379")),
-        decode_responses=True,
-        **options,
-    )
+    host, port = _redis_host_port()
+    return redis_lib.Redis(host=host, port=int(port), decode_responses=True, **options)
 
 
 def _publish_refresh(username: str) -> None:
     """Fire-and-forget Redis signal so the ranker can refresh immediately."""
     try:
         r = _redis_client(socket_connect_timeout=1)
-        r.publish("haf_fyp:refresh", json.dumps({"username": username}))
+        r.publish(_REFRESH_CHANNEL, json.dumps({"username": username}))
     except Exception:
         pass  # ranker picks up interests on next scheduled cycle regardless
 
@@ -1319,12 +1325,12 @@ class _BoundedProbe:
     When it ends, the next caller starts a fresh one; a finished answer is never reused.
     """
 
-    def __init__(self, name: str, probe, no_answer: str = "unreachable") -> None:
+    def __init__(self, name: str, probe, no_answer: Any = "unreachable") -> None:
         self._name = name
         self._probe = probe
         self._no_answer = no_answer
         self._guard = threading.Lock()      # held only to read or replace _current
-        self._current: tuple[threading.Thread, list[str]] | None = None
+        self._current: tuple[threading.Thread, list[Any]] | None = None
 
     def begin(self, end: float):
         """Start the probe, or join the one in flight; returns a function that waits
@@ -1332,7 +1338,7 @@ class _BoundedProbe:
         with self._guard:
             current = self._current
             if current is None or not current[0].is_alive():
-                answer: list[str] = []
+                answer: list[Any] = []
 
                 def work() -> None:
                     try:
@@ -1349,7 +1355,7 @@ class _BoundedProbe:
                 current = self._current = (worker, answer)
         worker, answer = current
 
-        def finish() -> str:
+        def finish() -> Any:
             worker.join(max(0.0, end - time.monotonic()))
             return answer[0] if answer else self._no_answer
 
@@ -1391,6 +1397,45 @@ def _rate_limit_store_state() -> str:
     return "ok" if storage.check() is True else "unreachable"
 
 
+def _refresh_channel_state() -> dict[str, Any]:
+    """For GET /metrics (#51): does the refresh-signal Redis answer, how many clients
+    listen on the refresh channel, and its maxmemory-policy.
+
+    Each command is optional after the PING: a managed Redis may disable CONFIG, and
+    that costs only its own field. Same timeouts and no retries as the /health ping.
+    """
+    client = _redis_client(
+        socket_connect_timeout=_HEALTH_REDIS_TIMEOUT,
+        socket_timeout=_HEALTH_REDIS_TIMEOUT,
+        retry=Retry(NoBackoff(), 0),
+    )
+    state: dict[str, Any] = {"reachable": False, "refresh_subscribers": None, "maxmemory_policy": None}
+    try:
+        try:
+            client.ping()
+        except redis_lib.RedisError as exc:
+            log.warning("metrics: refresh-signal Redis unreachable (%s)", exc)
+            return state
+        state["reachable"] = True
+        try:
+            state["refresh_subscribers"] = dict(client.pubsub_numsub(_REFRESH_CHANNEL)).get(
+                _REFRESH_CHANNEL
+            )
+        except redis_lib.RedisError as exc:
+            log.warning("metrics: PUBSUB NUMSUB failed (%s)", exc)
+        try:
+            state["maxmemory_policy"] = client.config_get("maxmemory-policy").get(
+                "maxmemory-policy"
+            )
+        except Exception:
+            # Optional, so ANY failure costs only this field: CONFIG disabled or
+            # renamed, an ACL denial, or a proxy whose reply redis-py cannot parse.
+            pass
+        return state
+    finally:
+        client.close()
+
+
 _DB_NO_ANSWER = "no answer in time"
 
 
@@ -1409,9 +1454,15 @@ def _new_store_probe() -> _BoundedProbe:
     return _BoundedProbe("rate-limit-store", lambda: _rate_limit_store_state())
 
 
+def _new_channel_probe() -> _BoundedProbe:
+    # No answer in time is None, which the report reads as unknown.
+    return _BoundedProbe("refresh-channel", lambda: _refresh_channel_state(), no_answer=None)
+
+
 _db_probe = _new_db_probe()
 _signal_probe = _new_signal_probe()
 _store_probe = _new_store_probe()
+_channel_probe = _new_channel_probe()
 
 
 def _begin_redis(end: float):
@@ -1541,6 +1592,14 @@ def metrics(response: Response):
     writes (#98). `outdated` means the SQL is older than the ranker, which then ranks
     nobody until the install is re-run; the section names both shapes.
 
+    redis (#51): whether the Redis the refresh signal is published to answers, and how
+    many clients are subscribed to haf_fyp:refresh there. Zero is a ranker that is
+    stopped, or one listening on another instance -- the state nothing else shows: the
+    publish succeeds and the ranker logs that it is subscribed. Alert on redis.degraded
+    held for a few minutes. The probe runs beside the database reads with a 1 s
+    deadline, so it never fails the route and adds at most 1 s to it. See
+    build_redis_report for the states.
+
     A failed credibility probe reports state "unknown" (and degraded true, which fails
     safe for a monitor) rather than taking the coverage metric down with it. The
     reverse does not hold: the coverage read runs first and is not optional, so if the
@@ -1559,6 +1618,9 @@ def metrics(response: Response):
     # it -- so it is also passed explicitly on the exception, exactly as /sync-status
     # does on each of its three.
     response.headers.update(_METRICS_HEADERS)
+    # Started first so it runs beside the database reads; it gets the /health Redis
+    # deadline, counted from here.
+    channel_answer = _channel_probe.begin(time.monotonic() + _HEALTH_REDIS_DEADLINE)
     try:
         with _db_conn() as conn:
             rows = fetch_coverage_rows(conn)
@@ -1621,6 +1683,7 @@ def metrics(response: Response):
     report["reader_first"] = build_reader_first_report(reader_first)
     report["history"] = build_history_report(history)
     report["feed_cache"] = build_feed_cache_report(feed_cache)
+    report["redis"] = build_redis_report(channel_answer(), ":".join(_redis_host_port()))
     return report
 
 

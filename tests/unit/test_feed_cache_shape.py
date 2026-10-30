@@ -192,5 +192,6 @@ def test_the_route_carries_the_section(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(api, "build_ranking_sources_report", lambda probe, serv: {})
     monkeypatch.setattr(api, "build_reader_first_report", lambda probe: {})
     monkeypatch.setattr(api, "build_history_report", lambda probe: {})
+    monkeypatch.setattr(api, "_channel_probe", api._BoundedProbe("c", lambda: None, no_answer=None))
 
     assert api.metrics(MagicMock())["feed_cache"]["state"] == "outdated"

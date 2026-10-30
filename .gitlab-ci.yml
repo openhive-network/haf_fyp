@@ -491,6 +491,11 @@ fastapi-tests:
     # loopback peer cannot actually reach it. Harmless, and survives someone
     # switching the bind to `::`.
     TRUSTED_PROXY_IPS: "127.0.0.1,::1"
+    # No Redis in this lane. A refused port answers at once; the default hostname
+    # would go to the runner's DNS, and a lookup slower than the 1 s probe deadline
+    # turns /metrics' redis.state from unreachable into unknown.
+    REDIS_HOST: "127.0.0.1"
+    REDIS_PORT: "1"
   script:
     # pytest and tavern, for the FastAPI tavern file below, are the image's.
     - pip install -c /tmp/python-test-tools.txt -r requirements.txt -q
