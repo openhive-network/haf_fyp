@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -521,6 +521,9 @@ def write_feed_cache(
     """
     top = scored_df.head(200)
     now = datetime.utcnow()
+    # Rows as Any: the stubs type each itertuples() field as a union of every pandas
+    # scalar type, NA and None, since the columns' dtypes are this frame's, not the
+    # checker's to know.
     rows = [
         (
             username,
@@ -536,7 +539,7 @@ def write_feed_cache(
             algo_version,
             now,
         )
-        for rank, row in enumerate(top.itertuples(index=False))
+        for rank, row in enumerate(cast(Any, top.itertuples(index=False)))
     ]
     with conn.cursor() as cur:
         # LOCK ORDER: active_users BEFORE feed_cache. This is a whole-system rule, not
@@ -634,6 +637,9 @@ def write_global_feed_cache(conn, scored_df: pd.DataFrame, algo_version: str) ->
     """
     top = scored_df.head(200)
     now = datetime.utcnow()
+    # Rows as Any: the stubs type each itertuples() field as a union of every pandas
+    # scalar type, NA and None, since the columns' dtypes are this frame's, not the
+    # checker's to know.
     rows = [
         (
             int(row.post_id),
@@ -645,7 +651,7 @@ def write_global_feed_cache(conn, scored_df: pd.DataFrame, algo_version: str) ->
             algo_version,
             now,
         )
-        for rank, row in enumerate(top.itertuples(index=False))
+        for rank, row in enumerate(cast(Any, top.itertuples(index=False)))
     ]
     with conn.cursor() as cur:
         cur.execute("DELETE FROM haf_fyp_app.global_feed_cache")
