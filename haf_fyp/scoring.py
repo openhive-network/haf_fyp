@@ -521,8 +521,8 @@ def write_feed_cache(
     """
     top = scored_df.head(200)
     now = datetime.utcnow()
-    # Rows as Any: the stubs type each itertuples() field as any pandas scalar, since the
-    # columns' dtypes are this frame's, not the type checker's to know.
+    # Rows as Any: the stubs type each itertuples() field as a union of every pandas
+    # scalar type, since the columns' dtypes are this frame's, not the checker's to know.
     rows = [
         (
             username,
@@ -636,8 +636,8 @@ def write_global_feed_cache(conn, scored_df: pd.DataFrame, algo_version: str) ->
     """
     top = scored_df.head(200)
     now = datetime.utcnow()
-    # Rows as Any: the stubs type each itertuples() field as any pandas scalar, since the
-    # columns' dtypes are this frame's, not the type checker's to know.
+    # Rows as Any: the stubs type each itertuples() field as a union of every pandas
+    # scalar type, since the columns' dtypes are this frame's, not the checker's to know.
     rows = [
         (
             int(row.post_id),
