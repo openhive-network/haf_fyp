@@ -497,7 +497,7 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Can this container serve: `503` when the database pool does not answer a query within 1.5 s. Redis is reported in the body (`redis`, `rate_limit_store`) and never fails it: the app serves without Redis. A probe slower than its deadline (1.5 s database, 1.0 s Redis) counts as no answer. Not sync-aware (#61) |
-| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), reader-first figures (#86, under `reader_first`: whether the ranker is ranking, readers in the last day, their stalest feed, rotation age; see "How fresh a feed is"), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why), whether the installed `feed_cache` is the one the ranker writes (#99, under `feed_cache`: `ok`, or `outdated` with both shapes) — not feed analytics |
+| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), reader-first figures (#86, under `reader_first`: whether the ranker is ranking, readers in the last day, their stalest feed, rotation age; see "How fresh a feed is"), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why), whether the installed `feed_cache` is the one the ranker writes (#99, under `feed_cache`: `ok`, or `outdated` with both shapes), whether the ranker is subscribed on the refresh-signal Redis (#51, under `redis`: alert on `redis.degraded`) — not feed analytics |
 | GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
 | POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10/min per IP, 60/min total) |
 | DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5/min per IP, 30/min total) |
@@ -1466,6 +1466,16 @@ only `REDIS_URL` and rate limiting moves while **pub/sub stays on `haf-fyp-redis
 which is silent by construction: `_publish_refresh` wraps its call in
 `except Exception: pass`. Set all three, and keep the `noeviction` policy on whatever
 you point them at.
+
+`GET /metrics` → `redis` is where a split shows (#51). It asks the instance the api
+publishes to (`address`, from `REDIS_HOST`/`REDIS_PORT`) how many clients listen on
+`haf_fyp:refresh`. A healthy stack reads `state: ok` with `refresh_subscribers` ≥ 1.
+`no_subscriber` means the ranker is down or restarting (it resubscribes within 10 s),
+or it listens on another instance. `unreachable` and `unknown` mean the probe got no
+answer. Alert on `redis.degraded` held for longer than a ranker restart.
+`maxmemory_policy` is reported but not judged (null where `CONFIG` is disabled). The
+section covers the pub/sub client only; the limiter's store is `rate_limit_store` on
+`GET /health`.
 
 **Deploying a change to this file's limits:** `requirements.txt` is part of the image,
 so rebuild it, not a bare `up -d`, which silently reuses the cached image:

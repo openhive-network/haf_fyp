@@ -922,3 +922,65 @@ def build_feed_cache_report(probe: dict | None) -> dict:
             "lock)."
         ),
     }
+
+
+# ---------------------------------------------------------------------------------------
+# redis (#51): can the refresh signal reach the ranker?
+# ---------------------------------------------------------------------------------------
+#
+# The API publishes haf_fyp:refresh after an interests write, and the ranker subscribes.
+# When the two talk to different Redis instances (a renamed compose service whose old
+# container kept the `redis` alias, a REDIS_HOST set on one side only), both report
+# success: the publish lands with nobody listening and the subscriber waits on a channel
+# nobody publishes to. The one place that state shows is the subscriber count on the
+# instance the API publishes to, which is zero.
+
+REDIS_OK = "ok"
+REDIS_NO_SUBSCRIBER = "no_subscriber"
+REDIS_UNREACHABLE = "unreachable"
+REDIS_UNKNOWN = STATE_UNKNOWN
+
+
+def build_redis_report(probe: dict | None, address: str) -> dict:
+    """
+    The redis section of GET /metrics, for the Redis the refresh signal is published
+    to (REDIS_HOST / REDIS_PORT, given as `address`). Not the rate limiter's store:
+    that is REDIS_URL, a separate setting, and /health reports it.
+
+    `degraded` is true unless the instance answers and at least one client is
+    subscribed to haf_fyp:refresh. Zero subscribers is either a ranker that is down or
+    restarting (it resubscribes within 10 s) or a ranker listening on another instance.
+    Either way a refresh asked for now waits for the next scheduled cycle, and an
+    un-opt-in waits for the hourly sweep.
+
+    maxmemory_policy is reported, not judged: it is null when CONFIG is disabled, and a
+    policy only takes effect when maxmemory is set.
+    """
+    answered = probe is not None
+    probe = probe or {"reachable": False, "refresh_subscribers": None, "maxmemory_policy": None}
+    subscribers = probe["refresh_subscribers"]
+    if not answered:
+        state, detail = REDIS_UNKNOWN, "the Redis probe failed or did not answer within 1 s"
+    elif not probe["reachable"]:
+        state, detail = REDIS_UNREACHABLE, (
+            f"{address} does not answer; force-refresh and un-opt-in wait for the "
+            "ranker's scheduled passes"
+        )
+    elif subscribers is None:
+        state, detail = REDIS_UNKNOWN, "PUBSUB NUMSUB failed; see the API log"
+    elif subscribers == 0:
+        state, detail = REDIS_NO_SUBSCRIBER, (
+            f"nobody is subscribed to haf_fyp:refresh on {address}: the ranker is down "
+            "or restarting, or it listens on another Redis (check REDIS_HOST / "
+            "REDIS_PORT on both containers, and for an orphaned `redis` container)"
+        )
+    else:
+        state, detail = REDIS_OK, None
+    return {
+        "state": state,
+        "degraded": state != REDIS_OK,
+        "address": address,
+        "refresh_subscribers": subscribers,
+        "maxmemory_policy": probe["maxmemory_policy"],
+        "detail": detail,
+    }
