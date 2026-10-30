@@ -197,6 +197,39 @@ def test_with_the_reader_lane_on_a_cycle_still_takes_no_one_else(conn: Connectio
     assert (rd._lane_taken, rd._lane_slots) == (1, 5)
 
 
+@pytest.mark.parametrize("filter_days", [7, 0])
+def test_with_the_read_filter_readers_that_earn_nothing_get_only_what_the_cycle_leaves(
+        conn: Connection, monkeypatch: pytest.MonkeyPatch, filter_days: int) -> None:
+    """#84: in the rotation's remainder, accounts whose read earns a slot come first,
+    then the readers that have not voted or reblogged within READER_ACTIVE_WITHIN_DAYS
+    and hold no interests, each group in the rotation's own order. Put last, not left
+    out: the unread-feed pass keeps a feed that is read, so a left-out reader would be
+    served a feed no one rebuilds. Off, the order is the rotation's alone.
+
+    Retention 30 days, filter 7: different, so the two cannot be swapped unseen."""
+    monkeypatch.setattr(rd, "READER_CYCLE_SHARE", 0.0)  # the rotation lane alone
+    monkeypatch.setattr(rd, "_read_filter_days", filter_days)
+    # Earn nothing at 7 days, and are the stalest of all.
+    _account(conn, "no_votes", read="3 days", scored=None, interacted=None)
+    _account(conn, "forged", read="3 days", scored="400 days", interacted="300 days")
+    _account(conn, "lapsed10", read="3 days", scored="9 hours", interacted="10 days")
+    # Earn: a vote within 7 days (one of them read 20 days ago: within retention, not
+    # within the filter's days), or interests.
+    _account(conn, "active", read="3 days", scored="7 hours", interacted="1 day")
+    _account(conn, "late_reader", read="20 days", scored="6 hours", interacted="1 day")
+    _account(conn, "picker", read="3 days", scored="5 hours", interacted="300 days", interests=True)
+    _account(conn, "opt_in", scored="4 hours", interacted=None, interests=True)
+
+    earned = ["active", "late_reader", "picker", "opt_in"]
+    unearned = ["no_votes", "forged", "lapsed10"]
+    if filter_days:
+        assert rd._fetch_personalised_users(conn, 50) == earned + unearned
+        # A cycle with no room left over takes no one who earns nothing.
+        assert rd._fetch_personalised_users(conn, 4) == earned
+    else:
+        assert rd._fetch_personalised_users(conn, 50) == unearned + earned
+
+
 # --------------------------------------------------------------------------
 # drop_unread_feeds: what goes
 # --------------------------------------------------------------------------

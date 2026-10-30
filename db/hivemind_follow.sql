@@ -215,7 +215,11 @@ BEGIN
     SELECT * INTO _reach FROM haf_fyp_app.hivemind_reach();
 
     IF NOT _backfilled THEN
-        IF _reach.indexed AND _reach.behind_head <= haf_fyp_app.hivemind_max_lag_blocks() THEN
+        -- An unknown head (behind_head NULL: this role may not ask HAF for it) counts
+        -- as not behind, which is what greatest() made of it before hivemind_reach()
+        -- reported it as unknown (#109). The block processor runs as haf_fyp_owner,
+        -- which can ask, so on a node this is the measured lag.
+        IF _reach.indexed AND coalesce(_reach.behind_head, 0) <= haf_fyp_app.hivemind_max_lag_blocks() THEN
             PERFORM haf_fyp_app.backfill_from_hivemind(_reach.hivemind_block, _first_block, _last_block);
         ELSE
             PERFORM haf_fyp_app.copy_hivemind_blocks(NULL, NULL, FALSE, _first_block, _last_block);
