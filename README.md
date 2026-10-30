@@ -640,7 +640,8 @@ posts by authors it muted directly or through a mute list it follows. hivemind's
 ranked lists return such posts greyed; a recommendation leaves them out. Also left out of
 every feed: posts by authors hivemind greys for a low reputation, posts downvoted to
 `DOWNVOTED_AT_NET_RSHARES` net rshares or below, and posts by the accounts in
-`EXCLUDED_AUTHORS` (the ranker settings are in the table under "How fresh a feed is").
+`EXCLUDED_AUTHORS` (see **Ranker settings**, under "How fresh a feed is"). The grey-author
+filter has no setting: it follows hivemind.
 Not filtered: blacklists (front ends show them as a badge), the account's own posts.
 The filters take effect when a feed is next written (see "How fresh a feed is"): a post
 downvoted or muted after that stays in the feed until then. An account still on the
@@ -767,7 +768,7 @@ session is open is held until the session ends, so warming up after the first pa
 too late for that visit. Like the feed itself it takes any username: it is a request,
 not an authenticated action.
 
-These are environment variables of the `haf-fyp-ranker` service.
+**Ranker settings.** These are environment variables of the `haf-fyp-ranker` service.
 `docker/docker-compose.yml` passes each one to the ranker when it is set, so add the
 line to your `docker/.env.local` (`MAX_USERS_PER_CYCLE=3000`; a copy made before this
 existed has no line for it) and recreate the ranker with the same `--env-file` as every
@@ -788,9 +789,9 @@ the next `up` of the ranker without it puts the ranker back. haf_api_node's
 `haf_fyp.yaml` does not pass them yet (#87): there, add them to that service's
 `environment:`.
 
-A value that is not a number (for `EXCLUDED_AUTHORS`, not a list of account names), or a
-negative `MAX_USERS_PER_CYCLE`, stops the ranker at start with a log line naming the
-variable. The others are held to their range.
+A value that is not a number (for `EXCLUDED_AUTHORS`, not a list of account names), a
+negative `MAX_USERS_PER_CYCLE`, or a `DOWNVOTED_AT_NET_RSHARES` above -1 stops the ranker
+at start with a log line naming the variable. The others are held to their range.
 
 | Variable | Default | What it bounds |
 |---|---|---|
@@ -801,8 +802,8 @@ variable. The others are held to their range.
 | `READ_REFRESH_MAX_PER_CYCLE` | `MAX_USERS_PER_CYCLE` x `READER_CYCLE_SHARE`, at most 300 | Re-ranks on read per cycle period: between two scheduled cycles, and ahead of their turn during one (a cycle grows by at most this many accounts). 0 turns them off. Between cycles they run in the 300 s the ranker waits: keep this times seconds-per-account well under `CYCLE_SECONDS`, or they start delaying the cycle. |
 | `READ_REFRESH_BATCH_SECONDS` | 30 | After one read-triggered re-rank, the next waits this long and takes everyone who became due meanwhile. Each one fetches the candidates before ranking anyone (about 8 s on a full node), so they are grouped. 0 turns the grouping off. |
 | `FEED_SESSION_SECONDS` | 900 | How long a read session keeps an account's feed from being rewritten after its last renewal (#104). At least 600: the feed function's signal is rationed to one per half window per account. Longer holds a reader's feed still longer, and delays the re-rank their read asked for by as much. |
-| `EXCLUDED_AUTHORS` | ecency.waves,hscr-isrc,leothreads,liketu.moments,peak.snaps,slothbuzz.hangs | Authors no feed recommends (#111; see "Left out before scoring"): comma-separated account names, or `-` for none. The default is the accounts that post only Snaps/Waves/Threads-style containers, roots that short posts reply to, which score like hits on their reply count. Setting it replaces the list, so copy the default to add to it. A name no Hive account could have (uppercase, a part under three characters, a trailing dash) stops the ranker at start. |
-| `DOWNVOTED_AT_NET_RSHARES` | -9999999999 | A post downvoted to this many net rshares or below is in no feed (#112). At most -1. Not 0: a dust downvote on a new post with no upvotes yet would take it out of discovery for almost nothing. On testapi (2026-10-30) the default left out 910 of the 1,500 candidates below zero. |
+| `EXCLUDED_AUTHORS` | ecency.waves,hscr-isrc,leothreads,liketu.moments,peak.snaps,slothbuzz.hangs | Authors no feed recommends (#111; see "Left out before scoring"): comma-separated account names, or `-` for none. The default is the accounts that post only Snaps/Waves/Threads-style containers, roots that short posts reply to, which score like hits on their reply count. Setting it replaces the list, so copy the default to add to it. A name no Hive account could have (uppercase, over 16 characters, a dotted part under three characters or ending in a dash) stops the ranker at start. In a compose file's `environment:` write it quoted, `"-"`. |
+| `DOWNVOTED_AT_NET_RSHARES` | -9999999999 | A post downvoted to this many net rshares or below is in no feed (#112). At most -1: at 0 every post nobody has voted on yet would go. The default is far below zero because one small downvote on a new post with no upvotes would otherwise take it out of discovery; it is about one full-strength downvote from a 280 HP account. On testapi (2026-10-30) it left out 910 of the 1,500 candidates below zero. A very low value turns the filter off. |
 | `READER_ACTIVE_WITHIN_DAYS` | 0 | Off at 0; at most 36500. Otherwise a read earns a lane slot, an early re-rank or a place ahead of other readers in the scheduled cycle only for an account that voted on or reblogged a post this app tracks within this many days (posting or commenting alone does not count), or that saved interests (interests do not lapse). A forged read for any other account then gets ranked only with what a cycle has left; it is still recorded. It narrows a flood, it does not stop one: 12,888 accounts had voted or reblogged within 30 days on testapi. At 30 days it would have turned away at most 1 of the 16 readers seen there on 2026-10-12. Off by itself while block processing is more than `ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS` behind, when every account looks lapsed, or while that cannot be told; the ranker logs when it turns on and off, and how many reads earned nothing. |
 
 What to expect, and what this does not do:

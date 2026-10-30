@@ -6,6 +6,10 @@ hivemind cannot be read, and that the ranker applies both filters where it shoul
 """
 
 import logging
+import os
+import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -263,11 +267,17 @@ def test_no_post_ids_reads_no_reputations():
 
 def test_account_names_are_trimmed_deduplicated_and_sorted():
     assert rd.account_names(" peak.snaps,leothreads , peak.snaps,,") == ("leothreads", "peak.snaps")
+    # Enough names that a set's order cannot match the sorted one by chance.
+    assert rd.account_names("zed,yak,xray,wolf,vole,umber") == ("umber", "vole", "wolf", "xray", "yak", "zed")
 
 
 @pytest.mark.parametrize("raw", [
     "Peak.Snaps", "pEak", "peak.Snaps", "peak_snaps", "peak snaps", "ab", "a" * 17, "1abc",
     "peak.snaps;drop", "abc-", "ab..cd", "a.bcd", "abc.de", ".abc", "abc.",
+    # A part other than the last: a digit first, a dash last, two characters.
+    "abc.1de", "abc-.def", "ab.cde",
+    # `-` alone means none; anywhere else it is no name.
+    "-abc", "-,leothreads", "leothreads,-",
     # One bad name in a list refuses the whole list.
     "leothreads,Peak.Snaps", "leothreads,ab", "peak.snaps,x;drop",
 ])
@@ -279,6 +289,22 @@ def test_a_name_that_cannot_be_an_account_is_refused(raw):
 @pytest.mark.parametrize("name", ["abc", "a1b", "hscr-isrc", "peak.snaps", "ecency.waves", "a" * 16, "abc.def.ghi"])
 def test_names_a_hive_account_can_have_are_accepted(name):
     assert rd.account_names(name) == (name,)
+
+
+@pytest.mark.parametrize("value, ok", [("-1", True), ("0", False), ("5", False)])
+def test_the_downvote_line_is_below_zero(value, ok):
+    """Through the module's own line: at 0 every post nobody has voted on would go."""
+    repo = str(Path(__file__).resolve().parents[2])
+    env = {k: v for k, v in os.environ.items() if k != "DOWNVOTED_AT_NET_RSHARES"}
+    out = subprocess.run(
+        [sys.executable, "-c", "import haf_fyp.ranker_daemon as rd; print(rd.DOWNVOTED_AT_NET_RSHARES)"],
+        cwd=repo, env={**env, "PYTHONPATH": repo, "DOWNVOTED_AT_NET_RSHARES": value},
+        capture_output=True, text=True,
+    )
+    if ok:
+        assert out.returncode == 0 and out.stdout.strip() == value, out.stderr[-300:]
+    else:
+        assert f"ValueError: DOWNVOTED_AT_NET_RSHARES='{value}' is above its maximum, -1" in out.stderr
 
 
 def test_a_dash_excludes_nobody():

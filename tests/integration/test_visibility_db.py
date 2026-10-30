@@ -171,6 +171,14 @@ def test_an_empty_exclusion_list_excludes_nobody(conn, monkeypatch) -> None:
     assert _candidates(conn, monkeypatch, ()) == [601, 604, 605, 607, 609]
 
 
+def test_at_the_highest_line_a_post_with_no_votes_stays(conn, monkeypatch) -> None:
+    """At -1 a dust downvote (609, at -1) goes, while 604 (0) and 605 (no engagement row
+    at all) stay: a post nobody has voted on is never 'downvoted'."""
+    monkeypatch.setattr(rd, "DOWNVOTED_AT_NET_RSHARES", -1)
+    kept = _candidates(conn, monkeypatch, ())
+    assert 609 not in kept and {604, 605} <= set(kept), kept
+
+
 def test_without_the_reputation_view_the_grey_filter_is_off_and_said_so(conn, monkeypatch, caplog) -> None:
     """A hivemind without hive_accounts_view (or the reptracker behind it): candidates
     are still read, with the greyed author's post in them, and the warning names the

@@ -102,8 +102,8 @@ def _tuning(key: str, default: str, convert: Callable[[str], _Setting],
     dbenv.env_or_default refuses it, because nothing here is concatenated into a
     connection string.
 
-    A value `convert` rejects, or one below `minimum`, still stops the daemon, and the
-    error says which variable. Refused, not raised to the minimum: where a minimum is
+    A value `convert` rejects, or one below `minimum` or above `maximum`, still stops the
+    daemon, and the error says which variable. Refused, not raised to the minimum: where a minimum is
     given, a smaller value deletes data, does no work or fails on every pass (every feed
     event pruned, maintenance on every poll, a negative LIMIT), so it is far more likely
     a mistake than a choice.
@@ -111,8 +111,9 @@ def _tuning(key: str, default: str, convert: Callable[[str], _Setting],
     hive/haf_api_node's haf_fyp.yaml passes these settings with their defaults COPIED
     (`NAME: ${HAF_FYP_NAME:-<default>}`, haf_api_node!273). Raising a minimum above a
     copied default stops every ranker on those nodes once haf_api_node pins that release:
-    change the copy there in the same release. The same goes for a changed default:
-    EXCLUDED_AUTHORS's list, copied there, stays the old list until the copy is edited.
+    change the copy there in the same release. The same goes for a changed default: once
+    EXCLUDED_AUTHORS or DOWNVOTED_AT_NET_RSHARES is copied there, the copy stays the old
+    value until it is edited.
     """
     raw = os.environ.get(key, "").strip()
     try:
@@ -150,7 +151,8 @@ _ACCOUNT_PART_RE = re.compile(r"[a-z][a-z0-9-]+[a-z0-9]")
 
 
 def _is_account_name(name: str) -> bool:
-    return 3 <= len(name) <= 16 and all(_ACCOUNT_PART_RE.fullmatch(part) for part in name.split("."))
+    # No lower bound on the length: every part is already at least three characters.
+    return len(name) <= 16 and all(_ACCOUNT_PART_RE.fullmatch(part) for part in name.split("."))
 
 
 def account_names(raw: str) -> tuple[str, ...]:
@@ -178,11 +180,12 @@ EXCLUDED_AUTHORS = _tuning(
 )
 
 # A post whose net rshares are at or below this is left out of every feed (#112). Not
-# below zero: one dust downvote on a new post with no upvotes yet would take it out of
-# discovery, which costs the downvoter next to nothing. hivemind's own `gray` does not
-# look at rshares at all (only the author's reputation and community mutes). On testapi
-# (2026-10-30) the default left out 910 of the 1,500 candidates below zero and kept the
-# 590 lightly downvoted ones, 25 of them within a dust vote of zero.
+# just below zero: one small downvote on a new post with no upvotes yet would take it
+# out of discovery, which costs the downvoter next to nothing. hivemind's own `gray`
+# does not look at rshares at all (only the author's reputation, mutes and community
+# mutes). -1e10 is about one full-strength downvote from a 280 HP account (a full vote
+# is roughly 3.6e7 rshares per HP). On testapi (2026-10-30) the default left out 910 of
+# the 1,500 candidates below zero and kept 590, 25 of them above -1e9.
 # At most -1: at 0 every post nobody has voted on yet would go too.
 DOWNVOTED_AT_NET_RSHARES = _tuning("DOWNVOTED_AT_NET_RSHARES", "-9999999999", int, maximum=-1)
 
