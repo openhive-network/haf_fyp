@@ -30,8 +30,9 @@ recommendation leaves them out.
 
 NOT done here: blacklists (`blacklisted`, `follow_blacklisted`), which front ends show as
 a badge rather than by hiding the post; the reader's own posts and posts they already
-voted on. Posts downvoted below zero (#112) and authors excluded by setting (#111) are
-left out by the candidate query itself, in ranker_daemon: both are haf_fyp's own data.
+voted on. Heavily downvoted posts (#112) and authors excluded by setting (#111) are
+left out by the candidate query itself, in ranker_daemon: both are haf_fyp's own data,
+so those two apply whether or not hivemind can be read.
 
 When hivemind is not there to read (no schema or table, no grant) the ranker writes feeds
 without these filters, warns once, and says when they work again. Any other failure (a

@@ -14,6 +14,7 @@ written against a node's hivemind (testapi, 2026-10-17) where 527,335 mutes and 
 followed mute lists were in exactly these tables.
 """
 
+import logging
 import os
 
 import psycopg2
@@ -138,29 +139,56 @@ def test_only_posts_by_greyed_authors_are_reported(conn) -> None:
 def _candidates(conn, monkeypatch, excluded):
     """The ranker's own candidate read, over the shipped post_candidates and
     engagement_metrics, of one post per case."""
+    line = rd.DOWNVOTED_AT_NET_RSHARES
     with conn.cursor() as cur:
         cur.execute(ddl("post_candidates", "engagement_metrics"))
         cur.execute("INSERT INTO hivemind_app.hive_accounts VALUES "
                     "(30, 'ordinary'), (31, 'grey.author'), (32, 'peak.snaps')")
         cur.execute("INSERT INTO hivemind_app.hive_accounts_view VALUES (30, FALSE), (31, TRUE), (32, FALSE)")
         cur.execute("INSERT INTO hivemind_app.hive_posts (id, author_id, counter_deleted) VALUES "
-                    "(601, 30, 0), (602, 31, 0), (603, 30, 0), (604, 32, 0), (605, 30, 0), (606, 30, 1)")
+                    "(601, 30, 0), (602, 31, 0), (603, 30, 0), (604, 32, 0), (605, 30, 0), (606, 30, 1), "
+                    "(607, 30, 0), (608, 30, 0), (609, 30, 0)")
         cur.execute("INSERT INTO haf_fyp_app.post_candidates (post_id, created_at) "
-                    "SELECT id, NOW() - INTERVAL '1 hour' FROM hivemind_app.hive_posts")
-        # 601 upvoted, 603 downvoted below zero, 604 at exactly zero; 605 has no row.
+                    "SELECT id, NOW() - INTERVAL '1 hour' FROM hivemind_app.hive_posts WHERE id < 608")
+        # 608 and 609 are out of their payout window, in the 7-30 day part of the pool.
+        cur.execute("INSERT INTO haf_fyp_app.post_candidates (post_id, created_at, payout_window) VALUES "
+                    "(608, NOW() - INTERVAL '10 days', FALSE), (609, NOW() - INTERVAL '10 days', FALSE)")
+        # 601 upvoted; 603 downvoted exactly to the line, 607 one rshare short of it,
+        # 608 past it; 604 at zero and 609 just below zero (a dust downvote); 605 no row.
         cur.execute("INSERT INTO haf_fyp_app.engagement_metrics (post_id, net_rshares) VALUES "
-                    "(601, 5), (602, 5), (603, -10), (604, 0)")
+                    "(601, 5), (602, 5), (603, %s), (604, 0), (607, %s), (608, %s), (609, -1)",
+                    (line, line + 1, line - 1))
     monkeypatch.setattr(rd, "EXCLUDED_AUTHORS", excluded)
     return sorted(rd._fetch_candidates(conn)["post_id"].tolist())
 
 
 def test_the_candidates_leave_out_greyed_downvoted_and_excluded_authors(conn, monkeypatch) -> None:
-    # 602 greyed author, 603 below zero, 604 excluded, 606 deleted (as before).
-    assert _candidates(conn, monkeypatch, ("leothreads", "peak.snaps")) == [601, 605]
+    # 602 greyed author, 603 and 608 downvoted to the line, 604 excluded, 606 deleted.
+    assert _candidates(conn, monkeypatch, ("leothreads", "peak.snaps")) == [601, 605, 607, 609]
 
 
 def test_an_empty_exclusion_list_excludes_nobody(conn, monkeypatch) -> None:
-    assert _candidates(conn, monkeypatch, ()) == [601, 604, 605]
+    assert _candidates(conn, monkeypatch, ()) == [601, 604, 605, 607, 609]
+
+
+def test_without_the_reputation_view_the_grey_filter_is_off_and_said_so(conn, monkeypatch, caplog) -> None:
+    """A hivemind without hive_accounts_view (or the reptracker behind it): candidates
+    are still read, with the greyed author's post in them, and the warning names the
+    grey filter, not the mute one."""
+    _candidates(conn, monkeypatch, ())  # the same rows as above
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE hivemind_app.hive_accounts_view")
+    visibility._warned.clear()
+    # One read only: the failed grey read rolls the session back, which in production
+    # discards nothing (the candidate rows are already fetched) but here takes the
+    # fixture's tables with it.
+    with caplog.at_level(logging.WARNING, logger="haf_fyp.visibility"):
+        assert 602 in rd._fetch_candidates(conn)["post_id"].tolist()
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and warnings[0].startswith("author reputations could not be read"), warnings
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1")
+        assert cur.fetchone() == (1,)
 
 
 def test_without_hivemind_the_reads_filter_nothing_and_the_session_carries_on(conn) -> None:

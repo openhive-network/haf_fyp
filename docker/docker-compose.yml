@@ -308,6 +308,7 @@ services:
       READER_ACTIVE_WITHIN_DAYS:
       FEED_SESSION_SECONDS:
       EXCLUDED_AUTHORS:
+      DOWNVOTED_AT_NET_RSHARES:
       # Retention and maintenance (README, "Retention and maintenance"), the same way. A
       # ranker image from before they were passed reads a blank one with int() and stops.
       FEED_EVENTS_MAINT_SECONDS:

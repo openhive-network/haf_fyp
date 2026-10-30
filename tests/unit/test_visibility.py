@@ -241,7 +241,8 @@ def test_the_candidate_query_is_given_the_excluded_authors(monkeypatch):
     monkeypatch.setattr(rd, "EXCLUDED_AUTHORS", ("leothreads", "peak.snaps"))
     rd._fetch_candidates(conn)
     # A list, which psycopg2 sends as an array; a tuple would go as a row.
-    assert cur.execute.call_args.args[1] == (["leothreads", "peak.snaps"], rd.CANDIDATE_LIMIT)
+    assert cur.execute.call_args.args[1] == (
+        rd.DOWNVOTED_AT_NET_RSHARES, ["leothreads", "peak.snaps"], rd.CANDIDATE_LIMIT)
 
 
 def test_no_candidates_asks_nothing(monkeypatch):
@@ -264,10 +265,25 @@ def test_account_names_are_trimmed_deduplicated_and_sorted():
     assert rd.account_names(" peak.snaps,leothreads , peak.snaps,,") == ("leothreads", "peak.snaps")
 
 
-@pytest.mark.parametrize("raw", ["Peak.Snaps", "peak snaps", "ab", "a" * 17, "1abc", "peak.snaps;drop"])
+@pytest.mark.parametrize("raw", [
+    "Peak.Snaps", "pEak", "peak.Snaps", "peak_snaps", "peak snaps", "ab", "a" * 17, "1abc",
+    "peak.snaps;drop", "abc-", "ab..cd", "a.bcd", "abc.de", ".abc", "abc.",
+    # One bad name in a list refuses the whole list.
+    "leothreads,Peak.Snaps", "leothreads,ab", "peak.snaps,x;drop",
+])
 def test_a_name_that_cannot_be_an_account_is_refused(raw):
     with pytest.raises(ValueError):
         rd.account_names(raw)
+
+
+@pytest.mark.parametrize("name", ["abc", "a1b", "hscr-isrc", "peak.snaps", "ecency.waves", "a" * 16, "abc.def.ghi"])
+def test_names_a_hive_account_can_have_are_accepted(name):
+    assert rd.account_names(name) == (name,)
+
+
+def test_a_dash_excludes_nobody():
+    assert rd.account_names("-") == ()
+    assert rd.account_names(" - ") == ()
 
 
 def test_the_setting_replaces_the_default_and_blank_keeps_it(monkeypatch):

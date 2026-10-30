@@ -111,7 +111,8 @@ def _tuning(key: str, default: str, convert: Callable[[str], _Setting],
     hive/haf_api_node's haf_fyp.yaml passes these settings with their defaults COPIED
     (`NAME: ${HAF_FYP_NAME:-<default>}`, haf_api_node!273). Raising a minimum above a
     copied default stops every ranker on those nodes once haf_api_node pins that release:
-    change the copy there in the same release.
+    change the copy there in the same release. The same goes for a changed default:
+    EXCLUDED_AUTHORS's list, copied there, stays the old list until the copy is edited.
     """
     raw = os.environ.get(key, "").strip()
     try:
@@ -143,13 +144,22 @@ FEED_EVENTS_MAX_ROWS = _tuning("FEED_EVENTS_MAX_ROWS", "20000000", int, minimum=
 EMBEDDING_COVERAGE_DAYS = _tuning("EMBEDDING_COVERAGE_DAYS", "14", int, minimum=1)
 CANDIDATE_LIMIT = 5000
 
-_ACCOUNT_NAME_RE = re.compile(r"[a-z][a-z0-9.-]{2,15}")
+# One dot-separated part of a Hive account name: at least three characters, a letter
+# first, a letter or digit last, and letters, digits or dashes between.
+_ACCOUNT_PART_RE = re.compile(r"[a-z][a-z0-9-]+[a-z0-9]")
+
+
+def _is_account_name(name: str) -> bool:
+    return 3 <= len(name) <= 16 and all(_ACCOUNT_PART_RE.fullmatch(part) for part in name.split("."))
 
 
 def account_names(raw: str) -> tuple[str, ...]:
-    """Comma-separated Hive account names; a name that cannot be one is refused."""
+    """Comma-separated Hive account names, or `-` for none. Any name no Hive account
+    could have is refused, so a typo stops the ranker rather than excluding nobody."""
+    if raw.strip() == "-":
+        return ()
     names = tuple(sorted({name.strip() for name in raw.split(",") if name.strip()}))
-    if not all(_ACCOUNT_NAME_RE.fullmatch(name) for name in names):
+    if not all(_is_account_name(name) for name in names):
         raise ValueError(raw)
     return names
 
@@ -159,12 +169,22 @@ def account_names(raw: str) -> tuple[str, ...]:
 # container is a thread to post into, not something to read, and with hundreds of
 # replies it scores like a hit. Each of these posted nothing but containers in the 60
 # days to 2026-10-30 on testapi; liketu.moments is the same kind, quiet since. Setting
-# the variable replaces the list, so copy it to add to it.
+# the variable replaces the list, so copy it to add to it; `-` excludes nobody (blank
+# means the default, as for every setting here).
 EXCLUDED_AUTHORS = _tuning(
     "EXCLUDED_AUTHORS",
     "ecency.waves,hscr-isrc,leothreads,liketu.moments,peak.snaps,slothbuzz.hangs",
     account_names,
 )
+
+# A post whose net rshares are at or below this is left out of every feed (#112). Not
+# below zero: one dust downvote on a new post with no upvotes yet would take it out of
+# discovery, which costs the downvoter next to nothing. hivemind's own `gray` does not
+# look at rshares at all (only the author's reputation and community mutes). On testapi
+# (2026-10-30) the default left out 910 of the 1,500 candidates below zero and kept the
+# 590 lightly downvoted ones, 25 of them within a dust vote of zero.
+# At most -1: at 0 every post nobody has voted on yet would go too.
+DOWNVOTED_AT_NET_RSHARES = _tuning("DOWNVOTED_AT_NET_RSHARES", "-9999999999", int, maximum=-1)
 
 # Personalized feeds are computed on demand, not bulk-precomputed for every
 # account that ever subscribed to a community (there can be tens of thousands,
@@ -824,14 +844,15 @@ def _fetch_candidates(conn) -> pd.DataFrame:
                    ON em.post_id = pc.post_id
             WHERE (pc.payout_window = TRUE
                    OR pc.created_at >= NOW() - INTERVAL '30 days')
-              -- #112: downvoted below zero, which hivemind's lists grey. The engagement
-              -- signal clips it to 0, so it would otherwise score like an unvoted post.
-              AND COALESCE(em.net_rshares, 0) >= 0
+              -- #112: downvoted past DOWNVOTED_AT_NET_RSHARES. The engagement signal
+              -- clips a negative total to 0, so it would otherwise score like an
+              -- unvoted post.
+              AND COALESCE(em.net_rshares, 0) > %s
               AND ha.name <> ALL(%s::text[])  -- #111: EXCLUDED_AUTHORS
             ORDER BY pc.created_at DESC
             LIMIT %s
             """,
-            (list(EXCLUDED_AUTHORS), CANDIDATE_LIMIT),
+            (DOWNVOTED_AT_NET_RSHARES, list(EXCLUDED_AUTHORS), CANDIDATE_LIMIT),
         )
         rows = cur.fetchall()
     if not rows:
