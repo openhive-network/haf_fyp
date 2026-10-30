@@ -100,15 +100,16 @@ python-lint:
     # mypy type-checks against the real dependencies (#42): requirements.txt is installed,
     # with stubs for the two that ship no types (pandas-stubs, types-psycopg2), and
     # --ignore-missing-imports is gone, so an import mypy cannot type is an error rather
-    # than a silent Any. requirements.txt has floors only, so every package mypy reads is
+    # than a silent Any. requirements.txt mostly sets floors, so every package mypy reads is
     # pinned, here or in requirements.txt (wax), or a new fastapi or stub release would
     # change the verdict on unchanged code (pandas-stubs 3.1.0 came out on 2026-10-29,
     # types-psycopg2 2.9.21.20261030 the day after). That set is what `mypy -v` parsed from
     # site-packages on 2026-10-29, in this image: the rest of what requirements.txt pulls in
     # (uvicorn, aiohttp, uvloop...) is never read. Some are read only because the image has
-    # them (Jinja2, PyJWT); they are pinned all the same, since the image follows a moving
-    # tag, and that also puts them in AIDEV's fresh /opt/lint. A requirements.txt change
-    # that adds an import adds its package to that set: re-run `mypy -v` and pin.
+    # them (Jinja2 with its MarkupSafe, PyJWT); they are pinned all the same, since the
+    # image follows a moving tag, and that also puts them in AIDEV's fresh /opt/lint. A
+    # requirements.txt change that adds an import adds its package to that set: re-run
+    # `mypy -v` and pin.
     # .aidev/runtime/Dockerfile's /opt/lint installs the same line.
     - >-
       pip install -q ruff==0.15.12
