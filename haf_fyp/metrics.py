@@ -966,7 +966,8 @@ def build_redis_report(probe: dict | None, address: str) -> dict:
     """
     # Anything but the probe's dict is no answer: a wrong no_answer must not 500 the route.
     answered = isinstance(probe, dict)
-    probe = probe if answered else {"reachable": False, "refresh_subscribers": None, "maxmemory_policy": None}
+    if not isinstance(probe, dict):
+        probe = {"reachable": False, "refresh_subscribers": None, "maxmemory_policy": None}
     subscribers = probe["refresh_subscribers"]
     if not answered:
         state, detail = REDIS_UNKNOWN, "the Redis probe failed or did not answer within 1 s"
