@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import pathlib
+import queue
 import threading
 import time
 from contextlib import contextmanager
@@ -56,6 +56,13 @@ def test_a_failed_numsub_is_unknown_not_ok() -> None:
     assert report["state"] == "unknown" and report["degraded"] is True
 
 
+@pytest.mark.parametrize("count", ["0", "1", 1.0])
+def test_a_count_that_is_not_an_integer_is_unknown_not_ok(count) -> None:
+    # Only a non-conforming proxy sends one; "1" must not read as a listener.
+    report = build_redis_report(_probe(subscribers=count), ADDRESS)
+    assert report["state"] == "unknown" and report["degraded"] is True
+
+
 def test_no_answer_is_unknown_with_the_same_keys() -> None:
     report = build_redis_report(None, ADDRESS)
     assert report["state"] == "unknown" and report["degraded"] is True
@@ -91,7 +98,8 @@ class _FakeRedis:
         return self._answer(self._numsub if self._numsub is not None else [(channels[0], 1)])
 
     def config_get(self, name):
-        return self._answer(self._config if self._config is not None else {name: "noeviction"})
+        # The real reply's key, not an echo of `name`, so a typo in the asked name shows.
+        return self._answer(self._config if self._config is not None else {"maxmemory-policy": "noeviction"})
 
     def close(self):
         self.closed = True
@@ -120,6 +128,7 @@ def test_the_probe_asks_numsub_for_the_channel_it_publishes_to(monkeypatch) -> N
     assert fake.numsub_args == ("haf_fyp:refresh",) and fake.closed
     # Bounded like the /health ping: short timeouts, no retries.
     assert seen["socket_timeout"] == api._HEALTH_REDIS_TIMEOUT
+    assert seen["socket_connect_timeout"] == api._HEALTH_REDIS_TIMEOUT
     assert seen["retry"]._retries == 0
 
 
@@ -128,8 +137,14 @@ def test_zero_subscribers_reads_zero_not_none(monkeypatch) -> None:
     assert api._refresh_channel_state()["refresh_subscribers"] == 0
 
 
-def test_an_unanswered_ping_stops_there(monkeypatch) -> None:
-    fake = _FakeRedis(ping=redis_lib.ConnectionError("refused"))
+@pytest.mark.parametrize("error", [
+    redis_lib.ConnectionError("refused"),
+    # Not a ConnectionError in redis-py 7: a narrower except would read it as unknown.
+    redis_lib.TimeoutError("timed out"),
+    redis_lib.AuthenticationError("NOAUTH"),
+])
+def test_an_unanswered_ping_stops_there(monkeypatch, error) -> None:
+    fake = _FakeRedis(ping=error)
     api, _ = _with_client(monkeypatch, fake)
 
     assert api._refresh_channel_state() == {
@@ -147,6 +162,17 @@ def test_a_disabled_config_costs_only_its_own_field(monkeypatch) -> None:
     }
 
 
+def test_a_config_reply_redis_py_cannot_parse_costs_only_its_own_field(monkeypatch) -> None:
+    # redis-py 8 raises AttributeError, not RedisError, on an off-spec CONFIG GET reply.
+    fake = _FakeRedis(config=AttributeError("'list' object has no attribute 'items'"))
+    api, _ = _with_client(monkeypatch, fake)
+
+    assert api._refresh_channel_state() == {
+        "reachable": True, "refresh_subscribers": 1, "maxmemory_policy": None,
+    }
+    assert fake.closed
+
+
 def test_a_failed_numsub_keeps_the_policy(monkeypatch) -> None:
     fake = _FakeRedis(numsub=redis_lib.ResponseError("NOPERM"))
     api, _ = _with_client(monkeypatch, fake)
@@ -156,12 +182,36 @@ def test_a_failed_numsub_keeps_the_policy(monkeypatch) -> None:
     assert state["maxmemory_policy"] == "noeviction"
 
 
-def test_the_ranker_subscribes_to_the_channel_the_api_publishes_to() -> None:
-    # Both sides hard-code the name; the count means nothing if they disagree.
-    from haf_fyp import api
+class _Stop(BaseException):
+    """Not an Exception, so the subscriber's retry loop does not swallow it."""
 
-    source = (pathlib.Path(api.__file__).parent / "ranker_daemon.py").read_text(encoding="utf-8")
-    assert f'pubsub.subscribe("{api._REFRESH_CHANNEL}")' in source
+
+def test_the_ranker_subscribes_to_the_channel_the_api_publishes_to(monkeypatch) -> None:
+    # Both sides name the channel separately; the count means nothing if they disagree.
+    from haf_fyp import api, ranker_daemon
+
+    subscribed = []
+
+    class _PubSub:
+        def subscribe(self, *channels):
+            subscribed.extend(channels)
+            raise _Stop
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def pubsub(self, **_kwargs):
+            return _PubSub()
+
+    def no_retry(_seconds):
+        raise _Stop
+
+    monkeypatch.setattr(ranker_daemon.redis_lib, "Redis", _Client)
+    monkeypatch.setattr(ranker_daemon.time, "sleep", no_retry)
+    with pytest.raises(_Stop):
+        ranker_daemon._redis_subscriber(queue.Queue())
+    assert subscribed == [api._REFRESH_CHANNEL]
 
 
 # --- the route ----------------------------------------------------------------------
@@ -184,7 +234,9 @@ def _route(monkeypatch, channel_probe):
         monkeypatch.setattr(api, name, lambda probe: {})
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
     monkeypatch.setattr(api, "build_ranking_sources_report", lambda probe, serv: {})
-    monkeypatch.setattr(api, "_channel_probe", api._BoundedProbe("c", channel_probe, no_answer=None))
+    # The module's own factory, so the no_answer it passes is what these tests see.
+    monkeypatch.setattr(api, "_refresh_channel_state", channel_probe)
+    monkeypatch.setattr(api, "_channel_probe", api._new_channel_probe())
     monkeypatch.setenv("REDIS_HOST", "elsewhere")
     monkeypatch.setenv("REDIS_PORT", "6380")
     return api
@@ -208,7 +260,25 @@ def test_a_hung_redis_reports_unknown_within_the_deadline(monkeypatch) -> None:
     finally:
         release.set()
     assert report["state"] == "unknown"
-    assert time.monotonic() - started < 2
+    # The Redis deadline, not the database's 1.5 s.
+    assert time.monotonic() - started < 0.2 + 0.6
+
+
+def test_the_probe_starts_before_the_database_reads(monkeypatch) -> None:
+    api = _route(monkeypatch, lambda: _probe())
+    order = []
+    real_begin = api._channel_probe.begin
+
+    def begin(end):
+        order.append(("channel", end - time.monotonic()))
+        return real_begin(end)
+
+    monkeypatch.setattr(api._channel_probe, "begin", begin)
+    monkeypatch.setattr(api, "fetch_coverage_rows", lambda _c: order.append(("coverage", None)))
+
+    api.metrics(MagicMock())
+    assert [name for name, _ in order] == ["channel", "coverage"]
+    assert order[0][1] == pytest.approx(api._HEALTH_REDIS_DEADLINE, abs=0.1)
 
 
 def test_a_probe_that_raises_does_not_take_the_route_down(monkeypatch) -> None:

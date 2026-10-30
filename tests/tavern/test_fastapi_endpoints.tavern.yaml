@@ -123,13 +123,13 @@ stages:
         # lane's feed_cache is the cut-down table of ci_fastapi_setup.sql, and the
         # verdict is tested against PostgreSQL in test_feed_cache_format_db.py.
         feed_cache: !anything
-        # #51. This job runs without a Redis (see /health above), so the real probe
-        # through the real route answers unreachable. An exception in the probe would
-        # read unknown instead.
+        # #51. This job points REDIS_HOST/REDIS_PORT at a refused port (.gitlab-ci.yml),
+        # so the real probe through the real route answers unreachable. An exception
+        # in the probe would read unknown instead.
         redis:
           state: "unreachable"
           degraded: true
-          address: !anystr
+          address: "127.0.0.1:1"
           refresh_subscribers: null
           maxmemory_policy: null
           detail: !anystr

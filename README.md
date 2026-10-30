@@ -497,7 +497,7 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Can this container serve: `503` when the database pool does not answer a query within 1.5 s. Redis is reported in the body (`redis`, `rate_limit_store`) and never fails it: the app serves without Redis. A probe slower than its deadline (1.5 s database, 1.0 s Redis) counts as no answer. Not sync-aware (#61) |
-| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), reader-first figures (#86, under `reader_first`: whether the ranker is ranking, readers in the last day, their stalest feed, rotation age; see "How fresh a feed is"), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why), whether the installed `feed_cache` is the one the ranker writes (#99, under `feed_cache`: `ok`, or `outdated` with both shapes), whether the ranker is subscribed on the refresh-signal Redis (#51, under `redis`: alert on `redis.degraded`) — not feed analytics |
+| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), reader-first figures (#86, under `reader_first`: whether the ranker is ranking, readers in the last day, their stalest feed, rotation age; see "How fresh a feed is"), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why), whether the installed `feed_cache` is the one the ranker writes (#99, under `feed_cache`: `ok`, or `outdated` with both shapes), whether the ranker is subscribed on the refresh-signal Redis (#51, under `redis`: how many clients listen on the refresh channel, the ranker among them; alert on `redis.degraded`) — not feed analytics |
 | GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
 | POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10/min per IP, 60/min total) |
 | DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5/min per IP, 30/min total) |
@@ -513,7 +513,8 @@ once at import, so it takes a restart.
 
 The two metrics endpoints are unrelated and answer different questions. This one, on the
 FastAPI overlay, is the *operational* read — embedding coverage, credibility source
-health, ranking source health and the reader-first figures — and is what an
+health, ranking source health, the reader-first figures, the feed_cache shape and the
+refresh-signal Redis — and is what an
 embedding-gap, lost-grant, empty-feed or stopped-ranker alert should watch. It carries no block
 height, so it is not a freshness check: for that, watch `GET /sync-status` below. Feed
 *performance* analytics are a separate, product-facing read, served by PostgREST itself as
@@ -1468,14 +1469,22 @@ which is silent by construction: `_publish_refresh` wraps its call in
 you point them at.
 
 `GET /metrics` → `redis` is where a split shows (#51). It asks the instance the api
-publishes to (`address`, from `REDIS_HOST`/`REDIS_PORT`) how many clients listen on
-`haf_fyp:refresh`. A healthy stack reads `state: ok` with `refresh_subscribers` ≥ 1.
-`no_subscriber` means the ranker is down or restarting (it resubscribes within 10 s),
-or it listens on another instance. `unreachable` and `unknown` mean the probe got no
-answer. Alert on `redis.degraded` held for longer than a ranker restart.
-`maxmemory_policy` is reported but not judged (null where `CONFIG` is disabled). The
-section covers the pub/sub client only; the limiter's store is `rate_limit_store` on
-`GET /health`.
+publishes to (`address`, echoing `REDIS_HOST`:`REDIS_PORT`) how many clients listen on
+`haf_fyp:refresh`. A healthy stack reads `state: ok` with `refresh_subscribers` ≥ 1, one
+of them the ranker.
+
+| `state` | meaning |
+|---|---|
+| `no_subscriber` | nobody listens: the ranker is stopped (an install or upgrade stops it on purpose), restarting, or listening on another instance |
+| `unreachable` | the PING failed or timed out (0.3 s); the API log says why, e.g. a refused connection or `NOAUTH` |
+| `unknown` | the probe did not finish within 1 s (typically name resolution), or the instance answered but `PUBSUB NUMSUB` failed |
+
+Alert on `redis.degraded` held for a few minutes, not on a single scrape. A restarted
+ranker subscribes as it starts, and after a Redis error it retries every 10 s.
+`maxmemory_policy` is reported but not judged (null where `CONFIG` is not allowed). It is
+the pub/sub instance's, so it describes the limiter's store only when `REDIS_URL` points
+at the same instance, which is the default. `GET /health` reports only whether that store
+answers (`rate_limit_store`).
 
 **Deploying a change to this file's limits:** `requirements.txt` is part of the image,
 so rebuild it, not a bare `up -d`, which silently reuses the cached image:

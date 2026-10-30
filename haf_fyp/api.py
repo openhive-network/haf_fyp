@@ -30,7 +30,7 @@ import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Annotated, Literal, Optional, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Optional, cast
 
 import anyio
 import anyio.to_thread
@@ -1325,12 +1325,12 @@ class _BoundedProbe:
     When it ends, the next caller starts a fresh one; a finished answer is never reused.
     """
 
-    def __init__(self, name: str, probe, no_answer: str = "unreachable") -> None:
+    def __init__(self, name: str, probe, no_answer: Any = "unreachable") -> None:
         self._name = name
         self._probe = probe
         self._no_answer = no_answer
         self._guard = threading.Lock()      # held only to read or replace _current
-        self._current: tuple[threading.Thread, list[str]] | None = None
+        self._current: tuple[threading.Thread, list[Any]] | None = None
 
     def begin(self, end: float):
         """Start the probe, or join the one in flight; returns a function that waits
@@ -1338,7 +1338,7 @@ class _BoundedProbe:
         with self._guard:
             current = self._current
             if current is None or not current[0].is_alive():
-                answer: list[str] = []
+                answer: list[Any] = []
 
                 def work() -> None:
                     try:
@@ -1355,7 +1355,7 @@ class _BoundedProbe:
                 current = self._current = (worker, answer)
         worker, answer = current
 
-        def finish() -> str:
+        def finish() -> Any:
             worker.join(max(0.0, end - time.monotonic()))
             return answer[0] if answer else self._no_answer
 
@@ -1397,7 +1397,7 @@ def _rate_limit_store_state() -> str:
     return "ok" if storage.check() is True else "unreachable"
 
 
-def _refresh_channel_state() -> dict:
+def _refresh_channel_state() -> dict[str, Any]:
     """For GET /metrics (#51): does the refresh-signal Redis answer, how many clients
     listen on the refresh channel, and its maxmemory-policy.
 
@@ -1409,7 +1409,7 @@ def _refresh_channel_state() -> dict:
         socket_timeout=_HEALTH_REDIS_TIMEOUT,
         retry=Retry(NoBackoff(), 0),
     )
-    state = {"reachable": False, "refresh_subscribers": None, "maxmemory_policy": None}
+    state: dict[str, Any] = {"reachable": False, "refresh_subscribers": None, "maxmemory_policy": None}
     try:
         try:
             client.ping()
@@ -1427,8 +1427,10 @@ def _refresh_channel_state() -> dict:
             state["maxmemory_policy"] = client.config_get("maxmemory-policy").get(
                 "maxmemory-policy"
             )
-        except redis_lib.RedisError:
-            pass  # CONFIG disabled or renamed: the field stays null
+        except Exception:
+            # Optional, so ANY failure costs only this field: CONFIG disabled or
+            # renamed, an ACL denial, or a proxy whose reply redis-py cannot parse.
+            pass
         return state
     finally:
         client.close()
@@ -1591,10 +1593,12 @@ def metrics(response: Response):
     nobody until the install is re-run; the section names both shapes.
 
     redis (#51): whether the Redis the refresh signal is published to answers, and how
-    many clients are subscribed to haf_fyp:refresh there. Zero is the state nothing
-    else shows: the publish succeeds and the ranker logs that it is subscribed, but to
-    another instance. Alert on redis.degraded. Not database-backed: a Redis that does
-    not answer within 1 s reports unknown, and never fails the route.
+    many clients are subscribed to haf_fyp:refresh there. Zero is a ranker that is
+    stopped, or one listening on another instance -- the state nothing else shows: the
+    publish succeeds and the ranker logs that it is subscribed. Alert on redis.degraded
+    held for a few minutes. The probe runs beside the database reads with a 1 s
+    deadline, so it never fails the route and adds at most 1 s to it. See
+    build_redis_report for the states.
 
     A failed credibility probe reports state "unknown" (and degraded true, which fails
     safe for a monitor) rather than taking the coverage metric down with it. The
