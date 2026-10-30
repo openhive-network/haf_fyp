@@ -791,7 +791,9 @@ def test_a_changed_error_is_printed_in_full_again(bash, tmp_path: Path) -> None:
     """The full error prints when it CHANGES, not only the first time: a new failure is
     new information."""
     make_psql(tmp_path, registry="f", ownership_failures=-1, varying_error=True)
-    out = run_until_parked(bash, tmp_path, marker="retrying in", min_ownership_calls=3)
+    # The stub counts a probe before the script prints its failure; the fourth probe
+    # comes only after the third failure has been printed.
+    out = run_until_parked(bash, tmp_path, marker="retrying in", min_ownership_calls=4)
     for n in (1, 2, 3):
         assert f"stub ownership failure #{n}" in out, out
     assert "same error" not in out, out
