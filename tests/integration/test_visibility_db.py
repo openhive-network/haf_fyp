@@ -177,6 +177,8 @@ def test_at_the_highest_line_a_post_with_no_votes_stays(conn, monkeypatch) -> No
     monkeypatch.setattr(rd, "DOWNVOTED_AT_NET_RSHARES", -1)
     kept = _candidates(conn, monkeypatch, ())
     assert 609 not in kept and {604, 605} <= set(kept), kept
+    # And the line itself: 603 is at -1, 607 at 0.
+    assert 603 not in kept and 607 in kept, kept
 
 
 def test_without_the_reputation_view_the_grey_filter_is_off_and_said_so(conn, monkeypatch, caplog) -> None:

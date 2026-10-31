@@ -103,13 +103,14 @@ def _tuning(key: str, default: str, convert: Callable[[str], _Setting],
     connection string.
 
     A value `convert` rejects, or one below `minimum` or above `maximum`, still stops the
-    daemon, and the error says which variable. Refused, not raised to the minimum: where a minimum is
-    given, a smaller value deletes data, does no work or fails on every pass (every feed
-    event pruned, maintenance on every poll, a negative LIMIT), so it is far more likely
-    a mistake than a choice.
+    daemon, and the error says which variable. Refused, not moved into range: where a
+    minimum is given, a smaller value deletes data, does no work or fails on every pass
+    (every feed event pruned, maintenance on every poll, a negative LIMIT); where a
+    maximum is, a larger one fails every pass or drops far more than meant (every unvoted
+    post, for DOWNVOTED_AT_NET_RSHARES). Either is far more likely a mistake than a choice.
 
-    hive/haf_api_node's haf_fyp.yaml passes these settings with their defaults COPIED
-    (`NAME: ${HAF_FYP_NAME:-<default>}`, haf_api_node!273). Raising a minimum above a
+    hive/haf_api_node's haf_fyp.yaml will pass these settings with their defaults COPIED
+    (`NAME: ${HAF_FYP_NAME:-<default>}`) once haf_api_node!273 lands. Raising a minimum above a
     copied default stops every ranker on those nodes once haf_api_node pins that release:
     change the copy there in the same release. The same goes for a changed default: once
     EXCLUDED_AUTHORS or DOWNVOTED_AT_NET_RSHARES is copied there, the copy stays the old
@@ -183,8 +184,8 @@ EXCLUDED_AUTHORS = _tuning(
 # just below zero: one small downvote on a new post with no upvotes yet would take it
 # out of discovery, which costs the downvoter next to nothing. hivemind's own `gray`
 # does not look at rshares at all (only the author's reputation, mutes and community
-# mutes). -1e10 is about one full-strength downvote from a 280 HP account (a full vote
-# is roughly 3.6e7 rshares per HP). On testapi (2026-10-30) the default left out 910 of
+# mutes). -1e10 is about one full-strength downvote from a 310 HP account (a full vote
+# is roughly 3.2e7 rshares per HP at the chain's 1,605 VESTS per HP of 2026-10-31). On testapi (2026-10-30) the default left out 910 of
 # the 1,500 candidates below zero and kept 590, 25 of them above -1e9.
 # At most -1: at 0 every post nobody has voted on yet would go too.
 DOWNVOTED_AT_NET_RSHARES = _tuning("DOWNVOTED_AT_NET_RSHARES", "-9999999999", int, maximum=-1)
