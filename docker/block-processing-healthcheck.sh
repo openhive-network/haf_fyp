@@ -115,19 +115,23 @@ CONTEXT=${HAF_FYP_CONTEXT:-"haf_fyp"}
 
 # Seconds the loop may go without iterating before this reports unhealthy.
 #
-# Upstream hard-codes 1 minute. This is 5 minutes and configurable, and the honest
-# reason is that the bound is NOT KNOWN. In live sync the gap is small -- one block
-# per iteration, and app_next_block waits at most ~4s -- so 60s would be ample there.
-# The open question is MASSIVE, where one iteration is up to 10,000 blocks of this
-# app's post and engagement ingestion. That duration has never been measured on a live
-# node, and because of the one-iteration lag described above the window has to cover
-# TWO of them: 300s here tolerates iterations of roughly 150s.
+# Upstream hard-codes 1 minute. This is 5 minutes and configurable. In live sync the
+# gap is small -- one block per iteration, and app_next_block waits at most ~4s -- so
+# 60s would be ample there. Because of the one-iteration lag described above the window
+# has to cover TWO iterations: 300s here tolerates iterations of roughly 150s.
 #
-# So this errs wide, and the trade is explicit: a window that is too generous delays
+# Measured since #97 (#37, testapi 2026-10-28): there is no replay, and the one long
+# iteration is the first, which backfills the history window from hivemind -- 676s for a
+# year there. On a fresh install it runs inside the compose start_period before any
+# check has passed, so it shows as `starting`, not unhealthy. A backfill started later
+# in a running container (a widened window) does trip this; raise the value for it.
+# Live batches afterwards take well under a second.
+#
+# It stays wide, and the trade is explicit: a window that is too generous delays
 # detection of a wedged loop (to MAX_AGE plus retries x interval, about 8 minutes at
-# the compose defaults), while one that is too tight reports a healthy replay as
+# the compose defaults), while one that is too tight reports a healthy sync as
 # unhealthy. haf_fyp has already caused one false alert (!41); that is why the error
-# is on this side. Narrow it once a MASSIVE batch has been timed.
+# is on this side.
 #
 # NOT justified by deployment/healthchecks/checks/haf_fyp.sh's 360s. An earlier
 # revision claimed that; it is a category error. That check measures

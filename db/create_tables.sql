@@ -660,6 +660,33 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.embedding_coverage_daily (
 );
 
 -- ---------------------------------------------------------------------------
+-- Ranker cycles (#37)
+--
+-- One row per scheduled ranker cycle, written by the ranker when the cycle ends
+-- (haf_fyp/ranker_daemon.py _record_cycle), which also deletes rows older than seven
+-- days. GET /metrics reports the last one and the last 24 hours (the ranker section).
+-- Until this the figures were only in the ranker's log, lost with its container.
+-- finished_at is the database's clock, so its age does not depend on the ranker's.
+-- A ranker older than this table writes nothing here; nothing else reads it.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS haf_fyp_app.ranker_cycles (
+    finished_at timestamptz NOT NULL DEFAULT now(),
+    duration_seconds real NOT NULL,
+    ok boolean NOT NULL,
+    candidates int NOT NULL,
+    users_attempted int NOT NULL,
+    users_ranked int NOT NULL,
+    users_failed int NOT NULL,
+    users_held int NOT NULL,
+    readers_ahead int NOT NULL,
+    lane_taken int NOT NULL,
+    lane_slots int NOT NULL,
+    reads_heard int NOT NULL,
+    PRIMARY KEY (finished_at)
+);
+
+-- ---------------------------------------------------------------------------
 -- Roles & privileges (#14) — least-privilege split
 --
 -- Two roles share the app schema:

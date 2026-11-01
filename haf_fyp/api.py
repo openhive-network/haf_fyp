@@ -62,6 +62,7 @@ from .metrics import (
     build_credibility_sources_report,
     build_feed_cache_report,
     build_history_report,
+    build_ranker_report,
     build_ranking_sources_report,
     build_reader_first_report,
     build_redis_report,
@@ -70,6 +71,7 @@ from .metrics import (
     fetch_feed_cache_shape,
     fetch_feed_servability,
     fetch_history,
+    fetch_ranker_cycles,
     fetch_ranking_sources,
     fetch_reader_first,
 )
@@ -1588,6 +1590,13 @@ def metrics(response: Response):
     `degraded`. See build_reader_first_report for what each figure means and what to
     watch.
 
+    ranker (#37): what the ranker's last scheduled cycle did, as it recorded it (how
+    long ago it finished, how long it took, accounts ranked, failed and held, the
+    reader lane, reads heard, readers taken ahead of their turn), and the count, median
+    and longest duration of the last 24 hours of cycles. Informational; see
+    build_ranker_report. last_cycle.finished_seconds_ago is the ranker's own liveness
+    figure: a stopped or wedged ranker records nothing, so it grows.
+
     feed_cache (#99): whether the installed feed_cache is the compact row the ranker
     writes (#98). `outdated` means the SQL is older than the ranker, which then ranks
     nobody until the install is re-run; the section names both shapes.
@@ -1657,7 +1666,9 @@ def metrics(response: Response):
             reader_first = fetch_reader_first(conn)
             # Its own SAVEPOINT too (#97), after the reader-first read.
             history = fetch_history(conn)
-            # After it, so its SAVEPOINT has left the transaction usable.
+            # Its own SAVEPOINT too (#37).
+            ranker = fetch_ranker_cycles(conn)
+            # After them, so their SAVEPOINTs have left the transaction usable.
             feed_cache = fetch_feed_cache_shape(conn)
     except psycopg2.pool.PoolError as exc:
         # Monitors poll this route, so a persistently exhausted pool must not write a
@@ -1682,6 +1693,7 @@ def metrics(response: Response):
     report["ranking_sources"] = build_ranking_sources_report(ranking_probe, servability)
     report["reader_first"] = build_reader_first_report(reader_first)
     report["history"] = build_history_report(history)
+    report["ranker"] = build_ranker_report(ranker)
     report["feed_cache"] = build_feed_cache_report(feed_cache)
     report["redis"] = build_redis_report(channel_answer(), ":".join(_redis_host_port()))
     return report

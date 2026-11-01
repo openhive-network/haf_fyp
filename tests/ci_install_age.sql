@@ -39,6 +39,10 @@ SELECT 'ci-aged-user', 42, 0.5, 1, code FROM haf_fyp_app.feed_cache_labels WHERE
 INSERT INTO haf_fyp_app.global_feed_cache (post_id, final_score, rank) VALUES (42, 0.5, 1);
 INSERT INTO haf_fyp_app.feed_metrics_daily (day) VALUES ('2016-09-15');
 INSERT INTO haf_fyp_app.embedding_coverage_daily (day, computed_at) VALUES ('2016-09-15', '2016-09-15 19:47:21+00');
+INSERT INTO haf_fyp_app.ranker_cycles
+(finished_at, duration_seconds, ok, candidates, users_attempted, users_ranked, users_failed,
+    users_held, readers_ahead, lane_taken, lane_slots, reads_heard)
+VALUES ('2016-09-15 19:47:21+00', 21.5, TRUE, 4976, 122, 122, 0, 0, 0, 3, 100, 5);
 RESET ROLE;
 
 -- The operator's: which algorithm version is live. The seed ships 1.1.0 active; an

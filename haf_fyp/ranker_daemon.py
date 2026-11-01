@@ -289,6 +289,17 @@ _reads_reranked = 0
 # Readers taken by the last scheduled cycle, and the slots the lane had for them.
 _lane_taken = 0
 _lane_slots = 0
+
+# What the last scheduled cycle did, for its row in haf_fyp_app.ranker_cycles (#37).
+# run_cycle fills it, main() writes it, with the lane and read figures above.
+_CYCLE_COUNTS = ("candidates", "users_attempted", "users_ranked", "users_failed",
+                 "users_held", "readers_ahead")
+_cycle_stats: dict[str, int] = dict.fromkeys(_CYCLE_COUNTS, 0)
+# Days of cycles kept: about 2,000 rows at the default CYCLE_SECONDS.
+_CYCLE_RECORD_DAYS = 7
+# The record's write fails the same way on every cycle until someone acts (the SQL is
+# older than this ranker, a grant): said once, and again after a write succeeds.
+_cycle_record_failing = False
 _feed_read_failure_logged_at = 0.0
 _missing_column_warned_at: float | None = None
 
@@ -1266,8 +1277,9 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
     account's time: the candidates are already loaded, where a targeted refresh after
     the cycle fetches them again (about 8 s on a full node).
     """
-    global _lane_taken, _lane_slots
+    global _lane_taken, _lane_slots, _cycle_stats
     _lane_taken = _lane_slots = 0  # a cycle that stops before the lane query took nobody
+    _cycle_stats = dict.fromkeys(_CYCLE_COUNTS, 0)
     register_vector_type(conn)
     _refresh_read_filter(conn)
 
@@ -1278,6 +1290,7 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
         log.info("no candidates to rank — skipping cycle")
         return set()
 
+    _cycle_stats["candidates"] = len(candidates)
     log.info("scoring %d candidates (algo %s)", len(candidates), algo_version)
 
     post_ids = candidates["post_id"].tolist()
@@ -1381,13 +1394,15 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
             failed += 1
             _log_user_failure(username, exc)
 
+    taken = ahead & done  # not one a later check turned away before its turn came
+    _cycle_stats.update(users_attempted=len(done), users_ranked=processed,
+                        users_failed=failed, users_held=held, readers_ahead=len(taken))
     if done:
         log.info(
             "refreshed personalized feeds for %d/%d cached users (%d failed%s)",
             processed, len(done), failed,
             f", {held} held for a read session" if held else "",
         )
-        taken = ahead & done  # not one a later check turned away before its turn came
         if taken:
             log.info(
                 "%d of them were readers with a stale feed, taken ahead of their turn%s",
@@ -1565,6 +1580,54 @@ def _run_history_retention(conn) -> None:
     except Exception:
         conn.rollback()
         log.exception("history retention failed — skipping")
+
+
+_RECORD_CYCLE_SQL = """
+INSERT INTO haf_fyp_app.ranker_cycles
+    (duration_seconds, ok, candidates, users_attempted, users_ranked, users_failed,
+     users_held, readers_ahead, lane_taken, lane_slots, reads_heard)
+VALUES (%(duration_seconds)s, %(ok)s, %(candidates)s, %(users_attempted)s,
+        %(users_ranked)s, %(users_failed)s, %(users_held)s, %(readers_ahead)s,
+        %(lane_taken)s, %(lane_slots)s, %(reads_heard)s)
+"""
+_PRUNE_CYCLES_SQL = (
+    "DELETE FROM haf_fyp_app.ranker_cycles WHERE finished_at < now() - make_interval(days => %s)"
+)
+
+
+def _record_cycle(conn, duration_seconds: float, ok: bool) -> None:
+    """
+    Write the scheduled cycle that just ended into haf_fyp_app.ranker_cycles, for GET
+    /metrics (#37), and drop the rows older than _CYCLE_RECORD_DAYS. Before
+    _log_feed_read_summary, which resets the read count.
+
+    Best-effort: the record must never cost a cycle. On SQL older than this ranker the
+    table is not there; that is said once, with the remedy, and ranking goes on.
+    """
+    global _cycle_record_failing
+    row = {**_cycle_stats, "duration_seconds": duration_seconds, "ok": ok,
+           "lane_taken": _lane_taken, "lane_slots": _lane_slots, "reads_heard": _reads_heard}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(_RECORD_CYCLE_SQL, row)
+            cur.execute(_PRUNE_CYCLES_SQL, (_CYCLE_RECORD_DAYS,))
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        _safe_rollback(conn)
+        if not _cycle_record_failing:
+            if getattr(exc, "pgcode", None) == "42P01":
+                log.warning(
+                    "haf_fyp_app.ranker_cycles is missing: the installed SQL is older than "
+                    "this ranker, so GET /metrics cannot show its cycles. Ranking goes on. "
+                    "Re-run the install with the block processor and this ranker stopped."
+                )
+            else:
+                log.warning("could not record the cycle for GET /metrics (%s)", exc)
+        _cycle_record_failing = True
+        return
+    if _cycle_record_failing:
+        log.info("the cycle record for GET /metrics is being written again")
+    _cycle_record_failing = False
 
 
 def _refresh_read_filter(conn) -> None:
@@ -1890,14 +1953,17 @@ def main() -> None:
         if time.monotonic() >= next_full_cycle:
             ranked: set[str] = set()
             handed.clear()
+            cycle_started, cycle_ok = time.monotonic(), False
             try:
                 ranked = run_cycle(conn, _reads_during_cycle) or set()
+                cycle_ok = True
             except (psycopg2.OperationalError, psycopg2.InterfaceError):
                 log.warning("database connection lost — reconnecting")
                 conn = _reconnect(conn)
             except Exception:
                 log.exception("ranking cycle failed")
                 _safe_rollback(conn)
+            _record_cycle(conn, time.monotonic() - cycle_started, cycle_ok)
             # Waiting readers the cycle ranked are done. The rest keep waiting for the
             # next grouped re-rank, and so does everyone handed to the cycle that it did
             # not get to: a cycle that failed, an account whose ranking failed, a lane
