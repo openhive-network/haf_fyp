@@ -35,7 +35,7 @@ stages:
       # and marks 1.3.0 active, so any other version here means the filter is wrong.
       json:
         - version: "1.3.0"
-          description: "Tiered community boost as in 1.1.0, but a boosted feed is rescaled into [0, 1] instead of clipped at 1, so its top keeps its order (#116)"
+          description: "Tiered community boost as in 1.1.0, but every score is divided by 1 + the larger boost instead of a boosted score being clipped at 1, so the top of a feed keeps its order (#116)"
           weights:
             relevance: 0.40
             recency: 0.30

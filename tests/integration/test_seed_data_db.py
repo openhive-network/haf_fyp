@@ -1,7 +1,7 @@
 """db/seed_data.sql's algorithm versions against a real database (#116).
 
 1.3.0 takes over from 1.1.0 on the install that registers it, and only where 1.1.0 is the
-one active version. The install lane sees a fresh database and then the operator's own
+one active version; its weights are the node's 1.1.0 weights plus boost_rescale. The install lane sees a fresh database and then the operator's own
 choice (tests/ci_install_age.sql); here the seed also meets the databases nodes have
 today -- the pre-1.3.0 seed with 1.1.0 active, or with another version chosen -- and an
 operator who goes back to 1.1.0 after 1.3.0 took over.
@@ -98,10 +98,47 @@ def test_fresh_install_activates_1_3_0(cur: cursor) -> None:
 
 
 def test_fresh_install_lists_1_3_0_newest(cur: cursor) -> None:
-    # list_algorithm_versions orders by deployed_at; one transaction, one NOW().
+    # list_algorithm_versions orders by deployed_at. Strictly later: here the whole seed
+    # is one transaction, where NOW() would give 1.2.0 and 1.3.0 the same time.
     cur.execute(_seed())
-    cur.execute(f"SELECT version FROM {_SCHEMA}.algorithm_versions ORDER BY deployed_at DESC LIMIT 1")
-    assert cur.fetchone() == ("1.3.0",)
+    cur.execute(f"SELECT (SELECT deployed_at FROM {_SCHEMA}.algorithm_versions WHERE version = '1.3.0')"
+                f"     > (SELECT deployed_at FROM {_SCHEMA}.algorithm_versions WHERE version = '1.2.0')")
+    assert cur.fetchone() == (True,)
+
+
+def _weights(cur: cursor, version: str) -> dict:
+    cur.execute(f"SELECT weights FROM {_SCHEMA}.algorithm_versions WHERE version = %s", (version,))
+    row = cur.fetchone()
+    assert row is not None
+    return dict(row[0])
+
+
+def test_1_3_0_is_1_1_0_plus_the_flag(cur: cursor) -> None:
+    cur.execute(_seed())
+    assert "boost_rescale" not in _weights(cur, "1.1.0")
+    assert _weights(cur, "1.3.0") == {**_weights(cur, "1.1.0"), "boost_rescale": True}
+
+
+def test_upgrade_carries_tuned_1_1_0_weights_over(cur: cursor) -> None:
+    # An operator who tuned 1.1.0 and runs it gets 1.3.0 with that tuning, not the
+    # shipped weights.
+    cur.execute(_seed_before_1_3_0())
+    cur.execute(f"""UPDATE {_SCHEMA}.algorithm_versions
+                   SET weights = weights || '{{"community_boost": 0.15}}'::jsonb WHERE version = '1.1.0'""")
+    tuned = _weights(cur, "1.1.0")
+    cur.execute(_seed())
+    assert _active(cur) == ["1.3.0"]
+    assert _weights(cur, "1.3.0") == {**tuned, "boost_rescale": True}
+
+
+def test_upgrade_without_a_1_1_0_row_uses_the_shipped_weights(cur: cursor) -> None:
+    cur.execute(_seed_before_1_3_0())
+    shipped = _weights(cur, "1.1.0")
+    cur.execute(f"DELETE FROM {_SCHEMA}.algorithm_versions WHERE version = '1.1.0'")
+    _choose(cur, "1.2.0")
+    cur.execute(_seed())
+    assert _weights(cur, "1.3.0") == {**shipped, "boost_rescale": True}
+    assert _active(cur) == ["1.2.0"]
 
 
 def test_upgrade_with_1_1_0_active_moves_to_1_3_0(cur: cursor) -> None:
@@ -133,6 +170,13 @@ def test_upgrade_with_none_active_changes_nothing(cur: cursor) -> None:
     cur.execute(f"UPDATE {_SCHEMA}.algorithm_versions SET is_active = FALSE")
     cur.execute(_seed())
     assert _active(cur) == []
+
+
+def test_rerun_with_1_3_0_active_changes_nothing(cur: cursor) -> None:
+    cur.execute(_seed())
+    cur.execute(_seed())
+    assert _versions(cur) == ["1.0.0", "1.1.0", "1.2.0", "1.3.0"]
+    assert _active(cur) == ["1.3.0"]
 
 
 def test_going_back_to_1_1_0_survives_the_next_install(cur: cursor) -> None:

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -199,13 +200,24 @@ class TestComputeScores:
         assert np.allclose(result["score_relevance"].values, 0.5, atol=1e-6)
 
 
+_SEED = os.path.join(os.path.dirname(__file__), "..", "..", "db", "seed_data.sql")
+
+
+def _json_after(text: str, start: int) -> dict:
+    """The first '{...}'::jsonb literal of the seed at or after `start`."""
+    return json.loads(text[text.index("'{", start) + 1 : text.index("}'::jsonb", start) + 1])
+
+
 def _seeded_weights(version: str) -> dict:
-    """The weights db/seed_data.sql registers for `version`, as the ranker reads them."""
-    seed = open(os.path.join(os.path.dirname(__file__), "..", "..", "db", "seed_data.sql"),
-                encoding="utf-8").read()
-    start = seed.index(f"'{version}'")
-    body = seed[seed.index("'{", start) + 1 : seed.index("}'::jsonb", start) + 1]
-    return json.loads(body)
+    """The weights db/seed_data.sql registers for `version` (1.0.0 to 1.2.0), as stored."""
+    seed = open(_SEED, encoding="utf-8").read()
+    return _json_after(seed, re.search(rf"\(\s*'{re.escape(version)}',", seed).start())
+
+
+# 1.3.0 is registered with the node's own 1.1.0 weights plus the flag (a fresh install:
+# the shipped ones). tests/integration/test_seed_data_db.py runs the seed itself.
+_V11 = _seeded_weights("1.1.0")
+_V13 = {**_V11, "boost_rescale": True}
 
 
 _STRONG = 6  # posts of community 7 whose base score is above 1 / 1.2
@@ -237,48 +249,58 @@ _CREDIBILITY = {f"strong{i}": 1.0 - 0.05 * i for i in range(_STRONG)}
 class TestBoostRescale:
     """#116: a boosted feed keeps its order instead of tying its top at 1."""
 
-    def test_seeded_versions(self) -> None:
-        # 1.3.0 is 1.1.0 plus boost_rescale, so what changes between them is #116 alone.
-        old, new = _seeded_weights("1.1.0"), _seeded_weights("1.3.0")
-        assert "boost_rescale" not in old
-        assert new == {**old, "boost_rescale": True}
+    def test_seed_fallback_is_the_shipped_1_1_0(self) -> None:
+        # Used only where a node has no 1.1.0 row: still 1.1.0 plus the flag.
+        seed = open(_SEED, encoding="utf-8").read()
+        assert "boost_rescale" not in _V11
+        assert _json_after(seed, seed.index("-- 1.3.0 (#116)")) == _V11
 
     def test_clipped_version_ties_the_top(self) -> None:
         # The bug as 1.1.0 still scores: every strong post reads exactly 1.
-        result = compute_scores(_strong_feed(), None, {}, _CREDIBILITY, {7}, set(),
-                                _seeded_weights("1.1.0"))
+        result = compute_scores(_strong_feed(), None, {}, _CREDIBILITY, {7}, set(), _V11)
         assert (result["final_score"] == 1.0).sum() == _STRONG
 
     def test_rescaled_top_is_distinct_and_ordered(self) -> None:
-        result = compute_scores(_strong_feed(), None, {}, _CREDIBILITY, {7}, set(),
-                                _seeded_weights("1.3.0"))
+        result = compute_scores(_strong_feed(), None, {}, _CREDIBILITY, {7}, set(), _V13)
         top = result.head(_STRONG)
         assert top["final_score"].nunique() == _STRONG
         # Best credibility first: the order of the unclipped products.
         assert list(top["author"]) == [f"strong{i}" for i in range(_STRONG)]
         assert (result["final_score"] >= 0.0).all() and (result["final_score"] <= 1.0).all()
 
-    def test_rescaled_score_is_the_product_over_the_largest_factor(self) -> None:
-        base = compute_scores(_strong_feed(), None, {}, _CREDIBILITY, set(), set(),
-                              _seeded_weights("1.1.0")).set_index("post_id")["final_score"]
-        for subscribed, engaged, factor in (({7}, set(), 1.2), (set(), {7}, 1.1)):
+    @staticmethod
+    def _base() -> pd.Series:
+        return compute_scores(_strong_feed(), None, {}, _CREDIBILITY, set(), set(),
+                              _V11).set_index("post_id")["final_score"]
+
+    def test_score_is_the_product_over_the_largest_factor(self) -> None:
+        base = self._base()
+        # Every feed, the global one (no communities) and one whose communities have no
+        # candidate included: a score depends on its own post alone, never on whether
+        # the feed holds a boosted post.
+        cases = (({7}, set(), 1.2), (set(), {7}, 1.1), (set(), set(), 1.0), ({999}, set(), 1.0))
+        for subscribed, engaged, factor in cases:
             got = compute_scores(_strong_feed(), None, {}, _CREDIBILITY, subscribed, engaged,
-                                 _seeded_weights("1.3.0")).set_index("post_id")
+                                 _V13).set_index("post_id")
             for pid, row in got.iterrows():
-                # Divided by 1 + the larger boost whichever tier applied; the
-                # uncommunitied posts of the same feed are divided too.
                 want = base[pid] * (factor if row["community_boost_applied"] else 1.0) / 1.2
                 assert row["final_score"] == pytest.approx(want)
 
-    def test_feed_without_a_boosted_post_is_unchanged(self) -> None:
-        # The global feed, or a reader whose communities have no candidate: nothing to
-        # rescale, so the scores are those of the clipped version.
-        for subscribed in (set(), {999}):
-            old = compute_scores(_strong_feed(), None, {}, _CREDIBILITY, subscribed, set(),
-                                 _seeded_weights("1.1.0"))
-            new = compute_scores(_strong_feed(), None, {}, _CREDIBILITY, subscribed, set(),
-                                 _seeded_weights("1.3.0"))
-            pd.testing.assert_series_equal(old["final_score"], new["final_score"])
+    def test_the_larger_boost_divides_whichever_tier_it_is(self) -> None:
+        weights = {**_V13, "community_boost": 0.1, "community_boost_engaged": 0.3}
+        base = self._base()
+        got = compute_scores(_strong_feed(), None, {}, _CREDIBILITY, set(), {7},
+                             weights).set_index("post_id")
+        assert (got["final_score"] <= 1.0).all()
+        for pid, row in got.iterrows():
+            want = base[pid] * (1.3 if row["community_boost_applied"] else 1.0) / 1.3
+            assert row["final_score"] == pytest.approx(want)
+
+    def test_flag_false_is_the_clipped_version(self) -> None:
+        old = compute_scores(_strong_feed(), None, {}, _CREDIBILITY, {7}, set(), _V11)
+        off = compute_scores(_strong_feed(), None, {}, _CREDIBILITY, {7}, set(),
+                             {**_V11, "boost_rescale": False})
+        pd.testing.assert_series_equal(old["final_score"], off["final_score"])
 
 
 class _FakeCursor:
