@@ -295,11 +295,12 @@ _lane_slots = 0
 _CYCLE_COUNTS = ("candidates", "users_attempted", "users_ranked", "users_failed",
                  "users_held", "readers_ahead")
 _cycle_stats: dict[str, int] = dict.fromkeys(_CYCLE_COUNTS, 0)
-# Days of cycles kept: about 2,000 rows at the default CYCLE_SECONDS.
+# Days of cycles kept: about 2,000 rows at CYCLE_SECONDS.
 _CYCLE_RECORD_DAYS = 7
 # The record's write fails the same way on every cycle until someone acts (the SQL is
-# older than this ranker, a grant): said once, and again after a write succeeds.
-_cycle_record_failing = False
+# older than this ranker, a grant). What is failing ("missing", or the error's code), so
+# it is said once, again when it changes, and again after a write succeeds; None if not.
+_cycle_record_failure: str | None = None
 _feed_read_failure_logged_at = 0.0
 _missing_column_warned_at: float | None = None
 
@@ -1584,9 +1585,9 @@ def _run_history_retention(conn) -> None:
 
 _RECORD_CYCLE_SQL = """
 INSERT INTO haf_fyp_app.ranker_cycles
-    (duration_seconds, ok, candidates, users_attempted, users_ranked, users_failed,
+    (finished_at, duration_seconds, ok, candidates, users_attempted, users_ranked, users_failed,
      users_held, readers_ahead, lane_taken, lane_slots, reads_heard)
-VALUES (%(duration_seconds)s, %(ok)s, %(candidates)s, %(users_attempted)s,
+VALUES (clock_timestamp(), %(duration_seconds)s, %(ok)s, %(candidates)s, %(users_attempted)s,
         %(users_ranked)s, %(users_failed)s, %(users_held)s, %(readers_ahead)s,
         %(lane_taken)s, %(lane_slots)s, %(reads_heard)s)
 """
@@ -1601,10 +1602,16 @@ def _record_cycle(conn, duration_seconds: float, ok: bool) -> None:
     /metrics (#37), and drop the rows older than _CYCLE_RECORD_DAYS. Before
     _log_feed_read_summary, which resets the read count.
 
+    finished_at is clock_timestamp(), not now(): this transaction may have opened when the
+    cycle began (a cycle with no candidates commits nothing), and now() would date the
+    row from then.
+
     Best-effort: the record must never cost a cycle. On SQL older than this ranker the
-    table is not there; that is said once, with the remedy, and ranking goes on.
+    table is not there; that is said, with the remedy, and ranking goes on. Each failure
+    is said once while it lasts, and again when it changes, so a passing connection error
+    does not hide a missing table or a missing grant behind it.
     """
-    global _cycle_record_failing
+    global _cycle_record_failure
     row = {**_cycle_stats, "duration_seconds": duration_seconds, "ok": ok,
            "lane_taken": _lane_taken, "lane_slots": _lane_slots, "reads_heard": _reads_heard}
     try:
@@ -1614,8 +1621,11 @@ def _record_cycle(conn, duration_seconds: float, ok: bool) -> None:
         conn.commit()
     except Exception as exc:  # noqa: BLE001 - see the docstring
         _safe_rollback(conn)
-        if not _cycle_record_failing:
-            if getattr(exc, "pgcode", None) == "42P01":
+        message = getattr(getattr(exc, "diag", None), "message_primary", None) or str(exc)
+        missing = getattr(exc, "pgcode", None) == "42P01" and "ranker_cycles" in message
+        failure = "missing" if missing else (getattr(exc, "pgcode", None) or type(exc).__name__)
+        if failure != _cycle_record_failure:
+            if missing:
                 log.warning(
                     "haf_fyp_app.ranker_cycles is missing: the installed SQL is older than "
                     "this ranker, so GET /metrics cannot show its cycles. Ranking goes on. "
@@ -1623,11 +1633,11 @@ def _record_cycle(conn, duration_seconds: float, ok: bool) -> None:
                 )
             else:
                 log.warning("could not record the cycle for GET /metrics (%s)", exc)
-        _cycle_record_failing = True
+        _cycle_record_failure = failure
         return
-    if _cycle_record_failing:
+    if _cycle_record_failure:
         log.info("the cycle record for GET /metrics is being written again")
-    _cycle_record_failing = False
+    _cycle_record_failure = None
 
 
 def _refresh_read_filter(conn) -> None:

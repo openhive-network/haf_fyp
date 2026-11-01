@@ -52,7 +52,7 @@ def conn():
 
 @pytest.fixture()
 def stats(monkeypatch):
-    monkeypatch.setattr(rd, "_cycle_record_failing", False)
+    monkeypatch.setattr(rd, "_cycle_record_failure", None)
     monkeypatch.setattr(rd, "_cycle_stats", dict(
         candidates=4976, users_attempted=122, users_ranked=120, users_failed=1,
         users_held=1, readers_ahead=3))
@@ -76,7 +76,11 @@ def _insert(conn, ago, duration, ok=True):
 def test_the_rankers_record_reads_back_as_the_last_cycle(conn, stats) -> None:
     rd._record_cycle(conn, 21.46, True)
 
-    report = build_ranker_report(fetch_ranker_cycles(conn))
+    other = _connect()  # what the API sees: only what the ranker committed
+    try:
+        report = build_ranker_report(fetch_ranker_cycles(other))
+    finally:
+        other.close()
 
     assert report["state"] == "ok"
     last = report["last_cycle"]
@@ -86,6 +90,17 @@ def test_the_rankers_record_reads_back_as_the_last_cycle(conn, stats) -> None:
                     "users_held": 1, "readers_ahead": 3, "reader_lane_taken": 4,
                     "reader_lane_slots": 100, "reads_heard": 7}
     assert report["last_24h"]["cycles"] == 1
+
+
+def test_a_cycle_whose_transaction_opened_long_ago_is_dated_when_it_ends(conn, stats) -> None:
+    # A cycle with no candidates commits nothing, so its reads' transaction is still
+    # open when the record is written.
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_sleep(1.5)")
+        rd._record_cycle(conn, 1.5, True)
+        cur.execute("SELECT finished_at > now() - interval '1 second' FROM haf_fyp_app.ranker_cycles")
+        assert cur.fetchone() == (True,)
+    conn.rollback()
 
 
 def test_the_record_drops_what_is_older_than_seven_days(conn, stats) -> None:
@@ -153,7 +168,7 @@ def test_the_rankers_write_on_a_missing_table_rolls_back_and_does_not_raise(conn
 
         rd._record_cycle(conn, 1.0, True)
 
-        assert rd._cycle_record_failing is True
+        assert rd._cycle_record_failure == "missing"
         with conn.cursor() as cur:  # not left aborted
             cur.execute("SELECT 1")
             assert cur.fetchone() == (1,)

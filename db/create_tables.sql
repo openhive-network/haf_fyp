@@ -666,12 +666,14 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.embedding_coverage_daily (
 -- (haf_fyp/ranker_daemon.py _record_cycle), which also deletes rows older than seven
 -- days. GET /metrics reports the last one and the last 24 hours (the ranker section).
 -- Until this the figures were only in the ranker's log, lost with its container.
--- finished_at is the database's clock, so its age does not depend on the ranker's.
+-- finished_at is the database's clock at the insert (clock_timestamp(), not now(): the
+-- ranker's transaction may have opened when the cycle began), so its age does not
+-- depend on the ranker's clock. About 2,000 rows at one cycle per five minutes.
 -- A ranker older than this table writes nothing here; nothing else reads it.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.ranker_cycles (
-    finished_at timestamptz NOT NULL DEFAULT now(),
+    finished_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     duration_seconds real NOT NULL,
     ok boolean NOT NULL,
     candidates int NOT NULL,
@@ -760,6 +762,7 @@ REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.post_bridge_cache    FROM haf_fyp_u
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.user_profile_vectors FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.feed_metrics_daily   FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.embedding_coverage_daily FROM haf_fyp_user;
+REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.ranker_cycles        FROM haf_fyp_user;
 REVOKE UPDATE               ON haf_fyp_app.feed_events_rollup_state FROM haf_fyp_user;
 REVOKE DELETE               ON haf_fyp_app.feed_events            FROM haf_fyp_user;
 -- active_users: UPDATE is the ranker's (last_scored_at, last_read_at and the read

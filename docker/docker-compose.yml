@@ -98,7 +98,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 72h   # replay can take days on first run
+      start_period: 72h   # see the note on this service's healthcheck below
     # As haf_api_node's haf_base.yaml does: compose's default ten seconds is not enough for
     # PostgreSQL to shut down cleanly, and a SIGKILL after it makes the next start perform
     # crash recovery. It is stored on the container when compose creates it, so it applies to
@@ -192,10 +192,11 @@ services:
     # said nothing about whether haf_fyp_app.main() was still advancing. The loop is
     # infinite; when it wedged, that check kept reporting healthy.
     #
-    # start_period covers a first run against a fresh HAF, which replays the whole
-    # chain in MASSIVE iterations of up to 10,000 blocks -- and the heartbeat does not
-    # move until an iteration finishes, so a long batch can exceed MAX_AGE on a replay
-    # that is perfectly healthy.
+    # start_period covers a first run's one long batch: since #97 there is no replay,
+    # and the first batch copies the history window from hivemind (676s for a year on
+    # testapi, #37). The heartbeat does not move until a batch finishes, so that batch
+    # can exceed MAX_AGE on a perfectly healthy sync. The cover lasts only until a check
+    # first passes, so it does not help when haf_fyp waited for hivemind first.
     #
     # 72h is inherited from the SELECT 1 check this replaces and is NOT a considered
     # number for the new one. Docker stops forgiving failures at the first SUCCESSFUL

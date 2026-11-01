@@ -143,7 +143,7 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.embedding_coverage_daily (
 -- The same columns as db/create_tables.sql; tests/unit/test_ranker_cycles.py holds
 -- the two copies together.
 CREATE TABLE IF NOT EXISTS haf_fyp_app.ranker_cycles (
-    finished_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     duration_seconds REAL NOT NULL,
     ok BOOLEAN NOT NULL,
     candidates INT NOT NULL,

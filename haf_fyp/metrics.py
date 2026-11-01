@@ -877,7 +877,7 @@ def build_history_report(probe: dict | None) -> dict:
 # stays). Until it did, these figures were only in its log, which is lost when
 # the container is recreated. Unlike reader_first, this is what the ranker REPORTED: a
 # stopped or wedged ranker reports nothing, so the age of the last row is the signal.
-# Both clocks are the database's (finished_at is now() at the insert), so the age does
+# Both clocks are the database's (finished_at is clock_timestamp() at the insert), so the age does
 # not depend on the ranker container's clock.
 
 RANKER_OK = "ok"
@@ -959,8 +959,9 @@ def build_ranker_report(probe: dict | None) -> dict:
     The ranker section of GET /metrics.
 
     last_cycle -- the most recent scheduled cycle the ranker recorded:
-        finished_seconds_ago -- the liveness figure. A ranker waits CYCLE_SECONDS (300 by
-            default) between cycles, so this stays under that plus one cycle's length.
+        finished_seconds_ago -- the liveness figure. A ranker waits CYCLE_SECONDS (300,
+            fixed in the ranker) between cycles, so this stays under that plus one
+            cycle's length, plus any re-rank on read still running when the wait ends.
             Well above CYCLE_SECONDS + last_24h.max_duration_seconds, the ranker is
             stopped, or wedged inside a cycle. reader_first.newest_feed_seconds says the
             same from the feeds, without the ranker's help.
@@ -974,8 +975,12 @@ def build_ranker_report(probe: dict | None) -> dict:
         reads_heard -- feed reads heard since the previous cycle ended.
     last_24h -- cycles, failed_cycles, median and max duration over the last 24 hours.
 
+    A cycle that raised is recorded with ok false and the counts it had reached. A
+    ranker that cannot write the record keeps ranking: a lasting no_cycles or a growing
+    age can mean that too, and newest_feed_seconds tells the two apart.
+
     Informational: it never sets a `degraded`. How long a cycle may take depends on the
-    node and on CYCLE_SECONDS, which this process is not given.
+    node.
     """
     if probe is None:
         return {

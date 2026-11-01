@@ -167,7 +167,7 @@ def test_an_aborted_transaction_is_unknown_without_raising() -> None:
 
 @pytest.fixture()
 def fresh_record(monkeypatch):
-    monkeypatch.setattr(rd, "_cycle_record_failing", False)
+    monkeypatch.setattr(rd, "_cycle_record_failure", None)
     monkeypatch.setattr(rd, "_cycle_stats", dict(
         candidates=4976, users_attempted=122, users_ranked=120, users_failed=1,
         users_held=1, readers_ahead=3))
@@ -232,7 +232,37 @@ def test_another_failure_is_said_once_and_a_success_says_it_is_back(fresh_record
     messages = [r.getMessage() for r in caplog.records]
     assert sum("permission denied" in m for m in messages) == 1
     assert sum("written again" in m for m in messages) == 1
-    assert rd._cycle_record_failing is False
+    assert rd._cycle_record_failure is None
+
+
+def test_a_different_failure_is_said_even_while_one_is_standing(fresh_record, monkeypatch, caplog) -> None:
+    # A passing connection error must not hide the missing table behind it.
+    monkeypatch.setattr(rd, "_safe_rollback", lambda conn: None)
+    missing = _PgError('relation "haf_fyp_app.ranker_cycles" does not exist', "42P01")
+
+    with caplog.at_level(logging.WARNING, logger=rd.log.name):
+        rd._record_cycle(_write_conn(psycopg2.OperationalError("gone"))[0], 1.0, True)
+        rd._record_cycle(_write_conn(missing)[0], 1.0, True)
+        rd._record_cycle(_write_conn(missing)[0], 1.0, True)
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(messages) == 2
+    assert "gone" in messages[0] and "ranker_cycles is missing" in messages[1]
+
+
+def test_another_missing_relation_is_not_the_missing_table(fresh_record, monkeypatch, caplog) -> None:
+    monkeypatch.setattr(rd, "_safe_rollback", lambda conn: None)
+    other = _PgError('relation "haf_fyp_app.active_users" does not exist', "42P01")
+
+    with caplog.at_level(logging.WARNING, logger=rd.log.name):
+        rd._record_cycle(_write_conn(other)[0], 1.0, True)
+    (message,) = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert "could not record the cycle" in message and "active_users" in message
+
+
+def test_the_insert_dates_the_row_by_the_clock_not_the_transaction() -> None:
+    # now() is the transaction's start, which can be the start of the cycle.
+    assert "clock_timestamp()" in rd._RECORD_CYCLE_SQL
+    assert "now()" not in rd._RECORD_CYCLE_SQL
 
 
 def test_a_lost_connection_is_not_raised_either(fresh_record, monkeypatch) -> None:
@@ -242,7 +272,7 @@ def test_a_lost_connection_is_not_raised_either(fresh_record, monkeypatch) -> No
 
     rd._record_cycle(_write_conn(psycopg2.OperationalError("gone"))[0], 1.0, True)
 
-    assert rd._cycle_record_failing is True
+    assert rd._cycle_record_failure is not None
 
 
 # ---- run_cycle counts what it did ------------------------------------------------------
@@ -258,6 +288,19 @@ def test_run_cycle_counts_what_it_took_ranked_failed_and_ahead(monkeypatch) -> N
         "candidates": 1, "users_attempted": 4, "users_ranked": 3, "users_failed": 1,
         "users_held": 0, "readers_ahead": 1,
     }
+
+
+@pytest.mark.usefixtures("_reader_state")
+def test_a_reader_taken_ahead_then_turned_away_is_not_counted_ahead(monkeypatch) -> None:
+    # Both are taken ahead; one is ranked, and the next check finds both have opted out.
+    # The other is still in the queue and is never ranked: it was not taken.
+    reads = _Reads([{"yan", "zed"}, {"reads": {"yan", "zed"}, "opts_out": {"yan", "zed"}}])
+
+    _result, order, _conn, _evictions = _cycle(monkeypatch, ["amy"], reads,
+                                                per_account=rd.POLL_SECONDS)
+
+    assert len({"yan", "zed"} & set(order)) == 1
+    assert rd._cycle_stats["readers_ahead"] == 1
 
 
 def test_a_cycle_with_nothing_to_rank_counts_zero_not_the_last_cycle(monkeypatch) -> None:
@@ -307,6 +350,23 @@ def test_main_records_a_failed_cycle_as_not_ok(monkeypatch) -> None:
 
 
 @pytest.mark.usefixtures("_reader_state")
+def test_main_rolls_a_failed_cycle_back_before_recording_it(monkeypatch) -> None:
+    # On a real database the record would otherwise go into the aborted transaction and
+    # fail, and no failed cycle would ever be recorded.
+    events = []
+    monkeypatch.setattr(rd, "_record_cycle", lambda conn, seconds, ok: events.append(("record", conn)))
+
+    def _bug(conn, reads):
+        stub = rd._safe_rollback  # _drive_main's
+        monkeypatch.setattr(rd, "_safe_rollback", lambda c: (events.append(("rollback", c)), stub(c)))
+        raise RuntimeError("bug")
+
+    seen = _drive_main(monkeypatch, drain=[set()], note=[set()], cycle=[_bug])
+
+    assert events[:2] == [("rollback", seen.first), ("record", seen.first)]
+
+
+@pytest.mark.usefixtures("_reader_state")
 def test_main_records_a_cycle_that_lost_its_connection_on_the_new_one(monkeypatch) -> None:
     calls = _recorded(monkeypatch)
 
@@ -353,7 +413,7 @@ def test_the_rankers_insert_and_the_report_name_every_column() -> None:
     written = {c.strip() for c in insert.split(",")}
     read = set(re.findall(r"last\.(\w+)", metrics._RANKER_SQL))
 
-    assert written == installed - {"finished_at"}  # the database's clock fills it
+    assert written == installed
     assert read == installed
 
 

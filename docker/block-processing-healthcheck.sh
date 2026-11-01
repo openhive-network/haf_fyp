@@ -122,9 +122,11 @@ CONTEXT=${HAF_FYP_CONTEXT:-"haf_fyp"}
 #
 # Measured since #97 (#37, testapi 2026-10-28): there is no replay, and the one long
 # iteration is the first, which backfills the history window from hivemind -- 676s for a
-# year there. On a fresh install it runs inside the compose start_period before any
-# check has passed, so it shows as `starting`, not unhealthy. A backfill started later
-# in a running container (a widened window) does trip this; raise the value for it.
+# year there (the 673s copy plus the batch's other work). There hivemind was live at
+# install, so it ran inside the compose start_period before any check had passed and
+# showed as `starting`, not unhealthy. If haf_fyp first waits for hivemind, the loop
+# iterates meanwhile, a check passes, and the backfill then DOES trip this; so does one
+# started later in a running container (a widened window). Raise the value for either.
 # Live batches afterwards take well under a second.
 #
 # It stays wide, and the trade is explicit: a window that is too generous delays

@@ -128,10 +128,10 @@ Measured on two full nodes near the chain head (block 111.2M), with the default 
 |---|---|---|
 | `haf_fyp_app` on disk | 7.5 GB (3.7 GB of it indexes) | 7.4 GB |
 | One-year backfill from hivemind | 673 s: 70.7M interactions, 535k root posts, 1.17M commenter pairs | 274 s |
-| Install to `following_hivemind` | about 13 min (install 21:42, backfill done 21:54:41, live 21:55:49 UTC) | not measured |
+| Install to `following_hivemind` | about 14 min (install 21:42, backfill done 21:54:41, live 21:55:49 UTC) | not measured |
 
 Almost all of it is `user_interactions`: 7.2 GB and 70.7M rows of the 7.5 GB on testapi.
-No other table is above about 100 MB. The size follows `FYP_HISTORY_DAYS`, not the
+The other tables share the remaining 0.3 GB. The size follows `FYP_HISTORY_DAYS`, not the
 length of the chain: the hourly maintenance deletes what ages out. For comparison, the
 replayed build this replaced held 259-305 GB after a 34-hour sync from genesis.
 
@@ -907,12 +907,13 @@ could not be read; the API log says why). The section never sets a `degraded` fl
 every threshold above depends on the node.
 
 The ranker's own figures for each cycle are under `ranker` (#37). The ranker writes one
-row per scheduled cycle into `haf_fyp_app.ranker_cycles` and keeps seven days of them,
-so they outlive its container and its log:
+row per scheduled cycle into `haf_fyp_app.ranker_cycles` and keeps seven days of them
+(about 2,000 rows), so they outlive its container and its log. A cycle that raised is
+recorded with `ok` false and the counts it had reached, so its `users_*` can be short:
 
 | Field | What it is | What to watch |
 |---|---|---|
-| `last_cycle.finished_seconds_ago` | How long ago the last scheduled cycle ended, by the database's clock | **Is the ranker cycling.** It waits `CYCLE_SECONDS` (300) between cycles, so this stays under 300 plus one cycle. Well above `CYCLE_SECONDS` + `last_24h.max_duration_seconds`: the ranker is stopped or wedged inside a cycle. A stopped ranker writes nothing, so its last row stays and this keeps growing |
+| `last_cycle.finished_seconds_ago` | How long ago the last scheduled cycle ended, by the database's clock | **Is the ranker cycling.** It waits `CYCLE_SECONDS` (300, fixed in the ranker) between cycles, so this stays under 300 plus one cycle, plus any re-rank on read still running when the wait ends. Well above `CYCLE_SECONDS` + `last_24h.max_duration_seconds`: the ranker is stopped or wedged inside a cycle. A stopped ranker writes nothing, so its last row stays and this keeps growing |
 | `last_cycle.duration_seconds` | How long that cycle took | Swings with load; compare with `last_24h` |
 | `last_cycle.ok` | `false` when the cycle raised | The traceback is in the ranker's log (`ranking cycle failed`) |
 | `last_cycle.candidates`, `users_attempted`, `users_ranked`, `users_failed`, `users_held` | Posts scored, and the accounts the cycle took, ranked, failed to rank, and held for a read session | `users_failed` above 0 cycle after cycle: an account fails every time (`failed to rank user` in the log) |
@@ -921,10 +922,13 @@ so they outlive its container and its log:
 | `last_24h` | `cycles`, `failed_cycles`, `median_duration_seconds`, `max_duration_seconds` over the last 24 h | A median creeping towards `CYCLE_SECONDS` or beyond: the rotation is slowing |
 
 `state` is `ok`, `no_cycles` (no row yet: the ranker has not finished a cycle since the
-install, or it is older than the record), `unsupported` (the installed SQL has no
-`ranker_cycles`: re-run the install as above) or `unknown`. A ranker older than the
-record runs as before on the new SQL; it just writes nothing here. A new ranker on older
-SQL logs once that it cannot write the record and goes on ranking. Like `reader_first`,
+install, it is older than the record, or it cannot write the record), `unsupported` (the
+installed SQL has no `ranker_cycles`: re-run the install as above) or `unknown`. A
+ranker older than the record runs as before on the new SQL; it just writes nothing here.
+A ranker that cannot write the record (older SQL, a missing grant) logs `could not
+record the cycle` or `ranker_cycles is missing`, once for each kind of failure, and goes
+on ranking, so a growing `finished_seconds_ago` or a lasting `no_cycles` can also mean
+that: `reader_first.newest_feed_seconds` tells the two apart. Like `reader_first`,
 the section sets no `degraded`: how long a cycle may take depends on the node.
 
 **What a notifying request costs.** It takes a transaction id and a brief cluster-wide
@@ -1273,17 +1277,19 @@ What it adds over the block pointer is the other case: at the chain tip the loop
 iterating while waiting for a block, so the heartbeat ticks even though nothing was
 processed, which separates "idle" from "wedged".
 
-The consequence, stated rather than hidden: on a long MASSIVE batch this check **can
-report unhealthy on a healthy replay**. Because of the one-iteration lag, the 300s
-default (upstream uses 60s) tolerates iterations of roughly 150s, not 300s. Since #97
-there is no replay, and one batch is long: the first, which backfills the history
-window from hivemind. It took 676 s on testapi (2026-10-28). On a fresh install that
-batch runs inside the 72-hour `start_period` before any check has passed, so the
-container showed `health: starting` throughout and turned healthy within a minute of
-the batch ending. A backfill started later in a running container (after clearing
-`hivemind_follow.backfilled_at` to widen the window) gets no such cover: expect the
-container to report unhealthy until it ends, or raise
-`HAF_FYP_HEALTHCHECK_MAX_AGE_SECONDS` first. Live batches afterwards take well under a
+The consequence, stated rather than hidden: on a long batch this check **can report
+unhealthy on a healthy sync**. Because of the one-iteration lag, the 300s default
+(upstream uses 60s) tolerates iterations of roughly 150s, not 300s. Since #97 there is
+no replay, and one batch is long: the first, which backfills the history window from
+hivemind. On testapi (2026-10-28) that batch took 676 s: the 673 s backfill plus the
+batch's other work. There hivemind was already live at install, so the batch ran inside
+the 72-hour `start_period` before any check had passed: the container showed
+`health: starting` throughout and turned healthy 68 s after the backfill ended. If
+haf_fyp first waits for hivemind to catch up, the loop iterates meanwhile, a check
+passes and the `start_period` cover ends: expect the container to report unhealthy for
+the length of the backfill, or raise `HAF_FYP_HEALTHCHECK_MAX_AGE_SECONDS` before the
+install. The same holds for a backfill started later in a running container (after
+clearing `hivemind_follow.backfilled_at` to widen the window). Live batches afterwards take well under a
 second. It is explicitly *not* justified by this app's 360s HAProxy
 agent-check, which measures how old the last processed *block* is, a different quantity.
 
