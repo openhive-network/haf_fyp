@@ -481,7 +481,7 @@ DECLARE
         'post_bridge_cache:d89ced139f29421e601fa1b8cd35e864',
         'post_candidates:75ca3322bbdd3d031ad38ffee2735ecb',
         'post_commenters:dd6b3cc9b3898e67d2f725176626ba17',
-        'ranker_cycles:00000000000000000000000000000000',
+        'ranker_cycles:05fc8ec3ef78deaba0f3849400079b32',
         'user_communities:83146409c11276c9ea90534eabba3df9',
         'user_interactions:e5c218f6e78c7effb3f65b87f6d2f3d0',
         'user_interests:d99ba90cbdab04aae0fef51df1af940e',
