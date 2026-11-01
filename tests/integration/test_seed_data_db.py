@@ -131,16 +131,6 @@ def test_upgrade_carries_tuned_1_1_0_weights_over(cur: cursor) -> None:
     assert _weights(cur, "1.3.0") == {**tuned, "boost_rescale": True}
 
 
-def test_upgrade_without_a_1_1_0_row_uses_the_shipped_weights(cur: cursor) -> None:
-    cur.execute(_seed_before_1_3_0())
-    shipped = _weights(cur, "1.1.0")
-    cur.execute(f"DELETE FROM {_SCHEMA}.algorithm_versions WHERE version = '1.1.0'")
-    _choose(cur, "1.2.0")
-    cur.execute(_seed())
-    assert _weights(cur, "1.3.0") == {**shipped, "boost_rescale": True}
-    assert _active(cur) == ["1.2.0"]
-
-
 def test_upgrade_with_1_1_0_active_moves_to_1_3_0(cur: cursor) -> None:
     cur.execute(_seed_before_1_3_0())
     assert _active(cur) == ["1.1.0"]

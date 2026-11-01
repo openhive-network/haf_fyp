@@ -51,7 +51,7 @@ ON CONFLICT (version) DO NOTHING;
 -- 1.3.0 (#116): 1.1.0 plus boost_rescale, which divides every score by 1 + the larger
 -- boost instead of clipping a boosted score at 1 (the clip tied the top of every boosted
 -- feed). Its weights are this node's 1.1.0 weights, so an operator's tuning carries over
--- (the shipped ones on a fresh install). It takes over from 1.1.0 only on the install
+-- (on a fresh install, the ones above). It takes over from 1.1.0 only on the install
 -- that registers it, and only where 1.1.0 is the one active version: an operator who
 -- chose another version keeps it, and one who goes back to 1.1.0 later is not rolled
 -- forward again by the next install.
@@ -71,17 +71,9 @@ BEGIN
             'Tiered community boost as in 1.1.0, but every score is divided by 1 + the larger '
             'boost instead of a boosted score being clipped at 1, so the top of a feed keeps '
             'its order (#116)',
-            COALESCE(
-                (SELECT v.weights FROM haf_fyp_app.algorithm_versions AS v WHERE v.version = '1.1.0'),
-                '{
-                    "relevance":               0.40,
-                    "recency":                 0.30,
-                    "engagement":              0.20,
-                    "credibility":             0.10,
-                    "community_boost":         0.20,
-                    "community_boost_engaged": 0.10
-                }'::jsonb
-            ) || '{"boost_rescale": true}'::jsonb,
+            -- The statement above has just made sure a 1.1.0 row exists.
+            (SELECT v.weights FROM haf_fyp_app.algorithm_versions AS v WHERE v.version = '1.1.0')
+            || '{"boost_rescale": true}'::jsonb,
             -- Later than the NOW() of 1.2.0 above even when both run in one
             -- transaction: list_algorithm_versions orders by deployed_at.
             CLOCK_TIMESTAMP(),
