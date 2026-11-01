@@ -612,7 +612,7 @@ matching no rule above — including the retired `/v1/fyp/metrics` — is rewrit
 
 ## Ranking Algorithm
 
-**Version 1.0.0** — four-signal weighted sum with community boost:
+**Version 1.3.0** (active on a new install) — four-signal weighted sum with a tiered community boost:
 
 ```
 final_score = 0.40 × relevance
@@ -620,9 +620,20 @@ final_score = 0.40 × relevance
             + 0.20 × engagement
             + 0.10 × credibility
 
-if post.community_id ∈ user_subscribed_communities:
-    final_score = min(1.0, final_score × 1.20)
+if post.community_id ∈ subscribed or declared communities:
+    final_score = final_score × 1.20
+elif post.community_id ∈ the reader's most-engaged communities:
+    final_score = final_score × 1.10
+
+if any post of the feed was boosted:
+    every final_score of the feed /= 1.20      (1 + the larger boost)
 ```
+
+`final_score` stays in [0, 1]. Versions 1.0.0 to 1.2.0 clip a boosted score at 1 instead
+of rescaling the feed, so in a boosted feed every post with a base score above
+1 / (1 + boost) reads exactly 1 and the top of the feed ties (#116). 1.3.0 has the 1.1.0
+weights plus `"boost_rescale": true`. An install that registers 1.3.0 activates it
+only where 1.1.0 was the one active version; a version the operator chose stays active.
 
 | Signal | Range | Source |
 |--------|-------|--------|
@@ -630,7 +641,9 @@ if post.community_id ∈ user_subscribed_communities:
 | `recency` | [0, 1] | `exp(−ln2 × age_hours / 24)` — 24-hour half-life |
 | `engagement` | [0, 1] | Sigmoid-normalised unique commenters + reblogs + net rshares |
 | `credibility` | [0, 1] | 0.6 × normalised reputation + 0.4 × log-normalised VESTS |
-| `community_boost` | ×1.20 | Applied post-sum for on-chain subscribed community posts |
+| `community_boost` | ×1.20 | Applied post-sum for subscribed or declared community posts |
+| `community_boost_engaged` | ×1.10 | Applied post-sum for the reader's most-engaged communities, when not subscribed |
+| `boost_rescale` | true | 1.3.0: a boosted feed is divided by 1 + the larger boost, not clipped at 1 |
 
 All weights are stored in `haf_fyp_app.algorithm_versions` and activated via `POST /v1/fyp/admin/algorithm`. The active version and its weights are returned by `/rpc/get_algorithm`. Every feed response includes per-signal component scores for full transparency; use `/rpc/get_score_explanation` for a detailed breakdown of any individual post.
 

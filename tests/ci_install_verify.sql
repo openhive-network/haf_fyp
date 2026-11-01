@@ -847,15 +847,15 @@ BEGIN
     -- Seed data must not multiply on a second install, and must not take back a choice
     -- the operator made: tests/ci_install_age.sql activates the OLDEST version.
     SELECT count(*) INTO _n FROM haf_fyp_app.algorithm_versions;
-    IF _n <> 3 THEN
-        RAISE EXCEPTION 'algorithm_versions holds % rows, the seed has 3', _n;
+    IF _n <> 4 THEN
+        RAISE EXCEPTION 'algorithm_versions holds % rows, the seed has 4', _n;
     END IF;
-    -- On a first install, the seed by VALUE: three rows is also what a seed with one
+    -- On a first install, the seed by VALUE: four rows is also what a seed with one
     -- weight ten times too large has. (Later the weights are the operator's.) And the
     -- telemetry rollup starts from the beginning.
     IF current_setting('ci.phase') = 'first' THEN
         IF (SELECT md5(string_agg(v.version || ' ' || v.is_active || ' ' || v.weights::text, E'\n' ORDER BY v.version COLLATE "C"))
-            FROM haf_fyp_app.algorithm_versions AS v) IS DISTINCT FROM '176bde5dbeb40a10ed92de0980847aba' THEN
+            FROM haf_fyp_app.algorithm_versions AS v) IS DISTINCT FROM 'b88afc4f53841499cf49966b59df778a' THEN
             RAISE EXCEPTION E'the seeded algorithm versions are not the ones tests/ci_install_verify.sql pins (db/seed_data.sql changed?). They read, as md5 %:\n%',
                 (SELECT md5(string_agg(v.version || ' ' || v.is_active || ' ' || v.weights::text, E'\n' ORDER BY v.version COLLATE "C"))
                  FROM haf_fyp_app.algorithm_versions AS v),
@@ -870,9 +870,10 @@ BEGIN
     SELECT string_agg(v.version, ',' ORDER BY v.version) INTO _active
     FROM haf_fyp_app.algorithm_versions AS v WHERE v.is_active;
     IF current_setting('ci.phase') = 'first' THEN
-        -- db/seed_data.sql ships 1.1.0 active and 1.2.0 registered but not yet live.
-        IF _active IS DISTINCT FROM '1.1.0' THEN
-            RAISE EXCEPTION 'a fresh install activated %, not 1.1.0 as db/seed_data.sql ships', _active;
+        -- db/seed_data.sql ships 1.3.0 active (it takes over from 1.1.0, #116) and 1.2.0
+        -- registered but not yet live.
+        IF _active IS DISTINCT FROM '1.3.0' THEN
+            RAISE EXCEPTION 'a fresh install activated %, not 1.3.0 as db/seed_data.sql ships', _active;
         END IF;
     ELSIF _active IS DISTINCT FROM (SELECT min(v.version) FROM haf_fyp_app.algorithm_versions AS v) THEN
         RAISE EXCEPTION 'in phase % the active version is %, not the one the operator chose', current_setting('ci.phase'), _active;
