@@ -47,7 +47,7 @@ schemas:
         description: Position in the feed (1-based)
       final_score:
         type: number
-        description: Composite ranking score [0, 1]. From algorithm 1.3.0 every score is divided by 1 + the larger community boost instead of a boosted score being clipped at 1, so the top scores of a feed stay distinct
+        description: Composite ranking score [0, 1]. From algorithm 1.3.0 every score is divided by 1 + the larger community boost instead of a boosted score being clipped at 1, so the top of a feed keeps its order
       score_relevance:
         type: [number, 'null']
         description: Semantic relevance to the user's interest vector (null in the global feed)
@@ -254,7 +254,7 @@ DECLARE
           },
           "final_score": {
             "type": "number",
-            "description": "Composite ranking score [0, 1]. From algorithm 1.3.0 every score is divided by 1 + the larger community boost instead of a boosted score being clipped at 1, so the top scores of a feed stay distinct"
+            "description": "Composite ranking score [0, 1]. From algorithm 1.3.0 every score is divided by 1 + the larger community boost instead of a boosted score being clipped at 1, so the top of a feed keeps its order"
           },
           "score_relevance": {
             "type": [

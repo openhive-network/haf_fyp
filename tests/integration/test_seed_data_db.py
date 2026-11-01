@@ -1,8 +1,8 @@
 """db/seed_data.sql's algorithm versions against a real database (#116).
 
 1.3.0 takes over from 1.1.0 on the install that registers it, and only where 1.1.0 is the
-one active version; its weights are the node's 1.1.0 weights plus boost_rescale. The install lane sees a fresh database and then the operator's own
-choice (tests/ci_install_age.sql); here the seed also meets the databases nodes have
+one active version; its weights are the node's 1.1.0 weights plus boost_rescale. The
+install lane sees a fresh database and then the operator's own choice (tests/ci_install_age.sql); here the seed also meets the databases nodes have
 today -- the pre-1.3.0 seed with 1.1.0 active, or with another version chosen -- and an
 operator who goes back to 1.1.0 after 1.3.0 took over.
 
