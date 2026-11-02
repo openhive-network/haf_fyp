@@ -1,12 +1,14 @@
 """
 Scoring functions for the HAF_FYP ranker daemon.
 
-Signal weights (v1.0.0):
+Signal weights (1.1.0; 1.3.0 is the same plus boost_rescale):
     relevance        0.40  cosine similarity between post and user interest vectors
     recency          0.30  exponential decay, 24-hour half-life
     engagement       0.20  log-normalised unique commenters + reblogs + rshares
     credibility      0.10  author reputation from btracker + reputation_tracker
     community_boost  x1.20 post-sum multiplier for subscribed-community posts
+    community_boost_engaged x1.10 the same for the reader's most-engaged communities
+    boost_rescale    1.3.0: every score / (1 + the larger boost) instead of a clip at 1 (#116)
 
 Phase 7: all four signals active — recency, engagement, semantic relevance (HiveSense),
 and credibility (btracker VESTS + reptracker reputation).
@@ -350,6 +352,9 @@ def compute_scores(
         engaged community (top by interaction), not subscribed
                                        -> final_score *= (1 + community_boost_engaged)
     Each boosted post records boost_source = 'subscribed' | 'engaged' (NULL if none).
+    A boosted score is clipped at 1.0, unless the version sets boost_rescale (1.3.0,
+    #116): then nothing is clipped and every score is divided by 1 + the larger of
+    the two boosts.
 
     If algorithm_weights sets max_per_community, a diversity cap is applied after
     sorting so no single community occupies more than that many leading positions
@@ -410,16 +415,26 @@ def compute_scores(
         else pd.Series(False, index=df.index)
     ) & ~sub_mask
 
+    # #116: clipping the boosted product at 1 tied every boosted post whose base score
+    # was above 1 / (1 + boost) at exactly 1, so the top of the feed lost its order.
+    # A version that sets boost_rescale keeps the product unclipped and divides every
+    # score, boosted or not and in every feed, by the largest boost factor: the order
+    # is the unclipped one, every feed is on one scale (a score is the post's own
+    # weighted sum x its boost / that factor, whatever else the feed holds) and, with
+    # weights summing to 1, every score stays in [0, 1]. Versions without the key keep
+    # the clip, so their scores read as they always did.
+    rescale = algorithm_weights.get("boost_rescale") is True
     for mask, factor, source in (
         (sub_mask, 1.0 + boost_sub, "subscribed"),
         (eng_mask, 1.0 + boost_eng, "engaged"),
     ):
         if mask.any():
-            df.loc[mask, "final_score"] = (df.loc[mask, "final_score"] * factor).clip(
-                upper=1.0
-            )
+            boosted = df.loc[mask, "final_score"] * factor
+            df.loc[mask, "final_score"] = boosted if rescale else boosted.clip(upper=1.0)
             df.loc[mask, "community_boost_applied"] = True
             df.loc[mask, "boost_source"] = source
+    if rescale:
+        df["final_score"] = df["final_score"] / max(1.0, 1.0 + boost_sub, 1.0 + boost_eng)
 
     ranked = df.sort_values("final_score", ascending=False).reset_index(drop=True)
 

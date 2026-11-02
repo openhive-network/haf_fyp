@@ -41,7 +41,7 @@ INSERT INTO haf_fyp_app.feed_metrics_daily (day) VALUES ('2016-09-15');
 INSERT INTO haf_fyp_app.embedding_coverage_daily (day, computed_at) VALUES ('2016-09-15', '2016-09-15 19:47:21+00');
 RESET ROLE;
 
--- The operator's: which algorithm version is live. The seed ships 1.1.0 active; an
+-- The operator's: which algorithm version is live. The seed ships 1.3.0 active; an
 -- operator who rolled back to the oldest must not find it rolled forward again.
 UPDATE haf_fyp_app.algorithm_versions AS v
 SET is_active = (v.version = (SELECT min(o.version) FROM haf_fyp_app.algorithm_versions AS o));
