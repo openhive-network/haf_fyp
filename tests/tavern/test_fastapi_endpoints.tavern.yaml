@@ -119,6 +119,18 @@ stages:
           rotation_age_seconds: !anything
           newest_feed_seconds: !anything
           notification_queue_usage: !anyfloat
+        # #37. No ranker runs in this lane, and the integration tests before this leave
+        # ranker_cycles empty, so the real probe through the real route answers
+        # no_cycles. A probe that raised would read unknown; a missing table, unsupported.
+        ranker:
+          state: "no_cycles"
+          last_cycle: null
+          last_24h:
+            cycles: 0
+            failed_cycles: 0
+            median_duration_seconds: null
+            max_duration_seconds: null
+          detail: !anystr
         # Whether the installed feed_cache is the compact row (#99). Not pinned: this
         # lane's feed_cache is the cut-down table of ci_fastapi_setup.sql, and the
         # verdict is tested against PostgreSQL in test_feed_cache_format_db.py.

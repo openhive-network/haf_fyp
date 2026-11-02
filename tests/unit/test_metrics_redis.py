@@ -226,7 +226,7 @@ def _route(monkeypatch, channel_probe):
 
     monkeypatch.setattr(api, "_db_conn", _conn_cm)
     for name in ("fetch_coverage_rows", "fetch_ranking_sources", "fetch_feed_servability",
-                 "fetch_credibility_sources", "fetch_reader_first", "fetch_history",
+                 "fetch_credibility_sources", "fetch_reader_first", "fetch_history", "fetch_ranker_cycles",
                  "fetch_feed_cache_shape"):
         monkeypatch.setattr(api, name, lambda _c: None)
     for name in ("build_credibility_sources_report", "build_reader_first_report",

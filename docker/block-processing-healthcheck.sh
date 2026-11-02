@@ -57,8 +57,9 @@
 # (hive.get_app_current_block_age), tracked in #29. The two are complementary; this one
 # does not subsume it, and nothing here is a reason to drop it.
 #
-# The consequence, stated rather than hidden: during a long MASSIVE batch this check
-# CAN report unhealthy on a perfectly healthy replay. See MAX_AGE.
+# The consequence, stated rather than hidden: during a long batch -- the first one,
+# which backfills the history window -- this check CAN report unhealthy on a perfectly
+# healthy sync. See MAX_AGE.
 #
 # Healthy if EITHER:
 #   - the loop iterated within MAX_AGE, and since this container started; or
@@ -115,19 +116,27 @@ CONTEXT=${HAF_FYP_CONTEXT:-"haf_fyp"}
 
 # Seconds the loop may go without iterating before this reports unhealthy.
 #
-# Upstream hard-codes 1 minute. This is 5 minutes and configurable, and the honest
-# reason is that the bound is NOT KNOWN. In live sync the gap is small -- one block
-# per iteration, and app_next_block waits at most ~4s -- so 60s would be ample there.
-# The open question is MASSIVE, where one iteration is up to 10,000 blocks of this
-# app's post and engagement ingestion. That duration has never been measured on a live
-# node, and because of the one-iteration lag described above the window has to cover
-# TWO of them: 300s here tolerates iterations of roughly 150s.
+# Upstream hard-codes 1 minute. This is 5 minutes and configurable. In live sync the
+# gap is small -- one block per iteration, and app_next_block waits at most ~4s -- so
+# 60s would be ample there. Because of the one-iteration lag described above the window
+# has to cover TWO iterations: 300s here tolerates iterations of roughly 150s.
 #
-# So this errs wide, and the trade is explicit: a window that is too generous delays
+# Measured since #97 (#37, testapi 2026-10-28): there is no replay, and the one long
+# iteration is the first, which backfills the history window from hivemind -- 676s for a
+# year there (the 673s copy plus the batch's other work). There hivemind was live at
+# install, so it ran inside the compose start_period before any check had passed and
+# showed as `starting`, not unhealthy. If haf_fyp first waits for hivemind, the loop
+# iterates meanwhile, a check passes, and the backfill then DOES trip this; so does one
+# started later in a running container (a widened window). For either, set
+# HAF_FYP_HEALTHCHECK_MAX_AGE_SECONDS above the batch (900 covers testapi's 676s; compose
+# passes it to haf-fyp-sync) and recreate the container. Live batches afterwards take
+# well under a second.
+#
+# It stays wide, and the trade is explicit: a window that is too generous delays
 # detection of a wedged loop (to MAX_AGE plus retries x interval, about 8 minutes at
-# the compose defaults), while one that is too tight reports a healthy replay as
+# the compose defaults), while one that is too tight reports a healthy sync as
 # unhealthy. haf_fyp has already caused one false alert (!41); that is why the error
-# is on this side. Narrow it once a MASSIVE batch has been timed.
+# is on this side.
 #
 # NOT justified by deployment/healthchecks/checks/haf_fyp.sh's 360s. An earlier
 # revision claimed that; it is a category error. That check measures

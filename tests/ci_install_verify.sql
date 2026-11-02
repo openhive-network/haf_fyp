@@ -325,8 +325,8 @@ DECLARE
         'active_users', 'algorithm_versions', 'app_config', 'app_status', 'app_version',
         'embedding_coverage_daily', 'engagement_metrics', 'feed_cache', 'feed_cache_labels', 'feed_events',
         'feed_events_rollup_state', 'feed_metrics_daily', 'global_feed_cache', 'haf_fyp', 'hivemind_follow',
-        'post_bridge_cache', 'post_candidates', 'post_commenters', 'user_communities', 'user_interactions',
-        'user_interests', 'user_profile_vectors'
+        'post_bridge_cache', 'post_candidates', 'post_commenters', 'ranker_cycles', 'user_communities',
+        'user_interactions', 'user_interests', 'user_profile_vectors'
     ];
     _want_functions TEXT [] := ARRAY[
         'haf_fyp_app.allow_processing()',
@@ -417,6 +417,7 @@ DECLARE
         'index post_bridge_cache_pkey on post_bridge_cache (primary key)',
         'index post_candidates_pkey on post_candidates (primary key)',
         'index post_commenters_pkey on post_commenters (primary key)',
+        'index ranker_cycles_pkey on ranker_cycles (primary key)',
         'index uq_app_config_singleton on app_config (unique)',
         'index uq_app_status_singleton on app_status (unique)',
         'index uq_app_version_singleton on app_version (unique)',
@@ -447,6 +448,7 @@ DECLARE
         'constraint post_bridge_cache_post_id_fkey on post_bridge_cache: FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates(post_id) ON DELETE CASCADE',
         'constraint post_candidates_pkey on post_candidates: PRIMARY KEY (post_id)',
         'constraint post_commenters_pkey on post_commenters: PRIMARY KEY (post_id, commenter_id)',
+        'constraint ranker_cycles_pkey on ranker_cycles: PRIMARY KEY (finished_at)',
         'constraint user_communities_pkey on user_communities: PRIMARY KEY (username, community_id)',
         'constraint user_interactions_pkey on user_interactions: PRIMARY KEY (account_id, post_id)',
         'constraint user_interests_pkey on user_interests: PRIMARY KEY (username, community_id)',
@@ -479,6 +481,7 @@ DECLARE
         'post_bridge_cache:d89ced139f29421e601fa1b8cd35e864',
         'post_candidates:75ca3322bbdd3d031ad38ffee2735ecb',
         'post_commenters:dd6b3cc9b3898e67d2f725176626ba17',
+        'ranker_cycles:05fc8ec3ef78deaba0f3849400079b32',
         'user_communities:83146409c11276c9ea90534eabba3df9',
         'user_interactions:e5c218f6e78c7effb3f65b87f6d2f3d0',
         'user_interests:d99ba90cbdab04aae0fef51df1af940e',
