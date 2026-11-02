@@ -1593,9 +1593,10 @@ def metrics(response: Response):
     ranker (#37): what the ranker's last scheduled cycle did, as it recorded it (how
     long ago it finished, how long it took, accounts ranked, failed and held, the
     reader lane, reads heard, readers taken ahead of their turn), and the count, median
-    and longest duration of the last 24 hours of cycles. Informational; see
-    build_ranker_report. last_cycle.finished_seconds_ago is the ranker's own liveness
-    figure: a stopped or wedged ranker records nothing, so it grows.
+    and longest duration of the last 24 hours of cycles. last_cycle.finished_seconds_ago
+    is the ranker's own liveness figure: a stopped or wedged ranker records nothing, so
+    it grows. `degraded` when no cycle has succeeded for an hour (stopped, wedged, or
+    failing every cycle) or the record could not be read; see build_ranker_report.
 
     feed_cache (#99): whether the installed feed_cache is the compact row the ranker
     writes (#98). `outdated` means the SQL is older than the ranker, which then ranks

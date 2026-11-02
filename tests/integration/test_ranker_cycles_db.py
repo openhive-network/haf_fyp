@@ -140,7 +140,57 @@ def test_a_ranker_stopped_for_days_still_shows_its_last_cycle(conn) -> None:
     assert report["state"] == "ok"
     assert report["last_cycle"]["finished_seconds_ago"] >= 172800
     assert report["last_24h"]["cycles"] == 0
+    # The case the flag exists for: the age reaches past the last day.
+    assert report["seconds_since_ok_cycle"] >= 172800
+    assert report["degraded"] is True
     assert report["last_24h"]["median_duration_seconds"] is None
+
+
+def test_the_age_without_success_counts_from_the_last_cycle_that_succeeded(conn) -> None:
+    # A ranker that keeps cycling but fails every time: the last cycle is recent, the
+    # last good one two hours old.
+    _insert(conn, "3 hours", 10.0, ok=False)
+    _insert(conn, "2 hours", 10.0)
+    _insert(conn, "1 hour", 10.0, ok=False)
+    _insert(conn, "1 minute", 10.0, ok=False)
+
+    report = build_ranker_report(fetch_ranker_cycles(conn))
+
+    assert 50 <= report["last_cycle"]["finished_seconds_ago"] <= 70
+    assert 7190 <= report["seconds_since_ok_cycle"] <= 7210
+    assert report["degraded"] is True
+
+
+def test_a_record_that_has_only_failed_ages_from_its_first_cycle(conn) -> None:
+    _insert(conn, "90 minutes", 10.0, ok=False)
+    _insert(conn, "5 minutes", 10.0, ok=False)
+
+    report = build_ranker_report(fetch_ranker_cycles(conn))
+
+    assert 5390 <= report["seconds_since_ok_cycle"] <= 5410
+    assert report["degraded"] is True
+
+
+def test_the_age_counts_from_the_latest_success_not_the_first(conn) -> None:
+    _insert(conn, "5 hours", 10.0)
+    _insert(conn, "2 minutes", 10.0)
+    _insert(conn, "1 minute", 10.0, ok=False)
+
+    report = build_ranker_report(fetch_ranker_cycles(conn))
+
+    assert 110 <= report["seconds_since_ok_cycle"] <= 130
+    assert report["degraded"] is False
+
+
+def test_a_ranker_cycling_well_is_not_degraded(conn) -> None:
+    _insert(conn, "2 hours", 10.0, ok=False)
+    _insert(conn, "10 minutes", 10.0)
+    _insert(conn, "5 minutes", 10.0, ok=False)
+
+    report = build_ranker_report(fetch_ranker_cycles(conn))
+
+    assert 590 <= report["seconds_since_ok_cycle"] <= 610
+    assert report["degraded"] is False
 
 
 def test_an_empty_table_is_no_cycles(conn) -> None:
@@ -149,6 +199,8 @@ def test_an_empty_table_is_no_cycles(conn) -> None:
     assert report["state"] == "no_cycles"
     assert report["last_cycle"] is None
     assert report["last_24h"]["cycles"] == 0
+    assert report["seconds_since_ok_cycle"] is None
+    assert report["degraded"] is False
 
 
 def test_a_missing_table_is_unsupported_and_leaves_the_transaction_usable(conn) -> None:

@@ -124,6 +124,8 @@ stages:
         # no_cycles. A probe that raised would read unknown; a missing table, unsupported.
         ranker:
           state: "no_cycles"
+          degraded: false
+          seconds_since_ok_cycle: null
           last_cycle: null
           last_24h:
             cycles: 0
