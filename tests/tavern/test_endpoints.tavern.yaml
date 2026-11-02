@@ -24,18 +24,18 @@ includes:
   - !include common.yaml
 
 stages:
-  - name: GET /rpc/get_algorithm returns the active row, 1.1.0, with its stored weights
+  - name: GET /rpc/get_algorithm returns the active row, 1.3.0, with its stored weights
     request:
       url: "{api_url}/rpc/get_algorithm"
       method: GET
     response:
       status_code: 200
       # The body, not just the status: with the active filter inverted this endpoint
-      # answered 200 with an inactive version. db/seed_data.sql stores three versions
-      # and marks 1.1.0 active, so 1.0.0 or 1.2.0 here means the filter is wrong.
+      # answered 200 with an inactive version. db/seed_data.sql stores four versions
+      # and marks 1.3.0 active, so any other version here means the filter is wrong.
       json:
-        - version: "1.1.0"
-          description: "Tiered community boost: full for subscribed/declared communities, smaller for engaged-only"
+        - version: "1.3.0"
+          description: "Tiered community boost as in 1.1.0, but every score is divided by 1 + the larger boost instead of a boosted score being clipped at 1, so the top of a feed keeps its order (#116)"
           weights:
             relevance: 0.40
             recency: 0.30
@@ -43,6 +43,7 @@ stages:
             credibility: 0.10
             community_boost: 0.20
             community_boost_engaged: 0.10
+            boost_rescale: true
           deployed_at: !anything
 
 ---
@@ -137,13 +138,18 @@ includes:
   - !include common.yaml
 
 stages:
-  - name: GET /rpc/list_algorithm_versions returns 200, newest first (1.2.0 challenger inactive, 1.1.0 active)
+  - name: GET /rpc/list_algorithm_versions returns 200, newest first (1.3.0 active, 1.2.0 challenger and 1.1.0 inactive)
     request:
       url: "{api_url}/rpc/list_algorithm_versions"
       method: GET
     response:
       status_code: 200
       json:
+        - version: "1.3.0"
+          description: !anything
+          weights: !anything
+          deployed_at: !anything
+          is_active: true
         - version: "1.2.0"
           description: !anything
           weights: !anything
@@ -153,7 +159,7 @@ stages:
           description: !anything
           weights: !anything
           deployed_at: !anything
-          is_active: true
+          is_active: false
         - version: "1.0.0"
           description: !anything
           weights: !anything
