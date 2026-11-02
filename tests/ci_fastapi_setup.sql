@@ -138,6 +138,26 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.embedding_coverage_daily (
     PRIMARY KEY (day)
 );
 
+-- #37: the ranker's cycle record, read by GET /metrics (the ranker section) and
+-- written by tests/integration/test_ranker_cycles_db.py with the ranker's own SQL.
+-- The same columns as db/create_tables.sql; tests/unit/test_ranker_cycles.py holds
+-- the two copies together.
+CREATE TABLE IF NOT EXISTS haf_fyp_app.ranker_cycles (
+    finished_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    duration_seconds REAL NOT NULL,
+    ok BOOLEAN NOT NULL,
+    candidates INT NOT NULL,
+    users_attempted INT NOT NULL,
+    users_ranked INT NOT NULL,
+    users_failed INT NOT NULL,
+    users_held INT NOT NULL,
+    readers_ahead INT NOT NULL,
+    lane_taken INT NOT NULL,
+    lane_slots INT NOT NULL,
+    reads_heard INT NOT NULL,
+    PRIMARY KEY (finished_at)
+);
+
 -- #15: minimal candidate + embedding tables so the pg-backed refresh test
 -- (tests/integration/test_embedding_coverage_db.py) can exercise the real
 -- refresh_embedding_coverage() from db/embedding_coverage_maintenance.sql. These

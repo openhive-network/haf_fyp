@@ -185,7 +185,8 @@ def test_the_route_carries_the_section(monkeypatch: MonkeyPatch) -> None:
 
     monkeypatch.setattr(api, "_db_conn", _conn_cm)
     for name in ("fetch_coverage_rows", "fetch_ranking_sources", "fetch_feed_servability",
-                 "fetch_credibility_sources", "fetch_reader_first", "fetch_history"):
+                 "fetch_credibility_sources", "fetch_reader_first", "fetch_history",
+                 "fetch_ranker_cycles"):
         monkeypatch.setattr(api, name, lambda _c: None)
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
     monkeypatch.setattr(api, "build_credibility_sources_report", lambda probe: {})

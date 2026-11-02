@@ -45,11 +45,11 @@ class _Reads:
 
 def _cycle(
     monkeypatch, users, reads, *, per_account=0.0, clock=None, evict=(), fail=(),
-    absent=(), closed=0, members=None, seen=None,
+    absent=(), closed=0, members=None, seen=None, raises=None,
 ):
     """run_cycle with everything around the per-account loop stubbed. Each account
     takes `per_account` seconds of the clock. Returns (result, order ranked, conn,
-    reconcile calls).
+    reconcile calls). `raises` maps an account to the exception its ranking raises.
 
     The rotation is modelled as the database has it: `evict` names accounts that have
     opted out, and the reconcile deletes such a row ONCE, answering nothing for it
@@ -72,6 +72,8 @@ def _cycle(
         clock.now += per_account
         if username in fail:
             raise RuntimeError(f"cannot rank {username}")
+        if raises and username in raises:
+            raise raises[username]
         order.append(username)
 
     evictions = []

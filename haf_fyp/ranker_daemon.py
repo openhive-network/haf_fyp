@@ -289,6 +289,18 @@ _reads_reranked = 0
 # Readers taken by the last scheduled cycle, and the slots the lane had for them.
 _lane_taken = 0
 _lane_slots = 0
+
+# What the last scheduled cycle did, for its row in haf_fyp_app.ranker_cycles (#37).
+# run_cycle fills it, main() writes it, with the lane and read figures above.
+_CYCLE_COUNTS = ("candidates", "users_attempted", "users_ranked", "users_failed",
+                 "users_held", "readers_ahead")
+_cycle_stats: dict[str, int] = dict.fromkeys(_CYCLE_COUNTS, 0)
+# Days of cycles kept: about 2,000 rows at CYCLE_SECONDS.
+_CYCLE_RECORD_DAYS = 7
+# The record's write fails the same way on every cycle until someone acts (the SQL is
+# older than this ranker, a grant). What is failing ("missing", or the error's code), so
+# it is said once, again when it changes, and again after a write succeeds; None if not.
+_cycle_record_failure: str | None = None
 _feed_read_failure_logged_at = 0.0
 _missing_column_warned_at: float | None = None
 
@@ -1266,8 +1278,9 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
     account's time: the candidates are already loaded, where a targeted refresh after
     the cycle fetches them again (about 8 s on a full node).
     """
-    global _lane_taken, _lane_slots
+    global _lane_taken, _lane_slots, _cycle_stats
     _lane_taken = _lane_slots = 0  # a cycle that stops before the lane query took nobody
+    _cycle_stats = dict.fromkeys(_CYCLE_COUNTS, 0)
     register_vector_type(conn)
     _refresh_read_filter(conn)
 
@@ -1278,6 +1291,7 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
         log.info("no candidates to rank — skipping cycle")
         return set()
 
+    _cycle_stats["candidates"] = len(candidates)
     log.info("scoring %d candidates (algo %s)", len(candidates), algo_version)
 
     post_ids = candidates["post_id"].tolist()
@@ -1357,6 +1371,10 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
             ahead.update(early)
             waiting.extendleft(reversed(early))
             next_read_check = time.monotonic() + POLL_SECONDS
+        # Per account, so a cycle that raises part-way records what it had reached.
+        _cycle_stats.update(users_attempted=len(done), users_ranked=processed,
+                            users_failed=failed, users_held=held,
+                            readers_ahead=len(ahead & done))
         if not waiting:
             break
         username = waiting.popleft()
@@ -1381,13 +1399,13 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
             failed += 1
             _log_user_failure(username, exc)
 
+    taken = ahead & done  # not one a later check turned away before its turn came
     if done:
         log.info(
             "refreshed personalized feeds for %d/%d cached users (%d failed%s)",
             processed, len(done), failed,
             f", {held} held for a read session" if held else "",
         )
-        taken = ahead & done  # not one a later check turned away before its turn came
         if taken:
             log.info(
                 "%d of them were readers with a stale feed, taken ahead of their turn%s",
@@ -1565,6 +1583,63 @@ def _run_history_retention(conn) -> None:
     except Exception:
         conn.rollback()
         log.exception("history retention failed — skipping")
+
+
+_RECORD_CYCLE_SQL = """
+INSERT INTO haf_fyp_app.ranker_cycles
+    (finished_at, duration_seconds, ok, candidates, users_attempted, users_ranked, users_failed,
+     users_held, readers_ahead, lane_taken, lane_slots, reads_heard)
+VALUES (clock_timestamp(), %(duration_seconds)s, %(ok)s, %(candidates)s, %(users_attempted)s,
+        %(users_ranked)s, %(users_failed)s, %(users_held)s, %(readers_ahead)s,
+        %(lane_taken)s, %(lane_slots)s, %(reads_heard)s)
+"""
+_PRUNE_CYCLES_SQL = (
+    "DELETE FROM haf_fyp_app.ranker_cycles WHERE finished_at < now() - make_interval(days => %s)"
+)
+
+
+def _record_cycle(conn, duration_seconds: float, ok: bool) -> None:
+    """
+    Write the scheduled cycle that just ended into haf_fyp_app.ranker_cycles, for GET
+    /metrics (#37), and drop the rows older than _CYCLE_RECORD_DAYS. Before
+    _log_feed_read_summary, which resets the read count.
+
+    finished_at is clock_timestamp(), not now(): this transaction may have opened when the
+    cycle began (a cycle with no candidates commits nothing), and now() would date the
+    row from then.
+
+    Best-effort: the record must never cost a cycle. On SQL older than this ranker the
+    table is not there; that is said, with the remedy, and ranking goes on. Each failure
+    is said once while it lasts, and again when it changes, so a passing connection error
+    does not hide a missing table or a missing grant behind it.
+    """
+    global _cycle_record_failure
+    row = {**_cycle_stats, "duration_seconds": duration_seconds, "ok": ok,
+           "lane_taken": _lane_taken, "lane_slots": _lane_slots, "reads_heard": _reads_heard}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(_RECORD_CYCLE_SQL, row)
+            cur.execute(_PRUNE_CYCLES_SQL, (_CYCLE_RECORD_DAYS,))
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        _safe_rollback(conn)
+        message = getattr(getattr(exc, "diag", None), "message_primary", None) or str(exc)
+        missing = getattr(exc, "pgcode", None) == "42P01" and "ranker_cycles" in message
+        failure = "missing" if missing else (getattr(exc, "pgcode", None) or type(exc).__name__)
+        if failure != _cycle_record_failure:
+            if missing:
+                log.warning(
+                    "haf_fyp_app.ranker_cycles is missing: the installed SQL is older than "
+                    "this ranker, so GET /metrics cannot show its cycles. Ranking goes on. "
+                    "Re-run the install with the block processor and this ranker stopped."
+                )
+            else:
+                log.warning("could not record the cycle for GET /metrics (%s)", exc)
+        _cycle_record_failure = failure
+        return
+    if _cycle_record_failure:
+        log.info("the cycle record for GET /metrics is being written again")
+    _cycle_record_failure = None
 
 
 def _refresh_read_filter(conn) -> None:
@@ -1890,14 +1965,23 @@ def main() -> None:
         if time.monotonic() >= next_full_cycle:
             ranked: set[str] = set()
             handed.clear()
+            cycle_started, cycle_ok = time.monotonic(), False
+            cycle_seconds: float | None = None
             try:
                 ranked = run_cycle(conn, _reads_during_cycle) or set()
+                cycle_ok = True
             except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                # Timed before the reconnect, which waits as long as the database is
+                # down or an install holds HAF's lock: that is not the cycle's length.
+                cycle_seconds = time.monotonic() - cycle_started
                 log.warning("database connection lost — reconnecting")
                 conn = _reconnect(conn)
             except Exception:
                 log.exception("ranking cycle failed")
                 _safe_rollback(conn)
+            if cycle_seconds is None:
+                cycle_seconds = time.monotonic() - cycle_started
+            _record_cycle(conn, cycle_seconds, cycle_ok)
             # Waiting readers the cycle ranked are done. The rest keep waiting for the
             # next grouped re-rank, and so does everyone handed to the cycle that it did
             # not get to: a cycle that failed, an account whose ranking failed, a lane

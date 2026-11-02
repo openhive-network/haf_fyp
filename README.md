@@ -100,7 +100,7 @@ hived ──► sql_serializer ──► HAF PostgreSQL
   waits: it copies nothing, a fresh install skips the community operations too, and
   `GET /sync-status` and `GET /metrics` report `history: waiting_for_hivemind`. The
   first batch that finds hivemind there backfills the whole window in one set-based
-  pass (about a minute for a year on a full node: 71.1M interactions, 556k root posts),
+  pass (a year took 274 s and 673 s on two full nodes; see "Disk and sync time"),
   takes `user_communities` from hivemind's subscriptions on a fresh install, and from
   then on every batch follows hivemind by `block_num`. `history: following_hivemind`
   says it has. The ranker's hourly maintenance deletes what has aged out of the window
@@ -118,6 +118,27 @@ hived ──► sql_serializer ──► HAF PostgreSQL
   the replayed tables (moving the cached feeds' post ids to hivemind's first), and the
   first batch backfills the window from hivemind. The time is the backfill's, whatever
   the size of the old tables.
+
+### Disk and sync time
+
+Measured on two full nodes near the chain head (block 111.2M), with the default one-year window
+([#37](https://gitlab.syncad.com/hive/haf_fyp/-/issues/37)):
+
+| | testapi, 2026-10-28 | steem-19 (blocktrades), 2026-10-26 |
+|---|---|---|
+| `haf_fyp_app` on disk | 7.5 GB (3.7 GB of it indexes) | 7.4 GB |
+| One-year backfill from hivemind | 673 s: 70.7M interactions, 535k root posts, 1.17M commenter pairs | 274 s |
+| Install to `following_hivemind` | about 14 min (install 21:42, backfill done 21:54:41, healthy 21:55:49 UTC) | not measured |
+
+Almost all of it is `user_interactions`: 7.2 GB and 70.7M rows of the 7.5 GB on testapi.
+The other tables share the remaining 0.3 GB. The size follows `FYP_HISTORY_DAYS`, not the
+length of the chain: the hourly maintenance deletes what ages out. For comparison, the
+replayed build this replaced held 259-305 GB after a 34-hour sync from genesis.
+
+There is no replay. Once hivemind is live, the whole time is the backfill, and it runs
+as the first block-processing batch. After that, live blocks take about 20-25 ms each
+on testapi, and the ranker's scheduled cycle there (122 accounts, about 5,000
+candidates) takes about 20-30 s.
 
 ### External HAF Apps (optional)
 
@@ -286,12 +307,13 @@ built per feed entry, so an empty response carries no `fyp` object at all and
 `fyp.source` cannot be read from it. (An earlier version of this section said to
 read `fyp.source`; that state is not observable.)
 
-There is also no staleness check: a ranker that stopped days ago leaves its last
+There is also no staleness check here: a ranker that stopped days ago leaves its last
 good 200 rows in place, and they keep resolving, so `global_feed` reads servable.
 **`/sync-status` does not answer this** — it reports the HAF context advanced by the
-`haf-fyp-sync` service, which keeps running when `haf-fyp-ranker` dies. The signal
-that does move with the ranker is the top-level `computed_at` in this same
-`/metrics` payload, refreshed on the ranker's hourly maintenance pass.
+`haf-fyp-sync` service, which keeps running when `haf-fyp-ranker` dies. The signals
+that do move with the ranker are elsewhere in this `/metrics` payload:
+`ranker.last_cycle.finished_seconds_ago` (#37) and `reader_first.newest_feed_seconds`
+(see "How fresh a feed is").
 
 After installing each external app, run:
 ```bash
@@ -497,7 +519,7 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Can this container serve: `503` when the database pool does not answer a query within 1.5 s. Redis is reported in the body (`redis`, `rate_limit_store`) and never fails it: the app serves without Redis. A probe slower than its deadline (1.5 s database, 1.0 s Redis) counts as no answer. Not sync-aware (#61) |
-| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), reader-first figures (#86, under `reader_first`: whether the ranker is ranking, readers in the last day, their stalest feed, rotation age; see "How fresh a feed is"), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why), whether the installed `feed_cache` is the one the ranker writes (#99, under `feed_cache`: `ok`, or `outdated` with both shapes), whether the ranker is subscribed on the refresh-signal Redis (#51, under `redis`: how many clients listen on the refresh channel, the ranker among them; alert on `redis.degraded`) — not feed analytics |
+| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), reader-first figures (#86, under `reader_first`: whether the ranker is ranking, readers in the last day, their stalest feed, rotation age; see "How fresh a feed is"), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why), whether the installed `feed_cache` is the one the ranker writes (#99, under `feed_cache`: `ok`, or `outdated` with both shapes), whether the ranker is subscribed on the refresh-signal Redis (#51, under `redis`: how many clients listen on the refresh channel, the ranker among them; alert on `redis.degraded`), the ranker's last cycle and the last 24 h of them (#37, under `ranker`: how long ago the last one ended, how long cycles take, accounts ranked and failed; see "How fresh a feed is") — not feed analytics |
 | GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
 | POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10/min per IP, 60/min total) |
 | DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5/min per IP, 30/min total) |
@@ -884,6 +906,33 @@ install with the block processor and the ranker stopped) or `unknown` (the figur
 could not be read; the API log says why). The section never sets a `degraded` flag:
 every threshold above depends on the node.
 
+The ranker's own figures for each cycle are under `ranker` (#37). The ranker writes one
+row per scheduled cycle into `haf_fyp_app.ranker_cycles` and keeps seven days of them
+(about 2,000 rows), so they outlive its container and its log. A cycle that raised is
+recorded with `ok` false and the counts it had reached, up to the account it was on; a
+cycle with no candidates is `ok` with every count 0. Ages are whole seconds, durations
+are rounded to 0.1 s:
+
+| Field | What it is | What to watch |
+|---|---|---|
+| `last_cycle.finished_seconds_ago` | How long ago the last scheduled cycle ended, by the database's clock | **Is the ranker cycling.** It waits `CYCLE_SECONDS` (300, fixed in the ranker) between cycles, so this stays under 300 plus one cycle, plus any targeted re-rank or hourly maintenance pass still running when the wait ends. Well above `CYCLE_SECONDS` + `last_24h.max_duration_seconds`: the ranker is stopped or wedged inside a cycle. A stopped ranker writes nothing, so its last row stays and this keeps growing |
+| `last_cycle.duration_seconds` | How long that cycle took (not counting the reconnect after a lost connection) | Swings with load; compare with `last_24h` |
+| `last_cycle.ok` | `false` when the cycle raised | The ranker's log says `ranking cycle failed` with the traceback, or `database connection lost` without one |
+| `last_cycle.candidates`, `users_attempted`, `users_ranked`, `users_failed`, `users_held` | Posts scored, and the accounts the cycle took, ranked, failed to rank, and held for a read session | `users_failed` above 0 cycle after cycle: an account fails every time (`failed to rank user` in the log) |
+| `last_cycle.reader_lane_taken`, `reader_lane_slots` | The reader lane, as in the log line above | Taken equal to slots cycle after cycle: the lane is full |
+| `last_cycle.readers_ahead`, `reads_heard` | Readers ranked ahead of their turn during the cycle; reads heard since the previous cycle ended | As in the log lines above |
+| `last_24h` | `cycles`, `failed_cycles`, `median_duration_seconds`, `max_duration_seconds` over the last 24 h | A median creeping towards `CYCLE_SECONDS` or beyond: the rotation is slowing |
+
+`state` is `ok`, `no_cycles` (no row yet: the ranker has not finished a cycle since the
+install, it is older than the record, or it cannot write the record), `unsupported` (the
+installed SQL has no `ranker_cycles`: re-run the install as above) or `unknown` (the figures could not be read; the section
+then has only `state` and `detail`). A ranker older than the record runs as before on the new SQL; it just writes nothing here.
+A ranker that cannot write the record (older SQL, a missing grant) logs `could not
+record the cycle` or `ranker_cycles is missing`, once for each kind of failure, and goes
+on ranking, so a growing `finished_seconds_ago` or a lasting `no_cycles` can also mean
+that: `reader_first.newest_feed_seconds` tells the two apart. Like `reader_first`,
+the section sets no `degraded`: how long a cycle may take depends on the node.
+
 **What a notifying request costs.** It takes a transaction id and a brief cluster-wide
 lock at commit, so the feed function rations it by the read session *once the ranker
 has recorded it*: the first page notifies when no session is open, any page notifies
@@ -1001,7 +1050,8 @@ haf_fyp_app
 ├── global_feed_cache     — unauthenticated global feed
 ├── user_communities      — on-chain community subscriptions
 ├── user_interests        — cold-start picker declarations
-└── algorithm_versions    — weight registry with is_active flag
+├── algorithm_versions    — weight registry with is_active flag
+└── ranker_cycles         — one row per scheduled ranker cycle, seven days (#37)
 
 haf_fyp_endpoints
 └── feed_post_row         — composite type returned by feed functions
@@ -1229,10 +1279,23 @@ What it adds over the block pointer is the other case: at the chain tip the loop
 iterating while waiting for a block, so the heartbeat ticks even though nothing was
 processed, which separates "idle" from "wedged".
 
-The consequence, stated rather than hidden: on a long MASSIVE batch this check **can
-report unhealthy on a healthy replay**. The 300s default (upstream uses 60s) is a wide
-guess, not a measurement — and because of the one-iteration lag it tolerates iterations
-of roughly 150s, not 300s. It is explicitly *not* justified by this app's 360s HAProxy
+The consequence, stated rather than hidden: on a long batch this check **can report
+unhealthy on a healthy sync**. Because of the one-iteration lag, the 300s default
+(upstream uses 60s) tolerates iterations of roughly 150s, not 300s. Since #97 there is
+no replay, and one batch is long: the first, which backfills the history window from
+hivemind. On testapi (2026-10-28) that batch took 676 s: the 673 s backfill plus the
+batch's other work. There hivemind was already live at install, so the batch ran inside
+the 72-hour `start_period` before any check had passed: the container showed
+`health: starting` throughout and turned healthy 68 s after the backfill ended. If
+haf_fyp first waits for hivemind to catch up, the loop iterates meanwhile, a check
+passes and the `start_period` cover ends: expect the container to report unhealthy for
+the last few minutes of the backfill (failures start once it has run `MAX_AGE`, and
+Docker counts three of them a minute apart). The same holds for a backfill started later
+in a running container (after clearing `hivemind_follow.backfilled_at` to widen the
+window). To avoid it, set `HAF_FYP_HEALTHCHECK_MAX_AGE_SECONDS` in `.env` above the
+batch's length (900 covers testapi's 676 s), which compose passes to `haf-fyp-sync`, and
+recreate that container (`up -d`) before the backfill starts. Live batches afterwards
+take well under a second. It is explicitly *not* justified by this app's 360s HAProxy
 agent-check, which measures how old the last processed *block* is, a different quantity.
 
 `SET TIME ZONE 'UTC'` is deliberately absent, diverging from upstream.
