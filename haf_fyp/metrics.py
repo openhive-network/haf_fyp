@@ -886,11 +886,12 @@ RANKER_UNSUPPORTED = "unsupported"
 RANKER_UNKNOWN = STATE_UNKNOWN
 
 # A ranker that has recorded no successful cycle for this long is degraded. A healthy one
-# finishes a cycle every CYCLE_SECONDS (300) plus the cycle's length, and an install stops
-# it for about 14 minutes (README, "Disk and sync time"), so an hour is about a dozen
-# missed cycles: it says the ranker has stopped, is wedged or fails every cycle, never
-# that it is slow. Fixed, not derived from the node's own cycle times, which would
-# loosen the threshold just as a node slows down.
+# finishes a cycle every CYCLE_SECONDS (300) plus the cycle's length -- about a dozen an
+# hour at testapi's 20-30 s cycles -- and an install stops it only for the install
+# itself, a few minutes. So an hour says the ranker has stopped, is wedged or raises on
+# every cycle; a slow one reaches it only with a single cycle near an hour long. Fixed,
+# not derived from the node's own cycle times, which would loosen the threshold just as
+# a node slows down.
 RANKER_STALE_SECONDS = 3600
 
 _RANKER_SQL = """
@@ -937,7 +938,9 @@ def fetch_ranker_cycles(conn) -> dict | None:
     be read. In a SAVEPOINT of its own, as fetch_reader_first.
 
     `{"unsupported": True}` means there is no ranker_cycles table: the installed SQL is
-    older than this API image.
+    older than this API image. `{"aborted": True}` means the SAVEPOINT itself was refused
+    (25P02): a probe before this one, which runs without a SAVEPOINT, has already aborted
+    the shared transaction, and its own section reports that.
     """
     try:
         with conn.cursor() as cur:
@@ -966,6 +969,8 @@ def fetch_ranker_cycles(conn) -> dict | None:
         # As the sibling probes: no rollback of the connection (the pool does that),
         # and no exc_info, because monitors poll this route.
         log.warning("ranker: cycles could not be read (%s) -- reporting unknown", exc)
+        if getattr(exc, "pgcode", None) == "25P02":
+            return {"aborted": True}
         return None
 
 
@@ -996,9 +1001,11 @@ def build_ranker_report(probe: dict | None) -> dict:
         recorded, since the first cycle recorded. null with no cycle at all.
     degraded -- true when the ranker is not ranking: seconds_since_ok_cycle is above
         RANKER_STALE_SECONDS (an hour), which a stopped or wedged ranker and one whose
-        every cycle fails all reach; or the cycles could not be read (unknown). false for
-        no_cycles and unsupported, which say that the ranker and the installed SQL are of
-        different ages, not that either is broken.
+        every cycle raises all reach; or this read failed (unknown). Not when an earlier
+        probe had already aborted the transaction (unknown too, but that probe's section
+        reports it: one cause, one alert). false for unsupported (the SQL predates the
+        record) and for no_cycles, which an empty record cannot tell from a ranker that
+        has not finished its first cycle; see the README for alerting on it.
 
     A cycle that raised is recorded with ok false and the counts it had reached, up to
     the account it was on. A cycle with no candidates is ok with every count 0. A
@@ -1010,6 +1017,15 @@ def build_ranker_report(probe: dict | None) -> dict:
             "state": RANKER_UNKNOWN,
             "degraded": True,  # never "fine" when it does not know
             "detail": "the ranker's cycles could not be read; see the API log",
+        }
+    if probe.get("aborted"):
+        return {
+            "state": RANKER_UNKNOWN,
+            "degraded": False,
+            "detail": (
+                "not read: an earlier probe of this request aborted the transaction, and "
+                "its own section reports it as degraded"
+            ),
         }
     if probe.get("unsupported"):
         return {

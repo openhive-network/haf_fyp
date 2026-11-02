@@ -24,7 +24,7 @@ REPO = os.path.join(os.path.dirname(__file__), "..", "..")
 # taken, lane slots, reads heard; then 24 h: cycles, failed, median, longest; then the
 # seconds since a cycle succeeded. Every count differs, so two columns swapped anywhere
 # on the way show.
-ROW = (61.9, 21.46, True, 4976, 122, 116, 2, 4, 3, 6, 100, 7, 288, 9, 20.04, 27.96, 61.9)
+ROW = (61.9, 21.46, True, 4976, 122, 116, 2, 4, 3, 6, 100, 7, 288, 9, 20.04, 27.96, 75.3)
 
 
 def _probe(**last):
@@ -32,7 +32,7 @@ def _probe(**last):
     cycle.update(last)
     return {"last_cycle": cycle, "cycles": 288, "failed_cycles": 9,
             "median_duration_seconds": 20.04, "max_duration_seconds": 27.96,
-            "seconds_since_ok_cycle": 61.9}
+            "seconds_since_ok_cycle": 75.3}
 
 
 # ---- the report ------------------------------------------------------------------------
@@ -42,7 +42,7 @@ def test_the_report_carries_the_last_cycle_and_the_last_day() -> None:
     assert build_ranker_report(_probe()) == {
         "state": "ok",
         "degraded": False,
-        "seconds_since_ok_cycle": 61,
+        "seconds_since_ok_cycle": 75,
         "last_cycle": {
             "finished_seconds_ago": 61, "duration_seconds": 21.5, "ok": True,
             "candidates": 4976, "users_attempted": 122, "users_ranked": 116,
@@ -117,6 +117,12 @@ def test_an_hour_without_a_successful_cycle_is_degraded(since_ok, degraded) -> N
     assert report["degraded"] is degraded
 
 
+def test_an_age_without_success_below_zero_is_zero() -> None:
+    report = build_ranker_report({**_probe(), "seconds_since_ok_cycle": -3.0})
+
+    assert report["seconds_since_ok_cycle"] == 0
+
+
 def test_a_ranker_failing_every_cycle_is_degraded_though_it_keeps_cycling() -> None:
     # Its last cycle ended a minute ago; none has succeeded for two hours.
     report = build_ranker_report({**_probe(ok=False), "seconds_since_ok_cycle": 7200.0})
@@ -146,7 +152,7 @@ def test_the_probe_reads_inside_a_savepoint_and_releases_it() -> None:
     assert probe["last_cycle"] == dict(zip(metrics._LAST_CYCLE_KEYS, ROW[:12]))
     assert (probe["cycles"], probe["failed_cycles"]) == (288, 9)
     assert (probe["median_duration_seconds"], probe["max_duration_seconds"]) == (20.04, 27.96)
-    assert probe["seconds_since_ok_cycle"] == 61.9
+    assert probe["seconds_since_ok_cycle"] == 75.3
 
 
 def test_an_empty_table_has_no_last_cycle() -> None:
@@ -208,6 +214,27 @@ def test_a_failed_read_is_unknown_without_raising(caplog) -> None:
         assert fetch_ranker_cycles(_conn(cur)) is None
     assert "boom" in caplog.text
     assert not any(r.exc_info for r in caplog.records)  # monitors poll this route
+
+
+def test_a_transaction_an_earlier_probe_aborted_is_unknown_but_not_degraded() -> None:
+    # The SAVEPOINT itself is refused: the probe that failed raises its own section's
+    # degraded, and this one would page a second time for the same cause.
+    cur = _Cursor(fail_on="SAVEPOINT", error=_PgError("current transaction is aborted", "25P02"))
+
+    probe = fetch_ranker_cycles(_conn(cur))
+    report = build_ranker_report(probe)
+
+    assert probe == {"aborted": True}
+    assert (report["state"], report["degraded"]) == ("unknown", False)
+
+
+def test_the_rankers_own_read_failing_is_unknown_and_degraded() -> None:
+    error = _PgError("canceling statement due to statement timeout", "57014")
+    cur = _Cursor(fail_on="ranker_cycles", error=error)
+
+    report = build_ranker_report(fetch_ranker_cycles(_conn(cur)))
+
+    assert (report["state"], report["degraded"]) == ("unknown", True)
 
 
 def test_an_aborted_transaction_is_unknown_without_raising() -> None:

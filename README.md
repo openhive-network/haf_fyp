@@ -947,20 +947,36 @@ are rounded to 0.1 s:
 | `last_cycle.readers_ahead`, `reads_heard` | Readers ranked ahead of their turn during the cycle; reads heard since the previous cycle ended | As in the log lines above |
 | `last_24h` | `cycles`, `failed_cycles`, `median_duration_seconds`, `max_duration_seconds` over the last 24 h | A median creeping towards `CYCLE_SECONDS` or beyond: the rotation is slowing |
 | `seconds_since_ok_cycle` | Since the last cycle that succeeded; if none has, since the first one recorded. `null` with no cycle | Above 3600 sets `degraded` |
-| `degraded` | `true` when no cycle has succeeded for an hour, or the figures could not be read | **Alert on this.** A healthy ranker finishes a cycle about every five minutes, and an install stops it for about 14, so an hour means it has stopped, is wedged or fails every cycle |
+| `degraded` | `true` when no cycle has succeeded for an hour, or this read failed | **Alert on this**, and also on a `no_cycles` that lasts over an hour (below). A healthy ranker finishes a cycle about every five minutes, and an install stops it for a few, so an hour means it has stopped, is wedged or raises on every cycle. Which: `last_cycle.finished_seconds_ago` small with `last_cycle.ok` false is failing (`ranking cycle failed` in the ranker's log); large is stopped (check the container) or wedged; `state: unknown` is the read (API log). A stopped ranker also sets `redis.degraded` within minutes, so expect both |
 
 `state` is `ok`, `no_cycles` (no row yet: the ranker has not finished a cycle since the
 install, it is older than the record, or it cannot write the record), `unsupported` (the
 installed SQL has no `ranker_cycles`: re-run the install as above) or `unknown` (the figures could not be read; the section
-then has only `state`, `degraded` (true) and `detail`). A ranker older than the record runs as before on the new SQL; it just writes nothing here.
+then has only `state`, `degraded` and `detail`). A ranker older than the record runs as before on the new SQL; it just writes nothing here.
 A ranker that cannot write the record (older SQL, a missing grant) logs `could not
 record the cycle` or `ranker_cycles is missing`, once for each kind of failure, and goes
 on ranking, so a growing `finished_seconds_ago` or a lasting `no_cycles` can also mean
-that: `reader_first.newest_feed_seconds` tells the two apart. `degraded` stays false for
-`no_cycles` and `unsupported`: they mean the ranker and the installed SQL are of
-different ages, not that either is broken. It never depends on how long cycles take,
-which depends on the node; the hour is fixed (`RANKER_STALE_SECONDS`) so that it does
-not loosen as a node slows down.
+that: `reader_first.newest_feed_seconds` tells the two apart.
+
+`degraded` and the record's gaps, stated rather than hidden:
+
+* **`no_cycles` never sets it.** An empty record cannot tell a fresh install, whose
+  first cycle is minutes away, from a ranker that never started or cannot write the
+  record. Alert on `no_cycles` lasting over an hour, or on `reader_first.newest_feed_seconds`
+  being `null` while `rotation_size` is above 0.
+* **It can fire on a ranker that is ranking**, once rows exist and the ranker stops
+  writing them: an image rolled back to one older than the record, or a lost INSERT
+  grant (`could not record the cycle` in the ranker's log). Check
+  `reader_first.newest_feed_seconds` before acting.
+* **It counts cycles that raised, not accounts.** A cycle in which every account fails
+  to rank is still recorded as ok; `users_failed` and `rotation_age_seconds` show that.
+* **An earlier probe's failure does not set it.** If a probe before this one aborted the
+  request's transaction, this section reads `unknown` without `degraded`; the section
+  that failed raises it.
+
+`unsupported` does not set it either (the SQL predates the record). It never depends
+on how long cycles take, which depends on the node; the hour is fixed
+(`RANKER_STALE_SECONDS`) so that it does not loosen as a node slows down.
 
 **What a notifying request costs.** It takes a transaction id and a brief cluster-wide
 lock at commit, so the feed function rations it by the read session *once the ranker
