@@ -885,6 +885,14 @@ RANKER_NO_CYCLES = "no_cycles"
 RANKER_UNSUPPORTED = "unsupported"
 RANKER_UNKNOWN = STATE_UNKNOWN
 
+# A ranker that has recorded no successful cycle for this long is degraded. A healthy one
+# finishes a cycle every CYCLE_SECONDS (300) plus the cycle's length, and an install stops
+# it for about 14 minutes (README, "Disk and sync time"), so an hour is about a dozen
+# missed cycles: it says the ranker has stopped, is wedged or fails every cycle, never
+# that it is slow. Fixed, not derived from the node's own cycle times, which would
+# loosen the threshold just as a node slows down.
+RANKER_STALE_SECONDS = 3600
+
 _RANKER_SQL = """
 WITH last AS (
     SELECT * FROM haf_fyp_app.ranker_cycles ORDER BY finished_at DESC LIMIT 1
@@ -895,13 +903,19 @@ WITH last AS (
            max(duration_seconds) AS longest
       FROM haf_fyp_app.ranker_cycles
      WHERE finished_at >= statement_timestamp() - interval '24 hours'
+), since_ok AS (
+    -- Since the last cycle that succeeded; with none in the record, since its first
+    -- cycle, so a record that has only ever failed ages from when it began.
+    SELECT EXTRACT(EPOCH FROM statement_timestamp()
+                   - coalesce(max(finished_at) FILTER (WHERE ok), min(finished_at))) AS seconds
+      FROM haf_fyp_app.ranker_cycles
 )
 SELECT EXTRACT(EPOCH FROM statement_timestamp() - last.finished_at),
        last.duration_seconds, last.ok, last.candidates, last.users_attempted,
        last.users_ranked, last.users_failed, last.users_held, last.readers_ahead,
        last.lane_taken, last.lane_slots, last.reads_heard,
-       day.cycles, day.failed, day.median, day.longest
-  FROM day LEFT JOIN last ON true
+       day.cycles, day.failed, day.median, day.longest, since_ok.seconds
+  FROM day CROSS JOIN since_ok LEFT JOIN last ON true
 """
 
 _RANKER_SAVEPOINT = "haf_fyp_metrics_ranker"
@@ -939,13 +953,14 @@ def fetch_ranker_cycles(conn) -> dict | None:
                 raise
             cur.execute(f"RELEASE SAVEPOINT {_RANKER_SAVEPOINT}")
         last = dict(zip(_LAST_CYCLE_KEYS, row[:12]))
-        cycles, failed, median, longest = row[12:]
+        cycles, failed, median, longest, since_ok = row[12:]
         return {
             "last_cycle": None if last["duration_seconds"] is None else last,
             "cycles": int(cycles),
             "failed_cycles": int(failed),
             "median_duration_seconds": median,
             "max_duration_seconds": longest,
+            "seconds_since_ok_cycle": since_ok,
         }
     except Exception as exc:
         # As the sibling probes: no rollback of the connection (the pool does that),
@@ -977,23 +992,29 @@ def build_ranker_report(probe: dict | None) -> dict:
             slots, cycle after cycle, means the rest of the rotation runs slower.
         reads_heard -- feed reads heard since the previous cycle ended.
     last_24h -- cycles, failed_cycles, median and max duration over the last 24 hours.
+    seconds_since_ok_cycle -- since the last cycle that succeeded (ok true); with none
+        recorded, since the first cycle recorded. null with no cycle at all.
+    degraded -- true when the ranker is not ranking: seconds_since_ok_cycle is above
+        RANKER_STALE_SECONDS (an hour), which a stopped or wedged ranker and one whose
+        every cycle fails all reach; or the cycles could not be read (unknown). false for
+        no_cycles and unsupported, which say that the ranker and the installed SQL are of
+        different ages, not that either is broken.
 
     A cycle that raised is recorded with ok false and the counts it had reached, up to
     the account it was on. A cycle with no candidates is ok with every count 0. A
     ranker that cannot write the record keeps ranking: a lasting no_cycles or a growing
     age can mean that too, and newest_feed_seconds tells the two apart.
-
-    Informational: it never sets a `degraded`. How long a cycle may take depends on the
-    node.
     """
     if probe is None:
         return {
             "state": RANKER_UNKNOWN,
+            "degraded": True,  # never "fine" when it does not know
             "detail": "the ranker's cycles could not be read; see the API log",
         }
     if probe.get("unsupported"):
         return {
             "state": RANKER_UNSUPPORTED,
+            "degraded": False,
             "detail": (
                 "haf_fyp_app.ranker_cycles does not exist: the installed SQL predates the "
                 "ranker's cycle record. Re-run the install, with the block processor and "
@@ -1007,8 +1028,11 @@ def build_ranker_report(probe: dict | None) -> dict:
             "finished_seconds_ago": _seconds(last["finished_seconds_ago"]),
             "duration_seconds": _rounded(last["duration_seconds"]),
         }
+    since_ok = _seconds(probe["seconds_since_ok_cycle"])
     report = {
         "state": RANKER_OK if last is not None else RANKER_NO_CYCLES,
+        "degraded": since_ok is not None and since_ok > RANKER_STALE_SECONDS,
+        "seconds_since_ok_cycle": since_ok,
         "last_cycle": last,
         "last_24h": {
             "cycles": probe["cycles"],

@@ -519,7 +519,7 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Can this container serve: `503` when the database pool does not answer a query within 1.5 s. Redis is reported in the body (`redis`, `rate_limit_store`) and never fails it: the app serves without Redis. A probe slower than its deadline (1.5 s database, 1.0 s Redis) counts as no answer. Not sync-aware (#61) |
-| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), reader-first figures (#86, under `reader_first`: whether the ranker is ranking, readers in the last day, their stalest feed, rotation age; see "How fresh a feed is"), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why), whether the installed `feed_cache` is the one the ranker writes (#99, under `feed_cache`: `ok`, or `outdated` with both shapes), whether the ranker is subscribed on the refresh-signal Redis (#51, under `redis`: how many clients listen on the refresh channel, the ranker among them; alert on `redis.degraded`), the ranker's last cycle and the last 24 h of them (#37, under `ranker`: how long ago the last one ended, how long cycles take, accounts ranked and failed; see "How fresh a feed is") — not feed analytics |
+| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), reader-first figures (#86, under `reader_first`: whether the ranker is ranking, readers in the last day, their stalest feed, rotation age; see "How fresh a feed is"), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why), whether the installed `feed_cache` is the one the ranker writes (#99, under `feed_cache`: `ok`, or `outdated` with both shapes), whether the ranker is subscribed on the refresh-signal Redis (#51, under `redis`: how many clients listen on the refresh channel, the ranker among them; alert on `redis.degraded`), the ranker's last cycle and the last 24 h of them (#37, under `ranker`: how long ago the last one ended, how long cycles take, accounts ranked and failed; alert on `ranker.degraded`, set after an hour without a successful cycle; see "How fresh a feed is") — not feed analytics |
 | GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
 | POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10/min per IP, 60/min total) |
 | DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5/min per IP, 30/min total) |
@@ -946,16 +946,21 @@ are rounded to 0.1 s:
 | `last_cycle.reader_lane_taken`, `reader_lane_slots` | The reader lane, as in the log line above | Taken equal to slots cycle after cycle: the lane is full |
 | `last_cycle.readers_ahead`, `reads_heard` | Readers ranked ahead of their turn during the cycle; reads heard since the previous cycle ended | As in the log lines above |
 | `last_24h` | `cycles`, `failed_cycles`, `median_duration_seconds`, `max_duration_seconds` over the last 24 h | A median creeping towards `CYCLE_SECONDS` or beyond: the rotation is slowing |
+| `seconds_since_ok_cycle` | Since the last cycle that succeeded; if none has, since the first one recorded. `null` with no cycle | Above 3600 sets `degraded` |
+| `degraded` | `true` when no cycle has succeeded for an hour, or the figures could not be read | **Alert on this.** A healthy ranker finishes a cycle about every five minutes, and an install stops it for about 14, so an hour means it has stopped, is wedged or fails every cycle |
 
 `state` is `ok`, `no_cycles` (no row yet: the ranker has not finished a cycle since the
 install, it is older than the record, or it cannot write the record), `unsupported` (the
 installed SQL has no `ranker_cycles`: re-run the install as above) or `unknown` (the figures could not be read; the section
-then has only `state` and `detail`). A ranker older than the record runs as before on the new SQL; it just writes nothing here.
+then has only `state`, `degraded` (true) and `detail`). A ranker older than the record runs as before on the new SQL; it just writes nothing here.
 A ranker that cannot write the record (older SQL, a missing grant) logs `could not
 record the cycle` or `ranker_cycles is missing`, once for each kind of failure, and goes
 on ranking, so a growing `finished_seconds_ago` or a lasting `no_cycles` can also mean
-that: `reader_first.newest_feed_seconds` tells the two apart. Like `reader_first`,
-the section sets no `degraded`: how long a cycle may take depends on the node.
+that: `reader_first.newest_feed_seconds` tells the two apart. `degraded` stays false for
+`no_cycles` and `unsupported`: they mean the ranker and the installed SQL are of
+different ages, not that either is broken. It never depends on how long cycles take,
+which depends on the node; the hour is fixed (`RANKER_STALE_SECONDS`) so that it does
+not loosen as a node slows down.
 
 **What a notifying request costs.** It takes a transaction id and a brief cluster-wide
 lock at commit, so the feed function rations it by the read session *once the ranker

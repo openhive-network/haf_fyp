@@ -21,16 +21,18 @@ from .test_reads_during_cycle import _cycle, _Reads
 REPO = os.path.join(os.path.dirname(__file__), "..", "..")
 
 # finished ago, duration, ok, candidates, attempted, ranked, failed, held, ahead, lane
-# taken, lane slots, reads heard; then 24 h: cycles, failed, median, longest. Every count
-# differs, so two columns swapped anywhere on the way show.
-ROW = (61.9, 21.46, True, 4976, 122, 116, 2, 4, 3, 6, 100, 7, 288, 9, 20.04, 27.96)
+# taken, lane slots, reads heard; then 24 h: cycles, failed, median, longest; then the
+# seconds since a cycle succeeded. Every count differs, so two columns swapped anywhere
+# on the way show.
+ROW = (61.9, 21.46, True, 4976, 122, 116, 2, 4, 3, 6, 100, 7, 288, 9, 20.04, 27.96, 61.9)
 
 
 def _probe(**last):
     cycle = dict(zip(metrics._LAST_CYCLE_KEYS, ROW[:12]))
     cycle.update(last)
     return {"last_cycle": cycle, "cycles": 288, "failed_cycles": 9,
-            "median_duration_seconds": 20.04, "max_duration_seconds": 27.96}
+            "median_duration_seconds": 20.04, "max_duration_seconds": 27.96,
+            "seconds_since_ok_cycle": 61.9}
 
 
 # ---- the report ------------------------------------------------------------------------
@@ -39,6 +41,8 @@ def _probe(**last):
 def test_the_report_carries_the_last_cycle_and_the_last_day() -> None:
     assert build_ranker_report(_probe()) == {
         "state": "ok",
+        "degraded": False,
+        "seconds_since_ok_cycle": 61,
         "last_cycle": {
             "finished_seconds_ago": 61, "duration_seconds": 21.5, "ok": True,
             "candidates": 4976, "users_attempted": 122, "users_ranked": 116,
@@ -58,10 +62,13 @@ def test_an_age_below_zero_is_zero() -> None:
 
 def test_no_row_is_no_cycles_not_ok_and_says_why() -> None:
     probe = {"last_cycle": None, "cycles": 0, "failed_cycles": 0,
-             "median_duration_seconds": None, "max_duration_seconds": None}
+             "median_duration_seconds": None, "max_duration_seconds": None,
+             "seconds_since_ok_cycle": None}
     report = build_ranker_report(probe)
 
     assert report["state"] == "no_cycles"
+    assert report["degraded"] is False
+    assert report["seconds_since_ok_cycle"] is None
     assert report["last_cycle"] is None
     assert report["last_24h"] == {"cycles": 0, "failed_cycles": 0,
                                   "median_duration_seconds": None, "max_duration_seconds": None}
@@ -72,10 +79,12 @@ def test_a_last_cycle_older_than_a_day_is_still_reported() -> None:
     # A ranker stopped two days ago: its last row stays (nothing prunes it), and its age
     # is the alarm, while the last day is empty.
     probe = {**_probe(finished_seconds_ago=172800.0), "cycles": 0, "failed_cycles": 0,
-             "median_duration_seconds": None, "max_duration_seconds": None}
+             "median_duration_seconds": None, "max_duration_seconds": None,
+             "seconds_since_ok_cycle": 172800.0}
     report = build_ranker_report(probe)
 
     assert report["state"] == "ok"
+    assert report["degraded"] is True
     assert report["last_cycle"]["finished_seconds_ago"] == 172800
     assert report["last_24h"]["cycles"] == 0
 
@@ -95,15 +104,33 @@ def test_a_missing_table_is_unsupported_and_a_failure_is_unknown() -> None:
     assert build_ranker_report(None)["state"] == "unknown"
 
 
-@pytest.mark.parametrize("probe", [None, {"unsupported": True}, "ok", "empty"])
-def test_the_section_never_carries_a_degraded_flag(probe) -> None:
-    if probe == "ok":
-        probe = _probe()
-    elif probe == "empty":
-        probe = {"last_cycle": None, "cycles": 0, "failed_cycles": 0,
-                 "median_duration_seconds": None, "max_duration_seconds": None}
+@pytest.mark.parametrize("since_ok, degraded", [
+    (61.9, False),
+    (3600.0, False),   # an hour exactly is not yet
+    (3600.9, False),   # whole seconds, truncated, as the age is reported
+    (3601.0, True),
+    (90000.0, True),
+])
+def test_an_hour_without_a_successful_cycle_is_degraded(since_ok, degraded) -> None:
+    report = build_ranker_report({**_probe(), "seconds_since_ok_cycle": since_ok})
 
-    assert "degraded" not in build_ranker_report(probe)
+    assert report["degraded"] is degraded
+
+
+def test_a_ranker_failing_every_cycle_is_degraded_though_it_keeps_cycling() -> None:
+    # Its last cycle ended a minute ago; none has succeeded for two hours.
+    report = build_ranker_report({**_probe(ok=False), "seconds_since_ok_cycle": 7200.0})
+
+    assert report["last_cycle"]["finished_seconds_ago"] == 61
+    assert report["degraded"] is True
+
+
+@pytest.mark.parametrize("probe, degraded", [
+    (None, True),                   # unknown: never "fine" when it does not know
+    ({"unsupported": True}, False),  # SQL older than the API: an upgrade, not a failure
+])
+def test_a_section_that_cannot_say_is_degraded_only_when_its_read_failed(probe, degraded) -> None:
+    assert build_ranker_report(probe)["degraded"] is degraded
 
 
 # ---- the probe -------------------------------------------------------------------------
@@ -119,10 +146,11 @@ def test_the_probe_reads_inside_a_savepoint_and_releases_it() -> None:
     assert probe["last_cycle"] == dict(zip(metrics._LAST_CYCLE_KEYS, ROW[:12]))
     assert (probe["cycles"], probe["failed_cycles"]) == (288, 9)
     assert (probe["median_duration_seconds"], probe["max_duration_seconds"]) == (20.04, 27.96)
+    assert probe["seconds_since_ok_cycle"] == 61.9
 
 
 def test_an_empty_table_has_no_last_cycle() -> None:
-    row = (None,) * 12 + (0, 0, None, None)
+    row = (None,) * 12 + (0, 0, None, None, None)
 
     probe = fetch_ranker_cycles(_conn(_Cursor(row=row)))
 
