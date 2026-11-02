@@ -98,7 +98,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 72h   # see the note on this service's healthcheck below
+      start_period: 72h   # replay can take days on first run
     # As haf_api_node's haf_base.yaml does: compose's default ten seconds is not enough for
     # PostgreSQL to shut down cleanly, and a SIGKILL after it makes the next start perform
     # crash recovery. It is stored on the container when compose creates it, so it applies to
@@ -165,6 +165,9 @@ services:
       POSTGRES_HOST: haf
       POSTGRES_USER: haf_fyp_owner
       POSTGRES_DB:   haf_block_log
+      # The healthcheck's window (docker/block-processing-healthcheck.sh, MAX_AGE). Read
+      # when the container is created, so a change needs `up -d` to recreate it.
+      HAF_FYP_HEALTHCHECK_MAX_AGE_SECONDS: ${HAF_FYP_HEALTHCHECK_MAX_AGE_SECONDS:-300}
     depends_on:
       haf-fyp-setup:
         condition: service_completed_successfully
@@ -200,15 +203,14 @@ services:
     #
     # 72h is inherited from the SELECT 1 check this replaces and is NOT a considered
     # number for the new one. Docker stops forgiving failures at the first SUCCESSFUL
-    # check, so it does not in fact cover a whole replay; but a container that never
+    # check, so it covers no batch after that one; but a container that never
     # succeeds -- one that parks at start (#76) -- stays `health: starting` for the full
     # three days, and every restart opens a fresh window. Inside it, Docker >= 25 probes
     # every 5s (the default start_interval); cheap here, since a parked check exits
     # before psql. That is the silent window #27 exists to close. It is left alone here
     # because nothing yet consumes this
     # service's health -- no depends_on keys on it, and the node's status page uses the
-    # HAProxy agent-check instead -- so tuning it without a measured MASSIVE batch
-    # duration would be guessing twice.
+    # HAProxy agent-check instead -- so there is nothing yet to tune it for.
     healthcheck:
       test: ["CMD", "/app/block-processing-healthcheck.sh"]
       interval: 60s

@@ -391,7 +391,7 @@ def _route(monkeypatch: MonkeyPatch, reader_first, ranker=None):
     monkeypatch.setattr(api, "fetch_reader_first", _stub("reader_first", reader_first))
     monkeypatch.setattr(api, "fetch_history", _stub("history", None))
     monkeypatch.setattr(api, "fetch_ranker_cycles", _stub("ranker", ranker))
-    monkeypatch.setattr(api, "fetch_feed_cache_shape", lambda conn: None)
+    monkeypatch.setattr(api, "fetch_feed_cache_shape", _stub("feed_cache", None))
     monkeypatch.setattr(api, "_channel_probe", api._BoundedProbe("c", lambda: None, no_answer=None))
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {"embedding_coverage": []})
     monkeypatch.setattr(api, "build_credibility_sources_report", lambda probe: {"c": 1})
@@ -422,7 +422,7 @@ def test_the_route_reads_reader_first_after_the_others_and_on_the_same_connectio
 
     names = [name for name, _c in order]
     assert names == ["coverage", "ranking", "servability", "credibility", "reader_first", "history",
-                     "ranker"]
+                     "ranker", "feed_cache"]
     assert len(conns) == 1 and all(c is conns[0] for _n, c in order)
 
 

@@ -1371,6 +1371,10 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
             ahead.update(early)
             waiting.extendleft(reversed(early))
             next_read_check = time.monotonic() + POLL_SECONDS
+        # Per account, so a cycle that raises part-way records what it had reached.
+        _cycle_stats.update(users_attempted=len(done), users_ranked=processed,
+                            users_failed=failed, users_held=held,
+                            readers_ahead=len(ahead & done))
         if not waiting:
             break
         username = waiting.popleft()
@@ -1396,8 +1400,6 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
             _log_user_failure(username, exc)
 
     taken = ahead & done  # not one a later check turned away before its turn came
-    _cycle_stats.update(users_attempted=len(done), users_ranked=processed,
-                        users_failed=failed, users_held=held, readers_ahead=len(taken))
     if done:
         log.info(
             "refreshed personalized feeds for %d/%d cached users (%d failed%s)",
@@ -1964,16 +1966,22 @@ def main() -> None:
             ranked: set[str] = set()
             handed.clear()
             cycle_started, cycle_ok = time.monotonic(), False
+            cycle_seconds: float | None = None
             try:
                 ranked = run_cycle(conn, _reads_during_cycle) or set()
                 cycle_ok = True
             except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                # Timed before the reconnect, which waits as long as the database is
+                # down or an install holds HAF's lock: that is not the cycle's length.
+                cycle_seconds = time.monotonic() - cycle_started
                 log.warning("database connection lost — reconnecting")
                 conn = _reconnect(conn)
             except Exception:
                 log.exception("ranking cycle failed")
                 _safe_rollback(conn)
-            _record_cycle(conn, time.monotonic() - cycle_started, cycle_ok)
+            if cycle_seconds is None:
+                cycle_seconds = time.monotonic() - cycle_started
+            _record_cycle(conn, cycle_seconds, cycle_ok)
             # Waiting readers the cycle ranked are done. The rest keep waiting for the
             # next grouped re-rank, and so does everyone handed to the cycle that it did
             # not get to: a cycle that failed, an account whose ranking failed, a lane

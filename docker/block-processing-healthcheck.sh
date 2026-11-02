@@ -57,8 +57,9 @@
 # (hive.get_app_current_block_age), tracked in #29. The two are complementary; this one
 # does not subsume it, and nothing here is a reason to drop it.
 #
-# The consequence, stated rather than hidden: during a long MASSIVE batch this check
-# CAN report unhealthy on a perfectly healthy replay. See MAX_AGE.
+# The consequence, stated rather than hidden: during a long batch -- the first one,
+# which backfills the history window -- this check CAN report unhealthy on a perfectly
+# healthy sync. See MAX_AGE.
 #
 # Healthy if EITHER:
 #   - the loop iterated within MAX_AGE, and since this container started; or
@@ -126,8 +127,10 @@ CONTEXT=${HAF_FYP_CONTEXT:-"haf_fyp"}
 # install, so it ran inside the compose start_period before any check had passed and
 # showed as `starting`, not unhealthy. If haf_fyp first waits for hivemind, the loop
 # iterates meanwhile, a check passes, and the backfill then DOES trip this; so does one
-# started later in a running container (a widened window). Raise the value for either.
-# Live batches afterwards take well under a second.
+# started later in a running container (a widened window). For either, set
+# HAF_FYP_HEALTHCHECK_MAX_AGE_SECONDS above the batch (900 covers testapi's 676s; compose
+# passes it to haf-fyp-sync) and recreate the container. Live batches afterwards take
+# well under a second.
 #
 # It stays wide, and the trade is explicit: a window that is too generous delays
 # detection of a wedged loop (to MAX_AGE plus retries x interval, about 8 minutes at

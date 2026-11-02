@@ -54,9 +54,9 @@ def conn():
 def stats(monkeypatch):
     monkeypatch.setattr(rd, "_cycle_record_failure", None)
     monkeypatch.setattr(rd, "_cycle_stats", dict(
-        candidates=4976, users_attempted=122, users_ranked=120, users_failed=1,
-        users_held=1, readers_ahead=3))
-    monkeypatch.setattr(rd, "_lane_taken", 4)
+        candidates=4976, users_attempted=122, users_ranked=116, users_failed=2,
+        users_held=4, readers_ahead=3))  # every count differs: a swapped column shows
+    monkeypatch.setattr(rd, "_lane_taken", 6)
     monkeypatch.setattr(rd, "_lane_slots", 100)
     monkeypatch.setattr(rd, "_reads_heard", 7)
 
@@ -86,8 +86,8 @@ def test_the_rankers_record_reads_back_as_the_last_cycle(conn, stats) -> None:
     last = report["last_cycle"]
     assert last["finished_seconds_ago"] <= 5
     assert last == {**last, "duration_seconds": 21.5, "ok": True, "candidates": 4976,
-                    "users_attempted": 122, "users_ranked": 120, "users_failed": 1,
-                    "users_held": 1, "readers_ahead": 3, "reader_lane_taken": 4,
+                    "users_attempted": 122, "users_ranked": 116, "users_failed": 2,
+                    "users_held": 4, "readers_ahead": 3, "reader_lane_taken": 6,
                     "reader_lane_slots": 100, "reads_heard": 7}
     assert report["last_24h"]["cycles"] == 1
 
@@ -117,14 +117,17 @@ def test_the_record_drops_what_is_older_than_seven_days(conn, stats) -> None:
 
 
 def test_the_last_day_counts_only_its_own_cycles(conn) -> None:
-    _insert(conn, "30 hours", 99.0)
-    _insert(conn, "3 hours", 30.0, ok=False)
+    # Chosen so a mean (40) is not the median (20), counting the ok cycles (2) is not
+    # counting the failed one (1), and the 30-hour row, failed too, changes both counts.
+    _insert(conn, "30 hours", 99.0, ok=False)
+    _insert(conn, "3 hours", 90.0, ok=False)
+    _insert(conn, "150 minutes", 20.0)
     _insert(conn, "2 hours", 10.0)
 
     report = build_ranker_report(fetch_ranker_cycles(conn))
 
-    assert report["last_24h"] == {"cycles": 2, "failed_cycles": 1,
-                                  "median_duration_seconds": 20.0, "max_duration_seconds": 30.0}
+    assert report["last_24h"] == {"cycles": 3, "failed_cycles": 1,
+                                  "median_duration_seconds": 20.0, "max_duration_seconds": 90.0}
     assert report["last_cycle"]["duration_seconds"] == 10.0  # the latest, not the longest
     assert 7190 <= report["last_cycle"]["finished_seconds_ago"] <= 7210
 

@@ -21,14 +21,15 @@ from .test_reads_during_cycle import _cycle, _Reads
 REPO = os.path.join(os.path.dirname(__file__), "..", "..")
 
 # finished ago, duration, ok, candidates, attempted, ranked, failed, held, ahead, lane
-# taken, lane slots, reads heard; then 24 h: cycles, failed, median, longest.
-ROW = (61.9, 21.46, True, 4976, 122, 120, 1, 1, 3, 4, 100, 7, 288, 2, 20.04, 27.96)
+# taken, lane slots, reads heard; then 24 h: cycles, failed, median, longest. Every count
+# differs, so two columns swapped anywhere on the way show.
+ROW = (61.9, 21.46, True, 4976, 122, 116, 2, 4, 3, 6, 100, 7, 288, 9, 20.04, 27.96)
 
 
 def _probe(**last):
     cycle = dict(zip(metrics._LAST_CYCLE_KEYS, ROW[:12]))
     cycle.update(last)
-    return {"last_cycle": cycle, "cycles": 288, "failed_cycles": 2,
+    return {"last_cycle": cycle, "cycles": 288, "failed_cycles": 9,
             "median_duration_seconds": 20.04, "max_duration_seconds": 27.96}
 
 
@@ -40,11 +41,11 @@ def test_the_report_carries_the_last_cycle_and_the_last_day() -> None:
         "state": "ok",
         "last_cycle": {
             "finished_seconds_ago": 61, "duration_seconds": 21.5, "ok": True,
-            "candidates": 4976, "users_attempted": 122, "users_ranked": 120,
-            "users_failed": 1, "users_held": 1, "readers_ahead": 3,
-            "reader_lane_taken": 4, "reader_lane_slots": 100, "reads_heard": 7,
+            "candidates": 4976, "users_attempted": 122, "users_ranked": 116,
+            "users_failed": 2, "users_held": 4, "readers_ahead": 3,
+            "reader_lane_taken": 6, "reader_lane_slots": 100, "reads_heard": 7,
         },
-        "last_24h": {"cycles": 288, "failed_cycles": 2,
+        "last_24h": {"cycles": 288, "failed_cycles": 9,
                      "median_duration_seconds": 20.0, "max_duration_seconds": 28.0},
     }
 
@@ -79,6 +80,15 @@ def test_a_last_cycle_older_than_a_day_is_still_reported() -> None:
     assert report["last_24h"]["cycles"] == 0
 
 
+def test_a_cycle_that_ranked_nobody_is_still_a_cycle() -> None:
+    # Candidates but no account in the rotation: a cycle all the same.
+    report = build_ranker_report(_probe(users_attempted=0, users_ranked=0, users_failed=0,
+                                        users_held=0, readers_ahead=0, candidates=0))
+
+    assert report["state"] == "ok"
+    assert report["last_cycle"]["users_attempted"] == 0
+
+
 def test_a_missing_table_is_unsupported_and_a_failure_is_unknown() -> None:
     assert build_ranker_report({"unsupported": True})["state"] == "unsupported"
     assert "re-run the install" in build_ranker_report({"unsupported": True})["detail"].lower()
@@ -106,9 +116,9 @@ def test_the_probe_reads_inside_a_savepoint_and_releases_it() -> None:
 
     assert cur.statements[0] == "SAVEPOINT haf_fyp_metrics_ranker"
     assert cur.statements[-1] == "RELEASE SAVEPOINT haf_fyp_metrics_ranker"
-    assert probe["last_cycle"]["users_ranked"] == 120
-    assert probe["last_cycle"]["reader_lane_slots"] == 100
-    assert (probe["cycles"], probe["failed_cycles"]) == (288, 2)
+    assert probe["last_cycle"] == dict(zip(metrics._LAST_CYCLE_KEYS, ROW[:12]))
+    assert (probe["cycles"], probe["failed_cycles"]) == (288, 9)
+    assert (probe["median_duration_seconds"], probe["max_duration_seconds"]) == (20.04, 27.96)
 
 
 def test_an_empty_table_has_no_last_cycle() -> None:
@@ -118,6 +128,15 @@ def test_an_empty_table_has_no_last_cycle() -> None:
 
     assert probe["last_cycle"] is None
     assert probe["cycles"] == 0
+
+
+def test_a_recorded_cycle_that_ranked_nobody_is_read_as_a_cycle() -> None:
+    row = ROW[:3] + (0,) * 9 + ROW[12:]
+
+    probe = fetch_ranker_cycles(_conn(_Cursor(row=row)))
+
+    assert probe["last_cycle"] is not None
+    assert probe["last_cycle"]["users_attempted"] == 0
 
 
 def test_the_query_reads_the_database_clock_on_both_sides() -> None:
@@ -146,6 +165,14 @@ def test_another_missing_relation_is_a_failure_not_unsupported() -> None:
     assert cur.statements[-1] == "ROLLBACK TO SAVEPOINT haf_fyp_metrics_ranker"
 
 
+def test_a_permission_error_naming_the_table_is_a_failure_not_unsupported() -> None:
+    # The remedy differs: re-running the install does not grant anything.
+    error = _PgError("permission denied for table ranker_cycles", "42501")
+    cur = _Cursor(fail_on="ranker_cycles", error=error)
+
+    assert fetch_ranker_cycles(_conn(cur)) is None
+
+
 def test_a_failed_read_is_unknown_without_raising(caplog) -> None:
     cur = _Cursor(fail_on="ranker_cycles", error=RuntimeError("boom"))
 
@@ -169,9 +196,9 @@ def test_an_aborted_transaction_is_unknown_without_raising() -> None:
 def fresh_record(monkeypatch):
     monkeypatch.setattr(rd, "_cycle_record_failure", None)
     monkeypatch.setattr(rd, "_cycle_stats", dict(
-        candidates=4976, users_attempted=122, users_ranked=120, users_failed=1,
-        users_held=1, readers_ahead=3))
-    monkeypatch.setattr(rd, "_lane_taken", 4)
+        candidates=4976, users_attempted=122, users_ranked=116, users_failed=2,
+        users_held=4, readers_ahead=3))
+    monkeypatch.setattr(rd, "_lane_taken", 6)
     monkeypatch.setattr(rd, "_lane_slots", 100)
     monkeypatch.setattr(rd, "_reads_heard", 7)
 
@@ -197,8 +224,8 @@ def test_the_record_carries_the_cycle_the_lane_and_the_reads(fresh_record) -> No
     assert "INSERT INTO haf_fyp_app.ranker_cycles" in insert.args[0]
     assert insert.args[1] == {
         "duration_seconds": 21.46, "ok": True, "candidates": 4976, "users_attempted": 122,
-        "users_ranked": 120, "users_failed": 1, "users_held": 1, "readers_ahead": 3,
-        "lane_taken": 4, "lane_slots": 100, "reads_heard": 7,
+        "users_ranked": 116, "users_failed": 2, "users_held": 4, "readers_ahead": 3,
+        "lane_taken": 6, "lane_slots": 100, "reads_heard": 7,
     }
     assert "DELETE FROM haf_fyp_app.ranker_cycles" in prune.args[0]
     assert prune.args[1] == (7,)
@@ -259,6 +286,17 @@ def test_another_missing_relation_is_not_the_missing_table(fresh_record, monkeyp
     assert "could not record the cycle" in message and "active_users" in message
 
 
+def test_a_permission_error_naming_the_table_is_not_the_missing_table(fresh_record, monkeypatch, caplog) -> None:
+    monkeypatch.setattr(rd, "_safe_rollback", lambda conn: None)
+    denied = _PgError("permission denied for table ranker_cycles", "42501")
+
+    with caplog.at_level(logging.WARNING, logger=rd.log.name):
+        rd._record_cycle(_write_conn(denied)[0], 1.0, True)
+    (message,) = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert "could not record the cycle" in message and "permission denied" in message
+    assert rd._cycle_record_failure == "42501"
+
+
 def test_the_insert_dates_the_row_by_the_clock_not_the_transaction() -> None:
     # now() is the transaction's start, which can be the start of the cycle.
     assert "clock_timestamp()" in rd._RECORD_CYCLE_SQL
@@ -287,6 +325,29 @@ def test_run_cycle_counts_what_it_took_ranked_failed_and_ahead(monkeypatch) -> N
     assert rd._cycle_stats == {
         "candidates": 1, "users_attempted": 4, "users_ranked": 3, "users_failed": 1,
         "users_held": 0, "readers_ahead": 1,
+    }
+
+
+@pytest.mark.usefixtures("_reader_state")
+def test_run_cycle_counts_an_account_in_a_read_session_as_held_only(monkeypatch) -> None:
+    _cycle(monkeypatch, ["amy", "bob", "cal"], None, fail={"cal"},
+           raises={"bob": rd.FeedSessionOpen()})
+
+    assert rd._cycle_stats == {
+        "candidates": 1, "users_attempted": 3, "users_ranked": 1, "users_failed": 1,
+        "users_held": 1, "readers_ahead": 0,
+    }
+
+
+@pytest.mark.usefixtures("_reader_state")
+def test_a_cycle_that_raises_part_way_keeps_the_counts_it_reached(monkeypatch) -> None:
+    with pytest.raises(psycopg2.OperationalError):
+        _cycle(monkeypatch, ["amy", "bob", "cal", "dan"], None, fail={"bob"},
+               raises={"cal": psycopg2.OperationalError("gone")})
+
+    assert rd._cycle_stats == {
+        "candidates": 1, "users_attempted": 2, "users_ranked": 1, "users_failed": 1,
+        "users_held": 0, "readers_ahead": 0,
     }
 
 
@@ -377,6 +438,28 @@ def test_main_records_a_cycle_that_lost_its_connection_on_the_new_one(monkeypatc
 
 
 @pytest.mark.usefixtures("_reader_state")
+def test_main_does_not_count_the_reconnect_in_the_cycles_duration(monkeypatch) -> None:
+    # The reconnect waits out a database outage or an install: not the cycle's time.
+    calls = _recorded(monkeypatch)
+    clock = _Clock()
+
+    def _lost(conn, reads):
+        reconnect = rd._reconnect  # _drive_main's
+
+        def _slow_reconnect(c):
+            clock.now += 600.0
+            return reconnect(c)
+
+        monkeypatch.setattr(rd, "_reconnect", _slow_reconnect)
+        clock.now += 7.0
+        raise psycopg2.OperationalError("gone")
+
+    seen = _drive_main(monkeypatch, drain=[set()], note=[set()], cycle=[_lost], clock=clock)
+
+    assert calls[0][:3] == (seen.second, 7.0, False)
+
+
+@pytest.mark.usefixtures("_reader_state")
 def test_main_records_before_the_read_summary_resets_the_count(monkeypatch) -> None:
     calls = _recorded(monkeypatch)
 
@@ -425,9 +508,10 @@ def test_the_route_reports_the_section_and_a_failed_read_does_not_take_it_down(m
 
     report, order, _conns = _route(monkeypatch, None, ranker=_probe())
     assert report["ranker"]["state"] == "ok"
-    assert report["ranker"]["last_cycle"]["users_ranked"] == 120
-    # After the history read, whose SAVEPOINT leaves the transaction usable for it.
-    assert [name for name, _c in order][-2:] == ["history", "ranker"]
+    assert report["ranker"]["last_cycle"]["users_ranked"] == 116
+    # After the history read, whose SAVEPOINT leaves the transaction usable for it, and
+    # before the feed_cache read, which needs its own left usable.
+    assert [name for name, _c in order][-3:] == ["history", "ranker", "feed_cache"]
 
     report, _order, _conns = _route(monkeypatch, None, ranker=None)
     assert report["ranker"]["state"] == "unknown"

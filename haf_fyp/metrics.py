@@ -961,12 +961,15 @@ def build_ranker_report(probe: dict | None) -> dict:
     last_cycle -- the most recent scheduled cycle the ranker recorded:
         finished_seconds_ago -- the liveness figure. A ranker waits CYCLE_SECONDS (300,
             fixed in the ranker) between cycles, so this stays under that plus one
-            cycle's length, plus any re-rank on read still running when the wait ends.
+            cycle's length, plus any targeted re-rank or hourly maintenance pass still
+            running when the wait ends.
             Well above CYCLE_SECONDS + last_24h.max_duration_seconds, the ranker is
             stopped, or wedged inside a cycle. reader_first.newest_feed_seconds says the
             same from the feeds, without the ranker's help.
-        duration_seconds -- how long the cycle took, from its start to the last account.
-        ok -- false when the cycle raised (the ranker's log has the traceback).
+        duration_seconds -- how long the whole cycle took, as main() timed it (not the
+            reconnect after a lost connection).
+        ok -- false when the cycle raised: the ranker's log says `ranking cycle failed`
+            with the traceback, or `database connection lost` without one.
         candidates, users_attempted, users_ranked, users_failed, users_held -- what it
             scored and ranked. users_held are accounts in a read session (#104).
         readers_ahead -- readers taken ahead of their turn during the cycle (#85).
@@ -975,7 +978,8 @@ def build_ranker_report(probe: dict | None) -> dict:
         reads_heard -- feed reads heard since the previous cycle ended.
     last_24h -- cycles, failed_cycles, median and max duration over the last 24 hours.
 
-    A cycle that raised is recorded with ok false and the counts it had reached. A
+    A cycle that raised is recorded with ok false and the counts it had reached, up to
+    the account it was on. A cycle with no candidates is ok with every count 0. A
     ranker that cannot write the record keeps ranking: a lasting no_cycles or a growing
     age can mean that too, and newest_feed_seconds tells the two apart.
 
@@ -1016,7 +1020,8 @@ def build_ranker_report(probe: dict | None) -> dict:
     if last is None:
         report["detail"] = (
             "the ranker has recorded no cycle: it has not finished one since the install "
-            "created the record, or it is older than the record and does not write it"
+            "created the record, it is older than the record and does not write it, or it "
+            "cannot write it (see the ranker's log)"
         )
     return report
 

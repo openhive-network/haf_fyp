@@ -669,7 +669,7 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.embedding_coverage_daily (
 -- finished_at is the database's clock at the insert (clock_timestamp(), not now(): the
 -- ranker's transaction may have opened when the cycle began), so its age does not
 -- depend on the ranker's clock. About 2,000 rows at one cycle per five minutes.
--- A ranker older than this table writes nothing here; nothing else reads it.
+-- A ranker older than this table writes nothing here; nothing but GET /metrics reads it.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.ranker_cycles (
