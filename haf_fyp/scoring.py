@@ -363,8 +363,10 @@ def compute_scores(
     with `affinity` the reader's affinity in [0, 1) for the post's author (see
     haf_fyp/affinity.py; 0 for an author it has not engaged with, whose posts keep
     the relevance they had). It stays in [0, 1], and only where relevance is computed:
-    in the cold-start branch the relevance weight is dropped, affinity with it.
-    score_affinity records the affinity used, 0 where none was.
+    without an interest vector or without post embeddings the relevance weight is
+    dropped, affinity with it. The frame's score_affinity column records the affinity
+    used, 0 where none was; feed_cache does not store it, and its score_relevance is
+    the raised one.
 
     If algorithm_weights sets max_per_community, a diversity cap is applied after
     sorting so no single community occupies more than that many leading positions

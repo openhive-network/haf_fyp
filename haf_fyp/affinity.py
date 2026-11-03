@@ -46,11 +46,12 @@ DEFAULTS = {
 
 COMMENT_WEIGHT = 1.5
 
-# Two index range reads for the reader: user_interactions on (account_id, created_at),
-# hive_posts on (author_id, created_at); names are looked up for the kept authors only.
-# On testapi (2026-11-03) the 99th-percentile reader had 3,022 votes and reblogs over
-# 821 authors in 30 days; the heaviest, 17,824 over 2,069 authors, took 194-225 ms, and
-# ecency 44 ms.
+# Per reader: a range read of user_interactions on (account_id, created_at) and of its
+# replies on hive_posts (author_id, created_at), then per vote or reblog a hive_posts and
+# a hive_votes primary-key probe; names are looked up for the kept authors only. On
+# testapi (2026-11-03), of 300 sampled accounts the 161 with votes or reblogs in 30 days
+# engaged a median 25 authors (p90 342, p99 821); the heaviest voter, 17,824 votes and
+# reblogs over 2,069 authors, took 299-513 ms, and ecency 69 ms.
 AFFINITY_SQL = """
     WITH reader AS MATERIALIZED (
         SELECT ha.id FROM hivemind_app.hive_accounts AS ha WHERE ha.name = %(username)s

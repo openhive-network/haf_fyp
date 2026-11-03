@@ -35,12 +35,18 @@ CREATE TABLE hivemind_app.hive_votes (post_id INT NOT NULL, voter_id INT NOT NUL
 INSERT INTO hivemind_app.hive_accounts VALUES
     (1, 'reader'), (2, 'fresh'), (3, 'weekold'), (4, 'reblogged'), (5, 'replied'),
     (6, 'tooold'), (7, 'stranger'), (8, 'deleted'), (9, 'downvoted'), (10, 'unvoted'),
-    (11, 'gonepost');
--- Root posts by each author; gonepost's was deleted.
-INSERT INTO hivemind_app.hive_posts (id, author_id) VALUES
-    (102, 2), (103, 3), (104, 4), (105, 5), (106, 6), (107, 7), (101, 1), (108, 8),
-    (109, 9), (110, 10);
-INSERT INTO hivemind_app.hive_posts (id, author_id, counter_deleted) VALUES (111, 11, 1);
+    (11, 'gonepost'), (12, 'commenter'), (13, 'rootholder'), (14, 'edge29');
+-- hivemind's root posts have parent_id 0, a placeholder post (here by `rootholder`), so
+-- a reader's own root post must not count as a reply to it: that is what depth > 0 does.
+INSERT INTO hivemind_app.hive_posts (id, author_id, parent_id, created_at) VALUES (0, 13, NULL, '2016-01-01');
+-- Root posts by each author; gonepost's was deleted; the reader's own is recent.
+INSERT INTO hivemind_app.hive_posts (id, author_id, parent_id) VALUES
+    (102, 2, 0), (103, 3, 0), (104, 4, 0), (105, 5, 0), (106, 6, 0), (107, 7, 0), (108, 8, 0),
+    (109, 9, 0), (110, 10, 0), (112, 12, 0), (114, 14, 0);
+INSERT INTO hivemind_app.hive_posts (id, author_id, parent_id, counter_deleted) VALUES (111, 11, 0, 1);
+INSERT INTO hivemind_app.hive_posts (id, author_id, parent_id, created_at) VALUES (101, 1, 0, '2026-03-30');
+-- A comment by `commenter` on 112, which the reader replies to (below).
+INSERT INTO hivemind_app.hive_posts (id, author_id, parent_id, depth) VALUES (301, 12, 112, 1);
 """
 
 REF = "2026-03-31 00:00:00"   # the reader's latest vote
@@ -54,17 +60,20 @@ INSERT INTO haf_fyp_app.user_interactions (account_id, post_id, action_weight, c
     (1, 101, 1.0, '{REF}'),                                  -- a self-vote: never counted
     (1, 109, 1.0, '{REF}'),                                  -- a downvote: never counted
     (1, 110, 1.0, '{REF}'),                                  -- a vote withdrawn to 0%
-    (7, 102, 1.0, '{REF}');                                  -- someone else's vote
+    (1, 114, 1.0, TIMESTAMP '{REF}' - INTERVAL '29 days'),   -- edge29: just inside 30 days
+    -- Someone else's vote, LATER than the reader's latest: the reference is per reader.
+    (7, 102, 1.0, TIMESTAMP '{REF}' + INTERVAL '5 days');
 INSERT INTO hivemind_app.hive_votes VALUES
     (102, 1, 10000), (103, 1, 5000), (106, 1, 10000), (101, 1, 10000),
-    (109, 1, -10000), (110, 1, 0), (102, 7, 10000);
+    (109, 1, -10000), (110, 1, 0), (114, 1, 10000), (102, 7, 10000);
 -- The reblog (104) has no vote row: a reblog counts on its own.
 -- The reader's comments: a reply to replied's post, one to its own post, a deleted one.
 INSERT INTO hivemind_app.hive_posts (id, author_id, parent_id, depth, counter_deleted, created_at) VALUES
     (201, 1, 105, 1, 0, TIMESTAMP '{REF}' - INTERVAL '14 days'),
     (202, 1, 101, 1, 0, '{REF}'),
     (203, 1, 108, 1, 1, '{REF}'),
-    (204, 1, 111, 1, 0, '{REF}');                             -- a reply to a deleted post
+    (204, 1, 111, 1, 0, '{REF}'),                             -- a reply to a deleted post
+    (206, 1, 301, 2, 0, '{REF}');                             -- a reply to commenter's comment
 """
 
 
@@ -123,13 +132,15 @@ def test_votes_reblogs_and_replies_decayed_by_age(conn) -> None:
         "weekold": 0.5,           # a vote one half-life back
         "reblogged": 1.5,         # a reblog weighs 1.5
         "replied": 1.5 * 0.25,    # a reply two half-lives back
+        "commenter": 1.5,         # a reply to a comment counts for the comment's author
+        "edge29": math.pow(0.5, 29 / 7),
     })
     assert got["fresh"][0] == pytest.approx(1.0 / 4.0)   # 1 / (1 + 3)
 
 
 def test_the_reader_itself_old_actions_deleted_replies_and_others_votes_are_left_out(conn) -> None:
     got = affinity.author_affinity(conn, "reader", {})
-    assert {"reader", "tooold", "deleted", "stranger", "gonepost"}.isdisjoint(got)
+    assert {"reader", "tooold", "deleted", "stranger", "gonepost", "rootholder"}.isdisjoint(got)
 
 
 def test_a_downvote_or_a_withdrawn_vote_is_no_affinity(conn) -> None:
@@ -150,13 +161,15 @@ def test_a_reply_newer_than_the_latest_vote_moves_the_reference(conn) -> None:
 
 def test_the_strongest_authors_are_kept_first(conn) -> None:
     got = affinity.author_affinity(conn, "reader", {"affinity_max_authors": 2})
-    assert list(got) == ["reblogged", "fresh"]
+    assert list(got) == ["commenter", "reblogged"]   # tied at 1.5: by name
 
 
 def test_the_versions_window_and_half_life_apply(conn) -> None:
-    got = affinity.author_affinity(conn, "reader", {"affinity_days": 40, "affinity_half_life_days": 14})
+    got = affinity.author_affinity(conn, "reader", {"affinity_days": 40, "affinity_half_life_days": 14,
+                                                    "affinity_half_at": 1})
     assert got["tooold"][1] == pytest.approx(math.pow(0.5, 31 / 14))
     assert got["weekold"][1] == pytest.approx(math.pow(0.5, 0.5))
+    assert got["fresh"][0] == pytest.approx(0.5)     # 1 / (1 + 1)
 
 
 def test_an_unknown_account_has_none(conn) -> None:

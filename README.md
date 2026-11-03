@@ -676,7 +676,8 @@ reblogs are those haf_fyp keeps (root posts in its history window; a downvote or
 withdrawn to 0% does not count); replies are read from hivemind, to posts and comments
 alike. Ages are measured from the reader's latest vote, reblog or reply. The reader's own
 posts and replies are not counted. Affinity rides on relevance, so a reader ranked
-without an interest vector (the cold-start weights) gets none. Each time a reader is
+without relevance (no interest vector, or no post embeddings from HiveSense) gets none.
+The stored and served `score_relevance` is the raised one. Each time a reader is
 ranked under 1.4.0 its affinity is stored in `haf_fyp_app.user_author_affinity` (at most
 200 authors); other versions neither read nor write it. Every setting is in the version's
 weights (`author_affinity`, `affinity_days`, `affinity_half_life_days`,
@@ -689,7 +690,7 @@ ranker; it keeps each reader's set from its last ranking under 1.4.0.
 
 | Signal | Range | Source |
 |--------|-------|--------|
-| `relevance` | [0, 1] | Cosine similarity: post embedding vs user interest vector (HiveSense 1024-dim) |
+| `relevance` | [0, 1] | Cosine similarity: post embedding vs user interest vector (HiveSense 1024-dim); under 1.4.0 raised by author affinity |
 | `recency` | [0, 1] | `exp(−ln2 × age_hours / 24)` — 24-hour half-life |
 | `engagement` | [0, 1] | Sigmoid-normalised unique commenters + reblogs + net rshares |
 | `credibility` | [0, 1] | 0.6 × normalised reputation + 0.4 × log-normalised VESTS |

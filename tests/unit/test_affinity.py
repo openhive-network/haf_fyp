@@ -143,6 +143,14 @@ def test_cold_start_drops_affinity_with_relevance():
     base = _scores(V13, None, user=None)
     got = _scores(V14, {"liked": (0.9, 27.0)}, user=None)
     assert np.allclose(got["final_score"], base["final_score"])
+    # What feed_cache stores and the API serves is not raised either.
+    assert np.allclose(got["score_relevance"], base["score_relevance"])
+    assert (got["score_affinity"] == 0.0).all()
+
+
+def test_the_versions_half_at_sets_the_scale():
+    conn, _cur = _conn([("bob", 3.0)])
+    assert affinity.author_affinity(conn, "alice", {"affinity_half_at": 1})["bob"][0] == pytest.approx(0.75)
 
 
 # ---- where the ranker applies it

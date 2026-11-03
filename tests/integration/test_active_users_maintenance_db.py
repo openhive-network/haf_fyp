@@ -288,9 +288,13 @@ def test_unsub_drops_the_accounts_affinity_and_spares_anothers(conn) -> None:
 def test_sweep_drops_the_evicted_accounts_affinity(conn) -> None:
     with conn.cursor() as cur:
         _active_user(cur, "alice", scored="1 hour")
+        _active_user(cur, "bob", scored="1 hour")
+        _interest(cur, "bob")                # kept: it opted in
         _add_affinity(cur, "alice")
+        _add_affinity(cur, "bob")
         assert _evict(cur) == 1
         assert _affinity(cur, "alice") == 0
+        assert _affinity(cur, "bob") == 1, "a kept account keeps its affinity"
 
 
 def test_unsub_keeps_an_account_that_still_has_interests(conn) -> None:
