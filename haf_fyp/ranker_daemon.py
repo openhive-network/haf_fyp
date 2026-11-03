@@ -61,7 +61,7 @@ import psycopg2
 import psycopg2.extras
 import redis as redis_lib
 
-from haf_fyp import visibility
+from haf_fyp import language, visibility
 from haf_fyp.credibility import credibility_failure_message, fetch_author_credibility
 from haf_fyp.embeddings import fetch_post_vectors_safe, register_vector_type
 from haf_fyp.schema_version import IncompatibleSchemaError, check_schema_version
@@ -1355,6 +1355,11 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
     log.info("scoring %d candidates (algo %s)", len(candidates), algo_version)
 
     post_ids = candidates["post_id"].tolist()
+    # #115: for the feeds' `language` parameter. Only the scheduled cycle detects: a
+    # targeted refresh ranks the same candidates, give or take the newest few.
+    detected = language.detect_post_languages(conn, post_ids)
+    if detected:
+        log.info("languages detected for %d new candidate(s)", detected)
     post_vectors = fetch_post_vectors_safe(conn, post_ids, scope="candidates")
     log.info(
         "embeddings available for %d / %d candidates", len(post_vectors), len(post_ids)

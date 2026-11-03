@@ -505,6 +505,21 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.post_bridge_cache (
 );
 
 -- ---------------------------------------------------------------------------
+-- Post languages (#115) — the languages a candidate is written in, detected by the
+-- ranker from its title and body (haf_fyp/language.py), for the feeds' `language`
+-- parameter. Up to two ISO 639-1 codes; empty when none could be told (a few words
+-- under a photo). Written once per post, keyed and pruned like post_bridge_cache.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS haf_fyp_app.post_language (
+    post_id int NOT NULL,                       -- hivemind_app.hive_posts.id
+    languages text[] NOT NULL,
+    detected_at timestamp NOT NULL DEFAULT now(),
+    PRIMARY KEY (post_id),
+    FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates (post_id) ON DELETE CASCADE
+);
+
+-- ---------------------------------------------------------------------------
 -- User communities — on-chain subscription state (synced from custom_json)
 -- NOTE (T-0.7): verify community custom_json_operation format on live node.
 -- ---------------------------------------------------------------------------
