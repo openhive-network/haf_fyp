@@ -49,7 +49,8 @@ MAINT_SQL = os.path.join(
 )
 TABLES = (
     "haf_fyp_app.active_users, haf_fyp_app.user_interests, haf_fyp_app.feed_cache, "
-    "haf_fyp_app.user_interactions, haf_fyp_app.user_profile_vectors"
+    "haf_fyp_app.user_interactions, haf_fyp_app.user_profile_vectors, "
+    "haf_fyp_app.user_author_affinity"
 )
 # A lock mistake in this file should fail a test, not hang the job until GitLab's
 # timeout: nothing here legitimately waits for a lock at all.

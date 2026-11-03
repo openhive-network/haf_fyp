@@ -76,6 +76,17 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.user_profile_vectors (
     PRIMARY KEY (username)
 );
 
+-- #117: the maintenance functions delete an evicted or unread account's affinity.
+-- The real table: it needs nothing this lane lacks.
+CREATE TABLE IF NOT EXISTS haf_fyp_app.user_author_affinity (
+    username varchar(16) NOT NULL,
+    author varchar(16) NOT NULL,
+    affinity real NOT NULL,
+    raw real NOT NULL,
+    updated_at timestamp NOT NULL,
+    PRIMARY KEY (username, author)
+);
+
 -- #12: the /v1/fyp/events endpoint appends telemetry, so FastAPI writes this too.
 CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_events (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

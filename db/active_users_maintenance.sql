@@ -172,6 +172,9 @@ BEGIN
     DELETE FROM haf_fyp_app.user_profile_vectors
     WHERE user_profile_vectors.username = ANY(removed)
       AND user_profile_vectors.posts_sampled = 0;
+    -- #117: an account that is no longer ranked keeps no affinity either.
+    DELETE FROM haf_fyp_app.user_author_affinity
+    WHERE user_author_affinity.username = ANY(removed);
 
     RETURN cardinality(removed);
 END;
@@ -264,6 +267,8 @@ BEGIN
     -- leaving it would silently re-personalize the account if it ever returned.
     DELETE FROM haf_fyp_app.user_profile_vectors
     WHERE user_profile_vectors.username = ANY(evicted_names);
+    DELETE FROM haf_fyp_app.user_author_affinity
+    WHERE user_author_affinity.username = ANY(evicted_names);
 
     RETURN QUERY SELECT u::varchar(16) FROM unnest(evicted_names) AS u;
 END;
@@ -413,6 +418,12 @@ BEGIN
               SELECT 1 FROM haf_fyp_app.user_interests ui WHERE ui.username = au.username
           )
         RETURNING fc.username
+    ),
+
+    -- #117: the affinity is rebuilt when the account is ranked again.
+    gone_affinity AS (
+        DELETE FROM haf_fyp_app.user_author_affinity uaa
+        WHERE uaa.username IN (SELECT g.username FROM gone g)
     )
 
     SELECT count(DISTINCT g.username) INTO dropped FROM gone g;

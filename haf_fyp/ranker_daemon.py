@@ -61,7 +61,7 @@ import psycopg2
 import psycopg2.extras
 import redis as redis_lib
 
-from haf_fyp import visibility
+from haf_fyp import affinity, visibility
 from haf_fyp.credibility import credibility_failure_message, fetch_author_credibility
 from haf_fyp.embeddings import fetch_post_vectors_safe, register_vector_type
 from haf_fyp.schema_version import IncompatibleSchemaError, check_schema_version
@@ -1259,6 +1259,12 @@ def _rank_user(
             if user_vector is not None:
                 write_user_vector(conn, username, user_vector, 0, sorted(engaged))
 
+    # #117: only a version that uses it reads and stores the reader's author affinity.
+    author_affinity = None
+    if weights.get("author_affinity"):
+        author_affinity = affinity.author_affinity(conn, username, weights)
+        affinity.write_author_affinity(conn, username, author_affinity)
+
     scored = compute_scores(
         candidates=candidates,
         user_vector=user_vector,
@@ -1267,6 +1273,7 @@ def _rank_user(
         subscribed_communities=subscribed,
         engaged_communities=engaged,
         algorithm_weights=weights,
+        author_affinity=author_affinity,
     )
     write_feed_cache(conn, username, scored, algo_version)
 

@@ -325,8 +325,8 @@ DECLARE
         'active_users', 'algorithm_versions', 'app_config', 'app_status', 'app_version',
         'embedding_coverage_daily', 'engagement_metrics', 'feed_cache', 'feed_cache_labels', 'feed_events',
         'feed_events_rollup_state', 'feed_metrics_daily', 'global_feed_cache', 'haf_fyp', 'hivemind_follow',
-        'post_bridge_cache', 'post_candidates', 'post_commenters', 'ranker_cycles', 'user_communities',
-        'user_interactions', 'user_interests', 'user_profile_vectors'
+        'post_bridge_cache', 'post_candidates', 'post_commenters', 'ranker_cycles', 'user_author_affinity',
+        'user_communities', 'user_interactions', 'user_interests', 'user_profile_vectors'
     ];
     _want_functions TEXT [] := ARRAY[
         'haf_fyp_app.allow_processing()',
@@ -422,6 +422,7 @@ DECLARE
         'index uq_app_config_singleton on app_config (unique)',
         'index uq_app_status_singleton on app_status (unique)',
         'index uq_app_version_singleton on app_version (unique)',
+        'index user_author_affinity_pkey on user_author_affinity (primary key)',
         'index user_communities_pkey on user_communities (primary key)',
         'index user_interactions_pkey on user_interactions (primary key)',
         'index user_interests_pkey on user_interests (primary key)',
@@ -450,6 +451,7 @@ DECLARE
         'constraint post_candidates_pkey on post_candidates: PRIMARY KEY (post_id)',
         'constraint post_commenters_pkey on post_commenters: PRIMARY KEY (post_id, commenter_id)',
         'constraint ranker_cycles_pkey on ranker_cycles: PRIMARY KEY (finished_at)',
+        'constraint user_author_affinity_pkey on user_author_affinity: PRIMARY KEY (username, author)',
         'constraint user_communities_pkey on user_communities: PRIMARY KEY (username, community_id)',
         'constraint user_interactions_pkey on user_interactions: PRIMARY KEY (account_id, post_id)',
         'constraint user_interests_pkey on user_interests: PRIMARY KEY (username, community_id)',
@@ -483,6 +485,7 @@ DECLARE
         'post_candidates:75ca3322bbdd3d031ad38ffee2735ecb',
         'post_commenters:dd6b3cc9b3898e67d2f725176626ba17',
         'ranker_cycles:05fc8ec3ef78deaba0f3849400079b32',
+        'user_author_affinity:00000000000000000000000000000000',
         'user_communities:83146409c11276c9ea90534eabba3df9',
         'user_interactions:e5c218f6e78c7effb3f65b87f6d2f3d0',
         'user_interests:d99ba90cbdab04aae0fef51df1af940e',
@@ -852,10 +855,10 @@ BEGIN
     -- Seed data must not multiply on a second install, and must not take back a choice
     -- the operator made: tests/ci_install_age.sql activates the OLDEST version.
     SELECT count(*) INTO _n FROM haf_fyp_app.algorithm_versions;
-    IF _n <> 4 THEN
-        RAISE EXCEPTION 'algorithm_versions holds % rows, the seed has 4', _n;
+    IF _n <> 5 THEN
+        RAISE EXCEPTION 'algorithm_versions holds % rows, the seed has 5', _n;
     END IF;
-    -- On a first install, the seed by VALUE: four rows is also what a seed with one
+    -- On a first install, the seed by VALUE: five rows is also what a seed with one
     -- weight ten times too large has. (Later the weights are the operator's.) And the
     -- telemetry rollup starts from the beginning.
     IF current_setting('ci.phase') = 'first' THEN

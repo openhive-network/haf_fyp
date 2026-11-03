@@ -658,6 +658,29 @@ node's 1.1.0 weights plus `"boost_rescale": true`. An install that registers 1.3
 activates it only where 1.1.0 was the one active version; a version the operator chose
 stays active.
 
+**Version 1.4.0** (registered inactive, #117) — 1.3.0 plus reader-to-author affinity.
+For a personal feed, relevance is raised for the authors the reader has lately engaged
+with:
+
+```
+relevance = relevance + 0.30 × (1 − relevance) × affinity(reader, author)
+
+affinity  = raw / (raw + 3)                     in [0, 1); 0.5 at raw = 3
+raw       = Σ weight × 0.5 ^ (age_days / 7)      the reader's last 30 days of
+            vote 1.0, reblog 1.5, reply 1.5      actions on the author's posts
+```
+
+An author the reader has not engaged with keeps the relevance it had, so 1.4.0 only
+reorders a feed in favour of authors the reader keeps coming back to. Ages are measured
+from the reader's latest vote or reblog, as the interest vector's are. The reader's own
+posts and replies are not counted. Affinity rides on relevance, so a reader ranked
+without an interest vector (the cold-start weights) gets none. Each time a reader is
+ranked under 1.4.0 its affinity is stored in `haf_fyp_app.user_author_affinity` (at most
+200 authors); other versions neither read nor write it. Every setting is in the version's
+weights (`author_affinity`, `affinity_days`, `affinity_half_life_days`,
+`affinity_half_at`, `affinity_max_authors`). Activate it with
+`POST /v1/fyp/admin/algorithm` to compare it with 1.3.0 on `feed_metrics_daily`.
+
 | Signal | Range | Source |
 |--------|-------|--------|
 | `relevance` | [0, 1] | Cosine similarity: post embedding vs user interest vector (HiveSense 1024-dim) |
@@ -667,6 +690,7 @@ stays active.
 | `community_boost` | ×1.20 | Applied post-sum for subscribed or declared community posts |
 | `community_boost_engaged` | ×1.10 | Applied post-sum for the reader's most-engaged communities, when not subscribed |
 | `boost_rescale` | true | 1.3.0: every score is divided by 1 + the larger boost, so a boosted one is not clipped at 1 |
+| `author_affinity` | 0.30 | 1.4.0: share of relevance's headroom given to the reader's affinity for the post's author |
 
 All weights are stored in `haf_fyp_app.algorithm_versions` and activated via `POST /v1/fyp/admin/algorithm`. The active version and its weights are returned by `/rpc/get_algorithm`. Every feed response includes per-signal component scores for full transparency; use `/rpc/get_score_explanation` for a detailed breakdown of any individual post.
 
@@ -1093,6 +1117,7 @@ haf_fyp_app
 ├── user_interactions     — strongest vote/reblog per (account, post), hivemind ids
 ├── hivemind_follow       — where the copy of hivemind's history stands (one row)
 ├── user_profile_vectors  — 1024-dim interest vector per user (pgvector)
+├── user_author_affinity  — per (reader, author) affinity, written under 1.4.0 (#117)
 ├── feed_cache            — precomputed top-200 ranked feeds
 ├── global_feed_cache     — unauthenticated global feed
 ├── user_communities      — on-chain community subscriptions
