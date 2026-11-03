@@ -1,7 +1,8 @@
 """
 What a reader must not be shown (#89): posts their community has muted, posts by authors
-their community has muted, and posts by authors the reader has muted. And, since #112,
-posts by authors hivemind greys for a low reputation.
+their community has muted, and posts by authors the reader has muted. Since #112, posts
+by authors hivemind greys for a low reputation; since #113, posts by authors the reader
+has blacklisted.
 
 Applied when the ranker WRITES a feed, not when it is served. Dropping posts from a served
 page would make it shorter than its page-size, and front ends read a short page as the end
@@ -19,6 +20,8 @@ Read from hivemind (the same sources its bridge API uses for an observer):
     muted (follower, following)        -- `follower` has muted `following`
     follow_muted (follower, following) -- `follower` follows `following`'s mute list (one
                                           level: hivemind_app.muted_accounts_by_id_view)
+    blacklisted, follow_blacklisted    -- the same two, for blacklists (one level:
+                                          hivemind_app.get_blacklisted_by_observer)
     hive_accounts_view.is_grayed -- the author's reputation is at or below hivemind's grey
                                     line (read from reptracker_app through the view, so
                                     the line and the schema stay hivemind's to change)
@@ -26,14 +29,16 @@ Account columns are hive_accounts ids. haf_fyp_owner, which the ranker connects 
 read them once scripts/grant_cross_schema.sh has run since hivemind was installed: the same
 grant the feed endpoints depend on.
 
-Stricter than hivemind, on purpose: its ranked lists return these posts GREYED; a
-recommendation leaves them out.
+Stricter than hivemind, on purpose: its ranked lists return these posts GREYED, and
+blacklisted authors with a badge; a recommendation leaves them out. A reader who
+blacklisted an author, or follows a list that names them, has said they do not want them
+suggested.
 
-NOT done here: blacklists (`blacklisted`, `follow_blacklisted`), which front ends show as
-a badge rather than by hiding the post; the reader's own posts and posts they already
-voted on. Heavily downvoted posts (#112) and authors excluded by setting (#111) are
-left out by the candidate query itself, in ranker_daemon: both are haf_fyp's own data,
-so those two apply whether or not hivemind can be read.
+NOT done here: posts the reader already voted on. The reader's own posts are never left
+out by these lists, even one that names the reader (ranker_daemon._rank_user; the same on
+the serve side, #114). Heavily downvoted posts (#112) and authors excluded by setting
+(#111) are left out by the candidate query itself, in ranker_daemon: both are haf_fyp's
+own data, so those two apply whether or not hivemind can be read.
 
 When hivemind is not there to read (no schema or table, no grant) the ranker writes feeds
 without these filters, warns once, and says when they work again. Any other failure (a
@@ -85,6 +90,24 @@ MUTED_AUTHORS_SQL = """
     JOIN hivemind_app.follow_muted AS fm ON fm.follower = reader.id
     JOIN hivemind_app.muted AS m ON m.follower = fm.following
     JOIN hivemind_app.hive_accounts AS author ON author.id = m.following
+    WHERE reader.name = %(username)s
+"""
+
+# The same shape for blacklists. The heaviest reader on testapi (2026-11-03) follows three
+# lists naming 70,934 accounts: 1.9 s with a cold cache, nearly all of it looking up the
+# authors' names in hive_accounts.
+BLACKLISTED_AUTHORS_SQL = """
+    SELECT author.name
+    FROM hivemind_app.hive_accounts AS reader
+    JOIN hivemind_app.blacklisted AS b ON b.follower = reader.id
+    JOIN hivemind_app.hive_accounts AS author ON author.id = b.following
+    WHERE reader.name = %(username)s
+    UNION
+    SELECT author.name
+    FROM hivemind_app.hive_accounts AS reader
+    JOIN hivemind_app.follow_blacklisted AS fb ON fb.follower = reader.id
+    JOIN hivemind_app.blacklisted AS b ON b.follower = fb.following
+    JOIN hivemind_app.hive_accounts AS author ON author.id = b.following
     WHERE reader.name = %(username)s
 """
 
@@ -145,6 +168,11 @@ def greyed_author_post_ids(conn, post_ids: list[int]) -> set[int]:
 def muted_authors(conn, username: str) -> set[str]:
     """Authors `username` has muted, directly or through a mute list it follows."""
     return _read(conn, "accounts' mute lists", MUTED_AUTHORS_SQL, {"username": username})
+
+
+def blacklisted_authors(conn, username: str) -> set[str]:
+    """Authors `username` has blacklisted, directly or through a blacklist it follows."""
+    return _read(conn, "accounts' blacklists", BLACKLISTED_AUTHORS_SQL, {"username": username})
 
 
 def without(candidates: pd.DataFrame, post_ids: set | None = None, authors: set | None = None) -> pd.DataFrame:
