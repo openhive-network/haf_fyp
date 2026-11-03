@@ -1,6 +1,6 @@
 psycopg2-binary>=2.9
 pgvector>=0.2
-numpy>=1.26
+numpy>=2.0  # py3langid needs it
 pandas>=2.1
 redis>=5.0
 fastapi>=0.111
@@ -22,6 +22,12 @@ limits>=3.0,<6
 # below 5 because the CapacityLimiter/to_thread surface this uses is exactly what a
 # major bump is free to move.
 anyio>=4.0,<5
+
+# Detects a post's language for the feeds' `language` parameter (#115, haf_fyp/language.py).
+# Exact: its bundled model decides which feed a post lands in, so an image rebuild must
+# not pick up a new one. Pure Python over numpy (it needs numpy>=2), BSD-3-Clause, model
+# inside the package.
+py3langid==0.4.0
 
 # Recovers the signer's key in auth.recover_pubkey. Exact, as hive's own consumers pin
 # it (clive): wax versions follow its last git tag, not its API, so an image rebuild

@@ -278,6 +278,7 @@ class _Cycle:
         monkeypatch.setattr(
             rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
         )
+        monkeypatch.setattr(rd.language, "detect_post_languages", lambda *a, **kw: 0)
         monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
         monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
         monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)
