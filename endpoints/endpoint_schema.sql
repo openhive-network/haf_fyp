@@ -738,7 +738,7 @@ DECLARE
               ],
               "default": null
             },
-            "description": "Only posts written in this language: an ISO 639-1 code, or several comma-separated (es or es,pt; case and spaces ignored). The posts are left out before the page is cut, so pages are full until the feed runs out. It filters the feed as ranked, which holds the reader's top 200 posts (the global fallback, 200 too), so a language that is a small share of it gives a short feed. A post's languages are detected from its title and body when the ranker first reads it; a post written in two languages counts for both, and one too short to tell (a caption under a photo) counts for none. A code no post has returns an empty feed. Nodes older than this parameter answer 404 when it is sent."
+            "description": "Only posts written in this language: a code, or several comma-separated (es or es,pt; case and spaces ignored, and a region cut off, so es-ES and pt_BR are es and pt). Codes are ISO 639-1 where the language has one, else ISO 639-3 (yue, ary); see README \"Languages\" for close languages to send together (no,nn; id,ms). The posts are left out before the page is cut, so pages are full until the feed runs out. It filters the feed as ranked, which holds the reader's top 200 posts (the global fallback, 200 too), so a language that is a small share of it gives a short feed. A post's languages are detected from its title and body when the ranker first reads it; a post written in two languages counts for both, and one too short to tell (a caption under a photo) counts for none; a language a post declares in its metadata is not read, and an edit does not change it. A code no post has returns an empty feed, not an error, so an empty first page means \"nothing in this language here\": offer the unfiltered feed. Blank means no filter. Nodes older than this parameter answer 404 when it is sent."
           }
         ],
         "responses": {
@@ -871,7 +871,7 @@ DECLARE
               ],
               "default": null
             },
-            "description": "Only posts written in this language: an ISO 639-1 code, or several comma-separated (es or es,pt; case and spaces ignored). The posts are left out before the page is cut, so pages are full until the feed runs out. It filters the feed as ranked, which holds 200 posts, so a language that is a small share of it gives a short feed. A post's languages are detected from its title and body when the ranker first reads it; a post written in two languages counts for both, and one too short to tell (a caption under a photo) counts for none. A code no post has returns an empty feed. Nodes older than this parameter answer 404 when it is sent."
+            "description": "Only posts written in this language: a code, or several comma-separated (es or es,pt; case and spaces ignored, and a region cut off, so es-ES and pt_BR are es and pt). Codes are ISO 639-1 where the language has one, else ISO 639-3 (yue, ary); see README \"Languages\" for close languages to send together (no,nn; id,ms). The posts are left out before the page is cut, so pages are full until the feed runs out. It filters the feed as ranked, which holds 200 posts, so a language that is a small share of it gives a short feed. A post's languages are detected from its title and body when the ranker first reads it; a post written in two languages counts for both, and one too short to tell (a caption under a photo) counts for none; a language a post declares in its metadata is not read, and an edit does not change it. A code no post has returns an empty feed, not an error, so an empty first page means \"nothing in this language here\": offer the unfiltered feed. Blank means no filter. Nodes older than this parameter answer 404 when it is sent."
           }
         ],
         "responses": {
@@ -1761,15 +1761,21 @@ GRANT EXECUTE ON FUNCTION haf_fyp_app.hivemind_post_identity(int) TO haf_fyp_use
           type: [string, 'null']
           default: null
         description: >-
-          Only posts written in this language: an ISO 639-1 code, or several
-          comma-separated (es or es,pt; case and spaces ignored). The posts are
-          left out before the page is cut, so pages are full until the feed runs out.
+          Only posts written in this language: a code, or several comma-separated
+          (es or es,pt; case and spaces ignored, and a region cut off, so es-ES and
+          pt_BR are es and pt). Codes are ISO 639-1 where the language has one, else
+          ISO 639-3 (yue, ary); see README "Languages" for close languages to send
+          together (no,nn; id,ms). The posts are left out before the page is cut, so
+          pages are full until the feed runs out.
           It filters the feed as ranked, which holds the reader's top 200 posts (the global fallback, 200 too), so a language that is a
           small share of it gives a short feed. A post's languages are detected from
           its title and body when the ranker first reads it; a post written in two
           languages counts for both, and one too short to tell (a caption under a
-          photo) counts for none. A code no post has returns an empty feed. Nodes
-          older than this parameter answer 404 when it is sent.
+          photo) counts for none; a language a post declares in its metadata is not
+          read, and an edit does not change it. A code no post has returns an empty
+          feed, not an error, so an empty first page means "nothing in this language
+          here": offer the unfiltered feed. Blank means no filter. Nodes older than
+          this parameter answer 404 when it is sent.
     responses:
       '200':
         description: Ranked post list (empty array before first ranker cycle)
@@ -1797,9 +1803,10 @@ AS $$
 DECLARE
     _observer_id int;
     _hidden int[];
-    -- #115: the languages asked for (lowercased, spaces dropped), or NULL for any.
-    _languages text[] := NULLIF(array_remove(string_to_array(
-        lower(regexp_replace(COALESCE(get_personalized_feed.language, ''), '\s', '', 'g')), ','), ''), '{}');
+    -- #115: the languages asked for, or NULL for any: lowercased, spaces dropped, and a
+    -- region cut off (es-ES and pt_BR are es and pt), as a client may send its locale.
+    _languages text[] := NULLIF(array_remove(string_to_array(lower(regexp_replace(
+        regexp_replace(COALESCE(get_personalized_feed.language, ''), '\s', '', 'g'), '[-_][^,]*', '', 'g')), ','), ''), '{}');
     -- The cached posts written in one of them. Read only when a language is asked
     -- for, so a feed read without one never touches post_language.
     _in_language int[];
@@ -2182,15 +2189,21 @@ $$;
           type: [string, 'null']
           default: null
         description: >-
-          Only posts written in this language: an ISO 639-1 code, or several
-          comma-separated (es or es,pt; case and spaces ignored). The posts are
-          left out before the page is cut, so pages are full until the feed runs out.
+          Only posts written in this language: a code, or several comma-separated
+          (es or es,pt; case and spaces ignored, and a region cut off, so es-ES and
+          pt_BR are es and pt). Codes are ISO 639-1 where the language has one, else
+          ISO 639-3 (yue, ary); see README "Languages" for close languages to send
+          together (no,nn; id,ms). The posts are left out before the page is cut, so
+          pages are full until the feed runs out.
           It filters the feed as ranked, which holds 200 posts, so a language that is a
           small share of it gives a short feed. A post's languages are detected from
           its title and body when the ranker first reads it; a post written in two
           languages counts for both, and one too short to tell (a caption under a
-          photo) counts for none. A code no post has returns an empty feed. Nodes
-          older than this parameter answer 404 when it is sent.
+          photo) counts for none; a language a post declares in its metadata is not
+          read, and an edit does not change it. A code no post has returns an empty
+          feed, not an error, so an empty first page means "nothing in this language
+          here": offer the unfiltered feed. Blank means no filter. Nodes older than
+          this parameter answer 404 when it is sent.
     responses:
       '200':
         description: Global ranked post list
@@ -2219,9 +2232,10 @@ AS $$
 DECLARE
     _observer_id int := 0;
     _hidden int[];
-    -- #115: the languages asked for (lowercased, spaces dropped), or NULL for any.
-    _languages text[] := NULLIF(array_remove(string_to_array(
-        lower(regexp_replace(COALESCE(get_global_feed.language, ''), '\s', '', 'g')), ','), ''), '{}');
+    -- #115: the languages asked for, or NULL for any: lowercased, spaces dropped, and a
+    -- region cut off (es-ES and pt_BR are es and pt), as a client may send its locale.
+    _languages text[] := NULLIF(array_remove(string_to_array(lower(regexp_replace(
+        regexp_replace(COALESCE(get_global_feed.language, ''), '\s', '', 'g'), '[-_][^,]*', '', 'g')), ','), ''), '{}');
     -- The cached posts written in one of them. Read only when a language is asked
     -- for, so a feed read without one never touches post_language.
     _in_language int[];

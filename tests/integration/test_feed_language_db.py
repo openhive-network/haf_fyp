@@ -190,6 +190,13 @@ def test_several_codes_case_and_spaces(db) -> None:
         assert _whole_feed(lambda p: _global(db, p, language=asked))[0] == want, asked
 
 
+def test_a_region_is_cut_off_so_a_client_can_send_its_locale(db) -> None:
+    for asked in ("es-ES", "ES_es", "es-419"):
+        assert _whole_feed(lambda p: _global(db, p, language=asked))[0] == _in("es"), asked
+    assert _whole_feed(lambda p: _global(db, p, language="es-ES, de_AT"))[0] == _in("es", "de")
+    assert _global(db, language="-ES") == _global(db), "a bare region is no code: no filter"
+
+
 def test_a_code_no_post_has_gives_an_empty_feed(db) -> None:
     assert _global(db, language="xx") == []
     assert _personal(db, "reader", language="xx") == []

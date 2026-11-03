@@ -233,6 +233,7 @@ def targeted(monkeypatch: MonkeyPatch):
     monkeypatch.setattr(
         rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
     )
+    monkeypatch.setattr(rd.language, "detect_post_languages", lambda *a, **kw: 0)
     monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
     monkeypatch.setattr(rd, "_rank_user", lambda _c, username, *_a, **_k: ranked.append(username))
@@ -1020,6 +1021,7 @@ def test_an_account_ranked_only_once_it_reads_gets_the_global_feed_until_then(
     monkeypatch.setattr(
         rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
     )
+    monkeypatch.setattr(rd.language, "detect_post_languages", lambda *a, **kw: 0)
     monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
     monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)
@@ -1283,6 +1285,7 @@ def test_a_read_during_a_cycle_is_recorded_and_its_feed_left_alone_for_the_sessi
     monkeypatch.setattr(
         rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
     )
+    monkeypatch.setattr(rd.language, "detect_post_languages", lambda *a, **kw: 0)
     monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
     monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)
@@ -1349,6 +1352,7 @@ def test_a_fresh_feed_read_during_a_cycle_is_recorded_but_not_ranked_again(conn,
     monkeypatch.setattr(
         rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
     )
+    monkeypatch.setattr(rd.language, "detect_post_languages", lambda *a, **kw: 0)
     monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
     monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)
@@ -1407,6 +1411,7 @@ def test_a_name_with_no_rotation_row_handed_to_a_cycle_is_not_ranked_into_one(
     monkeypatch.setattr(
         rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
     )
+    monkeypatch.setattr(rd.language, "detect_post_languages", lambda *a, **kw: 0)
     monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
     monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)

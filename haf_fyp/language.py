@@ -2,27 +2,30 @@
 The languages a post is written in (#115), for the feeds' `language` parameter.
 
 Hive posts rarely say: on testapi (2026-11-03) 7 of 5,000 candidates carried a language in
-their json_metadata, and a community's `lang` was 'en' for 90% of posts, whatever they
-were written in. So the ranker detects it from the post's own title and body with
-py3langid (langid.py's model, shipped inside the package: no download, no network), once
-per post. About 2 ms a post on one core (2,000 testapi candidates in 4.2 s); a cycle
-detects only the candidates it has not seen before.
+their json_metadata, and a community's `lang` was 'en' for 90% of community posts,
+whatever they were written in. So the ranker detects it from the post's own title and
+body with py3langid (langid.py's model, shipped inside the package: no download, no
+network), once per post. About 2 ms a post on one core (2,000 testapi candidates in 4.2 s);
+a cycle detects only the candidates it has not seen before. The model is loaded on the
+first call, in the first cycle: about 4 s and 120 MB.
 
 A post keeps up to two languages, so one written in both Spanish and English is in both
-languages' feeds. Over a whole post the detector leans hard to one language (two sentences,
-one English and one Spanish, came out 0.64 Spanish and 0.18 English), and Hive's Spanish-speaking authors often
-write the post twice, "[ENG|ESP]". So the first language is the whole text's, if it has at
-least MIN_SHARE of the probability; the second is the whole text's runner-up at MIN_SHARE,
-or failing that whichever other language a window of the text is told in with at least
-WINDOW_SHARE (WINDOWS of them, spread over the post). Over those 2,000 candidates 239 posts
-got two, 196 of them Spanish and English; with the whole text alone, 23. None at all (31
-of them: a caption of a few words, a video link) leaves the list empty, and the post in no
-language's feed.
+languages' feeds. Over a whole post the detector leans hard to one language (two
+sentences, one English and one Spanish, came out 0.64 Spanish and 0.18 English), and Hive's
+Spanish-speaking authors often write the post twice, "[ENG|ESP]". So the first language is
+that of the post's first MAX_CHARS, if it has at least MIN_SHARE of the probability; the
+second is the runner-up there at MIN_SHARE, or failing that whichever other language a
+window of the post is told in with at least WINDOW_SHARE (WINDOWS of them, spread over
+up to twice MAX_CHARS, so they reach the second version of a long post). Over those 2,000
+candidates 239 posts got two, 196 of them Spanish and English; with the whole text alone,
+23. None at all (31 of them: a caption of a few words, a video link) leaves the list
+empty, and the post in no language's feed.
 
 Stored in haf_fyp_app.post_language, keyed by the hivemind post id and pruned with
 post_candidates, like post_bridge_cache. A post is not detected again when it is edited.
 
-Best effort: a failure is logged and the cycle ranks on. Posts it missed are detected on
+Best effort: a failure, of the database or of the detector, is logged and the cycle
+ranks on. Posts it missed are detected on
 the next cycle, and are left out of language-filtered feeds until then. Lives outside
 ranker_daemon because .coveragerc omits that module.
 """
@@ -42,15 +45,17 @@ log = logging.getLogger(__name__)
 # Over the 2,000 testapi candidates, what fell below 0.3 was captions and links.
 MIN_SHARE = 0.3
 MAX_LANGUAGES = 2
-# Long enough to reach the second version of a post written twice, and a bound on the
-# work per post. The body is read at twice this, as markup and links come out of it
-# before the cut.
+# What the whole-text language is read from, and a bound on the work per post. The
+# windows range over twice this, the most text_of keeps, to reach the second version of
+# a long post written twice; the body is read at that, as markup and links come out of
+# it before the cut.
 MAX_CHARS = 6000
 WINDOWS = 4
 WINDOW_CHARS = 600
 WINDOW_SHARE = 0.9
 
-# Labels the model has for text that is no language.
+# Not languages: the model's label for text that is none (zxx), and the one classify
+# gives below a minimum confidence (und), which this does not set.
 _NOT_A_LANGUAGE = frozenset({"zxx", "und"})
 
 _MARKUP = (
@@ -80,6 +85,7 @@ INSERT_SQL = """
     FROM (VALUES %s) AS v(post_id, languages)
     WHERE EXISTS (SELECT 1 FROM haf_fyp_app.post_candidates AS pc WHERE pc.post_id = v.post_id)
     ON CONFLICT (post_id) DO NOTHING
+    RETURNING post_id
 """
 
 
@@ -89,7 +95,7 @@ def text_of(title: str | None, body: str | None) -> str:
     text = f"{title or ''}. {body or ''}"
     for pattern, replacement in _MARKUP:
         text = pattern.sub(replacement, text)
-    return _SPACE.sub(" ", text).strip()[:MAX_CHARS]
+    return _SPACE.sub(" ", text).strip()[: 2 * MAX_CHARS]
 
 
 def _is_language(lang: str, share: float, at_least: float) -> bool:
@@ -104,7 +110,8 @@ def languages_of(title: str | None, body: str | None) -> list[str]:
         return []
     if _identifier is None:
         _identifier = LanguageIdentifier.from_model_file(MODEL_FILE, norm_probs=True)
-    found = [lang for lang, share in _identifier.rank(text)[:MAX_LANGUAGES] if _is_language(lang, share, MIN_SHARE)]
+    ranked = _identifier.rank(text[:MAX_CHARS])[:MAX_LANGUAGES]
+    found = [lang for lang, share in ranked if _is_language(lang, share, MIN_SHARE)]
     if len(found) == 1 and len(text) > 2 * WINDOW_CHARS:
         step = (len(text) - WINDOW_CHARS) / (WINDOWS - 1)
         others: Counter[str] = Counter()
@@ -120,23 +127,27 @@ def languages_of(title: str | None, body: str | None) -> list[str]:
 
 def detect_post_languages(conn, post_ids: list[int]) -> int:
     """Detect and store the languages of the posts among `post_ids` that have none
-    stored yet. Returns how many were detected. A lost connection is raised for the main
-    loop to reconnect; any other database error is logged and rolled back."""
+    stored yet. Returns how many were stored. A lost connection is raised for the main
+    loop to reconnect; any other failure is logged and rolled back, as for the other
+    signals a cycle reads (_fetch_author_credibility_safe)."""
     if not post_ids:
         return 0
     try:
         with conn.cursor() as cur:
             cur.execute(MISSING_SQL, {"post_ids": list(post_ids), "chars": 2 * MAX_CHARS})
             rows = cur.fetchall()
+        # Not idle in a transaction while the detector runs: about 10 s on a first cycle.
+        conn.commit()
         if not rows:
             return 0
         found = [(post_id, languages_of(title, body)) for post_id, title, body in rows]
         with conn.cursor() as cur:
-            psycopg2.extras.execute_values(cur, INSERT_SQL, found, template="(%s::int, %s::text[])")
+            stored = psycopg2.extras.execute_values(
+                cur, INSERT_SQL, found, template="(%s::int, %s::text[])", fetch=True)
         conn.commit()
     except psycopg2.OperationalError:
         raise
-    except psycopg2.Error:
+    except Exception:
         conn.rollback()
         log.warning(
             "language detection failed for %d posts (continuing; the next cycle retries)",
@@ -144,4 +155,4 @@ def detect_post_languages(conn, post_ids: list[int]) -> int:
             exc_info=True,
         )
         return 0
-    return len(found)
+    return len(stored)

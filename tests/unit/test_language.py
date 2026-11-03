@@ -43,8 +43,21 @@ def test_markup_links_accounts_and_hashtags_are_not_read():
     assert text == "T. link text bold see"
 
 
-def test_the_text_is_cut_at_max_chars():
-    assert len(language.text_of("t", "word " * 5000)) == language.MAX_CHARS
+def test_the_text_is_cut_at_twice_max_chars():
+    assert len(language.text_of("t", "word " * 5000)) == 2 * language.MAX_CHARS
+
+
+def test_the_whole_text_language_is_read_from_the_first_max_chars():
+    seen = []
+
+    class _Rank(_Fake):
+        def rank(self, text):
+            seen.append(text)
+            return [("en", 0.99)]
+
+    _with(_Rank([]))
+    language.languages_of("t", "word " * 5000)
+    assert len(seen[0]) == language.MAX_CHARS
 
 
 # ---- the languages a post keeps
@@ -60,6 +73,15 @@ def test_a_post_written_twice_gets_both_languages():
     whole text one language wins; a window over the other half finds the second."""
     body = " ".join([EN[1]] * 4) + "\n\n---\n\n" + " ".join([ES[1]] * 4)
     assert sorted(language.languages_of("Ten minutes / Diez minutos", body)) == ["en", "es"]
+
+
+def test_a_long_post_written_twice_still_gets_its_second_language():
+    """The English version alone is longer than MAX_CHARS: the windows still reach the
+    Spanish one after it."""
+    english = " ".join([EN[1]] * 40)
+    assert len(english) > language.MAX_CHARS
+    body = english + "\n\n---\n\n" + " ".join([ES[1]] * 40)
+    assert language.languages_of("Ten minutes / Diez minutos", body) == ["en", "es"]
 
 
 @pytest.mark.parametrize("title, body", [
@@ -164,25 +186,28 @@ def test_no_post_ids_reads_nothing():
 def test_the_posts_without_languages_are_detected_stored_and_committed(monkeypatch):
     written = {}
     monkeypatch.setattr(language, "languages_of", lambda title, body: [title])
-    monkeypatch.setattr(
-        language.psycopg2.extras, "execute_values",
-        lambda cur, sql, rows, template: written.update(sql=sql, rows=rows, template=template),
-    )
+    def _execute_values(cur, sql, rows, template, fetch):
+        written.update(sql=sql, rows=rows, template=template, fetch=fetch)
+        return [(1,)]  # post 2 was pruned meanwhile: only 1 stored
+
+    monkeypatch.setattr(language.psycopg2.extras, "execute_values", _execute_values)
     conn = _conn(missing=[(1, "es", "cuerpo"), (2, "en", "body")])
-    assert language.detect_post_languages(conn, [1, 2, 3]) == 2
+    assert language.detect_post_languages(conn, [1, 2, 3]) == 1
     cur = conn.cursor.return_value.__enter__.return_value
     assert cur.execute.call_args.args == (
         language.MISSING_SQL, {"post_ids": [1, 2, 3], "chars": 2 * language.MAX_CHARS})
     assert written == {"sql": language.INSERT_SQL, "rows": [(1, ["es"]), (2, ["en"])],
-                       "template": "(%s::int, %s::text[])"}
-    conn.commit.assert_called_once()
+                       "template": "(%s::int, %s::text[])", "fetch": True}
+    # Once after the read, so the detector does not run inside a transaction, and once
+    # for the insert.
+    assert conn.commit.call_count == 2
 
 
 def test_nothing_missing_writes_nothing(monkeypatch):
     monkeypatch.setattr(language.psycopg2.extras, "execute_values", lambda *a, **k: pytest.fail("wrote"))
     conn = _conn(missing=[])
     assert language.detect_post_languages(conn, [1]) == 0
-    conn.commit.assert_not_called()
+    conn.commit.assert_called_once()  # the read's
 
 
 def test_a_database_error_is_rolled_back_and_logged(caplog):
@@ -192,6 +217,18 @@ def test_a_database_error_is_rolled_back_and_logged(caplog):
         assert language.detect_post_languages(conn, [1, 2]) == 0
     conn.rollback.assert_called_once()
     assert any("language detection failed for 2 posts" in r.getMessage() for r in caplog.records)
+
+
+def test_a_detector_failure_is_rolled_back_and_logged_and_the_cycle_ranks_on(monkeypatch, caplog):
+    def _broken(title, body):
+        raise RuntimeError("model would not load")
+
+    monkeypatch.setattr(language, "languages_of", _broken)
+    conn = _conn(missing=[(1, "t", "b")])
+    with caplog.at_level(logging.WARNING, logger="haf_fyp.language"):
+        assert language.detect_post_languages(conn, [1]) == 0
+    conn.rollback.assert_called_once()
+    assert any("language detection failed for 1 posts" in r.getMessage() for r in caplog.records)
 
 
 def test_a_lost_connection_is_raised():

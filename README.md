@@ -690,21 +690,30 @@ filters are haf_fyp's own and always apply.
 
 #### Languages
 
-Both feeds take `language`: an ISO 639-1 code, or several comma-separated (`es`, `es,pt`;
-case and spaces ignored), and return only posts written in one of them (#115). Hive posts
+Both feeds take `language`: a code, or several comma-separated (`es`, `es,pt`; case and
+spaces ignored, a region cut off so `es-ES` and `pt_BR` are `es` and `pt`), and return only
+posts written in one of them (#115). Hive posts
 rarely say what language they are in (7 of 5,000 testapi candidates on 2026-11-03 had one
 in their metadata), and a community's `lang` is `en` for most of them whatever they hold,
 so the ranker detects it from each post's title and body with
 [py3langid](https://pypi.org/project/py3langid/) when it first reads the post, and stores
-it in `post_language`. A post keeps up to two languages, so one written in Spanish and
-English (the "[ENG|ESP]" posts) is in both feeds: the whole text's language, and a second
-that a part of the post is told in (12% of 2,000 testapi candidates got two, mostly
-Spanish and English). A post with none (a caption under a photo, a bare video link: 2%)
+it in `post_language`; a language a post declares in its metadata is not read. A post
+keeps up to two languages, so one written in Spanish and English (the "[ENG|ESP]" posts)
+is in both feeds: the whole text's language, and a second language that one section of
+the post is written in (12% of 2,000 testapi candidates got two, mostly Spanish and
+English). A post with none (a caption under a photo, a bare video link: 2%)
 is in no language's feed. Edits do not change a post's languages.
 
 The parameter filters the feed as ranked, before the page is cut: pages are full until it
 runs out, and a reader's feed holds their top 200 posts (the global one, 200), so a
-language that is a small share of it gives a short feed. On testapi 76% of candidates were
+language that is a small share of it gives a short feed, or an empty one: a code no post
+has returns an empty feed, not an error, so a client should offer the unfiltered feed when
+the first page is empty. A blank `language` filters nothing.
+
+The codes are the detector's ([py3langid](https://pypi.org/project/py3langid/)'s 140):
+ISO 639-1 where a language has one (`en`, `es`, `zh`, `ko`), else ISO 639-3 (`yue`
+Cantonese, `ary` Moroccan Arabic). Close languages are told apart, and a post may land in
+either, so send them together: `no,nn`; `id,ms`; `sr,hr,bs`; `zh,yue,wuu`; `ar,ary,arz`. On testapi 76% of candidates were
 English, 11% Spanish, then Chinese, Korean, Polish and German. A post the ranker has not
 read yet, or has read since the last cycle only through a targeted refresh, is in no
 language's feed until the next cycle. Detection costs about 2 ms a post, and a cycle

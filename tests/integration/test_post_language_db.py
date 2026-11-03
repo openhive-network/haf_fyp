@@ -92,14 +92,32 @@ def _stored(conn):
         return dict(cur.fetchall())
 
 
-def test_only_posts_without_languages_are_detected_and_stored(conn) -> None:
+@pytest.fixture()
+def read(monkeypatch):
+    """The titles the detector is given: what a pass actually reads."""
+    titles = []
+    real = language.languages_of
+
+    def _recording(title, body):
+        titles.append(title)
+        return real(title, body)
+
+    monkeypatch.setattr(language, "languages_of", _recording)
+    return titles
+
+
+def test_only_posts_without_languages_are_detected_and_stored(conn, read) -> None:
     assert language.detect_post_languages(conn, [1, 2, 3, 4, 5]) == 3
     assert _stored(conn) == {1: ["es"], 2: ["en"], 3: [], 4: ["de"]}
+    # Post 4 has a row: it is not read again (it is ES's text, so a reread would show).
+    assert sorted(read) == sorted([ES[0], EN[0], "Hello London"])
 
 
-def test_a_second_pass_finds_nothing_to_do(conn) -> None:
+def test_a_second_pass_finds_nothing_to_do(conn, read) -> None:
     language.detect_post_languages(conn, [1, 2, 3])
+    read.clear()
     assert language.detect_post_languages(conn, [1, 2, 3]) == 0
+    assert read == []
 
 
 def test_only_the_posts_asked_about_are_read(conn) -> None:
@@ -112,7 +130,7 @@ def test_a_post_pruned_since_the_candidates_were_read_is_skipped_not_fatal(conn)
     still stored, and the foreign key does not fail the batch."""
     with conn.cursor() as cur:
         cur.execute("DELETE FROM haf_fyp_app.post_candidates WHERE post_id = 1")
-    language.detect_post_languages(conn, [1, 2])
+    assert language.detect_post_languages(conn, [1, 2]) == 1
     assert _stored(conn) == {2: ["en"], 4: ["de"]}
 
 

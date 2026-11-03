@@ -1,6 +1,6 @@
 psycopg2-binary>=2.9
 pgvector>=0.2
-numpy>=1.26
+numpy>=2.0  # py3langid needs it
 pandas>=2.1
 redis>=5.0
 fastapi>=0.111
