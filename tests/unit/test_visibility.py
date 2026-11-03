@@ -187,6 +187,8 @@ def test_a_closed_session_is_not_swallowed():
     conn, _cur = _conn(error=_PgError("42P01", "server closed the connection"), closed=True)
     with pytest.raises(_PgError):
         visibility.muted_authors(conn, "alice")
+    with pytest.raises(_PgError):
+        visibility.blacklisted_authors(conn, "alice")
     conn.rollback.assert_not_called()
 
 
