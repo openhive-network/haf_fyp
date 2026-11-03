@@ -497,9 +497,9 @@ below).
 | GET | `/version` | `/rpc/get_version` | Build version of the running app |
 | GET | `/v1/fyp/algorithm` | `/rpc/get_algorithm` | Active algorithm version and weights |
 | GET | `/v1/fyp/algorithms` | `/rpc/list_algorithm_versions` | All registered algorithm versions |
-| GET | `/v1/fyp/feed/{username}?page-size=20` | `/rpc/get_personalized_feed` | Ranked feed for a user; pages of one read session are stable (see [Read sessions](#read-sessions-stable-pages)) |
+| GET | `/v1/fyp/feed/{username}?page-size=20` | `/rpc/get_personalized_feed` | Ranked feed for a user; pages of one read session are stable (see [Read sessions](#read-sessions-stable-pages)). With `language=es` (or `es,pt`), only posts in those languages; see [Languages](#languages) |
 | GET | `/v1/fyp/warmup/{username}` | `/rpc/warm_up_feed` | Ask for a fresh feed before the user opens it; 204, no body (see [Read sessions](#read-sessions-stable-pages)) |
-| GET | `/v1/fyp/global?page-size=20` | `/rpc/get_global_feed` | Global feed. With `observer=<account>`, posts by authors that account muted or blacklisted (directly or through a list it follows) are left out before paging (#114); the feed holds at most 200 posts, so it ends sooner for a reader who hides many. Unauthenticated |
+| GET | `/v1/fyp/global?page-size=20` | `/rpc/get_global_feed` | Global feed. With `observer=<account>`, posts by authors that account muted or blacklisted (directly or through a list it follows) are left out before paging (#114); the feed holds at most 200 posts, so it ends sooner for a reader who hides many. `language` as on the user feed. Unauthenticated |
 | GET | `/v1/fyp/profile/{username}` | `/rpc/get_user_profile` | User vector status and top communities |
 | GET | `/v1/fyp/explain/{username}/{post_id}` | `/rpc/get_score_explanation` | Per-signal score breakdown |
 | GET | `/v1/fyp/feed-metrics` | `/rpc/get_feed_metrics` | Feed performance analytics per algorithm version (#13) — product metrics, not service health |
@@ -701,23 +701,58 @@ ranker; it keeps each reader's set from its last ranking under 1.4.0.
 
 All weights are stored in `haf_fyp_app.algorithm_versions` and activated via `POST /v1/fyp/admin/algorithm`. The active version and its weights are returned by `/rpc/get_algorithm`. Every feed response includes per-signal component scores for full transparency; use `/rpc/get_score_explanation` for a detailed breakdown of any individual post.
 
-**Left out before scoring (#89, #111, #112, #113).** Posts their community muted, and posts by
+**Left out before scoring (#89, #111, #112, #113, #115).** Posts their community muted, and posts by
 authors the community muted (all feeds, the global one included); and, for each account,
 posts by authors it muted or blacklisted, directly or through a mute list or blacklist it
 follows. hivemind's own ranked lists return such posts greyed or badged; a recommendation
 leaves them out. Also left out of
-every feed: posts by authors hivemind greys for a low reputation, posts downvoted to
+every feed: posts tagged `nsfw` or in a community marked NSFW (there is no opt-in yet),
+posts by authors hivemind greys for a low reputation, posts downvoted to
 `DOWNVOTED_AT_NET_RSHARES` net rshares or below, and posts by the accounts in
-`EXCLUDED_AUTHORS` (see **Ranker settings**, under "How fresh a feed is"). The grey-author
-filter has no setting: it follows hivemind.
-Not filtered: the account's own posts.
+`EXCLUDED_AUTHORS` (see **Ranker settings**, under "How fresh a feed is"). The NSFW and
+grey-author filters have no setting: the grey line is hivemind's, and the NSFW marks are
+read from hivemind's tags and communities. A community marked NSFW is left out whole, so
+`/v1/fyp/global?community_id=` for one returns an empty feed.
+Not filtered: the account's own posts, and other NSFW-like tags (`adult`, `18+`,
+`nsfw18`): front ends hide only `nsfw`.
 The filters take effect when a feed is next written (see "How fresh a feed is"): a post
 downvoted or muted after that stays in the feed until then. An account still on the
 cold-start global feed gets every filter, and its own mutes and blacklists are left out
-when it is served (#114). The mutes, blacklists and grey authors are read from hivemind;
-on a node where one cannot be read the ranker writes feeds
+when it is served (#114). The mutes, blacklists, NSFW marks and grey authors are read from
+hivemind; on a node where one cannot be read the ranker writes feeds
 without that filter and logs a warning until it can. The downvote and `EXCLUDED_AUTHORS`
 filters are haf_fyp's own and always apply.
+
+#### Languages
+
+Both feeds take `language`: a code, or several comma-separated (`es`, `es,pt`; case and
+spaces ignored, a region cut off so `es-ES` and `pt_BR` are `es` and `pt`), and return only
+posts written in one of them (#115). Hive posts
+rarely say what language they are in (7 of 5,000 testapi candidates on 2026-11-03 had one
+in their metadata), and a community's `lang` is `en` for most of them whatever they hold,
+so the ranker detects it from each post's title and body with
+[py3langid](https://pypi.org/project/py3langid/) when it first reads the post, and stores
+it in `post_language`; a language a post declares in its metadata is not read. A post
+keeps up to two languages, so one written in Spanish and English (the "[ENG|ESP]" posts)
+is in both feeds: the whole text's language, and a second language that one section of
+the post is written in (12% of 2,000 testapi candidates got two, mostly Spanish and
+English). A post with none (a caption under a photo, a bare video link: 2%)
+is in no language's feed. Edits do not change a post's languages.
+
+The parameter filters the feed as ranked, before the page is cut: pages are full until it
+runs out, and a reader's feed holds their top 200 posts (the global one, 200), so a
+language that is a small share of it gives a short feed, or an empty one: a code no post
+has returns an empty feed, not an error, so a client should offer the unfiltered feed when
+the first page is empty. A blank `language` filters nothing.
+
+The codes are the detector's ([py3langid](https://pypi.org/project/py3langid/)'s 140):
+ISO 639-1 where a language has one (`en`, `es`, `zh`, `ko`), else ISO 639-3 (`yue`
+Cantonese, `ary` Moroccan Arabic). Close languages are told apart, and a post may land in
+either, so send them together: `no,nn`; `id,ms`; `sr,hr,bs`; `zh,yue,wuu`; `ar,ary,arz`. On testapi 76% of candidates were
+English, 11% Spanish, then Chinese, Korean, Polish and German. A post the ranker has not
+read yet, or has read since the last cycle only through a targeted refresh, is in no
+language's feed until the next cycle. Detection costs about 2 ms a post, and a cycle
+detects only posts it has not seen; a failure is logged and the cycle ranks on.
 
 **Cold start:** for new users without an interest vector, relevance is dropped and the remaining three weights are renormalised to sum to 1.0. Bootstrap priority:
 
@@ -1120,6 +1155,7 @@ idempotent).
 haf_fyp_app
 ├── post_candidates       — root posts of the history window, by hivemind post id
 ├── post_commenters       — unique (post, commenter) pairs, hivemind ids
+├── post_language         — detected languages per candidate, for `language` (#115)
 ├── engagement_metrics    — comment/reblog/vote counts, net rshares, counted from hivemind
 ├── user_interactions     — strongest vote/reblog per (account, post), hivemind ids
 ├── hivemind_follow       — where the copy of hivemind's history stands (one row)

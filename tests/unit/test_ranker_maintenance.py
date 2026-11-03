@@ -219,6 +219,7 @@ def test_targeted_refresh_still_ranks_a_genuine_member(monkeypatch: MonkeyPatch)
     monkeypatch.setattr(rd, "_fetch_candidates", lambda _c: pd.DataFrame(
         {"post_id": [1], "author": ["a"]}))
     monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
+    monkeypatch.setattr(rd.language, "detect_post_languages", lambda *a, **kw: 0)
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
     monkeypatch.setattr(rd, "_rank_user", lambda *a, **k: ranked.append(a[1]))
 
@@ -268,6 +269,7 @@ def test_reconciliation_runs_once_per_batch_not_once_per_user(monkeypatch: Monke
     monkeypatch.setattr(rd, "_fetch_candidates", lambda _c: pd.DataFrame(
         {"post_id": [1], "author": ["a"]}))
     monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
+    monkeypatch.setattr(rd.language, "detect_post_languages", lambda *a, **kw: 0)
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
     monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)
     monkeypatch.setattr(rd, "compute_scores", lambda **k: pd.DataFrame())
@@ -282,6 +284,29 @@ def test_reconciliation_runs_once_per_batch_not_once_per_user(monkeypatch: Monke
         f"ranked {len(set(ranked) & set(batch))} account(s) that were just evicted — "
         f"write_feed_cache would re-enrol every one of them"
     )
+
+
+def test_the_cycle_detects_the_languages_of_its_candidates(monkeypatch) -> None:
+    """#115: every candidate the scheduled cycle reads goes to language detection, before
+    any feed is written, so the posts it ranks have their languages when they are served."""
+    order = []
+    conn, _ = _mock_conn()
+    monkeypatch.setattr(rd, "register_vector_type", lambda _c: None)
+    monkeypatch.setattr(rd, "_fetch_algorithm", lambda _c: ("1.0.0", {}))
+    monkeypatch.setattr(rd, "_fetch_candidates", lambda _c: pd.DataFrame(
+        {"post_id": [7, 8, 9], "author": ["a", "b", "c"]}))
+    monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
+    monkeypatch.setattr(rd.language, "detect_post_languages",
+                        lambda _c, post_ids: order.append(("detect", post_ids)) or 3)
+    monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
+    monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: order.append(("global",)))
+    monkeypatch.setattr(rd, "compute_scores", lambda **k: pd.DataFrame())
+    monkeypatch.setattr(rd, "_fetch_personalised_users", lambda _c, _l: [])
+    monkeypatch.setattr(rd, "_evict_unsubscribed", lambda _c, _u: set())
+
+    rd.run_cycle(conn)
+
+    assert order[:2] == [("detect", [7, 8, 9]), ("global",)], order
 
 
 def test_repair_runs_after_eviction_in_the_same_pass() -> None:
@@ -342,6 +367,7 @@ def test_cycle_is_topped_up_after_eviction_rather_than_running_short(monkeypatch
     monkeypatch.setattr(rd, "_fetch_candidates", lambda _c: pd.DataFrame(
         {"post_id": [1], "author": ["a"]}))
     monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
+    monkeypatch.setattr(rd.language, "detect_post_languages", lambda *a, **kw: 0)
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
     monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)
     monkeypatch.setattr(rd, "compute_scores", lambda **k: pd.DataFrame())
