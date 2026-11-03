@@ -1236,9 +1236,11 @@ def _rank_user(
 ) -> None:
     """Score and write feed_cache for a single user."""
     # #89, #113: nothing by an author this account has muted or blacklisted, directly
-    # or through a list it follows. Before scoring, so that the diversity cap and the
-    # 200-post cut are made over what the account can actually be shown.
+    # or through a list it follows; never its own posts, even if a list it follows names
+    # it (as the global feed does, #114). Before scoring, so that the diversity cap and
+    # the 200-post cut are made over what the account can actually be shown.
     hidden = visibility.muted_authors(conn, username) | visibility.blacklisted_authors(conn, username)
+    hidden.discard(username)
     candidates = visibility.without(candidates, authors=hidden)
     # Explicit communities (on-chain subscriptions + declared interests) get the
     # full boost; engaged communities (top by interaction) get the smaller tier.

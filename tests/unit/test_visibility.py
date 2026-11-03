@@ -215,8 +215,9 @@ def test_rank_user_scores_only_what_the_reader_can_be_shown(monkeypatch):
 
     monkeypatch.setattr(rd.visibility, "muted_authors",
                         lambda _c, u: {"bob"} if u == "alice" else set())
+    # A list alice follows names alice herself: her own posts stay.
     monkeypatch.setattr(rd.visibility, "blacklisted_authors",
-                        lambda _c, u: {"carol"} if u == "alice" else set())
+                        lambda _c, u: {"carol", "alice"} if u == "alice" else set())
     monkeypatch.setattr(rd, "fetch_user_communities", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_user_interests", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_top_communities", lambda _c, _u: [])

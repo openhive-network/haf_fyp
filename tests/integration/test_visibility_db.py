@@ -6,12 +6,13 @@ Runs in the fastapi-tests CI job. Skipped when no DB is reachable, except in CI.
 
 The hivemind tables are the test's own: the columns the queries read, with hivemind's
 names and its primary keys (`muted`, `follow_muted`, `blacklisted` and
-`follow_blacklisted` are keyed (follower, following) on hive_accounts ids). They are made inside the test's transaction and rolled back, so
-nothing of them is left for another file. What is NOT shown here: that hivemind keeps
+`follow_blacklisted` are keyed (follower, following) on hive_accounts ids). They are made
+inside the test's transaction and rolled back, so nothing of them is left for another file. What is NOT shown here: that hivemind keeps
 these tables the way this file fills them -- that a mute op writes `muted` and a "follow
 this mute list" op writes `follow_muted`. Those are hivemind's, and the queries were
 written against a node's hivemind (testapi, 2026-10-17) where 527,335 mutes and 1,445
-followed mute lists were in exactly these tables.
+followed mute lists were in exactly these tables; the blacklist read likewise (testapi,
+2026-11-03: 118,921 blacklist entries and 1,346 follows of a blacklist).
 """
 
 import logging
@@ -49,7 +50,7 @@ INSERT INTO hivemind_app.hive_accounts VALUES
     (1, 'reader'), (2, 'listkeeper'), (3, 'stranger'),
     (10, 'mutedbyreader'), (11, 'mutedbylist'), (12, 'mutedbystranger'),
     (13, 'blacklisted.one'), (14, 'listkeeperalso'),
-    (4, 'blkeeper'), (15, 'blacklistedbylist'), (16, 'blacklistedbystranger'), (17, 'blacklistedbymutekeeper');
+    (4, 'blkeeper'), (15, 'blbylist'), (16, 'blbystranger'), (17, 'blbymutekeeper');
 -- The reader mutes one author, and follows listkeeper's mute list.
 INSERT INTO hivemind_app.muted VALUES (1, 10, 100), (2, 11, 100), (3, 12, 100), (2, 14, 100);
 INSERT INTO hivemind_app.follow_muted VALUES (1, 2, 100);
@@ -124,20 +125,20 @@ def test_an_account_hivemind_does_not_know_hides_nothing(conn) -> None:
 
 
 def test_the_reader_hides_its_own_blacklist_and_those_of_the_lists_it_follows(conn) -> None:
-    assert visibility.blacklisted_authors(conn, "reader") == {"blacklisted.one", "blacklistedbylist"}
+    assert visibility.blacklisted_authors(conn, "reader") == {"blacklisted.one", "blbylist"}
 
 
 def test_a_blacklist_is_followed_one_way(conn) -> None:
-    assert visibility.blacklisted_authors(conn, "stranger") == {"blacklistedbystranger", "blacklisted.one"}
-    assert "blacklistedbystranger" not in visibility.blacklisted_authors(conn, "reader")
+    assert visibility.blacklisted_authors(conn, "stranger") == {"blbystranger", "blacklisted.one"}
+    assert "blbystranger" not in visibility.blacklisted_authors(conn, "reader")
 
 
 def test_a_mute_is_not_a_blacklist_and_the_two_kinds_of_list_stay_apart(conn) -> None:
     blacklisted = visibility.blacklisted_authors(conn, "reader")
     assert "mutedbyreader" not in blacklisted and "mutedbylist" not in blacklisted
     # The reader follows listkeeper's mute list, not its blacklist.
-    assert "blacklistedbymutekeeper" not in blacklisted
-    assert "blacklistedbymutekeeper" not in visibility.muted_authors(conn, "reader")
+    assert "blbymutekeeper" not in blacklisted
+    assert "blbymutekeeper" not in visibility.muted_authors(conn, "reader")
 
 
 def test_only_posts_and_authors_their_community_muted_are_left_out(conn) -> None:

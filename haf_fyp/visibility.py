@@ -34,9 +34,11 @@ blacklisted authors with a badge; a recommendation leaves them out. A reader who
 blacklisted an author, or follows a list that names them, has said they do not want them
 suggested.
 
-NOT done here: the reader's own posts and posts they already voted on. Heavily downvoted posts (#112) and authors excluded by setting (#111) are
-left out by the candidate query itself, in ranker_daemon: both are haf_fyp's own data,
-so those two apply whether or not hivemind can be read.
+NOT done here: posts the reader already voted on. The reader's own posts are never left
+out by these lists, even one that names the reader (ranker_daemon._rank_user; the same on
+the serve side, #114). Heavily downvoted posts (#112) and authors excluded by setting
+(#111) are left out by the candidate query itself, in ranker_daemon: both are haf_fyp's
+own data, so those two apply whether or not hivemind can be read.
 
 When hivemind is not there to read (no schema or table, no grant) the ranker writes feeds
 without these filters, warns once, and says when they work again. Any other failure (a
@@ -92,7 +94,8 @@ MUTED_AUTHORS_SQL = """
 """
 
 # The same shape for blacklists. The heaviest reader on testapi (2026-11-03) follows three
-# lists naming 70,934 accounts: 1.9 s with nothing cached, nearly all of it reading names.
+# lists naming 70,934 accounts: 1.9 s with a cold cache, nearly all of it looking up the
+# authors' names in hive_accounts.
 BLACKLISTED_AUTHORS_SQL = """
     SELECT author.name
     FROM hivemind_app.hive_accounts AS reader
