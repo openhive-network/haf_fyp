@@ -7,7 +7,8 @@ Applied when the ranker WRITES a feed, not when it is served. Dropping posts fro
 page would make it shorter than its page-size, and front ends read a short page as the end
 of the feed. So a feed is filtered from the next time its account is ranked; a mute made
 after that shows until the one after. An account with no feed of its own yet is
-served the global feed, which carries the community filters and not the reader's.
+served the global feed, which carries the community filters; the reader's mutes and
+blacklists are left out of it when it is served (#114, in endpoint_schema.sql).
 
 Read from hivemind (the same sources its bridge API uses for an observer):
     hive_posts.is_muted          -- the post was muted in its community: by a moderator, or

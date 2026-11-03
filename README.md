@@ -499,7 +499,7 @@ below).
 | GET | `/v1/fyp/algorithms` | `/rpc/list_algorithm_versions` | All registered algorithm versions |
 | GET | `/v1/fyp/feed/{username}?page-size=20` | `/rpc/get_personalized_feed` | Ranked feed for a user; pages of one read session are stable (see [Read sessions](#read-sessions-stable-pages)) |
 | GET | `/v1/fyp/warmup/{username}` | `/rpc/warm_up_feed` | Ask for a fresh feed before the user opens it; 204, no body (see [Read sessions](#read-sessions-stable-pages)) |
-| GET | `/v1/fyp/global?page-size=20` | `/rpc/get_global_feed` | Unauthenticated global feed |
+| GET | `/v1/fyp/global?page-size=20` | `/rpc/get_global_feed` | Global feed. With `observer=<account>`, posts by authors that account muted or blacklisted (directly or through a list it follows) are left out before paging (#114); the feed holds at most 200 posts, so it ends sooner for a reader who hides many. Unauthenticated |
 | GET | `/v1/fyp/profile/{username}` | `/rpc/get_user_profile` | User vector status and top communities |
 | GET | `/v1/fyp/explain/{username}/{post_id}` | `/rpc/get_score_explanation` | Per-signal score breakdown |
 | GET | `/v1/fyp/feed-metrics` | `/rpc/get_feed_metrics` | Feed performance analytics per algorithm version (#13) — product metrics, not service health |
@@ -681,7 +681,8 @@ filter has no setting: it follows hivemind.
 Not filtered: blacklists (front ends show them as a badge), the account's own posts.
 The filters take effect when a feed is next written (see "How fresh a feed is"): a post
 downvoted or muted after that stays in the feed until then. An account still on the
-cold-start global feed gets every filter but its own mutes. The mutes and the grey authors
+cold-start global feed gets every filter, and its own mutes and blacklists are left out
+when it is served (#114). The mutes and the grey authors
 are read from hivemind; on a node where one cannot be read the ranker writes feeds
 without that filter and logs a warning until it can. The downvote and `EXCLUDED_AUTHORS`
 filters are haf_fyp's own and always apply.
