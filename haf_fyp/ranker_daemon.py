@@ -881,11 +881,15 @@ def _fetch_candidates(conn) -> pd.DataFrame:
     muted = visibility.community_muted_post_ids(conn, post_ids)
     if muted:
         log.info("%d candidate(s) left out: muted by their community", len(muted))
+    # #115: and one marked NSFW, from everyone's.
+    nsfw = visibility.nsfw_post_ids(conn, post_ids)
+    if nsfw:
+        log.info("%d candidate(s) left out: NSFW", len(nsfw))
     # #112: and one whose author hivemind greys for a low reputation, from everyone's.
     greyed = visibility.greyed_author_post_ids(conn, post_ids)
     if greyed:
         log.info("%d candidate(s) left out: author greyed for a low reputation", len(greyed))
-    return visibility.without(candidates, post_ids=muted | greyed)
+    return visibility.without(candidates, post_ids=muted | nsfw | greyed)
 
 
 def _fetch_author_credibility_safe(conn, authors: list[str]) -> dict:

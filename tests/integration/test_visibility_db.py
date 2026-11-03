@@ -1,6 +1,6 @@
 """
-haf_fyp.visibility's queries against a real database (#89, #112, #113), and the ranker's
-candidate read with every filter it applies (#111, #112).
+haf_fyp.visibility's queries against a real database (#89, #112, #113, #115), and the
+ranker's candidate read with every filter it applies (#111, #112, #115).
 
 Runs in the fastapi-tests CI job. Skipped when no DB is reachable, except in CI.
 
@@ -39,6 +39,12 @@ CREATE TABLE hivemind_app.follow_blacklisted (follower INT NOT NULL, following I
 CREATE TABLE hivemind_app.hive_posts (id INT PRIMARY KEY, is_muted BOOLEAN NOT NULL DEFAULT FALSE,
                                       author_id INT NOT NULL, community_id INT,
                                       counter_deleted INT NOT NULL DEFAULT 0);
+CREATE TABLE hivemind_app.hive_communities (id INT PRIMARY KEY, is_nsfw BOOLEAN NOT NULL DEFAULT FALSE);
+CREATE TABLE hivemind_app.hive_tag_data (id INT PRIMARY KEY, tag VARCHAR(64) NOT NULL UNIQUE);
+CREATE TABLE hivemind_app.hive_post_tags (post_id INT NOT NULL, tag_id INT NOT NULL, PRIMARY KEY (post_id, tag_id));
+-- 117 is the id 'nsfw' has on testapi; any id the query hard-coded would miss it.
+INSERT INTO hivemind_app.hive_tag_data VALUES (1, 'photography'), (117, 'nsfw'), (3, 'nsfw18');
+INSERT INTO hivemind_app.hive_communities VALUES (7, FALSE), (9, TRUE);
 -- hivemind's is a view over hive_accounts and reptracker_app's reputations; the read
 -- uses only these two of its columns.
 CREATE TABLE hivemind_app.hive_accounts_view (id INT PRIMARY KEY, is_grayed BOOLEAN NOT NULL);
@@ -97,6 +103,15 @@ def conn():
     finally:
         c.rollback()  # every table above goes with it
         c.close()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_warnings():
+    """visibility warns once per filter, in module state: a test that leaves a filter
+    marked unreadable makes the next one log "can be read again"."""
+    visibility._warned.clear()
+    yield
+    visibility._warned.clear()
 
 
 def _hivemind_exists(cur):
@@ -164,6 +179,18 @@ def test_only_posts_by_greyed_authors_are_reported(conn) -> None:
     assert visibility.greyed_author_post_ids(conn, [511]) == set()
 
 
+def test_only_posts_tagged_nsfw_or_in_an_nsfw_community_are_reported(conn) -> None:
+    with conn.cursor() as cur:
+        # 521 ordinary, in community 7; 522 tagged nsfw among other tags; 523 tagged only
+        # nsfw18, which is not the tag front ends hide; 524 in NSFW community 9; 526 in a
+        # community hivemind does not have.
+        cur.execute("INSERT INTO hivemind_app.hive_posts (id, author_id, community_id) VALUES "
+                    "(521, 11, 7), (522, 11, NULL), (523, 11, NULL), (524, 11, 9), (526, 11, 99)")
+        cur.execute("INSERT INTO hivemind_app.hive_post_tags VALUES (521, 1), (522, 1), (522, 117), (523, 3)")
+    assert visibility.nsfw_post_ids(conn, [521, 522, 523, 524, 526, 527]) == {522, 524}
+    assert visibility.nsfw_post_ids(conn, [521, 523]) == set()
+
+
 def _candidates(conn, monkeypatch, excluded):
     """The ranker's own candidate read, over the shipped post_candidates and
     engagement_metrics, of one post per case."""
@@ -176,8 +203,12 @@ def _candidates(conn, monkeypatch, excluded):
         cur.execute("INSERT INTO hivemind_app.hive_posts (id, author_id, counter_deleted) VALUES "
                     "(601, 30, 0), (602, 31, 0), (603, 30, 0), (604, 32, 0), (605, 30, 0), (606, 30, 1), "
                     "(607, 30, 0), (608, 30, 0), (609, 30, 0)")
+        # 610 tagged nsfw, 611 in an NSFW community.
+        cur.execute("INSERT INTO hivemind_app.hive_posts (id, author_id, community_id) VALUES "
+                    "(610, 30, NULL), (611, 30, 9)")
+        cur.execute("INSERT INTO hivemind_app.hive_post_tags VALUES (610, 117)")
         cur.execute("INSERT INTO haf_fyp_app.post_candidates (post_id, created_at) "
-                    "SELECT id, NOW() - INTERVAL '1 hour' FROM hivemind_app.hive_posts WHERE id < 608")
+                    "SELECT id, NOW() - INTERVAL '1 hour' FROM hivemind_app.hive_posts WHERE id < 608 OR id > 609")
         # 608 and 609 are out of their payout window, in the 7-30 day part of the pool.
         cur.execute("INSERT INTO haf_fyp_app.post_candidates (post_id, created_at, payout_window) VALUES "
                     "(608, NOW() - INTERVAL '10 days', FALSE), (609, NOW() - INTERVAL '10 days', FALSE)")
@@ -190,8 +221,9 @@ def _candidates(conn, monkeypatch, excluded):
     return sorted(rd._fetch_candidates(conn)["post_id"].tolist())
 
 
-def test_the_candidates_leave_out_greyed_downvoted_and_excluded_authors(conn, monkeypatch) -> None:
-    # 602 greyed author, 603 and 608 downvoted to the line, 604 excluded, 606 deleted.
+def test_the_candidates_leave_out_greyed_downvoted_nsfw_and_excluded_authors(conn, monkeypatch) -> None:
+    # 602 greyed author, 603 and 608 downvoted to the line, 604 excluded, 606 deleted,
+    # 610 and 611 NSFW.
     assert _candidates(conn, monkeypatch, ("leothreads", "peak.snaps")) == [601, 605, 607, 609]
 
 
@@ -227,6 +259,20 @@ def test_without_the_reputation_view_the_grey_filter_is_off_and_said_so(conn, mo
     with conn.cursor() as cur:
         cur.execute("SELECT 1")
         assert cur.fetchone() == (1,)
+
+
+def test_without_the_tag_table_the_nsfw_filter_is_off_and_said_so(conn, monkeypatch, caplog) -> None:
+    """A hivemind without hive_post_tags: candidates are still read, the NSFW posts in
+    them, and the one warning names the NSFW filter. The failed read rolls the fixture
+    back (see the grey test above), so the reads after it warn too: only the first
+    warning is this test's."""
+    _candidates(conn, monkeypatch, ())
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE hivemind_app.hive_post_tags")
+    with caplog.at_level(logging.WARNING, logger="haf_fyp.visibility"):
+        assert {610, 611} <= set(rd._fetch_candidates(conn)["post_id"].tolist())
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings and warnings[0].startswith("NSFW marks could not be read"), warnings
 
 
 def test_without_hivemind_the_reads_filter_nothing_and_the_session_carries_on(conn) -> None:
