@@ -485,7 +485,7 @@ DECLARE
         'post_candidates:75ca3322bbdd3d031ad38ffee2735ecb',
         'post_commenters:dd6b3cc9b3898e67d2f725176626ba17',
         'ranker_cycles:05fc8ec3ef78deaba0f3849400079b32',
-        'user_author_affinity:00000000000000000000000000000000',
+        'user_author_affinity:f8d3245d01c34d47275dc294e3722ef1',
         'user_communities:83146409c11276c9ea90534eabba3df9',
         'user_interactions:e5c218f6e78c7effb3f65b87f6d2f3d0',
         'user_interests:d99ba90cbdab04aae0fef51df1af940e',
@@ -863,7 +863,7 @@ BEGIN
     -- telemetry rollup starts from the beginning.
     IF current_setting('ci.phase') = 'first' THEN
         IF (SELECT md5(string_agg(v.version || ' ' || v.is_active || ' ' || v.weights::text, E'\n' ORDER BY v.version COLLATE "C"))
-            FROM haf_fyp_app.algorithm_versions AS v) IS DISTINCT FROM 'b88afc4f53841499cf49966b59df778a' THEN
+            FROM haf_fyp_app.algorithm_versions AS v) IS DISTINCT FROM '9f08b3450f6d6eb3ffd28392fcb9d4fc' THEN
             RAISE EXCEPTION E'the seeded algorithm versions are not the ones tests/ci_install_verify.sql pins (db/seed_data.sql changed?). They read, as md5 %:\n%',
                 (SELECT md5(string_agg(v.version || ' ' || v.is_active || ' ' || v.weights::text, E'\n' ORDER BY v.version COLLATE "C"))
                  FROM haf_fyp_app.algorithm_versions AS v),
