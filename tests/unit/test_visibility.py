@@ -214,12 +214,13 @@ def test_rank_user_scores_only_what_the_reader_can_be_shown(monkeypatch):
     assert seen["candidates"]["post_id"].tolist() == [1, 2, 3, 4]
 
 
-def test_the_cycle_candidates_leave_out_community_muted_posts_and_greyed_authors(monkeypatch):
+def test_the_cycle_candidates_leave_out_community_muted_nsfw_and_greyed_posts(monkeypatch):
     conn = MagicMock()
     cur = conn.cursor.return_value.__enter__.return_value
     cur.fetchall.return_value = [
         {"post_id": 1, "author": "alice"}, {"post_id": 2, "author": "bob"},
         {"post_id": 3, "author": "carol"}, {"post_id": 4, "author": "dave"},
+        {"post_id": 5, "author": "erin"},
     ]
     asked = {}
 
@@ -231,10 +232,16 @@ def test_the_cycle_candidates_leave_out_community_muted_posts_and_greyed_authors
         asked["greyed"] = post_ids
         return {3}
 
+    def _nsfw(_c, post_ids):
+        asked["nsfw"] = post_ids
+        return {5}
+
     monkeypatch.setattr(rd.visibility, "community_muted_post_ids", _muted)
     monkeypatch.setattr(rd.visibility, "greyed_author_post_ids", _greyed)
+    monkeypatch.setattr(rd.visibility, "nsfw_post_ids", _nsfw)
     out = rd._fetch_candidates(conn)
-    assert asked == {"muted": [1, 2, 3, 4], "greyed": [1, 2, 3, 4]}
+    every = [1, 2, 3, 4, 5]
+    assert asked == {"muted": every, "greyed": every, "nsfw": every}
     assert out["post_id"].tolist() == [1, 4]
 
 
@@ -252,7 +259,7 @@ def test_the_candidate_query_is_given_the_excluded_authors(monkeypatch):
 def test_no_candidates_asks_nothing(monkeypatch):
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value.fetchall.return_value = []
-    for name in ("community_muted_post_ids", "greyed_author_post_ids"):
+    for name in ("community_muted_post_ids", "greyed_author_post_ids", "nsfw_post_ids"):
         monkeypatch.setattr(rd.visibility, name, lambda *_a: pytest.fail("asked about no posts"))
     assert rd._fetch_candidates(conn).empty
 
@@ -260,6 +267,12 @@ def test_no_candidates_asks_nothing(monkeypatch):
 def test_no_post_ids_reads_no_reputations():
     conn, cur = _conn()
     assert visibility.greyed_author_post_ids(conn, []) == set()
+    cur.execute.assert_not_called()
+
+
+def test_no_post_ids_reads_no_tags():
+    conn, cur = _conn()
+    assert visibility.nsfw_post_ids(conn, []) == set()
     cur.execute.assert_not_called()
 
 

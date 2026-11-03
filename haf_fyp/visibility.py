@@ -1,7 +1,7 @@
 """
 What a reader must not be shown (#89): posts their community has muted, posts by authors
 their community has muted, and posts by authors the reader has muted. And, since #112,
-posts by authors hivemind greys for a low reputation.
+posts by authors hivemind greys for a low reputation; since #115, posts marked NSFW.
 
 Applied when the ranker WRITES a feed, not when it is served. Dropping posts from a served
 page would make it shorter than its page-size, and front ends read a short page as the end
@@ -22,6 +22,12 @@ Read from hivemind (the same sources its bridge API uses for an observer):
     hive_accounts_view.is_grayed -- the author's reputation is at or below hivemind's grey
                                     line (read from reptracker_app through the view, so
                                     the line and the schema stay hivemind's to change)
+    hive_post_tags 'nsfw'        -- the post is tagged nsfw: its json_metadata tags or its
+                                    category (hivemind keeps tags lowercased; on testapi,
+                                    2026-11-03, every root post with either had this row)
+    hive_communities.is_nsfw     -- the post is in a community its owner marked NSFW
+                                    (hive_posts.is_nsfw is not read: set on none of the last 2M
+                                    posts on testapi)
 Account columns are hive_accounts ids. haf_fyp_owner, which the ranker connects as, can
 read them once scripts/grant_cross_schema.sh has run since hivemind was installed: the same
 grant the feed endpoints depend on.
@@ -68,6 +74,19 @@ GREYED_AUTHOR_SQL = """
     JOIN hivemind_app.hive_accounts_view AS author ON author.id = hp.author_id
     WHERE hp.id = ANY(%(post_ids)s::int[])
       AND author.is_grayed
+"""
+
+# 45 ms for 5,000 candidates on testapi (2026-11-03), 9 of them NSFW: 3 tagged, 6 in an
+# NSFW community. Front ends hide these behind a click; a recommendation leaves them out.
+NSFW_SQL = """
+    SELECT hp.id
+    FROM hivemind_app.hive_posts AS hp
+    LEFT JOIN hivemind_app.hive_communities AS hc ON hc.id = hp.community_id
+    WHERE hp.id = ANY(%(post_ids)s::int[])
+      AND (hc.is_nsfw
+           OR EXISTS (SELECT 1 FROM hivemind_app.hive_post_tags AS pt
+                      JOIN hivemind_app.hive_tag_data AS td ON td.id = pt.tag_id
+                      WHERE pt.post_id = hp.id AND td.tag = 'nsfw'))
 """
 
 # One range read of the reader's mutes (muted_pkey leads with `follower`), plus one per
@@ -140,6 +159,13 @@ def greyed_author_post_ids(conn, post_ids: list[int]) -> set[int]:
     if not post_ids:
         return set()
     return _read(conn, "author reputations", GREYED_AUTHOR_SQL, {"post_ids": list(post_ids)})
+
+
+def nsfw_post_ids(conn, post_ids: list[int]) -> set[int]:
+    """Post ids among `post_ids` tagged nsfw, or in a community marked NSFW."""
+    if not post_ids:
+        return set()
+    return _read(conn, "NSFW marks", NSFW_SQL, {"post_ids": list(post_ids)})
 
 
 def muted_authors(conn, username: str) -> set[str]:
