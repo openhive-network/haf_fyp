@@ -1,4 +1,4 @@
-"""haf_fyp.visibility (#89): what a reader must not be shown, and how the ranker uses it.
+"""haf_fyp.visibility (#89, #113): what a reader must not be shown, and how the ranker uses it.
 
 The queries themselves run against a real database in
 tests/integration/test_visibility_db.py; here: the frame filter, what happens when
@@ -99,6 +99,18 @@ def test_muted_authors_are_asked_for_the_reader():
     assert "JOIN hivemind_app.muted AS m ON m.follower = fm.following" in query
 
 
+def test_blacklisted_authors_are_asked_for_the_reader():
+    conn, cur = _conn(rows=[("bob",), ("carol",)])
+    assert visibility.blacklisted_authors(conn, "alice") == {"bob", "carol"}
+    query, params = cur.execute.call_args.args
+    assert params == {"username": "alice"}
+    # The reader's own blacklist, and one level of the blacklists it follows.
+    assert "hivemind_app.blacklisted AS b ON b.follower = reader.id" in query
+    assert "hivemind_app.follow_blacklisted AS fb ON fb.follower = reader.id" in query
+    assert "JOIN hivemind_app.blacklisted AS b ON b.follower = fb.following" in query
+    assert "muted" not in query
+
+
 class _PgError(Exception):
     """Stands in for a psycopg2 error: what the code reads of one is its SQLSTATE."""
 
@@ -111,6 +123,7 @@ class _PgError(Exception):
 @pytest.mark.parametrize("read", [
     lambda conn: visibility.community_muted_post_ids(conn, [1]),
     lambda conn: visibility.muted_authors(conn, "alice"),
+    lambda conn: visibility.blacklisted_authors(conn, "alice"),
 ])
 def test_no_hivemind_to_read_filters_nothing_and_rolls_back(read, pgcode, caplog):
     conn, _cur = _conn(error=_PgError(pgcode, 'relation "hivemind_app.muted" does not exist'))
@@ -134,6 +147,8 @@ def test_any_other_failure_is_raised_not_written_unfiltered(error):
         visibility.muted_authors(conn, "alice")
     with pytest.raises(type(error)):
         visibility.community_muted_post_ids(conn, [1])
+    with pytest.raises(type(error)):
+        visibility.blacklisted_authors(conn, "alice")
 
 
 def test_the_warning_is_given_once_per_process_not_once_per_account(caplog):
@@ -144,12 +159,13 @@ def test_the_warning_is_given_once_per_process_not_once_per_account(caplog):
     assert sum("WITHOUT that filter" in r.getMessage() for r in caplog.records) == 1
 
 
-def test_the_two_filters_warn_separately(caplog):
+def test_each_filter_warns_separately(caplog):
     conn, _cur = _conn(error=_PgError("3F000", "schema hivemind_app does not exist"))
     with caplog.at_level(logging.WARNING, logger="haf_fyp.visibility"):
         visibility.muted_authors(conn, "a")
         visibility.community_muted_post_ids(conn, [1])
-    assert sum("WITHOUT that filter" in r.getMessage() for r in caplog.records) == 2
+        visibility.blacklisted_authors(conn, "a")
+    assert sum("WITHOUT that filter" in r.getMessage() for r in caplog.records) == 3
 
 
 def test_filtering_that_works_again_says_so_and_a_later_outage_warns_again(caplog):
@@ -198,7 +214,9 @@ def test_rank_user_scores_only_what_the_reader_can_be_shown(monkeypatch):
         return pd.DataFrame()
 
     monkeypatch.setattr(rd.visibility, "muted_authors",
-                        lambda _c, u: {"bob", "carol"} if u == "alice" else set())
+                        lambda _c, u: {"bob"} if u == "alice" else set())
+    monkeypatch.setattr(rd.visibility, "blacklisted_authors",
+                        lambda _c, u: {"carol"} if u == "alice" else set())
     monkeypatch.setattr(rd, "fetch_user_communities", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_user_interests", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_top_communities", lambda _c, _u: [])

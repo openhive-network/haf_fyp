@@ -1,12 +1,12 @@
 """
-haf_fyp.visibility's queries against a real database (#89, #112), and the ranker's
+haf_fyp.visibility's queries against a real database (#89, #112, #113), and the ranker's
 candidate read with every filter it applies (#111, #112).
 
 Runs in the fastapi-tests CI job. Skipped when no DB is reachable, except in CI.
 
 The hivemind tables are the test's own: the columns the queries read, with hivemind's
-names and its primary keys (`muted` and `follow_muted` are keyed (follower, following)
-on hive_accounts ids). They are made inside the test's transaction and rolled back, so
+names and its primary keys (`muted`, `follow_muted`, `blacklisted` and
+`follow_blacklisted` are keyed (follower, following) on hive_accounts ids). They are made inside the test's transaction and rolled back, so
 nothing of them is left for another file. What is NOT shown here: that hivemind keeps
 these tables the way this file fills them -- that a mute op writes `muted` and a "follow
 this mute list" op writes `follow_muted`. Those are hivemind's, and the queries were
@@ -33,6 +33,8 @@ CREATE TABLE hivemind_app.follow_muted (follower INT NOT NULL, following INT NOT
                                         PRIMARY KEY (follower, following));
 CREATE TABLE hivemind_app.blacklisted (follower INT NOT NULL, following INT NOT NULL, block_num INT NOT NULL,
                                        PRIMARY KEY (follower, following));
+CREATE TABLE hivemind_app.follow_blacklisted (follower INT NOT NULL, following INT NOT NULL, block_num INT NOT NULL,
+                                              PRIMARY KEY (follower, following));
 CREATE TABLE hivemind_app.hive_posts (id INT PRIMARY KEY, is_muted BOOLEAN NOT NULL DEFAULT FALSE,
                                       author_id INT NOT NULL, community_id INT,
                                       counter_deleted INT NOT NULL DEFAULT 0);
@@ -46,15 +48,22 @@ CREATE TABLE hivemind_app.hive_roles (account_id INT NOT NULL, community_id INT 
 INSERT INTO hivemind_app.hive_accounts VALUES
     (1, 'reader'), (2, 'listkeeper'), (3, 'stranger'),
     (10, 'mutedbyreader'), (11, 'mutedbylist'), (12, 'mutedbystranger'),
-    (13, 'blacklisted.one'), (14, 'listkeeperalso');
+    (13, 'blacklisted.one'), (14, 'listkeeperalso'),
+    (4, 'blkeeper'), (15, 'blacklistedbylist'), (16, 'blacklistedbystranger'), (17, 'blacklistedbymutekeeper');
 -- The reader mutes one author, and follows listkeeper's mute list.
 INSERT INTO hivemind_app.muted VALUES (1, 10, 100), (2, 11, 100), (3, 12, 100), (2, 14, 100);
 INSERT INTO hivemind_app.follow_muted VALUES (1, 2, 100);
 -- The stranger follows the READER's list: that must not make the reader hide the
 -- stranger's mutes (the join goes from follower to list, never back).
 INSERT INTO hivemind_app.follow_muted VALUES (3, 1, 100);
--- A blacklist entry is not a mute (see the module docstring).
-INSERT INTO hivemind_app.blacklisted VALUES (1, 13, 100);
+-- The reader blacklists one author, and follows blkeeper's blacklist.
+INSERT INTO hivemind_app.blacklisted VALUES (1, 13, 100), (4, 15, 100), (3, 16, 100);
+INSERT INTO hivemind_app.follow_blacklisted VALUES (1, 4, 100);
+-- The stranger follows the reader's blacklist: one way, as for mutes.
+INSERT INTO hivemind_app.follow_blacklisted VALUES (3, 1, 100);
+-- listkeeper, whose MUTE list the reader follows, also blacklists someone: following a
+-- mute list does not take on that account's blacklist.
+INSERT INTO hivemind_app.blacklisted VALUES (2, 17, 100);
 """
 
 
@@ -111,6 +120,24 @@ def test_a_blacklist_is_not_a_mute(conn) -> None:
 
 def test_an_account_hivemind_does_not_know_hides_nothing(conn) -> None:
     assert visibility.muted_authors(conn, "nobody") == set()
+    assert visibility.blacklisted_authors(conn, "nobody") == set()
+
+
+def test_the_reader_hides_its_own_blacklist_and_those_of_the_lists_it_follows(conn) -> None:
+    assert visibility.blacklisted_authors(conn, "reader") == {"blacklisted.one", "blacklistedbylist"}
+
+
+def test_a_blacklist_is_followed_one_way(conn) -> None:
+    assert visibility.blacklisted_authors(conn, "stranger") == {"blacklistedbystranger", "blacklisted.one"}
+    assert "blacklistedbystranger" not in visibility.blacklisted_authors(conn, "reader")
+
+
+def test_a_mute_is_not_a_blacklist_and_the_two_kinds_of_list_stay_apart(conn) -> None:
+    blacklisted = visibility.blacklisted_authors(conn, "reader")
+    assert "mutedbyreader" not in blacklisted and "mutedbylist" not in blacklisted
+    # The reader follows listkeeper's mute list, not its blacklist.
+    assert "blacklistedbymutekeeper" not in blacklisted
+    assert "blacklistedbymutekeeper" not in visibility.muted_authors(conn, "reader")
 
 
 def test_only_posts_and_authors_their_community_muted_are_left_out(conn) -> None:

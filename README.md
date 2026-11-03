@@ -670,20 +670,21 @@ stays active.
 
 All weights are stored in `haf_fyp_app.algorithm_versions` and activated via `POST /v1/fyp/admin/algorithm`. The active version and its weights are returned by `/rpc/get_algorithm`. Every feed response includes per-signal component scores for full transparency; use `/rpc/get_score_explanation` for a detailed breakdown of any individual post.
 
-**Left out before scoring (#89, #111, #112).** Posts their community muted, and posts by
+**Left out before scoring (#89, #111, #112, #113).** Posts their community muted, and posts by
 authors the community muted (all feeds, the global one included); and, for each account,
-posts by authors it muted directly or through a mute list it follows. hivemind's own
-ranked lists return such posts greyed; a recommendation leaves them out. Also left out of
+posts by authors it muted or blacklisted, directly or through a mute list or blacklist it
+follows. hivemind's own ranked lists return such posts greyed or badged; a recommendation
+leaves them out. Also left out of
 every feed: posts by authors hivemind greys for a low reputation, posts downvoted to
 `DOWNVOTED_AT_NET_RSHARES` net rshares or below, and posts by the accounts in
 `EXCLUDED_AUTHORS` (see **Ranker settings**, under "How fresh a feed is"). The grey-author
 filter has no setting: it follows hivemind.
-Not filtered: blacklists (front ends show them as a badge), the account's own posts.
+Not filtered: the account's own posts.
 The filters take effect when a feed is next written (see "How fresh a feed is"): a post
 downvoted or muted after that stays in the feed until then. An account still on the
 cold-start global feed gets every filter, and its own mutes and blacklists are left out
-when it is served (#114). The mutes and the grey authors
-are read from hivemind; on a node where one cannot be read the ranker writes feeds
+when it is served (#114). The mutes, blacklists and grey authors are read from hivemind;
+on a node where one cannot be read the ranker writes feeds
 without that filter and logs a warning until it can. The downvote and `EXCLUDED_AUTHORS`
 filters are haf_fyp's own and always apply.
 
