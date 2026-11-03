@@ -835,13 +835,14 @@ def test_a_schema_without_the_read_column_ranks_without_the_reader_lane(conn, ot
 _FEED_SCHEMA = "fyp81_shipped_feed"
 
 
-def _shipped_feed_function(name="get_personalized_feed"):
+def _shipped_feed_function(name="get_personalized_feed", schema="haf_fyp_endpoints"):
     sql = open(ENDPOINT_SQL, encoding="utf-8").read()
-    start = sql.index(f"CREATE OR REPLACE FUNCTION haf_fyp_endpoints.{name}(")
+    start = sql.index(f"CREATE OR REPLACE FUNCTION {schema}.{name}(")
     ddl = sql[start : sql.index("\n$$;", start) + len("\n$$;")]
     for home in ("haf_fyp_endpoints.", "haf_fyp_app.", "hivemind_app."):
         ddl = ddl.replace(home, f"{_FEED_SCHEMA}.")
-    assert "pg_notify" in ddl, "the shipped function no longer notifies; these tests are void"
+    if name in ("get_personalized_feed", "warm_up_feed"):
+        assert "pg_notify" in ddl, "the shipped function no longer notifies; these tests are void"
     return ddl
 
 
@@ -877,6 +878,7 @@ def shipped_feed(other):
             INSERT INTO {s}.active_users (username) VALUES ('alice');
             """
         )
+        cur.execute(_shipped_feed_function("global_feed_hidden_for", "haf_fyp_app"))
         cur.execute(_shipped_feed_function())
         cur.execute(_shipped_feed_function("warm_up_feed"))
     other.commit()

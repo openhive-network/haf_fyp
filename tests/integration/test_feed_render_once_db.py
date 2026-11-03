@@ -39,9 +39,9 @@ def _rehome(sql: str) -> str:
     return sql
 
 
-def _shipped_function(name: str) -> str:
+def _shipped_function(name: str, schema: str = "haf_fyp_endpoints") -> str:
     sql = open(ENDPOINT_SQL, encoding="utf-8").read()
-    start = sql.index(f"CREATE OR REPLACE FUNCTION haf_fyp_endpoints.{name}(")
+    start = sql.index(f"CREATE OR REPLACE FUNCTION {schema}.{name}(")
     return _rehome(sql[start : sql.index("\n$$;", start) + len("\n$$;")])
 
 
@@ -144,6 +144,7 @@ def db() -> Iterator[Connection]:
                     f"INSERT INTO {S}.global_feed_cache VALUES (%s, %s, %s, 0.2, 0.3, 0.4, '1.1.0')",
                     (post_id, 26 - n, n / 100),
                 )
+            cur.execute(_shipped_function("global_feed_hidden_for", "haf_fyp_app"))
             cur.execute(_shipped_function("get_personalized_feed"))
             cur.execute(_shipped_function("get_global_feed"))
         c.commit()

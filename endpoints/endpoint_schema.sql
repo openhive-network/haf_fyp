@@ -833,6 +833,19 @@ DECLARE
               "default": 0
             },
             "description": "Truncate each post body to this many characters (0 = full body)"
+          },
+          {
+            "in": "query",
+            "name": "observer",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "description": "Hive account the feed is shown to (optional; a leading @ is ignored). Posts by authors it has muted or blacklisted, directly or through a list it follows, are left out before the page is cut, so pages are full until the feed runs out; it holds at most 200 posts, so a reader who hides many authors reaches the end sooner. Cached posts carry no observer context; a post not yet in the render cache is rendered for this account. An unknown account is served as if none was given. Not authenticated: it filters for whoever is named. Nodes older than this parameter answer 404 when it is sent."
           }
         ],
         "responses": {
@@ -1590,6 +1603,55 @@ $$;
 
 GRANT EXECUTE ON FUNCTION haf_fyp_app.get_bridge_post(int, int, int) TO haf_fyp_user;
 
+-- Posts in global_feed_cache that an observer is not to be shown (#114): by authors it
+-- has muted or blacklisted, directly or through a mute list or blacklist it follows (one
+-- level, as hivemind's own muted_accounts_by_id_view and get_blacklisted_by_observer
+-- read them). haf_fyp.visibility leaves the same muted authors out of a personal feed
+-- when the ranker writes it, and the blacklisted ones once #113 is in.
+--
+-- Applied to the whole cache (at most 200 posts) before the page is cut, so the hidden
+-- posts are skipped, not blanked: pages are full until the cache runs out, which for a
+-- reader who hides many authors is sooner. The reader's own posts are never hidden.
+-- Primary-key probes per post (all four tables are keyed (follower, following)): the
+-- size of a list does not matter, the number of lists the observer follows does.
+-- Observer 0 or below is anonymous: nothing hidden, and hivemind not read.
+-- When those tables cannot be read (not there, or no grant), nothing is hidden and the
+-- feed is served, as the ranker writes feeds without a filter it cannot read.
+-- plpgsql so that it binds to hivemind's tables when called (see hivemind_post_identity).
+CREATE OR REPLACE FUNCTION haf_fyp_app.global_feed_hidden_for(_observer_id int)
+RETURNS int[]
+LANGUAGE plpgsql
+STABLE
+AS $$
+BEGIN
+    IF COALESCE(_observer_id, 0) <= 0 THEN
+        RETURN '{}'::int[];
+    END IF;
+    RETURN COALESCE((
+        SELECT array_agg(gfc.post_id::int)
+        FROM haf_fyp_app.global_feed_cache AS gfc
+        JOIN hivemind_app.hive_posts AS hp ON hp.id = gfc.post_id
+        WHERE hp.author_id <> _observer_id
+          AND (EXISTS (SELECT 1 FROM hivemind_app.muted AS m
+                      WHERE m.follower = _observer_id AND m.following = hp.author_id)
+           OR EXISTS (SELECT 1 FROM hivemind_app.follow_muted AS fm
+                      JOIN hivemind_app.muted AS m ON m.follower = fm.following
+                      WHERE fm.follower = _observer_id AND m.following = hp.author_id)
+           OR EXISTS (SELECT 1 FROM hivemind_app.blacklisted AS b
+                      WHERE b.follower = _observer_id AND b.following = hp.author_id)
+           OR EXISTS (SELECT 1 FROM hivemind_app.follow_blacklisted AS fb
+                      JOIN hivemind_app.blacklisted AS b ON b.follower = fb.following
+                      WHERE fb.follower = _observer_id AND b.following = hp.author_id))
+    ), '{}'::int[]);
+EXCEPTION
+    -- The same SQLSTATEs as haf_fyp.visibility._NOT_THERE.
+    WHEN invalid_schema_name OR undefined_table OR undefined_column OR insufficient_privilege THEN
+        RETURN '{}'::int[];
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION haf_fyp_app.global_feed_hidden_for(int) TO haf_fyp_user;
+
 -- A post's author, permlink and title, which haf_fyp does not copy (#97): read from
 -- hivemind when an endpoint names them. No row for a post hivemind does not have.
 -- plpgsql so that it binds to hivemind's tables when called, not when created: a SQL
@@ -1691,6 +1753,7 @@ LANGUAGE plpgsql STABLE
 AS $$
 DECLARE
     _observer_id int;
+    _hidden int[];
     _result jsonb;
     -- Pagination uses page / page-size (not limit / offset, which PostgREST
     -- reserves for result-set slicing and would not forward as arguments).
@@ -1842,6 +1905,9 @@ BEGIN
             (SELECT ha.id FROM hivemind_app.hive_accounts ha
              WHERE ha.name = get_personalized_feed.username), 0
         );
+        -- The reader's muted and blacklisted authors are left out (#114): this is
+        -- the feed a new account reads until the ranker has built one of its own.
+        _hidden := haf_fyp_app.global_feed_hidden_for(_observer_id);
         SELECT COALESCE(
             jsonb_agg(s.post ORDER BY s.rank) FILTER (WHERE s.post IS NOT NULL),
             '[]'::jsonb
@@ -1894,6 +1960,7 @@ BEGIN
                     ) AS fyp
                 FROM haf_fyp_app.global_feed_cache gfc
                 LEFT JOIN haf_fyp_app.post_bridge_cache pbc ON pbc.post_id = gfc.post_id
+                WHERE gfc.post_id <> ALL (_hidden)
                 ORDER BY gfc.rank
                 LIMIT _limit
                 OFFSET _offset
@@ -2025,6 +2092,21 @@ $$;
           type: integer
           default: 0
         description: Truncate each post body to this many characters (0 = full body)
+      - in: query
+        name: observer
+        required: false
+        schema:
+          type: [string, 'null']
+          default: null
+        description: >-
+          Hive account the feed is shown to (optional; a leading @ is ignored).
+          Posts by authors it has muted or blacklisted, directly or through a list
+          it follows, are left out before the page is cut, so pages are full until
+          the feed runs out; it holds at most 200 posts, so a reader who hides many
+          authors reaches the end sooner. Cached posts carry no observer context; a
+          post not yet in the render cache is rendered for this account. An unknown
+          account is served as if none was given. Not authenticated: it filters for
+          whoever is named. Nodes older than this parameter answer 404 when it is sent.
     responses:
       '200':
         description: Global ranked post list
@@ -2042,21 +2124,33 @@ CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_global_feed(
     "page" INT = 1,
     "page-size" INT = 20,
     "community_id" INT = NULL,
-    "truncate_body" INT = 0
+    "truncate_body" INT = 0,
+    "observer" TEXT = NULL
 )
 RETURNS jsonb
 -- openapi-generated-code-end
 LANGUAGE plpgsql STABLE
 AS $$
 DECLARE
+    _observer_id int := 0;
+    _hidden int[];
     _result jsonb;
     -- See get_personalized_feed: page / page-size, capped, windowed in-query.
     _limit int := LEAST(GREATEST(get_global_feed."page-size", 1), 20);
     _offset int := (GREATEST(get_global_feed."page", 1) - 1) * _limit;
 BEGIN
-    -- Global feed is unauthenticated, so observer_id is 0 (no account-specific
-    -- vote / mute context). Hivemind is only joined when the cache has rows.
+    -- Without an observer the feed is anonymous (observer 0) and hivemind is read
+    -- only to render a cache miss. With one (#114), the posts global_feed_hidden_for
+    -- names are skipped before the page is cut. Not authentication: it filters for
+    -- whoever is named, as hivemind's bridge does with its own observer parameter.
     IF EXISTS (SELECT 1 FROM haf_fyp_app.global_feed_cache) THEN
+        IF NULLIF(btrim(get_global_feed.observer), '') IS NOT NULL THEN
+            _observer_id := COALESCE(
+                (SELECT ha.id FROM hivemind_app.hive_accounts ha
+                 WHERE ha.name = ltrim(lower(btrim(get_global_feed.observer)), '@')), 0
+            );
+        END IF;
+        _hidden := haf_fyp_app.global_feed_hidden_for(_observer_id);
         SELECT COALESCE(
             jsonb_agg(s.post ORDER BY s.rank) FILTER (WHERE s.post IS NOT NULL),
             '[]'::jsonb
@@ -2081,7 +2175,7 @@ BEGIN
                              )
                         ELSE page.cached
                     END,
-                    haf_fyp_app.get_bridge_post(page.post_id, 0, get_global_feed.truncate_body)
+                    haf_fyp_app.get_bridge_post(page.post_id, _observer_id, get_global_feed.truncate_body)
                 )
                 || jsonb_build_object('fyp', page.fyp) AS post
             FROM (
@@ -2113,12 +2207,13 @@ BEGIN
                 -- capped at the top ~200 posts, so this is a tiny PK-probed scan).
                 FROM haf_fyp_app.global_feed_cache gfc
                 LEFT JOIN haf_fyp_app.post_bridge_cache pbc ON pbc.post_id = gfc.post_id
-                WHERE get_global_feed.community_id IS NULL
-                   OR EXISTS (
-                       SELECT 1 FROM haf_fyp_app.post_candidates pc
-                       WHERE pc.post_id = gfc.post_id
-                         AND pc.community_id = get_global_feed.community_id
-                   )
+                WHERE gfc.post_id <> ALL (_hidden)
+                  AND (get_global_feed.community_id IS NULL
+                       OR EXISTS (
+                           SELECT 1 FROM haf_fyp_app.post_candidates pc
+                           WHERE pc.post_id = gfc.post_id
+                             AND pc.community_id = get_global_feed.community_id
+                       ))
                 ORDER BY gfc.rank
                 LIMIT _limit
                 OFFSET _offset
