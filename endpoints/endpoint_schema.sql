@@ -1606,8 +1606,8 @@ GRANT EXECUTE ON FUNCTION haf_fyp_app.get_bridge_post(int, int, int) TO haf_fyp_
 -- Posts in global_feed_cache that an observer is not to be shown (#114): by authors it
 -- has muted or blacklisted, directly or through a mute list or blacklist it follows (one
 -- level, as hivemind's own muted_accounts_by_id_view and get_blacklisted_by_observer
--- read them). haf_fyp.visibility leaves the same muted authors out of a personal feed
--- when the ranker writes it, and the blacklisted ones once #113 is in.
+-- read them). haf_fyp.visibility leaves the same authors out of a personal feed when the
+-- ranker writes it (#89, #113).
 --
 -- Applied to the whole cache (at most 200 posts) before the page is cut, so the hidden
 -- posts are skipped, not blanked: pages are full until the cache runs out, which for a
