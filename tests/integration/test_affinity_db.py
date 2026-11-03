@@ -29,12 +29,18 @@ CREATE TABLE hivemind_app.hive_posts (id INT PRIMARY KEY, author_id INT NOT NULL
                                       depth SMALLINT NOT NULL DEFAULT 0,
                                       counter_deleted INT NOT NULL DEFAULT 0,
                                       created_at TIMESTAMP NOT NULL DEFAULT '2026-01-01');
+-- hivemind keeps one row per (voter, post), downvotes and withdrawn votes included.
+CREATE TABLE hivemind_app.hive_votes (post_id INT NOT NULL, voter_id INT NOT NULL, vote_percent INT NOT NULL,
+                                      PRIMARY KEY (post_id, voter_id));
 INSERT INTO hivemind_app.hive_accounts VALUES
     (1, 'reader'), (2, 'fresh'), (3, 'weekold'), (4, 'reblogged'), (5, 'replied'),
-    (6, 'tooold'), (7, 'stranger'), (8, 'deleted');
--- Root posts by each author.
+    (6, 'tooold'), (7, 'stranger'), (8, 'deleted'), (9, 'downvoted'), (10, 'unvoted'),
+    (11, 'gonepost');
+-- Root posts by each author; gonepost's was deleted.
 INSERT INTO hivemind_app.hive_posts (id, author_id) VALUES
-    (102, 2), (103, 3), (104, 4), (105, 5), (106, 6), (107, 7), (101, 1), (108, 8);
+    (102, 2), (103, 3), (104, 4), (105, 5), (106, 6), (107, 7), (101, 1), (108, 8),
+    (109, 9), (110, 10);
+INSERT INTO hivemind_app.hive_posts (id, author_id, counter_deleted) VALUES (111, 11, 1);
 """
 
 REF = "2026-03-31 00:00:00"   # the reader's latest vote
@@ -46,12 +52,19 @@ INSERT INTO haf_fyp_app.user_interactions (account_id, post_id, action_weight, c
     (1, 104, 1.5, '{REF}'),                                  -- reblogged
     (1, 106, 1.0, TIMESTAMP '{REF}' - INTERVAL '31 days'),   -- tooold: outside 30 days
     (1, 101, 1.0, '{REF}'),                                  -- a self-vote: never counted
+    (1, 109, 1.0, '{REF}'),                                  -- a downvote: never counted
+    (1, 110, 1.0, '{REF}'),                                  -- a vote withdrawn to 0%
     (7, 102, 1.0, '{REF}');                                  -- someone else's vote
+INSERT INTO hivemind_app.hive_votes VALUES
+    (102, 1, 10000), (103, 1, 5000), (106, 1, 10000), (101, 1, 10000),
+    (109, 1, -10000), (110, 1, 0), (102, 7, 10000);
+-- The reblog (104) has no vote row: a reblog counts on its own.
 -- The reader's comments: a reply to replied's post, one to its own post, a deleted one.
 INSERT INTO hivemind_app.hive_posts (id, author_id, parent_id, depth, counter_deleted, created_at) VALUES
     (201, 1, 105, 1, 0, TIMESTAMP '{REF}' - INTERVAL '14 days'),
     (202, 1, 101, 1, 0, '{REF}'),
-    (203, 1, 108, 1, 1, '{REF}');
+    (203, 1, 108, 1, 1, '{REF}'),
+    (204, 1, 111, 1, 0, '{REF}');                             -- a reply to a deleted post
 """
 
 
@@ -116,7 +129,23 @@ def test_votes_reblogs_and_replies_decayed_by_age(conn) -> None:
 
 def test_the_reader_itself_old_actions_deleted_replies_and_others_votes_are_left_out(conn) -> None:
     got = affinity.author_affinity(conn, "reader", {})
-    assert {"reader", "tooold", "deleted", "stranger"}.isdisjoint(got)
+    assert {"reader", "tooold", "deleted", "stranger", "gonepost"}.isdisjoint(got)
+
+
+def test_a_downvote_or_a_withdrawn_vote_is_no_affinity(conn) -> None:
+    got = affinity.author_affinity(conn, "reader", {})
+    assert "downvoted" not in got and "unvoted" not in got
+
+
+def test_a_reply_newer_than_the_latest_vote_moves_the_reference(conn) -> None:
+    # Seven days after the latest vote the reader replies to `replied` again: every age
+    # is now measured from that reply, so nothing counts at more than its own weight.
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO hivemind_app.hive_posts (id, author_id, parent_id, depth, created_at) "
+                    f"VALUES (205, 1, 105, 1, TIMESTAMP '{REF}' + INTERVAL '7 days')")
+    raw = {a: r for a, (_, r) in affinity.author_affinity(conn, "reader", {}).items()}
+    assert raw["fresh"] == pytest.approx(0.5)
+    assert raw["replied"] == pytest.approx(1.5 + 1.5 * 0.125)
 
 
 def test_the_strongest_authors_are_kept_first(conn) -> None:

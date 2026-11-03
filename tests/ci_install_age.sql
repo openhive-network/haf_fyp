@@ -31,6 +31,8 @@ INSERT INTO haf_fyp_app.post_commenters (post_id, commenter_id) VALUES (42, 7);
 INSERT INTO haf_fyp_app.post_bridge_cache (post_id, bridge, computed_at) VALUES (42, '{}', '2016-09-15 19:47:21');
 INSERT INTO haf_fyp_app.engagement_metrics (post_id, updated_at) VALUES (42, '2016-09-15 19:47:21');
 INSERT INTO haf_fyp_app.user_profile_vectors (username, updated_at) VALUES ('ci-aged-user', '2016-09-15 19:47:21');
+INSERT INTO haf_fyp_app.user_author_affinity (username, author, affinity, raw, updated_at)
+VALUES ('ci-aged-user', 'ci-aged-author', 0.5, 3, '2016-09-15 19:47:21');
 INSERT INTO haf_fyp_app.user_communities (username, community_id, subscribed_at)
 VALUES ('ci-aged-user', 1, '2016-09-15 19:47:21');
 INSERT INTO haf_fyp_app.feed_cache_labels (label) VALUES ('ci-aged-label');

@@ -188,7 +188,8 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.user_profile_vectors (
 -- Reader-to-author affinity (#117): what the ranker last computed for a reader, one
 -- row per author it engaged with (haf_fyp/affinity.py), the reader's whole set
 -- replaced each time it is ranked. Written only by an algorithm version that sets
--- author_affinity; empty otherwise. affinity is in [0, 1), raw the decayed sum.
+-- author_affinity; empty otherwise. affinity is in [0, 1), raw the decayed sum. Never
+-- read back by the ranker: it is there to inspect.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS haf_fyp_app.user_author_affinity (

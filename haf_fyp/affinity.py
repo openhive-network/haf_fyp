@@ -2,27 +2,35 @@
 Reader-to-author affinity (#117): how much a reader has engaged with each author lately.
 
 From the reader's own actions within `affinity_days` (default 30):
-    a vote on the author's post      1.0   haf_fyp_app.user_interactions (root posts)
+    an upvote on the author's post   1.0   haf_fyp_app.user_interactions (root posts in
+                                           haf_fyp's history window), counted only while
+                                           hivemind_app.hive_votes has it above 0%: that
+                                           table copies every vote, downvotes included
     a reblog of the author's post    1.5   the same table: one row per (reader, post),
                                            the strongest action wins
     a comment replying to the author 1.5   hivemind_app.hive_posts: the reader's own
                                            comments, scored for the post or comment
-                                           they reply to
+                                           they reply to (posts and comments of any age;
+                                           neither the reply nor what it replies to
+                                           deleted)
 each decayed by half every `affinity_half_life_days` (default 7), summed per author, and
 mapped into [0, 1) as raw / (raw + affinity_half_at): at the default of 3, three fresh
 votes give 0.5, and no amount gets to 1. The reader's own posts are not an author they
 have affinity with (self-votes and replies on their own threads are left out).
 
-Ages are measured from the reader's latest recorded vote or reblog, as the interest
-vector's are (haf_fyp/embeddings.py), so a node whose history trails real time still
-sees a reader's last month; a reader with none falls back to now.
+Ages are measured from the reader's latest recorded vote, reblog or reply (the interest
+vector measures from the latest vote or reblog, haf_fyp/embeddings.py), so a node whose
+history trails real time still sees a reader's last month, and nothing counted is newer
+than the reference; a reader with none falls back to now.
 
 Applied only by an algorithm version whose weights set `author_affinity` (1.4.0); the
 others neither read nor write it. In scoring it raises relevance, never lowers it: see
 scoring.compute_scores.
 
 Stored per (reader, author) in haf_fyp_app.user_author_affinity each time the reader is
-ranked, the whole set replaced, at most `affinity_max_authors` (default 200) authors.
+ranked, the whole set replaced, at most `affinity_max_authors` (default 200) authors. The
+ranker never reads it back: it is there to inspect, and keeps the set of the last ranking
+under 1.4.0 until the account is ranked under it again or dropped.
 """
 
 from __future__ import annotations
@@ -48,9 +56,14 @@ AFFINITY_SQL = """
         SELECT ha.id FROM hivemind_app.hive_accounts AS ha WHERE ha.name = %(username)s
     ),
     ref AS MATERIALIZED (
+        -- greatest() skips a NULL side; both NULL is a reader with nothing to count.
         SELECT coalesce(
-            (SELECT max(x.created_at) FROM haf_fyp_app.user_interactions AS x
-              WHERE x.account_id = (SELECT id FROM reader)),
+            greatest(
+                (SELECT max(x.created_at) FROM haf_fyp_app.user_interactions AS x
+                  WHERE x.account_id = (SELECT id FROM reader)),
+                (SELECT max(r.created_at) FROM hivemind_app.hive_posts AS r
+                  WHERE r.author_id = (SELECT id FROM reader) AND r.depth > 0
+                    AND r.counter_deleted = 0)),
             now() AT TIME ZONE 'utc') AS t
     ),
     actions AS (
@@ -59,6 +72,10 @@ AFFINITY_SQL = """
         JOIN hivemind_app.hive_posts AS hp ON hp.id = ui.post_id
         WHERE ui.account_id = (SELECT id FROM reader)
           AND ui.created_at >= (SELECT t FROM ref) - make_interval(days => %(days)s)
+          AND (ui.action_weight > 1.0
+               OR EXISTS (SELECT 1 FROM hivemind_app.hive_votes AS v
+                          WHERE v.post_id = ui.post_id AND v.voter_id = ui.account_id
+                            AND v.vote_percent > 0))
         UNION ALL
         SELECT parent.author_id, %(comment_weight)s::float8, c.created_at
         FROM hivemind_app.hive_posts AS c
@@ -66,6 +83,7 @@ AFFINITY_SQL = """
         WHERE c.author_id = (SELECT id FROM reader)
           AND c.depth > 0
           AND c.counter_deleted = 0
+          AND parent.counter_deleted = 0
           AND c.created_at >= (SELECT t FROM ref) - make_interval(days => %(days)s)
     ),
     top AS (

@@ -667,19 +667,25 @@ relevance = relevance + 0.30 × (1 − relevance) × affinity(reader, author)
 
 affinity  = raw / (raw + 3)                     in [0, 1); 0.5 at raw = 3
 raw       = Σ weight × 0.5 ^ (age_days / 7)      the reader's last 30 days of
-            vote 1.0, reblog 1.5, reply 1.5      actions on the author's posts
+            upvote 1.0, reblog 1.5, reply 1.5    actions on the author's posts
 ```
 
 An author the reader has not engaged with keeps the relevance it had, so 1.4.0 only
-reorders a feed in favour of authors the reader keeps coming back to. Ages are measured
-from the reader's latest vote or reblog, as the interest vector's are. The reader's own
+reorders a feed in favour of authors the reader keeps coming back to. Upvotes and
+reblogs are those haf_fyp keeps (root posts in its history window; a downvote or a vote
+withdrawn to 0% does not count); replies are read from hivemind, to posts and comments
+alike. Ages are measured from the reader's latest vote, reblog or reply. The reader's own
 posts and replies are not counted. Affinity rides on relevance, so a reader ranked
 without an interest vector (the cold-start weights) gets none. Each time a reader is
 ranked under 1.4.0 its affinity is stored in `haf_fyp_app.user_author_affinity` (at most
 200 authors); other versions neither read nor write it. Every setting is in the version's
 weights (`author_affinity`, `affinity_days`, `affinity_half_life_days`,
 `affinity_half_at`, `affinity_max_authors`). Activate it with
-`POST /v1/fyp/admin/algorithm` to compare it with 1.3.0 on `feed_metrics_daily`.
+`POST /v1/fyp/admin/algorithm` to compare it with 1.3.0 on `feed_metrics_daily`, and
+only once the ranker runs this release: an older ranker ignores `author_affinity`, ranks
+exactly as 1.3.0 and labels its feeds 1.4.0. One version is active at a time, so the
+comparison is of one period against another. The table is never read back by the
+ranker; it keeps each reader's set from its last ranking under 1.4.0.
 
 | Signal | Range | Source |
 |--------|-------|--------|

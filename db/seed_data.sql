@@ -90,8 +90,9 @@ $$;
 -- 1.4.0 (#117): 1.3.0 plus reader-to-author affinity, which raises relevance for the
 -- authors a reader has lately voted on, reblogged or replied to (haf_fyp/affinity.py,
 -- scoring.compute_scores). Registered INACTIVE: activate it with
--- POST /v1/fyp/admin/algorithm to compare it with 1.3.0 on feed_metrics_daily. Its
--- weights are this node's 1.3.0 weights, so an operator's tuning carries over.
+-- POST /v1/fyp/admin/algorithm to compare it with 1.3.0 on feed_metrics_daily, once the
+-- ranker runs this release. Its weights are this node's 1.3.0 weights when it is
+-- registered, so the tuning made until then carries over (not later changes to 1.3.0).
 INSERT INTO haf_fyp_app.algorithm_versions (version, description, weights, deployed_at, is_active)
 SELECT
     '1.4.0' AS version,
