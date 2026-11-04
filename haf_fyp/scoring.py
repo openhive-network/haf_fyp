@@ -9,6 +9,7 @@ Signal weights (1.1.0; 1.3.0 is the same plus boost_rescale):
     community_boost  x1.20 post-sum multiplier for subscribed-community posts
     community_boost_engaged x1.10 the same for the reader's most-engaged communities
     boost_rescale    1.3.0: every score / (1 + the larger boost) instead of a clip at 1 (#116)
+    author_affinity  1.4.0: raises relevance for authors the reader engages with (#117)
 
 Phase 7: all four signals active — recency, engagement, semantic relevance (HiveSense),
 and credibility (btracker VESTS + reptracker reputation).
@@ -25,6 +26,7 @@ import pandas as pd
 import psycopg2
 import psycopg2.extras
 
+from haf_fyp.affinity import share as affinity_share
 from haf_fyp.credibility import DEFAULT_CREDIBILITY
 
 log = logging.getLogger(__name__)
@@ -339,6 +341,7 @@ def compute_scores(
     subscribed_communities: set,
     engaged_communities: set,
     algorithm_weights: dict,
+    author_affinity: dict | None = None,
 ) -> pd.DataFrame:
     """
     Compute final_score for each candidate post and return a sorted DataFrame.
@@ -355,6 +358,16 @@ def compute_scores(
     A boosted score is clipped at 1.0, unless the version sets boost_rescale (1.3.0,
     #116): then nothing is clipped and every score is divided by 1 + the larger of
     the two boosts.
+
+    If algorithm_weights sets author_affinity (1.4.0, #117), relevance becomes
+        relevance + author_affinity x (1 - relevance) x affinity
+    with `affinity` the reader's affinity in [0, 1) for the post's author (see
+    haf_fyp/affinity.py; 0 for an author it has not engaged with, whose posts keep
+    the relevance they had). It stays in [0, 1], and only where relevance is computed:
+    without an interest vector or without post embeddings the relevance weight is
+    dropped, affinity with it. The frame's score_affinity column records the affinity
+    used, 0 where none was; feed_cache does not store it, and its score_relevance is
+    the raised one.
 
     If algorithm_weights sets max_per_community, a diversity cap is applied after
     sorting so no single community occupies more than that many leading positions
@@ -392,6 +405,17 @@ def compute_scores(
     df["score_relevance"] = compute_semantic_relevance(
         df["post_id"], post_vectors, user_vector
     )
+    share = affinity_share(algorithm_weights) if author_affinity else 0.0
+    if author_affinity and share > 0 and w_v > 0:
+        df["score_affinity"] = df["author"].map(
+            lambda a: author_affinity[a][0] if a in author_affinity else 0.0
+        ).astype(float)
+        df["score_relevance"] = (
+            df["score_relevance"]
+            + share * (1.0 - df["score_relevance"]) * df["score_affinity"]
+        )
+    else:
+        df["score_affinity"] = 0.0
 
     df["final_score"] = (
         w_v * df["score_relevance"]

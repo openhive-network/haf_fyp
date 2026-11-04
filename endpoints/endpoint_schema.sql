@@ -50,7 +50,7 @@ schemas:
         description: Composite ranking score [0, 1]. From algorithm 1.3.0 every score is divided by 1 + the larger community boost instead of a boosted score being clipped at 1, so the top of a feed keeps its order
       score_relevance:
         type: [number, 'null']
-        description: Semantic relevance to the user's interest vector (null in the global feed)
+        description: Semantic relevance to the user's interest vector; from algorithm 1.4.0 raised for authors the reader engages with (null in the global feed)
       score_recency:
         type: number
       score_engagement:
@@ -261,7 +261,7 @@ DECLARE
               "number",
               "null"
             ],
-            "description": "Semantic relevance to the user's interest vector (null in the global feed)"
+            "description": "Semantic relevance to the user's interest vector; from algorithm 1.4.0 raised for authors the reader engages with (null in the global feed)"
           },
           "score_recency": {
             "type": "number"

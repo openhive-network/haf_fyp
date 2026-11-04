@@ -325,8 +325,8 @@ DECLARE
         'active_users', 'algorithm_versions', 'app_config', 'app_status', 'app_version',
         'embedding_coverage_daily', 'engagement_metrics', 'feed_cache', 'feed_cache_labels', 'feed_events',
         'feed_events_rollup_state', 'feed_metrics_daily', 'global_feed_cache', 'haf_fyp', 'hivemind_follow',
-        'post_bridge_cache', 'post_candidates', 'post_commenters', 'post_language', 'ranker_cycles', 'user_communities',
-        'user_interactions', 'user_interests', 'user_profile_vectors'
+        'post_bridge_cache', 'post_candidates', 'post_commenters', 'post_language', 'ranker_cycles',
+        'user_author_affinity', 'user_communities', 'user_interactions', 'user_interests', 'user_profile_vectors'
     ];
     _want_functions TEXT [] := ARRAY[
         'haf_fyp_app.allow_processing()',
@@ -423,6 +423,7 @@ DECLARE
         'index uq_app_config_singleton on app_config (unique)',
         'index uq_app_status_singleton on app_status (unique)',
         'index uq_app_version_singleton on app_version (unique)',
+        'index user_author_affinity_pkey on user_author_affinity (primary key)',
         'index user_communities_pkey on user_communities (primary key)',
         'index user_interactions_pkey on user_interactions (primary key)',
         'index user_interests_pkey on user_interests (primary key)',
@@ -453,6 +454,7 @@ DECLARE
         'constraint post_language_pkey on post_language: PRIMARY KEY (post_id)',
         'constraint post_language_post_id_fkey on post_language: FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates(post_id) ON DELETE CASCADE',
         'constraint ranker_cycles_pkey on ranker_cycles: PRIMARY KEY (finished_at)',
+        'constraint user_author_affinity_pkey on user_author_affinity: PRIMARY KEY (username, author)',
         'constraint user_communities_pkey on user_communities: PRIMARY KEY (username, community_id)',
         'constraint user_interactions_pkey on user_interactions: PRIMARY KEY (account_id, post_id)',
         'constraint user_interests_pkey on user_interests: PRIMARY KEY (username, community_id)',
@@ -487,6 +489,7 @@ DECLARE
         'post_commenters:dd6b3cc9b3898e67d2f725176626ba17',
         'post_language:3d813e2c4808191be5a6405e08f1e244',
         'ranker_cycles:05fc8ec3ef78deaba0f3849400079b32',
+        'user_author_affinity:f8d3245d01c34d47275dc294e3722ef1',
         'user_communities:83146409c11276c9ea90534eabba3df9',
         'user_interactions:e5c218f6e78c7effb3f65b87f6d2f3d0',
         'user_interests:d99ba90cbdab04aae0fef51df1af940e',
@@ -856,15 +859,15 @@ BEGIN
     -- Seed data must not multiply on a second install, and must not take back a choice
     -- the operator made: tests/ci_install_age.sql activates the OLDEST version.
     SELECT count(*) INTO _n FROM haf_fyp_app.algorithm_versions;
-    IF _n <> 4 THEN
-        RAISE EXCEPTION 'algorithm_versions holds % rows, the seed has 4', _n;
+    IF _n <> 5 THEN
+        RAISE EXCEPTION 'algorithm_versions holds % rows, the seed has 5', _n;
     END IF;
-    -- On a first install, the seed by VALUE: four rows is also what a seed with one
+    -- On a first install, the seed by VALUE: five rows is also what a seed with one
     -- weight ten times too large has. (Later the weights are the operator's.) And the
     -- telemetry rollup starts from the beginning.
     IF current_setting('ci.phase') = 'first' THEN
         IF (SELECT md5(string_agg(v.version || ' ' || v.is_active || ' ' || v.weights::text, E'\n' ORDER BY v.version COLLATE "C"))
-            FROM haf_fyp_app.algorithm_versions AS v) IS DISTINCT FROM 'b88afc4f53841499cf49966b59df778a' THEN
+            FROM haf_fyp_app.algorithm_versions AS v) IS DISTINCT FROM '9f08b3450f6d6eb3ffd28392fcb9d4fc' THEN
             RAISE EXCEPTION E'the seeded algorithm versions are not the ones tests/ci_install_verify.sql pins (db/seed_data.sql changed?). They read, as md5 %:\n%',
                 (SELECT md5(string_agg(v.version || ' ' || v.is_active || ' ' || v.weights::text, E'\n' ORDER BY v.version COLLATE "C"))
                  FROM haf_fyp_app.algorithm_versions AS v),

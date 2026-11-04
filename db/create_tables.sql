@@ -185,6 +185,24 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.user_profile_vectors (
 );
 
 -- ---------------------------------------------------------------------------
+-- Reader-to-author affinity (#117): what the ranker last computed for a reader, one
+-- row per author it engaged with (haf_fyp/affinity.py), the reader's whole set
+-- replaced each time it is applied, its strongest affinity_max_authors kept. Written
+-- only under an algorithm version that sets author_affinity; a reader's rows stay from
+-- its last ranking under one until it is dropped. affinity is in [0, 1), raw the
+-- decayed sum. Never read back by the ranker: it is there to inspect.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS haf_fyp_app.user_author_affinity (
+    username varchar(16) NOT NULL,
+    author varchar(16) NOT NULL,
+    affinity real NOT NULL,
+    raw real NOT NULL,
+    updated_at timestamp NOT NULL,
+    PRIMARY KEY (username, author)
+);
+
+-- ---------------------------------------------------------------------------
 -- User interactions — each account's votes and reblogs of root posts within the
 -- window, one row per (account, post): the strongest action (reblog > vote) and the
 -- time of the latest. The ranker reads one account's most recent rows to build its
@@ -775,6 +793,7 @@ REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.feed_cache           FROM haf_fyp_u
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.global_feed_cache    FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.post_bridge_cache    FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.user_profile_vectors FROM haf_fyp_user;
+REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.user_author_affinity FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.feed_metrics_daily   FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.embedding_coverage_daily FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.ranker_cycles        FROM haf_fyp_user;

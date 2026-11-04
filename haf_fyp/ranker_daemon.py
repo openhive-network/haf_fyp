@@ -61,7 +61,7 @@ import psycopg2
 import psycopg2.extras
 import redis as redis_lib
 
-from haf_fyp import language, visibility
+from haf_fyp import affinity, language, visibility
 from haf_fyp.credibility import credibility_failure_message, fetch_author_credibility
 from haf_fyp.embeddings import fetch_post_vectors_safe, register_vector_type
 from haf_fyp.schema_version import IncompatibleSchemaError, check_schema_version
@@ -1263,6 +1263,15 @@ def _rank_user(
             if user_vector is not None:
                 write_user_vector(conn, username, user_vector, 0, sorted(engaged))
 
+    # #117: read and stored only where compute_scores applies it -- a version that sets
+    # author_affinity, and relevance computed (the same test as compute_scores') -- so
+    # a 1.4.0 feed ranked without embeddings leaves no affinity behind.
+    author_affinity = affinity.for_reader(
+        conn, username, weights,
+        relevance_computed=user_vector is not None and bool(post_vectors),
+        exclude=EXCLUDED_AUTHORS,
+    )
+
     scored = compute_scores(
         candidates=candidates,
         user_vector=user_vector,
@@ -1271,6 +1280,7 @@ def _rank_user(
         subscribed_communities=subscribed,
         engaged_communities=engaged,
         algorithm_weights=weights,
+        author_affinity=author_affinity,
     )
     write_feed_cache(conn, username, scored, algo_version)
 
