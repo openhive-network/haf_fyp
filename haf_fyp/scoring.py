@@ -26,6 +26,7 @@ import pandas as pd
 import psycopg2
 import psycopg2.extras
 
+from haf_fyp.affinity import share as affinity_share
 from haf_fyp.credibility import DEFAULT_CREDIBILITY
 
 log = logging.getLogger(__name__)
@@ -404,8 +405,8 @@ def compute_scores(
     df["score_relevance"] = compute_semantic_relevance(
         df["post_id"], post_vectors, user_vector
     )
-    share = float(algorithm_weights.get("author_affinity") or 0.0)
-    if share > 0 and author_affinity and w_v > 0:
+    share = affinity_share(algorithm_weights) if author_affinity else 0.0
+    if author_affinity and share > 0 and w_v > 0:
         df["score_affinity"] = df["author"].map(
             lambda a: author_affinity[a][0] if a in author_affinity else 0.0
         ).astype(float)

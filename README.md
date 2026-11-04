@@ -674,12 +674,16 @@ An author the reader has not engaged with keeps the relevance it had, so 1.4.0 o
 reorders a feed in favour of authors the reader keeps coming back to. Upvotes and
 reblogs are those haf_fyp keeps (root posts in its history window; a downvote or a vote
 withdrawn to 0% does not count); replies are read from hivemind, to posts and comments
-alike. Ages are measured from the reader's latest vote, reblog or reply. The reader's own
-posts and replies are not counted. Affinity rides on relevance, so a reader ranked
-without relevance (no interest vector, or no post embeddings from HiveSense) gets none.
-The stored and served `score_relevance` is the raised one. Each time a reader is
-ranked under 1.4.0 its affinity is stored in `haf_fyp_app.user_author_affinity` (at most
-200 authors); other versions neither read nor write it. Every setting is in the version's
+alike, counted once per thread and author (a back-and-forth in one thread is one reply).
+Ages are measured from the reader's latest vote, reblog or reply. The reader's own
+posts and replies are not counted, nor the authors never recommended (`EXCLUDED_AUTHORS`).
+Every author the reader engaged with is scored. Affinity rides on relevance, so a reader
+ranked without relevance (no interest vector, or no post embeddings from HiveSense) gets
+none, and none is read or stored for it. If the read fails the reader is ranked without
+it, as under 1.3.0, and the failure is logged. The stored and served `score_relevance`
+is the raised one. Each time affinity is applied it is stored in
+`haf_fyp_app.user_author_affinity` (the strongest 200 authors); other versions neither
+read nor write it. Every setting is in the version's
 weights (`author_affinity`, `affinity_days`, `affinity_half_life_days`,
 `affinity_half_at`, `affinity_max_authors`). Activate it with
 `POST /v1/fyp/admin/algorithm` to compare it with 1.3.0 on `feed_metrics_daily`, and

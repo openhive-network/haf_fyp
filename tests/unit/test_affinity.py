@@ -7,6 +7,8 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pandas as pd
+import psycopg2
+import psycopg2.errors
 import pytest
 
 from haf_fyp import affinity
@@ -21,7 +23,7 @@ V14 = {
 V13 = {k: v for k, v in V14.items() if not (k == "author_affinity" or k.startswith("affinity_"))}
 
 
-# ---- squash / settings
+# ---- squash / settings / share
 
 @pytest.mark.parametrize("raw, want", [(0.0, 0.0), (-1.0, 0.0), (3.0, 0.5), (9.0, 0.75)])
 def test_squash(raw, want):
@@ -33,8 +35,20 @@ def test_squash_never_reaches_one():
 
 
 def test_settings_take_the_versions_own_and_default_the_rest():
-    s = affinity.settings({"affinity_days": 14, "relevance": 0.4})
+    s = affinity.settings({"affinity_days": 14, "relevance": 0.4, "affinity_half_at": None})
     assert s == {**affinity.DEFAULTS, "affinity_days": 14}
+
+
+@pytest.mark.parametrize("bad", [{"affinity_days": 0}, {"affinity_half_life_days": 0},
+                                 {"affinity_half_at": -1}, {"affinity_max_authors": -1}])
+def test_a_setting_every_read_would_fail_on_raises(bad):
+    with pytest.raises(ValueError):
+        affinity.settings(bad)
+
+
+@pytest.mark.parametrize("value, want", [(None, 0.0), (0.3, 0.3), (-0.3, 0.0), (1.7, 1.0)])
+def test_share_is_kept_in_0_1(value, want):
+    assert affinity.share({"author_affinity": value}) == want
 
 
 # ---- the read and the write
@@ -48,15 +62,19 @@ def _conn(rows=()):
 
 def test_the_read_is_asked_for_the_reader_with_the_versions_settings():
     conn, cur = _conn([("bob", 3.0), ("carol", 1.0)])
-    got = affinity.author_affinity(conn, "alice", {**V14, "affinity_days": 14})
+    got = affinity.author_affinity(conn, "alice", {**V14, "affinity_days": 14}, ("peak.snaps",))
     query, params = cur.execute.call_args.args
-    assert params == {"username": "alice", "days": 14, "half_life": 7.0, "max_authors": 200,
-                      "comment_weight": affinity.COMMENT_WEIGHT}
+    assert params == {"username": "alice", "days": 14, "half_life": 7.0,
+                      "comment_weight": affinity.COMMENT_WEIGHT, "exclude": ["peak.snaps"]}
     assert got == {"bob": (0.5, 3.0), "carol": (0.25, 1.0)}
-    # Votes and reblogs from haf_fyp's own copy; comments from hivemind; never the reader.
+    # Votes and reblogs from haf_fyp's own copy; comments from hivemind, once per thread;
+    # never the reader; never an excluded author; no cap on what is scored.
     assert "haf_fyp_app.user_interactions AS ui" in query
     assert "parent.id = c.parent_id" in query and "c.author_id = (SELECT id FROM reader)" in query
+    assert "DISTINCT ON (parent.author_id, c.root_id)" in query
     assert "a.author_id <> (SELECT id FROM reader)" in query
+    assert "author.name <> ALL(%(exclude)s::text[])" in query
+    assert "LIMIT" not in query
 
 
 def test_the_write_replaces_the_readers_set(monkeypatch):
@@ -72,12 +90,73 @@ def test_the_write_replaces_the_readers_set(monkeypatch):
     conn.commit.assert_called_once()
 
 
+def test_the_write_keeps_the_strongest_only(monkeypatch):
+    conn, _cur = _conn()
+    inserted = []
+    monkeypatch.setattr(affinity.psycopg2.extras, "execute_values",
+                        lambda _cur, sql, rows, template: inserted.append(rows))
+    affinity.write_author_affinity(conn, "alice", {"bob": (0.5, 3.0), "carol": (0.25, 1.0)}, 1)
+    assert inserted == [[("alice", "bob", 0.5, 3.0)]]
+
+
 def test_an_empty_set_still_clears_the_old_one():
     conn, cur = _conn()
     affinity.write_author_affinity(conn, "alice", {})
     assert cur.execute.call_count == 1
     assert "DELETE" in cur.execute.call_args.args[0]
     conn.commit.assert_called_once()
+
+
+# ---- for_reader: when it is read, and a failed read
+
+def test_for_reader_reads_and_stores_the_strongest(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(affinity, "author_affinity",
+                        lambda _c, u, w, ex: seen.setdefault("read", (u, list(ex))) and {"bob": (0.5, 3.0)})
+    monkeypatch.setattr(affinity, "write_author_affinity",
+                        lambda _c, u, a, n: seen.setdefault("written", (u, a, n)))
+    got = affinity.for_reader(MagicMock(), "alice", {**V14, "affinity_max_authors": 50}, True,
+                              ("peak.snaps",))
+    assert got == {"bob": (0.5, 3.0)}
+    assert seen == {"read": ("alice", ["peak.snaps"]), "written": ("alice", got, 50)}
+
+
+@pytest.mark.parametrize("weights, relevance_computed", [(V13, True), (V14, False)])
+def test_for_reader_does_nothing_where_affinity_is_not_applied(weights, relevance_computed):
+    conn = MagicMock()
+    assert affinity.for_reader(conn, "alice", weights, relevance_computed) is None
+    conn.cursor.assert_not_called()
+
+
+def test_a_failed_read_ranks_without_affinity_and_logs_once(monkeypatch, caplog):
+    conn = MagicMock()
+
+    def boom(*_a):
+        raise psycopg2.errors.InsufficientPrivilege("no grant")
+
+    monkeypatch.setattr(affinity, "author_affinity", boom)
+    monkeypatch.setattr(affinity, "_failures_logged", {})
+    with caplog.at_level("WARNING", logger="haf_fyp.affinity"):
+        assert affinity.for_reader(conn, "alice", V14, True) is None
+        assert affinity.for_reader(conn, "bob", V14, True) is None
+    assert conn.rollback.call_count == 2
+    assert len([r for r in caplog.records if "ranked without it" in r.getMessage()]) == 1
+
+
+def test_a_bad_setting_ranks_without_affinity():
+    conn = MagicMock()
+    assert affinity.for_reader(conn, "alice", {**V14, "affinity_half_life_days": 0}, True) is None
+    conn.rollback.assert_called_once()
+    conn.cursor.assert_not_called()
+
+
+def test_a_lost_connection_is_raised(monkeypatch):
+    def gone(*_a):
+        raise psycopg2.OperationalError("server closed the connection")
+
+    monkeypatch.setattr(affinity, "author_affinity", gone)
+    with pytest.raises(psycopg2.OperationalError):
+        affinity.for_reader(MagicMock(), "alice", V14, True)
 
 
 # ---- scoring
@@ -126,7 +205,8 @@ def test_affinity_reorders_equally_relevant_posts():
 
 
 def test_relevance_stays_at_most_one():
-    got = _scores(V14, {"liked": (0.999, 1e6), "liked2": (0.999, 1e6)}, user=np.array([1.0, 0.0]))
+    got = _scores({**V14, "author_affinity": 5.0}, {"liked": (0.999, 1e6), "liked2": (0.999, 1e6)},
+                  user=np.array([1.0, 0.0]))
     assert (got["score_relevance"] <= 1.0).all()
 
 
@@ -148,6 +228,14 @@ def test_cold_start_drops_affinity_with_relevance():
     assert (got["score_affinity"] == 0.0).all()
 
 
+def test_no_post_embeddings_drops_affinity_with_relevance():
+    # A stored interest vector but no embeddings (HiveSense degraded): the same.
+    base = _scores(V13, None, vecs={})
+    got = _scores(V14, {"liked": (0.9, 27.0)}, vecs={})
+    assert np.allclose(got["final_score"], base["final_score"])
+    assert (got["score_affinity"] == 0.0).all()
+
+
 def test_the_versions_half_at_sets_the_scale():
     conn, _cur = _conn([("bob", 3.0)])
     assert affinity.author_affinity(conn, "alice", {"affinity_half_at": 1})["bob"][0] == pytest.approx(0.75)
@@ -158,33 +246,33 @@ def test_the_versions_half_at_sets_the_scale():
 rd = pytest.importorskip("haf_fyp.ranker_daemon")
 
 
-def _rank(monkeypatch, weights):
+def _rank(monkeypatch, weights, vector=None, vecs=None):
     seen = {}
     monkeypatch.setattr(rd.visibility, "muted_authors", lambda _c, _u: set())
     monkeypatch.setattr(rd.visibility, "blacklisted_authors", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_user_communities", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_user_interests", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_top_communities", lambda _c, _u: [])
-    monkeypatch.setattr(rd, "build_user_profile_vector", lambda _c, _u, _v: (None, 0))
+    monkeypatch.setattr(rd, "build_user_profile_vector", lambda _c, _u, _v: (vector, 0))
+    monkeypatch.setattr(rd, "write_user_vector", lambda *a: None)
     monkeypatch.setattr(rd, "read_user_vector", lambda _c, _u: (None, None))
-    monkeypatch.setattr(rd.affinity, "author_affinity",
-                        lambda _c, u, w: seen.setdefault("read", (u, w)) and {"bob": (0.5, 3.0)})
-    monkeypatch.setattr(rd.affinity, "write_author_affinity",
-                        lambda _c, u, a: seen.setdefault("written", (u, a)))
+    monkeypatch.setattr(
+        rd.affinity, "for_reader",
+        lambda _c, u, w, relevance_computed, exclude:
+            seen.setdefault("asked", (u, w, relevance_computed, exclude)) and {"bob": (0.5, 3.0)})
     monkeypatch.setattr(rd, "compute_scores", lambda **kw: seen.setdefault("kw", kw) and pd.DataFrame())
     monkeypatch.setattr(rd, "write_feed_cache", lambda *a, **k: None)
-    rd._rank_user(MagicMock(), "alice", _feed(), {}, {}, "x", weights)
+    rd._rank_user(MagicMock(), "alice", _feed(), vecs or {}, {}, "x", weights)
     return seen
 
 
-def test_a_version_with_affinity_reads_stores_and_scores_it(monkeypatch):
-    seen = _rank(monkeypatch, V14)
-    assert seen["read"] == ("alice", V14)
-    assert seen["written"] == ("alice", {"bob": (0.5, 3.0)})
+def test_the_ranker_asks_for_affinity_and_scores_with_it(monkeypatch):
+    seen = _rank(monkeypatch, V14, vector=_USER, vecs=_VECS)
+    assert seen["asked"] == ("alice", V14, True, rd.EXCLUDED_AUTHORS)
     assert seen["kw"]["author_affinity"] == {"bob": (0.5, 3.0)}
 
 
-def test_a_version_without_it_neither_reads_nor_stores(monkeypatch):
-    seen = _rank(monkeypatch, V13)
-    assert "read" not in seen and "written" not in seen
-    assert seen["kw"]["author_affinity"] is None
+@pytest.mark.parametrize("vector, vecs", [(None, _VECS), (_USER, {})])
+def test_the_ranker_says_when_relevance_is_not_computed(monkeypatch, vector, vecs):
+    # The test compute_scores makes: an interest vector AND post embeddings.
+    assert _rank(monkeypatch, V14, vector=vector, vecs=vecs)["asked"][2] is False

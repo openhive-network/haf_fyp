@@ -1263,11 +1263,14 @@ def _rank_user(
             if user_vector is not None:
                 write_user_vector(conn, username, user_vector, 0, sorted(engaged))
 
-    # #117: only a version that uses it reads and stores the reader's author affinity.
-    author_affinity = None
-    if weights.get("author_affinity"):
-        author_affinity = affinity.author_affinity(conn, username, weights)
-        affinity.write_author_affinity(conn, username, author_affinity)
+    # #117: read and stored only where compute_scores applies it -- a version that sets
+    # author_affinity, and relevance computed (the same test as compute_scores') -- so
+    # a 1.4.0 feed ranked without embeddings leaves no affinity behind.
+    author_affinity = affinity.for_reader(
+        conn, username, weights,
+        relevance_computed=user_vector is not None and bool(post_vectors),
+        exclude=EXCLUDED_AUTHORS,
+    )
 
     scored = compute_scores(
         candidates=candidates,
