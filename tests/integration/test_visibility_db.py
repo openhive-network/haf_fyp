@@ -74,6 +74,11 @@ INSERT INTO hivemind_app.blacklisted VALUES (2, 17, 100);
 """
 
 
+# Every account above. The reads are asked about the candidates' authors (#118); asked
+# about all of them, they return the whole of each list.
+EVERYONE = [1, 2, 3, 4, 10, 11, 12, 13, 14, 15, 16, 17]
+
+
 def _connect():
     return psycopg2.connect(
         host=os.environ.get("POSTGRES_HOST", "haf"),
@@ -120,40 +125,60 @@ def _hivemind_exists(cur):
 
 
 def test_the_reader_hides_its_own_mutes_and_those_of_the_lists_it_follows(conn) -> None:
-    assert visibility.muted_authors(conn, "reader") == {"mutedbyreader", "mutedbylist", "listkeeperalso"}
+    assert visibility.muted_authors(conn, "reader", EVERYONE) == {"mutedbyreader", "mutedbylist", "listkeeperalso"}
 
 
 def test_a_list_is_followed_one_way(conn) -> None:
     # The stranger follows the reader's list, so the stranger hides the reader's mute
     # as well as its own; the reader hides nothing of the stranger's.
-    assert visibility.muted_authors(conn, "stranger") == {"mutedbystranger", "mutedbyreader"}
-    assert "mutedbystranger" not in visibility.muted_authors(conn, "reader")
+    assert visibility.muted_authors(conn, "stranger", EVERYONE) == {"mutedbystranger", "mutedbyreader"}
+    assert "mutedbystranger" not in visibility.muted_authors(conn, "reader", EVERYONE)
 
 
 def test_a_blacklist_is_not_a_mute(conn) -> None:
-    assert "blacklisted.one" not in visibility.muted_authors(conn, "reader")
+    assert "blacklisted.one" not in visibility.muted_authors(conn, "reader", EVERYONE)
 
 
 def test_an_account_hivemind_does_not_know_hides_nothing(conn) -> None:
-    assert visibility.muted_authors(conn, "nobody") == set()
-    assert visibility.blacklisted_authors(conn, "nobody") == set()
+    assert visibility.muted_authors(conn, "nobody", EVERYONE) == set()
+    assert visibility.blacklisted_authors(conn, "nobody", EVERYONE) == set()
 
 
 def test_the_reader_hides_its_own_blacklist_and_those_of_the_lists_it_follows(conn) -> None:
-    assert visibility.blacklisted_authors(conn, "reader") == {"blacklisted.one", "blbylist"}
+    assert visibility.blacklisted_authors(conn, "reader", EVERYONE) == {"blacklisted.one", "blbylist"}
 
 
 def test_a_blacklist_is_followed_one_way(conn) -> None:
-    assert visibility.blacklisted_authors(conn, "stranger") == {"blbystranger", "blacklisted.one"}
-    assert "blbystranger" not in visibility.blacklisted_authors(conn, "reader")
+    assert visibility.blacklisted_authors(conn, "stranger", EVERYONE) == {"blbystranger", "blacklisted.one"}
+    assert "blbystranger" not in visibility.blacklisted_authors(conn, "reader", EVERYONE)
 
 
 def test_a_mute_is_not_a_blacklist_and_the_two_kinds_of_list_stay_apart(conn) -> None:
-    blacklisted = visibility.blacklisted_authors(conn, "reader")
+    blacklisted = visibility.blacklisted_authors(conn, "reader", EVERYONE)
     assert "mutedbyreader" not in blacklisted and "mutedbylist" not in blacklisted
     # The reader follows listkeeper's mute list, not its blacklist.
     assert "blbymutekeeper" not in blacklisted
-    assert "blbymutekeeper" not in visibility.muted_authors(conn, "reader")
+    assert "blbymutekeeper" not in visibility.muted_authors(conn, "reader", EVERYONE)
+
+
+def test_only_the_candidates_authors_are_reported(conn) -> None:
+    """#118: a listed author who wrote none of the candidates is not read back, whichever
+    list names them; an id hivemind does not have is not an author of anyone's list."""
+    # mutedbyreader (10, direct) and mutedbylist (11, through listkeeper's list) are
+    # candidates, listkeeperalso (14) is not; nor is blbylist (15).
+    assert visibility.muted_authors(conn, "reader", [10, 11, 12, 99]) == {"mutedbyreader", "mutedbylist"}
+    assert visibility.muted_authors(conn, "reader", [14]) == {"listkeeperalso"}
+    assert visibility.muted_authors(conn, "reader", [12, 15, 99]) == set()
+    assert visibility.blacklisted_authors(conn, "reader", [15, 10]) == {"blbylist"}
+    assert visibility.blacklisted_authors(conn, "reader", [13]) == {"blacklisted.one"}
+    assert visibility.blacklisted_authors(conn, "reader", [16, 17, 10, 99]) == set()
+
+
+def test_an_author_on_two_lists_is_reported_once(conn) -> None:
+    with conn.cursor() as cur:
+        # The reader also mutes mutedbylist directly, as listkeeper's list does.
+        cur.execute("INSERT INTO hivemind_app.muted VALUES (1, 11, 101)")
+    assert visibility.muted_authors(conn, "reader", [11]) == {"mutedbylist"}
 
 
 def test_only_posts_and_authors_their_community_muted_are_left_out(conn) -> None:
@@ -221,6 +246,13 @@ def _candidates(conn, monkeypatch, excluded):
     return sorted(rd._fetch_candidates(conn)["post_id"].tolist())
 
 
+def test_the_candidates_carry_their_authors_hivemind_ids(conn, monkeypatch) -> None:
+    """The reader's mute and blacklist probes are asked by these ids (#118)."""
+    _candidates(conn, monkeypatch, ())
+    frame = rd._fetch_candidates(conn)
+    assert set(zip(frame["author"], frame["author_id"])) == {("ordinary", 30), ("peak.snaps", 32)}
+
+
 def test_the_candidates_leave_out_greyed_downvoted_nsfw_and_excluded_authors(conn, monkeypatch) -> None:
     # 602 greyed author, 603 and 608 downvoted to the line, 604 excluded, 606 deleted,
     # 610 and 611 NSFW.
@@ -279,7 +311,7 @@ def test_without_hivemind_the_reads_filter_nothing_and_the_session_carries_on(co
     with conn.cursor() as cur:
         cur.execute("DROP TABLE hivemind_app.muted")
     visibility._warned.clear()
-    assert visibility.muted_authors(conn, "reader") == set()
+    assert visibility.muted_authors(conn, "reader", EVERYONE) == set()
     # The failed read was rolled back, and the session still answers.
     with conn.cursor() as cur:
         cur.execute("SELECT 1")
