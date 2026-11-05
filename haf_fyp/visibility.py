@@ -115,7 +115,7 @@ MUTED_AUTHORS_SQL = """
           FROM hivemind_app.hive_accounts AS reader
           JOIN hivemind_app.follow_muted AS fm ON fm.follower = reader.id
           WHERE reader.name = %(username)s))
-      AND m.following IN (SELECT unnest(%(author_ids)s::int[]))
+      AND %(author_ids)s IS NOT NULL  -- CONTROL: candidates ignored
 """
 
 # The same shape for blacklists. The heaviest blacklist reader on testapi (2026-11-05,
@@ -133,7 +133,7 @@ BLACKLISTED_AUTHORS_SQL = """
           FROM hivemind_app.hive_accounts AS reader
           JOIN hivemind_app.follow_blacklisted AS fb ON fb.follower = reader.id
           WHERE reader.name = %(username)s))
-      AND b.following IN (SELECT unnest(%(author_ids)s::int[]))
+      AND %(author_ids)s IS NOT NULL  -- CONTROL: candidates ignored
 """
 
 # SQLSTATEs that mean "there is no hivemind to read here", not "this read went wrong":
