@@ -98,11 +98,11 @@ NSFW_SQL = """
 # follows (#118). The reader's id and the owners of the lists it follows are read first
 # (an InitPlan); their entries come from muted_pkey (follower, following) as ids only,
 # are matched to the candidates' authors, and only the matches are looked up by name.
-# Looking up every listed name was nearly all of the old cost. On testapi (2026-11-05,
-# 1,850 candidate authors), the heaviest mute reader (38,957 names through two followed
-# lists) went from 89-117 ms warm (1.37 s cold) to 9-10 ms; a reader with no list stays
-# at 1-2 ms. Probing the primary key once per candidate author instead was slower for
-# everyone: ~10 ms even with no list at all.
+# Looking up every listed name was nearly all of the old cost, so a long list now costs
+# an index scan of ids, not a name lookup per entry (timings in !147). Two forms measured
+# slower: probing the primary key once per candidate author (~10 ms even with no list),
+# and `= ANY(<ids>)`, whose literal the planner estimates element by element (7-8 ms of
+# planning for ~1,800 ids).
 MUTED_AUTHORS_SQL = """
     SELECT DISTINCT author.name
     FROM hivemind_app.muted AS m
@@ -118,9 +118,7 @@ MUTED_AUTHORS_SQL = """
       AND m.following IN (SELECT unnest(%(author_ids)s::int[]))
 """
 
-# The same shape for blacklists. The heaviest blacklist reader on testapi (2026-11-05,
-# 70,950 names through three followed lists) went from 150-230 ms warm (1.9 s cold,
-# 2026-11-03) to 9-10 ms.
+# The same shape for blacklists.
 BLACKLISTED_AUTHORS_SQL = """
     SELECT DISTINCT author.name
     FROM hivemind_app.blacklisted AS b
@@ -197,22 +195,28 @@ def nsfw_post_ids(conn, post_ids: list[int]) -> set[int]:
     return _read(conn, "NSFW marks", NSFW_SQL, {"post_ids": list(post_ids)})
 
 
+def _ints(ids) -> list[int]:
+    # Ids taken from a frame are numpy integers, which psycopg2 cannot adapt; that error
+    # carries no SQLSTATE, so _read would raise it for every account ranked.
+    return [int(i) for i in ids]
+
+
 def muted_authors(conn, username: str, author_ids: list[int]) -> set[str]:
     """Those of `author_ids` (hive_accounts ids) that `username` has muted, directly or
     through a mute list it follows, by name."""
-    if not author_ids:
+    ids = _ints(author_ids)
+    if not ids:
         return set()
-    return _read(conn, "accounts' mute lists", MUTED_AUTHORS_SQL,
-                 {"username": username, "author_ids": list(author_ids)})
+    return _read(conn, "accounts' mute lists", MUTED_AUTHORS_SQL, {"username": username, "author_ids": ids})
 
 
 def blacklisted_authors(conn, username: str, author_ids: list[int]) -> set[str]:
     """Those of `author_ids` that `username` has blacklisted, directly or through a
     blacklist it follows, by name."""
-    if not author_ids:
+    ids = _ints(author_ids)
+    if not ids:
         return set()
-    return _read(conn, "accounts' blacklists", BLACKLISTED_AUTHORS_SQL,
-                 {"username": username, "author_ids": list(author_ids)})
+    return _read(conn, "accounts' blacklists", BLACKLISTED_AUTHORS_SQL, {"username": username, "author_ids": ids})
 
 
 def without(candidates: pd.DataFrame, post_ids: set | None = None, authors: set | None = None) -> pd.DataFrame:

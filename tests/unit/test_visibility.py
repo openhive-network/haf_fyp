@@ -116,6 +116,17 @@ def test_blacklisted_authors_are_asked_for_the_reader_and_the_candidates_authors
 
 
 @pytest.mark.parametrize("read", [visibility.muted_authors, visibility.blacklisted_authors])
+def test_ids_taken_from_a_frame_are_sent_as_ints_psycopg2_can_adapt(read):
+    import psycopg2.extensions
+
+    conn, cur = _conn()
+    read(conn, "alice", _frame()["author_id"].unique())
+    ids = cur.execute.call_args.args[1]["author_ids"]
+    assert ids == [11, 12, 13] and all(type(i) is int for i in ids)
+    psycopg2.extensions.adapt(ids).getquoted()  # numpy integers raise here
+
+
+@pytest.mark.parametrize("read", [visibility.muted_authors, visibility.blacklisted_authors])
 def test_no_candidate_authors_no_query(read):
     conn, cur = _conn()
     assert read(conn, "alice", []) == set()

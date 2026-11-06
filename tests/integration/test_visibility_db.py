@@ -172,6 +172,10 @@ def test_only_the_candidates_authors_are_reported(conn) -> None:
     assert visibility.blacklisted_authors(conn, "reader", [15, 10]) == {"blbylist"}
     assert visibility.blacklisted_authors(conn, "reader", [13]) == {"blacklisted.one"}
     assert visibility.blacklisted_authors(conn, "reader", [16, 17, 10, 99]) == set()
+    # The lists' owners (the reader, listkeeper, blkeeper) are on none of them: the
+    # candidates are matched to the listed accounts, never to who listed them.
+    assert visibility.muted_authors(conn, "reader", [1, 2, 4]) == set()
+    assert visibility.blacklisted_authors(conn, "reader", [1, 2, 4]) == set()
 
 
 def test_an_author_on_two_lists_is_reported_once(conn) -> None:
@@ -179,6 +183,10 @@ def test_an_author_on_two_lists_is_reported_once(conn) -> None:
         # The reader also mutes mutedbylist directly, as listkeeper's list does.
         cur.execute("INSERT INTO hivemind_app.muted VALUES (1, 11, 101)")
     assert visibility.muted_authors(conn, "reader", [11]) == {"mutedbylist"}
+    # The read builds a set, so the rows themselves show the DISTINCT.
+    with conn.cursor() as cur:
+        cur.execute(visibility.MUTED_AUTHORS_SQL, {"username": "reader", "author_ids": [11]})
+        assert cur.fetchall() == [("mutedbylist",)]
 
 
 def test_only_posts_and_authors_their_community_muted_are_left_out(conn) -> None:
