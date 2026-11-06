@@ -122,7 +122,7 @@ SELECT
     '1.4.1' AS version,
     'As 1.4.0, with twice the share of relevance headroom given to reader-to-author '
     'affinity (0.60, not 0.30) (#117)' AS description,
-    v.weights || '{"author_affinity": 0.60}'::jsonb AS weights,
+    v.weights || '{"author_affinity": 0.30}'::jsonb AS weights,
     -- After 1.4.0 even within one transaction: list_algorithm_versions orders by it.
     CLOCK_TIMESTAMP() AS deployed_at,
     FALSE AS is_active
