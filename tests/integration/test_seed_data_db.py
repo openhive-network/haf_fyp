@@ -5,7 +5,8 @@ one active version; its weights are the node's 1.1.0 weights plus boost_rescale.
 install lane sees a fresh database and then the operator's own choice (tests/ci_install_age.sql); here the seed also meets the databases nodes have
 today -- the pre-1.3.0 seed with 1.1.0 active, or with another version chosen -- and an
 operator who goes back to 1.1.0 after 1.3.0 took over. 1.4.0 (#117) is 1.3.0 plus the
-author affinity settings, and is registered inactive: it never takes over.
+author affinity settings, and is registered inactive: it never takes over. 1.4.1 is 1.4.0
+with author_affinity 0.60, and is registered inactive too.
 
 What runs is the table and the seed as written in db/create_tables.sql and
 db/seed_data.sql, re-homed into a throwaway schema. Both are schema-qualified
@@ -94,7 +95,7 @@ def _choose(cur: cursor, version: str) -> None:
 
 def test_fresh_install_activates_1_3_0(cur: cursor) -> None:
     cur.execute(_seed())
-    assert _versions(cur) == ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"]
+    assert _versions(cur) == ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.4.1"]
     assert _active(cur) == ["1.3.0"]
 
 
@@ -144,7 +145,7 @@ def test_upgrade_keeps_another_chosen_version(cur: cursor, chosen: str) -> None:
     cur.execute(_seed_before_1_3_0())
     _choose(cur, chosen)
     cur.execute(_seed())
-    assert _versions(cur) == ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"]
+    assert _versions(cur) == ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.4.1"]
     assert _active(cur) == [chosen]
 
 
@@ -166,7 +167,7 @@ def test_upgrade_with_none_active_changes_nothing(cur: cursor) -> None:
 def test_rerun_with_1_3_0_active_changes_nothing(cur: cursor) -> None:
     cur.execute(_seed())
     cur.execute(_seed())
-    assert _versions(cur) == ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"]
+    assert _versions(cur) == ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.4.1"]
     assert _active(cur) == ["1.3.0"]
 
 
@@ -174,7 +175,7 @@ def test_going_back_to_1_1_0_survives_the_next_install(cur: cursor) -> None:
     cur.execute(_seed())
     _choose(cur, "1.1.0")
     cur.execute(_seed())
-    assert _versions(cur) == ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"]
+    assert _versions(cur) == ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.4.1"]
     assert _active(cur) == ["1.1.0"]
 
 
@@ -193,10 +194,39 @@ def test_1_4_0_is_1_3_0_plus_affinity_and_inactive(cur: cursor) -> None:
     assert _active(cur) == ["1.3.0"]
 
 
-def test_1_4_0_is_listed_newest(cur: cursor) -> None:
+def test_1_4_1_then_1_4_0_are_listed_newest(cur: cursor) -> None:
     cur.execute(_seed())
-    cur.execute(f"SELECT version FROM {_SCHEMA}.algorithm_versions ORDER BY deployed_at DESC LIMIT 1")
-    assert cur.fetchone() == ("1.4.0",)
+    cur.execute(f"SELECT version FROM {_SCHEMA}.algorithm_versions ORDER BY deployed_at DESC LIMIT 3")
+    assert [r[0] for r in cur.fetchall()] == ["1.4.1", "1.4.0", "1.3.0"]
+
+
+def test_1_4_1_is_1_4_0_with_twice_the_share_and_inactive(cur: cursor) -> None:
+    cur.execute(_seed())
+    assert _weights(cur, "1.4.1") == {**_weights(cur, "1.4.0"), "author_affinity": 0.60}
+    assert _active(cur) == ["1.3.0"]
+    cur.execute(f"SELECT description FROM {_SCHEMA}.algorithm_versions WHERE version = '1.4.1'")
+    assert "0.60" in cur.fetchone()[0]
+
+
+def test_1_4_1_takes_this_nodes_1_4_0_weights(cur: cursor) -> None:
+    # A node already on 1.4.0, tuned: 1.4.1 arrives with that tuning, and its own share.
+    cur.execute(_seed()[: _seed().index("-- 1.4.1 (#117)")])
+    _choose(cur, "1.4.0")
+    cur.execute(f"""UPDATE {_SCHEMA}.algorithm_versions
+                   SET weights = weights || '{{"affinity_half_at": 5, "author_affinity": 0.45}}'::jsonb
+                   WHERE version = '1.4.0'""")
+    cur.execute(_seed())
+    assert _weights(cur, "1.4.1") == {**_weights(cur, "1.4.0"), "author_affinity": 0.60}
+    assert _weights(cur, "1.4.1")["affinity_half_at"] == 5
+    assert _active(cur) == ["1.4.0"]
+
+
+def test_rerun_keeps_a_tuned_1_4_1(cur: cursor) -> None:
+    cur.execute(_seed())
+    cur.execute(f"""UPDATE {_SCHEMA}.algorithm_versions
+                   SET weights = weights || '{{"author_affinity": 0.50}}'::jsonb WHERE version = '1.4.1'""")
+    cur.execute(_seed())
+    assert _weights(cur, "1.4.1")["author_affinity"] == 0.50
 
 
 def test_1_4_0_takes_this_nodes_1_3_0_weights(cur: cursor) -> None:
@@ -214,5 +244,13 @@ def test_choosing_1_4_0_survives_the_next_install(cur: cursor) -> None:
     cur.execute(_seed())
     _choose(cur, "1.4.0")
     cur.execute(_seed())
-    assert _versions(cur) == ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"]
+    assert _versions(cur) == ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.4.1"]
     assert _active(cur) == ["1.4.0"]
+
+
+def test_choosing_1_4_1_survives_the_next_install(cur: cursor) -> None:
+    cur.execute(_seed())
+    _choose(cur, "1.4.1")
+    cur.execute(_seed())
+    assert _versions(cur) == ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.4.1"]
+    assert _active(cur) == ["1.4.1"]

@@ -27,7 +27,7 @@ vector measures from the latest vote or reblog, haf_fyp/embeddings.py), so a nod
 history trails real time still sees a reader's last month, and nothing counted is newer
 than the reference.
 
-Applied only by an algorithm version whose weights set `author_affinity` (1.4.0), and
+Applied only by an algorithm version whose weights set `author_affinity` (1.4.0, 1.4.1), and
 only where relevance is computed (an interest vector and post embeddings): elsewhere
 compute_scores drops relevance, and affinity with it, so it is neither read nor stored.
 In scoring it raises relevance, never lowers it: see scoring.compute_scores. Every author
@@ -36,7 +36,8 @@ the reader engaged with is scored; a failed read ranks the reader without it, as
 Stored per (reader, author) in haf_fyp_app.user_author_affinity each time it is applied,
 the whole set replaced, the strongest `affinity_max_authors` (default 200) authors only.
 The ranker never reads it back: it is there to inspect, and keeps the set of the last
-ranking under 1.4.0 until the account is ranked under it again or dropped.
+ranking under a version that sets it until the account is ranked under one again or
+dropped.
 """
 
 from __future__ import annotations

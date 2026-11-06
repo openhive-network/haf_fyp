@@ -859,15 +859,15 @@ BEGIN
     -- Seed data must not multiply on a second install, and must not take back a choice
     -- the operator made: tests/ci_install_age.sql activates the OLDEST version.
     SELECT count(*) INTO _n FROM haf_fyp_app.algorithm_versions;
-    IF _n <> 5 THEN
-        RAISE EXCEPTION 'algorithm_versions holds % rows, the seed has 5', _n;
+    IF _n <> 6 THEN
+        RAISE EXCEPTION 'algorithm_versions holds % rows, the seed has 6', _n;
     END IF;
-    -- On a first install, the seed by VALUE: five rows is also what a seed with one
+    -- On a first install, the seed by VALUE: six rows is also what a seed with one
     -- weight ten times too large has. (Later the weights are the operator's.) And the
     -- telemetry rollup starts from the beginning.
     IF current_setting('ci.phase') = 'first' THEN
         IF (SELECT md5(string_agg(v.version || ' ' || v.is_active || ' ' || v.weights::text, E'\n' ORDER BY v.version COLLATE "C"))
-            FROM haf_fyp_app.algorithm_versions AS v) IS DISTINCT FROM '9f08b3450f6d6eb3ffd28392fcb9d4fc' THEN
+            FROM haf_fyp_app.algorithm_versions AS v) IS DISTINCT FROM 'd8e1aae3f43fb30bc884167d5bb74e67' THEN
             RAISE EXCEPTION E'the seeded algorithm versions are not the ones tests/ci_install_verify.sql pins (db/seed_data.sql changed?). They read, as md5 %:\n%',
                 (SELECT md5(string_agg(v.version || ' ' || v.is_active || ' ' || v.weights::text, E'\n' ORDER BY v.version COLLATE "C"))
                  FROM haf_fyp_app.algorithm_versions AS v),
