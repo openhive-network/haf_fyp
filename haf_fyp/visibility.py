@@ -94,40 +94,44 @@ NSFW_SQL = """
                       WHERE pt.post_id = hp.id AND td.tag = 'nsfw'))
 """
 
-# One range read of the reader's mutes (muted_pkey leads with `follower`), plus one per
-# mute list the reader follows. A reader following a large list gets all of it: the
-# heaviest on testapi (2026-10-17) came back with 132,166 names in under a second.
+# Which of the candidates' authors the reader has muted, directly or through a mute list it
+# follows (#118). The reader's id and the owners of the lists it follows are read first
+# (an InitPlan); their entries come from muted_pkey (follower, following) as ids only,
+# are matched to the candidates' authors, and only the matches are looked up by name.
+# Looking up every listed name was nearly all of the old cost, so a long list now costs
+# an index scan of ids, not a name lookup per entry (timings in !147). Two forms measured
+# slower: probing the primary key once per candidate author (~10 ms even with no list),
+# and `= ANY(<ids>)`, whose literal the planner estimates element by element (7-8 ms of
+# planning for ~1,800 ids).
 MUTED_AUTHORS_SQL = """
-    SELECT author.name
-    FROM hivemind_app.hive_accounts AS reader
-    JOIN hivemind_app.muted AS m ON m.follower = reader.id
+    SELECT DISTINCT author.name
+    FROM hivemind_app.muted AS m
     JOIN hivemind_app.hive_accounts AS author ON author.id = m.following
-    WHERE reader.name = %(username)s
-    UNION
-    SELECT author.name
-    FROM hivemind_app.hive_accounts AS reader
-    JOIN hivemind_app.follow_muted AS fm ON fm.follower = reader.id
-    JOIN hivemind_app.muted AS m ON m.follower = fm.following
-    JOIN hivemind_app.hive_accounts AS author ON author.id = m.following
-    WHERE reader.name = %(username)s
+    WHERE m.follower = ANY(ARRAY(
+          SELECT reader.id FROM hivemind_app.hive_accounts AS reader
+          WHERE reader.name = %(username)s
+          UNION ALL
+          SELECT fm.following
+          FROM hivemind_app.hive_accounts AS reader
+          JOIN hivemind_app.follow_muted AS fm ON fm.follower = reader.id
+          WHERE reader.name = %(username)s))
+      AND m.following IN (SELECT unnest(%(author_ids)s::int[]))
 """
 
-# The same shape for blacklists. The heaviest reader on testapi (2026-11-03) follows three
-# lists naming 70,934 accounts: 1.9 s with a cold cache, nearly all of it looking up the
-# authors' names in hive_accounts.
+# The same shape for blacklists.
 BLACKLISTED_AUTHORS_SQL = """
-    SELECT author.name
-    FROM hivemind_app.hive_accounts AS reader
-    JOIN hivemind_app.blacklisted AS b ON b.follower = reader.id
+    SELECT DISTINCT author.name
+    FROM hivemind_app.blacklisted AS b
     JOIN hivemind_app.hive_accounts AS author ON author.id = b.following
-    WHERE reader.name = %(username)s
-    UNION
-    SELECT author.name
-    FROM hivemind_app.hive_accounts AS reader
-    JOIN hivemind_app.follow_blacklisted AS fb ON fb.follower = reader.id
-    JOIN hivemind_app.blacklisted AS b ON b.follower = fb.following
-    JOIN hivemind_app.hive_accounts AS author ON author.id = b.following
-    WHERE reader.name = %(username)s
+    WHERE b.follower = ANY(ARRAY(
+          SELECT reader.id FROM hivemind_app.hive_accounts AS reader
+          WHERE reader.name = %(username)s
+          UNION ALL
+          SELECT fb.following
+          FROM hivemind_app.hive_accounts AS reader
+          JOIN hivemind_app.follow_blacklisted AS fb ON fb.follower = reader.id
+          WHERE reader.name = %(username)s))
+      AND b.following IN (SELECT unnest(%(author_ids)s::int[]))
 """
 
 # SQLSTATEs that mean "there is no hivemind to read here", not "this read went wrong":
@@ -191,14 +195,28 @@ def nsfw_post_ids(conn, post_ids: list[int]) -> set[int]:
     return _read(conn, "NSFW marks", NSFW_SQL, {"post_ids": list(post_ids)})
 
 
-def muted_authors(conn, username: str) -> set[str]:
-    """Authors `username` has muted, directly or through a mute list it follows."""
-    return _read(conn, "accounts' mute lists", MUTED_AUTHORS_SQL, {"username": username})
+def _ints(ids) -> list[int]:
+    # Ids taken from a frame are numpy integers, which psycopg2 cannot adapt; that error
+    # carries no SQLSTATE, so _read would raise it for every account ranked.
+    return [int(i) for i in ids]
 
 
-def blacklisted_authors(conn, username: str) -> set[str]:
-    """Authors `username` has blacklisted, directly or through a blacklist it follows."""
-    return _read(conn, "accounts' blacklists", BLACKLISTED_AUTHORS_SQL, {"username": username})
+def muted_authors(conn, username: str, author_ids: list[int]) -> set[str]:
+    """Those of `author_ids` (hive_accounts ids) that `username` has muted, directly or
+    through a mute list it follows, by name."""
+    ids = _ints(author_ids)
+    if not ids:
+        return set()
+    return _read(conn, "accounts' mute lists", MUTED_AUTHORS_SQL, {"username": username, "author_ids": ids})
+
+
+def blacklisted_authors(conn, username: str, author_ids: list[int]) -> set[str]:
+    """Those of `author_ids` that `username` has blacklisted, directly or through a
+    blacklist it follows, by name."""
+    ids = _ints(author_ids)
+    if not ids:
+        return set()
+    return _read(conn, "accounts' blacklists", BLACKLISTED_AUTHORS_SQL, {"username": username, "author_ids": ids})
 
 
 def without(candidates: pd.DataFrame, post_ids: set | None = None, authors: set | None = None) -> pd.DataFrame:

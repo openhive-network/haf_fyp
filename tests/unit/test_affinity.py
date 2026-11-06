@@ -164,7 +164,7 @@ def test_a_lost_connection_is_raised(monkeypatch):
 def _feed():
     now = datetime.now(tz=timezone.utc).replace(tzinfo=None)
     return pd.DataFrame([
-        {"post_id": i, "author": a, "permlink": f"p{i}", "community_id": None, "created_at": now,
+        {"post_id": i, "author": a, "author_id": 100 + i, "permlink": f"p{i}", "community_id": None, "created_at": now,
          "unique_commenters": 1, "reblog_count": 0, "net_rshares": 0, "vote_count": 1}
         for i, a in enumerate(["liked", "stranger", "liked2"])
     ])
@@ -248,8 +248,8 @@ rd = pytest.importorskip("haf_fyp.ranker_daemon")
 
 def _rank(monkeypatch, weights, vector=None, vecs=None):
     seen = {}
-    monkeypatch.setattr(rd.visibility, "muted_authors", lambda _c, _u: set())
-    monkeypatch.setattr(rd.visibility, "blacklisted_authors", lambda _c, _u: set())
+    monkeypatch.setattr(rd.visibility, "muted_authors", lambda _c, _u, _ids: set())
+    monkeypatch.setattr(rd.visibility, "blacklisted_authors", lambda _c, _u, _ids: set())
     monkeypatch.setattr(rd, "fetch_user_communities", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_user_interests", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_top_communities", lambda _c, _u: [])

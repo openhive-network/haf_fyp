@@ -845,6 +845,7 @@ def _fetch_candidates(conn) -> pd.DataFrame:
             SELECT
                 pc.post_id,
                 ha.name AS author,
+                ha.id AS author_id,  -- #118: the reader's mute and blacklist probes
                 pc.community_id,
                 pc.created_at,
                 COALESCE(em.unique_commenters, 0) AS unique_commenters,
@@ -1242,8 +1243,11 @@ def _rank_user(
     # #89, #113: nothing by an author this account has muted or blacklisted, directly
     # or through a list it follows; never its own posts, even if a list it follows names
     # it (as the global feed does, #114). Before scoring, so that the diversity cap and
-    # the 200-post cut are made over what the account can actually be shown.
-    hidden = visibility.muted_authors(conn, username) | visibility.blacklisted_authors(conn, username)
+    # the 200-post cut are made over what the account can actually be shown. Asked only
+    # about the candidates' authors, so a long list costs no name lookups (#118).
+    author_ids = candidates["author_id"].unique().tolist()
+    hidden = (visibility.muted_authors(conn, username, author_ids)
+              | visibility.blacklisted_authors(conn, username, author_ids))
     hidden.discard(username)
     candidates = visibility.without(candidates, authors=hidden)
     # Explicit communities (on-chain subscriptions + declared interests) get the
