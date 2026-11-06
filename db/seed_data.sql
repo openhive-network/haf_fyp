@@ -113,15 +113,15 @@ FROM haf_fyp_app.algorithm_versions AS v
 WHERE v.version = '1.3.0'
 ON CONFLICT (version) DO NOTHING;
 
--- 1.4.1 (#117): 1.4.0 with twice the affinity share (author_affinity 0.60, not 0.30).
--- A dry run of 1.4.0 on a live node left most top-20s as 1.3.0 ranks them: relevance
--- there is already about 0.7, so 0.30 of the headroom moves little. Registered
--- INACTIVE, like 1.4.0. Its weights are this node's 1.4.0 weights when it is registered.
+-- 1.4.1 (#117): 1.4.0 with author_affinity 0.60 (1.4.0 ships 0.30). A dry run of 1.4.0
+-- on a live node kept the same 20 posts in most top-20s: relevance there is already
+-- about 0.7, so 0.30 of the headroom moves little. Registered INACTIVE, like 1.4.0. Its
+-- weights are this node's 1.4.0 weights when it is registered, with the share set to 0.60.
 INSERT INTO haf_fyp_app.algorithm_versions (version, description, weights, deployed_at, is_active)
 SELECT
     '1.4.1' AS version,
-    'As 1.4.0, with twice the share of relevance headroom given to reader-to-author '
-    'affinity (0.60, not 0.30) (#117)' AS description,
+    'As 1.4.0, with 0.60 of relevance headroom given to reader-to-author affinity '
+    '(1.4.0 ships 0.30) (#117)' AS description,
     v.weights || '{"author_affinity": 0.60}'::jsonb AS weights,
     -- After 1.4.0 even within one transaction: list_algorithm_versions orders by it.
     CLOCK_TIMESTAMP() AS deployed_at,

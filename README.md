@@ -690,18 +690,21 @@ weights (`author_affinity`, `affinity_days`, `affinity_half_life_days`,
 only once the ranker runs this release: an older ranker ignores `author_affinity`, ranks
 exactly as 1.3.0 and labels its feeds 1.4.0. One version is active at a time, so the
 comparison is of one period against another. The table is never read back by the
-ranker; it keeps each reader's set from its last ranking under 1.4.0.
+ranker; it keeps each reader's set from its last ranking under a version that sets
+`author_affinity` (1.4.0, 1.4.1).
 
-**Version 1.4.1** (registered inactive, #117) — 1.4.0 with twice the affinity share:
+**Version 1.4.1** (registered inactive, #117) — 1.4.0 with the affinity share doubled:
 `author_affinity` 0.60 instead of 0.30, everything else as the node's 1.4.0. Relevance
-at the top of a feed is already about 0.7, so 0.30 of the headroom moves little: in a
-dry run over 136 live readers, 1.4.0 left 79 top-20s exactly as 1.3.0 ranks them, and
-0.60 left 54. Like 1.4.0 it is activated with `POST /v1/fyp/admin/algorithm`, stores
-affinity in the same table, and needs a ranker that runs 1.4.0's code or later.
+at the top of a feed is already about 0.7, so 0.30 of the headroom moves little. In a
+dry run over the 136 cached readers with affinity data on testapi, 1.4.0 kept the same
+20 posts as 1.3.0 in 79 top-20s, and 0.60 in 54; the posts swapped into top-20s about
+doubled (101 to 214). Like 1.4.0 it is activated with `POST /v1/fyp/admin/algorithm`
+and stores affinity in the same table. It needs a ranker that runs 1.4.0's code or
+later: an older one ranks exactly as 1.3.0 and labels its feeds 1.4.1.
 
 | Signal | Range | Source |
 |--------|-------|--------|
-| `relevance` | [0, 1] | Cosine similarity: post embedding vs user interest vector (HiveSense 1024-dim); under 1.4.0 raised by author affinity |
+| `relevance` | [0, 1] | Cosine similarity: post embedding vs user interest vector (HiveSense 1024-dim); under 1.4.0 and 1.4.1 raised by author affinity |
 | `recency` | [0, 1] | `exp(−ln2 × age_hours / 24)` — 24-hour half-life |
 | `engagement` | [0, 1] | Sigmoid-normalised unique commenters + reblogs + net rshares |
 | `credibility` | [0, 1] | 0.6 × normalised reputation + 0.4 × log-normalised VESTS |

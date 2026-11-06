@@ -204,6 +204,8 @@ def test_1_4_1_is_1_4_0_with_twice_the_share_and_inactive(cur: cursor) -> None:
     cur.execute(_seed())
     assert _weights(cur, "1.4.1") == {**_weights(cur, "1.4.0"), "author_affinity": 0.60}
     assert _active(cur) == ["1.3.0"]
+    cur.execute(f"SELECT description FROM {_SCHEMA}.algorithm_versions WHERE version = '1.4.1'")
+    assert "0.60" in cur.fetchone()[0]
 
 
 def test_1_4_1_takes_this_nodes_1_4_0_weights(cur: cursor) -> None:
