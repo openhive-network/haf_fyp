@@ -144,7 +144,7 @@ def conn(db):
 # The race, against the shipped file
 # ---------------------------------------------------------------------------
 
-def _churn(stop_at):
+def _churn(stop_at) -> None:
     """GRANT/REVOKE on every hivemind_app table until stop_at, as another app's installer
     or maintenance would. Its own conflicts are expected and ignored."""
     c = _connect(TEST_DB)
@@ -215,7 +215,7 @@ def _many_tables(conn: connection) -> None:
             % CHURN_TABLES)
 
 
-def test_negative_control_bare_grant_hits_the_conflict(conn):
+def test_negative_control_bare_grant_hits_the_conflict(conn) -> None:
     """Without a retry, the same churn breaks a bare GRANT. If this ever passes, the
     harness has stopped reproducing #90 and the test below proves nothing. Both ways the
     race ends count: the conflict, and (PostgreSQL 17) a deadlock."""
@@ -237,7 +237,7 @@ def test_negative_control_bare_grant_hits_the_conflict(conn):
     assert conflicts + deadlocks >= 1
 
 
-def test_shipped_file_survives_a_concurrent_grant_writer(conn):
+def test_shipped_file_survives_a_concurrent_grant_writer(conn) -> None:
     _many_tables(conn)
     statements = _statements(open(GRANTS_SQL, encoding="utf-8").read())
     retries = 0
@@ -351,7 +351,7 @@ def _run_injected(conn, schema, code, message, fail_times):
 
 @pytest.mark.parametrize("schema", LOOP_SCHEMAS)
 @pytest.mark.parametrize("code,message", RETRIED)
-def test_conflict_is_retried_with_backoff_then_succeeds(conn, schema, code, message):
+def test_conflict_is_retried_with_backoff_then_succeeds(conn, schema, code, message) -> None:
     err, attempts, elapsed, notices = _run_injected(conn, schema, code, message, fail_times=2)
     assert err is None, err
     assert attempts == 3
@@ -362,7 +362,7 @@ def test_conflict_is_retried_with_backoff_then_succeeds(conn, schema, code, mess
 
 @pytest.mark.parametrize("schema", LOOP_SCHEMAS)
 @pytest.mark.parametrize("code,message", RETRIED)
-def test_conflict_is_reraised_after_the_last_attempt(conn, schema, code, message):
+def test_conflict_is_reraised_after_the_last_attempt(conn, schema, code, message) -> None:
     err, attempts, elapsed, _ = _run_injected(conn, schema, code, message, fail_times=99)
     assert err is not None and err.pgcode == code and message in str(err)
     assert attempts == MAX_ATTEMPTS
@@ -377,7 +377,7 @@ def test_conflict_is_reraised_after_the_last_attempt(conn, schema, code, message
     ("55P03", CONFLICT),
     ("42501", "permission denied for table t1"),
 ])
-def test_any_other_error_fails_on_the_first_attempt(conn, schema, code, message):
+def test_any_other_error_fails_on_the_first_attempt(conn, schema, code, message) -> None:
     err, attempts, elapsed, notices = _run_injected(conn, schema, code, message, fail_times=99)
     assert err is not None and err.pgcode == code, err
     assert attempts == 1
@@ -385,7 +385,7 @@ def test_any_other_error_fails_on_the_first_attempt(conn, schema, code, message)
     assert elapsed < 0.5
 
 
-def test_second_guard_in_the_balance_block_counts_its_own_attempts(conn):
+def test_second_guard_in_the_balance_block_counts_its_own_attempts(conn) -> None:
     """btracker_backend and hafbe_bal share one DO block. A conflict retried in the first
     loop must not eat into the second loop's five attempts."""
     sql = open(GRANTS_SQL, encoding="utf-8").read()
