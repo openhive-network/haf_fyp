@@ -13,8 +13,10 @@ GRANTS_SQL = os.path.join(os.path.dirname(__file__), "..", "..", "db", "cross_sc
 
 HANDLER = (
     "EXCEPTION WHEN internal_error OR deadlock_detected THEN\n"
-    "{pad}        IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated')"
-    " OR _attempt >= _max_attempts THEN\n"
+    "{pad}        IF (SQLSTATE = 'XX000'\n"
+    "{pad}            AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')\n"
+    "{pad}            AND SQLERRM NOT LIKE 'cache lookup failed for relation %')\n"
+    "{pad}           OR _attempt >= _max_attempts THEN\n"
     "{pad}            RAISE;\n"
     "{pad}        END IF;\n"
 )
@@ -39,12 +41,12 @@ def _grant_blocks():
     return [b for b in _do_blocks() if re.search(r"^\s*GRANT ", b, re.M)]
 
 
-def test_no_grant_runs_outside_a_do_block():
+def test_no_grant_runs_outside_a_do_block() -> None:
     outside = re.sub(r"(?ms)^DO \$\$\n.*?^\$\$;", "", _sql())
     assert not re.search(r"^\s*GRANT ", outside, re.M)
 
 
-def test_every_grant_block_declares_five_attempts():
+def test_every_grant_block_declares_five_attempts() -> None:
     assert len(_guarded_blocks()) == 6
     blocks = _grant_blocks()
     assert len(blocks) == 7
@@ -54,7 +56,7 @@ def test_every_grant_block_declares_five_attempts():
         assert "_attempt      int := 0;" in b
 
 
-def test_every_grant_in_a_block_is_inside_a_retry_loop():
+def test_every_grant_in_a_block_is_inside_a_retry_loop() -> None:
     loops = 0
     for b in _grant_blocks():
         # Split into retry loops and what is outside them; no GRANT may be outside.
@@ -72,7 +74,7 @@ def test_every_grant_in_a_block_is_inside_a_retry_loop():
     assert loops == 8
 
 
-def test_handler_catches_only_the_two_conflict_errors():
+def test_handler_catches_only_the_two_conflict_errors() -> None:
     sql = _sql()
     handlers = re.findall(r"EXCEPTION WHEN ([^\n]*) THEN", sql)
     # 8 retry loops + the self-heal pass's insufficient_privilege fallback; nothing wider.
@@ -81,7 +83,7 @@ def test_handler_catches_only_the_two_conflict_errors():
     assert sorted(set(handlers)) == ["insufficient_privilege", "internal_error OR deadlock_detected"]
 
 
-def test_attempt_counter_is_reset_for_the_second_guard_of_the_balance_block():
+def test_attempt_counter_is_reset_for_the_second_guard_of_the_balance_block() -> None:
     (block,) = [b for b in _guarded_blocks() if "'hafbe_bal'" in b]
     before_hafbe = block.split("schema_name = 'hafbe_bal'")[0]
     assert before_hafbe.rstrip().endswith(
@@ -89,7 +91,7 @@ def test_attempt_counter_is_reset_for_the_second_guard_of_the_balance_block():
     )
 
 
-def test_success_notices_stay_after_the_loop():
+def test_success_notices_stay_after_the_loop() -> None:
     # One success line per schema, printed once even when a block retried.
     for b in _grant_blocks():
         for m in re.finditer(r"(?ms)^(\s*)LOOP\n.*?^\1END LOOP;", b):
