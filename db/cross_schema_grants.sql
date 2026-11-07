@@ -34,20 +34,26 @@
 -- Concurrent catalog updates (#90): GRANT ... ON ALL TABLES IN SCHEMA s rewrites the
 -- pg_class row (relacl) of every table in s. When another session updates one of those
 -- same rows at the same moment -- another app's installer granting on its own schema,
--- that app's own maintenance -- PostgreSQL raises XX000 "tuple concurrently updated",
--- or, when the two sessions reach the rows in a different order, 40P01 "deadlock
+-- that app's own maintenance -- PostgreSQL raises XX000 "tuple concurrently updated".
+-- When another session drops one of those tables meanwhile -- an app's block processing
+-- -- the same race raises XX000 "tuple concurrently deleted" when the drop is still in
+-- flight as GRANT reaches the row, or XX000 "cache lookup failed for relation N" when
+-- the drop committed between GRANT listing the schema's tables and looking that one up
+-- (#119; under a create/drop loop the second is the more frequent). When the two
+-- sessions reach the rows in a different order, the race ends in 40P01 "deadlock
 -- detected" (seen on PostgreSQL 17, which HAF 1.28.8 runs). psql runs this file with
 -- ON_ERROR_STOP, so one such collision used to fail the whole install (exit 3) although
 -- a retry seconds later succeeds. Each schema-guarded block below, and the hafd grants
--- after them, therefore run their grants in a retry loop: up to 5 attempts, each in its own subtransaction (the
--- BEGIN ... EXCEPTION block, whose rollback releases the row and tuple locks the
--- attempt took), sleeping 0.5 s, 1 s, 2 s, 4 s between them. ONLY those two errors are
--- retried: the handler catches internal_error (XX000) and deadlock_detected (40P01),
--- re-raises an XX000 unless SQLERRM is exactly 'tuple concurrently updated', and
--- re-raises either after the last attempt, so every other failure still reaches
--- ON_ERROR_STOP at once. The grants are idempotent, so repeating them after a
--- rolled-back attempt is safe. The success NOTICE stays after the loop, so a retried
--- block still prints it exactly once.
+-- after them, therefore run their grants in a retry loop: up to 5 attempts, each in its
+-- own subtransaction (the BEGIN ... EXCEPTION block, whose rollback releases the row and
+-- tuple locks the attempt took), sleeping 0.5 s, 1 s, 2 s, 4 s between them. ONLY those
+-- conflicts are retried: the handler catches internal_error (XX000) and
+-- deadlock_detected (40P01), re-raises an XX000 unless SQLERRM is exactly 'tuple
+-- concurrently updated' or 'tuple concurrently deleted', or starts with 'cache lookup
+-- failed for relation ', and re-raises any of them after the last attempt, so every
+-- other failure still reaches ON_ERROR_STOP at once. The grants are idempotent, so
+-- repeating them after a rolled-back attempt is safe. The success NOTICE stays after
+-- the loop, so a retried block still prints it exactly once.
 
 DO $$
 DECLARE
@@ -65,7 +71,10 @@ BEGIN
                 GRANT SELECT ON ALL TABLES IN SCHEMA hivesense_app TO haf_fyp_user, haf_fyp_owner;
                 EXIT;
             EXCEPTION WHEN internal_error OR deadlock_detected THEN
-                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
+                IF (SQLSTATE = 'XX000'
+                    AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
+                    AND SQLERRM NOT LIKE 'cache lookup failed for relation %')
+                   OR _attempt >= _max_attempts THEN
                     RAISE;
                 END IF;
                 RAISE NOTICE 'hivesense_app: % (attempt % of %), retrying in % s',
@@ -114,7 +123,10 @@ BEGIN
                 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_app TO haf_fyp_owner;
                 EXIT;
             EXCEPTION WHEN internal_error OR deadlock_detected THEN
-                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
+                IF (SQLSTATE = 'XX000'
+                    AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
+                    AND SQLERRM NOT LIKE 'cache lookup failed for relation %')
+                   OR _attempt >= _max_attempts THEN
                     RAISE;
                 END IF;
                 RAISE NOTICE 'hivemind_app: % (attempt % of %), retrying in % s',
@@ -162,7 +174,10 @@ BEGIN
                 GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
                 EXIT;
             EXCEPTION WHEN internal_error OR deadlock_detected THEN
-                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
+                IF (SQLSTATE = 'XX000'
+                    AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
+                    AND SQLERRM NOT LIKE 'cache lookup failed for relation %')
+                   OR _attempt >= _max_attempts THEN
                     RAISE;
                 END IF;
                 RAISE NOTICE 'hivemind_postgrest_utilities: % (attempt % of %), retrying in % s',
@@ -193,7 +208,10 @@ BEGIN
                 GRANT SELECT ON ALL TABLES IN SCHEMA reptracker_app TO haf_fyp_user, haf_fyp_owner;
                 EXIT;
             EXCEPTION WHEN internal_error OR deadlock_detected THEN
-                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
+                IF (SQLSTATE = 'XX000'
+                    AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
+                    AND SQLERRM NOT LIKE 'cache lookup failed for relation %')
+                   OR _attempt >= _max_attempts THEN
                     RAISE;
                 END IF;
                 RAISE NOTICE 'reptracker_app: % (attempt % of %), retrying in % s',
@@ -224,7 +242,10 @@ BEGIN
                 GRANT SELECT ON ALL TABLES IN SCHEMA btracker_app TO haf_fyp_user, haf_fyp_owner;
                 EXIT;
             EXCEPTION WHEN internal_error OR deadlock_detected THEN
-                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
+                IF (SQLSTATE = 'XX000'
+                    AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
+                    AND SQLERRM NOT LIKE 'cache lookup failed for relation %')
+                   OR _attempt >= _max_attempts THEN
                     RAISE;
                 END IF;
                 RAISE NOTICE 'btracker_app: % (attempt % of %), retrying in % s',
@@ -259,7 +280,10 @@ BEGIN
                 GRANT SELECT ON ALL TABLES IN SCHEMA btracker_backend TO haf_fyp_user, haf_fyp_owner;
                 EXIT;
             EXCEPTION WHEN internal_error OR deadlock_detected THEN
-                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
+                IF (SQLSTATE = 'XX000'
+                    AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
+                    AND SQLERRM NOT LIKE 'cache lookup failed for relation %')
+                   OR _attempt >= _max_attempts THEN
                     RAISE;
                 END IF;
                 RAISE NOTICE 'btracker_backend: % (attempt % of %), retrying in % s',
@@ -281,7 +305,10 @@ BEGIN
                 GRANT SELECT ON ALL TABLES IN SCHEMA hafbe_bal TO haf_fyp_user, haf_fyp_owner;
                 EXIT;
             EXCEPTION WHEN internal_error OR deadlock_detected THEN
-                IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
+                IF (SQLSTATE = 'XX000'
+                    AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
+                    AND SQLERRM NOT LIKE 'cache lookup failed for relation %')
+                   OR _attempt >= _max_attempts THEN
                     RAISE;
                 END IF;
                 RAISE NOTICE 'hafbe_bal: % (attempt % of %), retrying in % s',
@@ -326,7 +353,10 @@ BEGIN
             GRANT SELECT ON hafd.accounts TO haf_fyp_user;
             EXIT;
         EXCEPTION WHEN internal_error OR deadlock_detected THEN
-            IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated') OR _attempt >= _max_attempts THEN
+            IF (SQLSTATE = 'XX000'
+                AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
+                AND SQLERRM NOT LIKE 'cache lookup failed for relation %')
+               OR _attempt >= _max_attempts THEN
                 RAISE;
             END IF;
             RAISE NOTICE 'hafd: % (attempt % of %), retrying in % s',

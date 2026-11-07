@@ -13,8 +13,10 @@ GRANTS_SQL = os.path.join(os.path.dirname(__file__), "..", "..", "db", "cross_sc
 
 HANDLER = (
     "EXCEPTION WHEN internal_error OR deadlock_detected THEN\n"
-    "{pad}        IF (SQLSTATE = 'XX000' AND SQLERRM <> 'tuple concurrently updated')"
-    " OR _attempt >= _max_attempts THEN\n"
+    "{pad}        IF (SQLSTATE = 'XX000'\n"
+    "{pad}            AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')\n"
+    "{pad}            AND SQLERRM NOT LIKE 'cache lookup failed for relation %')\n"
+    "{pad}           OR _attempt >= _max_attempts THEN\n"
     "{pad}            RAISE;\n"
     "{pad}        END IF;\n"
 )
