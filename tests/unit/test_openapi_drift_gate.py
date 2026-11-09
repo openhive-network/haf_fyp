@@ -58,7 +58,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CI = ROOT / ".gitlab-ci.yml"
 SCRIPT = ROOT / "scripts" / "openapi_rewrite.sh"
 
-PINNED_REF = "96889a650b3f45244cecc4bb3f250af439a71900"
+PINNED_REF = "1d952fd19118762d0e66f91953e194ff08e69bb0"
 
 
 def _drift_block() -> str:
@@ -102,12 +102,12 @@ def _run(repo: Path) -> subprocess.CompletedProcess:
     )
 
 
-def test_clean_tree_passes(tmp_path):
+def test_clean_tree_passes(tmp_path: Path) -> None:
     """A tree that matches the generator must not fail the job."""
     assert _run(_repo(tmp_path)).returncode == 0
 
 
-def test_modified_artefact_fails(tmp_path):
+def test_modified_artefact_fails(tmp_path: Path) -> None:
     """The case #45 is about: a regenerated artefact differs from what was committed."""
     repo = _repo(tmp_path)
     (repo / "endpoints" / "endpoint_schema.sql").write_text("regenerated\n", encoding="utf-8")
@@ -117,14 +117,14 @@ def test_modified_artefact_fails(tmp_path):
     assert "endpoint_schema.sql" in res.stdout, "the failure must name the offending file"
 
 
-def test_untracked_artefact_fails(tmp_path):
+def test_untracked_artefact_fails(tmp_path: Path) -> None:
     """Why `git status`, not `git diff`: diff ignores untracked files entirely."""
     repo = _repo(tmp_path)
     (repo / "endpoints" / "new_endpoint.conf").write_text("new\n", encoding="utf-8")
     assert _run(repo).returncode == 1
 
 
-def test_drift_outside_endpoints_is_ignored(tmp_path):
+def test_drift_outside_endpoints_is_ignored(tmp_path: Path) -> None:
     """The pathspec must stay scoped: the script's own gitignored leftovers live in
     scripts/, and a job that failed on those would be unusable."""
     repo = _repo(tmp_path)
@@ -135,7 +135,7 @@ def test_drift_outside_endpoints_is_ignored(tmp_path):
 
 # --- assertions about the job itself, which no pipeline run can make ------------------
 
-def test_gate_uses_status_not_diff():
+def test_gate_uses_status_not_diff() -> None:
     """`git diff` silently ignores untracked files. If someone swaps the command, the
     untracked half of the gate disappears with no test failing -- unless this one does."""
     block = _drift_block()
@@ -152,14 +152,14 @@ def test_gate_uses_status_not_diff():
     assert "exit 1" in code, "the drift branch must actually fail the job"
 
 
-def test_pathspec_existence_is_asserted():
+def test_pathspec_existence_is_asserted() -> None:
     """`git status --porcelain -- nosuchdir/` exits 0 with empty output, so a renamed
     endpoints/ would leave the job reporting success forever."""
     text = CI.read_text(encoding="utf-8")
     assert "git ls-files --error-unmatch endpoints/endpoint_schema.sql" in text
 
 
-def test_generator_ref_is_pinned_and_matches_ci():
+def test_generator_ref_is_pinned_and_matches_ci() -> None:
     """The script is fetched at run time, so an unpinned ref means the same annotations
     can produce different artefacts on different days. The script's default and the job's
     COMMON_CI_REF must be the same SHA, or a developer regenerating by hand produces
@@ -173,7 +173,7 @@ def test_generator_ref_is_pinned_and_matches_ci():
     )
 
 
-def test_generator_is_always_refetched():
+def test_generator_is_always_refetched() -> None:
     """A cached scripts/process_openapi.py is gitignored, so it survives every checkout.
     Fetching only when absent made the pin a no-op on any machine that had run the script
     once -- the same drift the pin prevents, one level down."""
@@ -191,7 +191,7 @@ def test_generator_is_always_refetched():
 
 
 @pytest.mark.parametrize("keyword", ["nullable: true"])
-def test_no_openapi_30_nullable_in_annotations(keyword):
+def test_no_openapi_30_nullable_in_annotations(keyword) -> None:
     """This document declares openapi 3.1.0, where `nullable` was removed and is inert --
     endpoint_schema.sql says so itself. openapi-spec-validator tolerates unknown keywords,
     so the drift job cannot see these: a response documented `type: number` that actually

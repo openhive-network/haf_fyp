@@ -237,7 +237,7 @@ openapi-drift:
     # The script's own default stays "develop" for local runs, so a developer regenerating
     # by hand can still produce output this job rejects. They agree today; if they diverge,
     # bump both together.
-    COMMON_CI_REF: "96889a650b3f45244cecc4bb3f250af439a71900"
+    COMMON_CI_REF: "1d952fd19118762d0e66f91953e194ff08e69bb0"
   script:
     # endpoints/endpoint_schema.sql's embedded spec and endpoints/rewrite_rules.conf are
     # GENERATED from the /** openapi:paths */ annotations, by a script a developer is
@@ -250,15 +250,15 @@ openapi-drift:
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl >/dev/null
     - bash scripts/openapi_rewrite.sh
     # Assert the pathspec below still resolves: see the note in that block.
-    - git ls-files --error-unmatch endpoints/endpoint_schema.sql endpoints/rewrite_rules.conf >/dev/null
+    - git ls-files --error-unmatch endpoints/endpoint_schema.sql endpoints/rewrite_rules.conf endpoints/rpc_arguments.lua >/dev/null
     - |
       # git status, not `git diff`: diff ignores UNTRACKED files. Today the generator can
-      # only ever rewrite two already-tracked paths, so that arm is belt-and-braces rather
+      # only ever rewrite three already-tracked paths, so that arm is belt-and-braces rather
       # than load-bearing -- but it costs nothing and stops being theoretical the moment a
       # generated artefact is added. --porcelain is stable output by contract.
       #
       # The pathspec scopes this to endpoints/. Note a pathspec matching NOTHING also
-      # yields empty output and a pass, so the ls-files check above asserts the two files
+      # yields empty output and a pass, so the ls-files check above asserts the three files
       # still exist under that path; without it, renaming endpoints/ would leave this job
       # reporting success forever. The script's leftovers (scripts/process_openapi.py,
       # scripts/openapi_out/, a repo-root rewrite_rules.conf) are outside the pathspec;

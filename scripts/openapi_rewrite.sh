@@ -1,6 +1,6 @@
 #!/bin/bash
 # Regenerates the embedded OpenAPI JSON in endpoint_schema.sql and rewrites
-# rewrite_rules.conf from the /** openapi:paths ... */ annotations.
+# rewrite_rules.conf and rpc_arguments.lua from the /** openapi:paths ... */ annotations.
 #
 # Run this after adding or changing endpoint annotations, then commit the result.
 #
@@ -20,7 +20,7 @@ OUTPUT_DIR="${SCRIPTDIR}/openapi_out"
 # whole point is that they regenerate with the generator CI validates against -- an
 # earlier revision of this line defaulted to "develop", which let local and CI drift
 # apart silently, which is the divergence this comment exists to prevent.
-COMMON_CI_REF="${COMMON_CI_REF:-96889a650b3f45244cecc4bb3f250af439a71900}"
+COMMON_CI_REF="${COMMON_CI_REF:-1d952fd19118762d0e66f91953e194ff08e69bb0}"
 COMMON_CI_URL="https://gitlab.syncad.com/hive/common-ci-configuration/-/raw/${COMMON_CI_REF}"
 PROCESS_OPENAPI="${SCRIPTDIR}/process_openapi.py"
 OFFLINE="${COMMON_CI_OFFLINE:-0}"
@@ -50,7 +50,7 @@ echo "Running process_openapi.py..."
 # `Path(out) / Path("/abs/...")` discards the left side and returns the absolute
 # path, passing an absolute input would make it open (and truncate) the source
 # file itself. A relative path keeps the output inside OUTPUT_DIR. The generator
-# also writes rewrite_rules.conf into the CWD, hence the repo-root cd.
+# also writes rewrite_rules.conf and rpc_arguments.lua into the CWD, hence the repo-root cd.
 # PYTHONUTF8=1 forces UTF-8 for all file I/O regardless of the host locale. Without it,
 # process_openapi.py reads the UTF-8 source under the platform default (e.g. cp1252 on
 # Windows) and mangles non-ASCII in the regenerated JSON blob — em-dashes become mojibake
@@ -80,8 +80,13 @@ sed -i 's/[[:space:]]*$//' "${ENDPOINTS_DIR}/endpoint_schema.sql"
         "${SCRIPTDIR}/../rewrite_rules.conf"
 } | sed -E 's#^(rewrite \^[^ ]*[^$]) #\1$ #' > "${ENDPOINTS_DIR}/rewrite_rules.conf"
 
+# The parameters each /rpc/ function declares, for the rewriter's hive.rpc_form module: it
+# forwards those in a form POST body, so a value such as "not.x" reaches the function as an
+# argument instead of being read by PostgREST as a filter. Kept as the generator writes it.
+mv "${SCRIPTDIR}/../rpc_arguments.lua" "${ENDPOINTS_DIR}/rpc_arguments.lua"
+
 # Clean up temp files
 rm -f "${SCRIPTDIR}/../rewrite_rules.conf"
 rm -rf "${OUTPUT_DIR}"
 
-echo "Done. Review and commit endpoints/endpoint_schema.sql and endpoints/rewrite_rules.conf."
+echo "Done. Review and commit endpoints/endpoint_schema.sql, endpoints/rewrite_rules.conf and endpoints/rpc_arguments.lua."

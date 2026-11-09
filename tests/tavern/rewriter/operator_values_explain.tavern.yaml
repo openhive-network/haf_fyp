@@ -1,0 +1,19 @@
+---
+test_name: rewriter - operator-prefixed account names reach get_score_explanation
+
+includes:
+  - !include ../common.yaml
+
+stages:
+  - name: not.blocktrades reaches get_score_explanation with its post_id
+    # Two path segments, both arguments: both go to the body, in their own fields.
+    request: {url: "{rewriter_url}/v1/fyp/explain/not.blocktrades/1", method: GET}
+    response:
+      status_code: 200
+      json: []
+
+  - name: eq.blocktrades reaches get_score_explanation with its post_id
+    request: {url: "{rewriter_url}/v1/fyp/explain/eq.blocktrades/1", method: GET}
+    response:
+      status_code: 200
+      json: []
