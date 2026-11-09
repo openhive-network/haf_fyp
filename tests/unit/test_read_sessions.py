@@ -132,6 +132,7 @@ def _refresh(monkeypatch: MonkeyPatch, names, *, in_session=(), rank=None):
     monkeypatch.setattr(
         rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
     )
+    monkeypatch.setattr(rd.language, "detect_post_languages", lambda *a, **kw: 0)
     monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
     monkeypatch.setattr(rd, "_rank_user", _rank)
@@ -150,6 +151,7 @@ def test_a_refresh_leaves_an_account_in_a_session_alone_and_says_so(monkeypatch:
 
 def test_a_refresh_with_everyone_in_a_session_fetches_nothing(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(rd, "_fetch_candidates", lambda _c: (_ for _ in ()).throw(AssertionError))
+    monkeypatch.setattr(rd.language, "detect_post_languages", lambda *a, **kw: 0)
     conn, _ = _mock_conn([])
     monkeypatch.setattr(rd, "_in_session", lambda _c, users: set(users))
     monkeypatch.setattr(rd, "register_vector_type", lambda _c: None)
@@ -184,6 +186,7 @@ def _cycle(monkeypatch: MonkeyPatch, users, rank, reads=None):
     monkeypatch.setattr(
         rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
     )
+    monkeypatch.setattr(rd.language, "detect_post_languages", lambda *a, **kw: 0)
     monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
     monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)

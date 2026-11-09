@@ -76,6 +76,17 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.user_profile_vectors (
     PRIMARY KEY (username)
 );
 
+-- #117: the maintenance functions delete an evicted or unread account's affinity.
+-- The real table: it needs nothing this lane lacks.
+CREATE TABLE IF NOT EXISTS haf_fyp_app.user_author_affinity (
+    username varchar(16) NOT NULL,
+    author varchar(16) NOT NULL,
+    affinity real NOT NULL,
+    raw real NOT NULL,
+    updated_at timestamp NOT NULL,
+    PRIMARY KEY (username, author)
+);
+
 -- #12: the /v1/fyp/events endpoint appends telemetry, so FastAPI writes this too.
 CREATE TABLE IF NOT EXISTS haf_fyp_app.feed_events (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -136,6 +147,26 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.embedding_coverage_daily (
     embedded INT NOT NULL DEFAULT 0,
     computed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (day)
+);
+
+-- #37: the ranker's cycle record, read by GET /metrics (the ranker section) and
+-- written by tests/integration/test_ranker_cycles_db.py with the ranker's own SQL.
+-- The same columns as db/create_tables.sql; tests/unit/test_ranker_cycles.py holds
+-- the two copies together.
+CREATE TABLE IF NOT EXISTS haf_fyp_app.ranker_cycles (
+    finished_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    duration_seconds REAL NOT NULL,
+    ok BOOLEAN NOT NULL,
+    candidates INT NOT NULL,
+    users_attempted INT NOT NULL,
+    users_ranked INT NOT NULL,
+    users_failed INT NOT NULL,
+    users_held INT NOT NULL,
+    readers_ahead INT NOT NULL,
+    lane_taken INT NOT NULL,
+    lane_slots INT NOT NULL,
+    reads_heard INT NOT NULL,
+    PRIMARY KEY (finished_at)
 );
 
 -- #15: minimal candidate + embedding tables so the pg-backed refresh test

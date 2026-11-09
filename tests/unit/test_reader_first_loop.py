@@ -193,6 +193,7 @@ def _refresh(monkeypatch: MonkeyPatch, names, rank=lambda *a, **k: None) -> None
     monkeypatch.setattr(
         rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
     )
+    monkeypatch.setattr(rd.language, "detect_post_languages", lambda *a, **kw: 0)
     monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
     monkeypatch.setattr(rd, "_log_user_failure", lambda _u, _e: None)
@@ -265,6 +266,7 @@ def _cycle(monkeypatch: MonkeyPatch, users, *, candidates=None, rank=lambda *a, 
     monkeypatch.setattr(rd, "_fetch_personalised_users", lambda _c, _limit: list(users))
     monkeypatch.setattr(rd, "_fetch_algorithm", lambda _c: ("1.0.0", {}))
     monkeypatch.setattr(rd, "_fetch_candidates", lambda _c: candidates)
+    monkeypatch.setattr(rd.language, "detect_post_languages", lambda *a, **kw: 0)
     monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
     monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)

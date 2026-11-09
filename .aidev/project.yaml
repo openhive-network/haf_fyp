@@ -28,7 +28,7 @@ branches:
 environment:
   kind: "container"
   # Built by .aidev/runtime/build.sh from .aidev/runtime/Dockerfile and requirements.txt.
-  image: "registry.gitlab.syncad.com/hive/haf_fyp/aidev-tests@sha256:5731845ab349cbcacab9ced70309b118deac604f4c2fcea1ae039a68f48f1744"
+  image: "registry.gitlab.syncad.com/hive/haf_fyp/aidev-tests@sha256:765c6ddf1734d8ff71e9ba862bdcfbd29487820ef61351507ce86e0066e56d47"
   inputs: [".aidev/runtime/Dockerfile", "requirements.txt"]
 
 issues:

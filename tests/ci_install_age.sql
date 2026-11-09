@@ -29,8 +29,11 @@ INSERT INTO haf_fyp_app.post_candidates (post_id, created_at)
 VALUES (42, '2016-09-15 19:47:21');
 INSERT INTO haf_fyp_app.post_commenters (post_id, commenter_id) VALUES (42, 7);
 INSERT INTO haf_fyp_app.post_bridge_cache (post_id, bridge, computed_at) VALUES (42, '{}', '2016-09-15 19:47:21');
+INSERT INTO haf_fyp_app.post_language (post_id, languages, detected_at) VALUES (42, '{en}', '2016-09-15 19:47:21');
 INSERT INTO haf_fyp_app.engagement_metrics (post_id, updated_at) VALUES (42, '2016-09-15 19:47:21');
 INSERT INTO haf_fyp_app.user_profile_vectors (username, updated_at) VALUES ('ci-aged-user', '2016-09-15 19:47:21');
+INSERT INTO haf_fyp_app.user_author_affinity (username, author, affinity, raw, updated_at)
+VALUES ('ci-aged-user', 'ci-aged-author', 0.5, 3, '2016-09-15 19:47:21');
 INSERT INTO haf_fyp_app.user_communities (username, community_id, subscribed_at)
 VALUES ('ci-aged-user', 1, '2016-09-15 19:47:21');
 INSERT INTO haf_fyp_app.feed_cache_labels (label) VALUES ('ci-aged-label');
@@ -39,9 +42,13 @@ SELECT 'ci-aged-user', 42, 0.5, 1, code FROM haf_fyp_app.feed_cache_labels WHERE
 INSERT INTO haf_fyp_app.global_feed_cache (post_id, final_score, rank) VALUES (42, 0.5, 1);
 INSERT INTO haf_fyp_app.feed_metrics_daily (day) VALUES ('2016-09-15');
 INSERT INTO haf_fyp_app.embedding_coverage_daily (day, computed_at) VALUES ('2016-09-15', '2016-09-15 19:47:21+00');
+INSERT INTO haf_fyp_app.ranker_cycles
+(finished_at, duration_seconds, ok, candidates, users_attempted, users_ranked, users_failed,
+    users_held, readers_ahead, lane_taken, lane_slots, reads_heard)
+VALUES ('2016-09-15 19:47:21+00', 21.5, TRUE, 4976, 122, 122, 0, 0, 0, 3, 100, 5);
 RESET ROLE;
 
--- The operator's: which algorithm version is live. The seed ships 1.1.0 active; an
+-- The operator's: which algorithm version is live. The seed ships 1.3.0 active; an
 -- operator who rolled back to the oldest must not find it rolled forward again.
 UPDATE haf_fyp_app.algorithm_versions AS v
 SET is_active = (v.version = (SELECT min(o.version) FROM haf_fyp_app.algorithm_versions AS o));

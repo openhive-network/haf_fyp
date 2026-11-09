@@ -338,8 +338,8 @@ DECLARE
         'active_users', 'algorithm_versions', 'app_config', 'app_status', 'app_version',
         'embedding_coverage_daily', 'engagement_metrics', 'feed_cache', 'feed_cache_labels', 'feed_events',
         'feed_events_rollup_state', 'feed_metrics_daily', 'global_feed_cache', 'haf_fyp', 'hivemind_follow',
-        'post_bridge_cache', 'post_candidates', 'post_commenters', 'user_communities', 'user_interactions',
-        'user_interests', 'user_profile_vectors'
+        'post_bridge_cache', 'post_candidates', 'post_commenters', 'post_language', 'ranker_cycles',
+        'user_author_affinity', 'user_communities', 'user_interactions', 'user_interests', 'user_profile_vectors'
     ];
     _want_functions TEXT [] := ARRAY[
         'haf_fyp_app.allow_processing()',
@@ -363,6 +363,7 @@ DECLARE
         'haf_fyp_app.evict_unsubscribed_users(character varying[])',
         'haf_fyp_app.follow_hivemind(integer,integer)',
         'haf_fyp_app.get_bridge_post(integer,integer,integer)',
+        'haf_fyp_app.global_feed_hidden_for(integer)',
         'haf_fyp_app.history_days()',
         'haf_fyp_app.history_status()',
         'haf_fyp_app.hivemind_max_lag_blocks()',
@@ -393,9 +394,9 @@ DECLARE
         'haf_fyp_app.take_block_processor_locks()',
         'haf_fyp_endpoints.get_algorithm()',
         'haf_fyp_endpoints.get_feed_metrics(date,date,text,text)',
-        'haf_fyp_endpoints.get_global_feed(integer,integer,integer,integer)',
+        'haf_fyp_endpoints.get_global_feed(integer,integer,integer,integer,text,text)',
         'haf_fyp_endpoints.get_health()',
-        'haf_fyp_endpoints.get_personalized_feed(text,integer,integer,integer)',
+        'haf_fyp_endpoints.get_personalized_feed(text,integer,integer,integer,text)',
         'haf_fyp_endpoints.get_score_explanation(text,bigint)',
         'haf_fyp_endpoints.get_sync_status()',
         'haf_fyp_endpoints.get_user_profile(text)',
@@ -430,9 +431,12 @@ DECLARE
         'index post_bridge_cache_pkey on post_bridge_cache (primary key)',
         'index post_candidates_pkey on post_candidates (primary key)',
         'index post_commenters_pkey on post_commenters (primary key)',
+        'index post_language_pkey on post_language (primary key)',
+        'index ranker_cycles_pkey on ranker_cycles (primary key)',
         'index uq_app_config_singleton on app_config (unique)',
         'index uq_app_status_singleton on app_status (unique)',
         'index uq_app_version_singleton on app_version (unique)',
+        'index user_author_affinity_pkey on user_author_affinity (primary key)',
         'index user_communities_pkey on user_communities (primary key)',
         'index user_interactions_pkey on user_interactions (primary key)',
         'index user_interests_pkey on user_interests (primary key)',
@@ -460,6 +464,10 @@ DECLARE
         'constraint post_bridge_cache_post_id_fkey on post_bridge_cache: FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates(post_id) ON DELETE CASCADE',
         'constraint post_candidates_pkey on post_candidates: PRIMARY KEY (post_id)',
         'constraint post_commenters_pkey on post_commenters: PRIMARY KEY (post_id, commenter_id)',
+        'constraint post_language_pkey on post_language: PRIMARY KEY (post_id)',
+        'constraint post_language_post_id_fkey on post_language: FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates(post_id) ON DELETE CASCADE',
+        'constraint ranker_cycles_pkey on ranker_cycles: PRIMARY KEY (finished_at)',
+        'constraint user_author_affinity_pkey on user_author_affinity: PRIMARY KEY (username, author)',
         'constraint user_communities_pkey on user_communities: PRIMARY KEY (username, community_id)',
         'constraint user_interactions_pkey on user_interactions: PRIMARY KEY (account_id, post_id)',
         'constraint user_interests_pkey on user_interests: PRIMARY KEY (username, community_id)',
@@ -492,6 +500,9 @@ DECLARE
         'post_bridge_cache:d89ced139f29421e601fa1b8cd35e864',
         'post_candidates:75ca3322bbdd3d031ad38ffee2735ecb',
         'post_commenters:dd6b3cc9b3898e67d2f725176626ba17',
+        'post_language:3d813e2c4808191be5a6405e08f1e244',
+        'ranker_cycles:05fc8ec3ef78deaba0f3849400079b32',
+        'user_author_affinity:f8d3245d01c34d47275dc294e3722ef1',
         'user_communities:83146409c11276c9ea90534eabba3df9',
         'user_interactions:e5c218f6e78c7effb3f65b87f6d2f3d0',
         'user_interests:d99ba90cbdab04aae0fef51df1af940e',
@@ -522,6 +533,7 @@ DECLARE
         'haf_fyp_app.evict_unsubscribed_users(character varying[]) = 2bf9d3fbbbc50aa7d1720d2b754f57d2',
         'haf_fyp_app.follow_hivemind(integer,integer) = 63509946c93495bcef4527848f67839d',
         'haf_fyp_app.get_bridge_post(integer,integer,integer) = 21367c62940e9d817140e64d80f9b769',
+        'haf_fyp_app.global_feed_hidden_for(integer) = 614e6a5653efea3fc11892a7e1c8d4bb',
         'haf_fyp_app.history_days() = 628c7ab4d94cf29a9fa51c4d991d9df4',
         'haf_fyp_app.history_status() = 9444fc2f47bca02204e9d75192d5bde8',
         'haf_fyp_app.hivemind_max_lag_blocks() = 628c7ab4d94cf29a9fa51c4d991d9df4',
@@ -552,9 +564,9 @@ DECLARE
         'haf_fyp_app.take_block_processor_locks() = a967f1b32caec08ccf85d72f4970fb78',
         'haf_fyp_endpoints.get_algorithm() = 53d14f83dbe2498fd331423fea1f004a',
         'haf_fyp_endpoints.get_feed_metrics(date,date,text,text) = 68e585d4563f3a7285e4f8535d002a6f',
-        'haf_fyp_endpoints.get_global_feed(integer,integer,integer,integer) = d2481ac525c42378151e6823f8251366',
+        'haf_fyp_endpoints.get_global_feed(integer,integer,integer,integer,text,text) = 86cd414e07eca1d293c45f322d435c32',
         'haf_fyp_endpoints.get_health() = 7bdb2db38614dd93de16bbcae08639c7',
-        'haf_fyp_endpoints.get_personalized_feed(text,integer,integer,integer) = 8c209b127b6ff9da861538a7724be254',
+        'haf_fyp_endpoints.get_personalized_feed(text,integer,integer,integer,text) = a67e7ee16c43b4e16dc46681cba6f476',
         'haf_fyp_endpoints.get_score_explanation(text,bigint) = e40cc0b5821a9966a0243f919da929cb',
         'haf_fyp_endpoints.get_sync_status() = 33dba2c778f9e4a5d74e1fbd237c944d',
         'haf_fyp_endpoints.get_user_profile(text) = b753d667674c709140999f0816726c27',
@@ -860,15 +872,15 @@ BEGIN
     -- Seed data must not multiply on a second install, and must not take back a choice
     -- the operator made: tests/ci_install_age.sql activates the OLDEST version.
     SELECT count(*) INTO _n FROM haf_fyp_app.algorithm_versions;
-    IF _n <> 3 THEN
-        RAISE EXCEPTION 'algorithm_versions holds % rows, the seed has 3', _n;
+    IF _n <> 6 THEN
+        RAISE EXCEPTION 'algorithm_versions holds % rows, the seed has 6', _n;
     END IF;
-    -- On a first install, the seed by VALUE: three rows is also what a seed with one
+    -- On a first install, the seed by VALUE: six rows is also what a seed with one
     -- weight ten times too large has. (Later the weights are the operator's.) And the
     -- telemetry rollup starts from the beginning.
     IF current_setting('ci.phase') = 'first' THEN
         IF (SELECT md5(string_agg(v.version || ' ' || v.is_active || ' ' || v.weights::text, E'\n' ORDER BY v.version COLLATE "C"))
-            FROM haf_fyp_app.algorithm_versions AS v) IS DISTINCT FROM '176bde5dbeb40a10ed92de0980847aba' THEN
+            FROM haf_fyp_app.algorithm_versions AS v) IS DISTINCT FROM 'd8e1aae3f43fb30bc884167d5bb74e67' THEN
             RAISE EXCEPTION E'the seeded algorithm versions are not the ones tests/ci_install_verify.sql pins (db/seed_data.sql changed?). They read, as md5 %:\n%',
                 (SELECT md5(string_agg(v.version || ' ' || v.is_active || ' ' || v.weights::text, E'\n' ORDER BY v.version COLLATE "C"))
                  FROM haf_fyp_app.algorithm_versions AS v),
@@ -883,9 +895,10 @@ BEGIN
     SELECT string_agg(v.version, ',' ORDER BY v.version) INTO _active
     FROM haf_fyp_app.algorithm_versions AS v WHERE v.is_active;
     IF current_setting('ci.phase') = 'first' THEN
-        -- db/seed_data.sql ships 1.1.0 active and 1.2.0 registered but not yet live.
-        IF _active IS DISTINCT FROM '1.1.0' THEN
-            RAISE EXCEPTION 'a fresh install activated %, not 1.1.0 as db/seed_data.sql ships', _active;
+        -- db/seed_data.sql ships 1.3.0 active (it takes over from 1.1.0, #116) and 1.2.0
+        -- registered but not yet live.
+        IF _active IS DISTINCT FROM '1.3.0' THEN
+            RAISE EXCEPTION 'a fresh install activated %, not 1.3.0 as db/seed_data.sql ships', _active;
         END IF;
     ELSIF _active IS DISTINCT FROM (SELECT min(v.version) FROM haf_fyp_app.algorithm_versions AS v) THEN
         RAISE EXCEPTION 'in phase % the active version is %, not the one the operator chose', current_setting('ci.phase'), _active;

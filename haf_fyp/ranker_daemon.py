@@ -61,7 +61,7 @@ import psycopg2
 import psycopg2.extras
 import redis as redis_lib
 
-from haf_fyp import visibility
+from haf_fyp import affinity, language, visibility
 from haf_fyp.credibility import credibility_failure_message, fetch_author_credibility
 from haf_fyp.embeddings import fetch_post_vectors_safe, register_vector_type
 from haf_fyp.schema_version import IncompatibleSchemaError, check_schema_version
@@ -88,11 +88,11 @@ CYCLE_SECONDS = 300
 POLL_SECONDS = 5
 
 
-_Number = TypeVar("_Number", int, float)
+_Setting = TypeVar("_Setting", int, float, tuple[str, ...])
 
 
-def _tuning(key: str, default: str, convert: Callable[[str], _Number],
-            minimum: _Number | None = None, maximum: _Number | None = None) -> _Number:
+def _tuning(key: str, default: str, convert: Callable[[str], _Setting],
+            minimum: _Setting | None = None, maximum: _Setting | None = None) -> _Setting:
     """A tuning variable, with unset and empty meaning the same thing: the default (#87).
 
     docker/docker-compose.yml passes these to the ranker by name, so `NAME=` left blank
@@ -102,16 +102,19 @@ def _tuning(key: str, default: str, convert: Callable[[str], _Number],
     dbenv.env_or_default refuses it, because nothing here is concatenated into a
     connection string.
 
-    A value `convert` rejects, or one below `minimum`, still stops the daemon, and the
-    error says which variable. Refused, not raised to the minimum: where a minimum is
-    given, a smaller value deletes data, does no work or fails on every pass (every feed
-    event pruned, maintenance on every poll, a negative LIMIT), so it is far more likely
-    a mistake than a choice.
+    A value `convert` rejects, or one below `minimum` or above `maximum`, still stops the
+    daemon, and the error says which variable. Refused, not moved into range: where a
+    minimum is given, a smaller value deletes data, does no work or fails on every pass
+    (every feed event pruned, maintenance on every poll, a negative LIMIT); where a
+    maximum is, a larger one fails every pass or drops far more than meant (every unvoted
+    post, for DOWNVOTED_AT_NET_RSHARES). Either is far more likely a mistake than a choice.
 
-    hive/haf_api_node's haf_fyp.yaml passes these settings with their defaults COPIED
-    (`NAME: ${HAF_FYP_NAME:-<default>}`, haf_api_node!273). Raising a minimum above a
+    hive/haf_api_node's haf_fyp.yaml will pass these settings with their defaults COPIED
+    (`NAME: ${HAF_FYP_NAME:-<default>}`) once haf_api_node!273 lands. Raising a minimum above a
     copied default stops every ranker on those nodes once haf_api_node pins that release:
-    change the copy there in the same release.
+    change the copy there in the same release. The same goes for a changed default: once
+    EXCLUDED_AUTHORS or DOWNVOTED_AT_NET_RSHARES is copied there, the copy stays the old
+    value until it is edited.
     """
     raw = os.environ.get(key, "").strip()
     try:
@@ -142,6 +145,50 @@ FEED_EVENTS_MAX_ROWS = _tuning("FEED_EVENTS_MAX_ROWS", "20000000", int, minimum=
 # the background rather than inline in the endpoint.
 EMBEDDING_COVERAGE_DAYS = _tuning("EMBEDDING_COVERAGE_DAYS", "14", int, minimum=1)
 CANDIDATE_LIMIT = 5000
+
+# One dot-separated part of a Hive account name: at least three characters, a letter
+# first, a letter or digit last, and letters, digits or dashes between.
+_ACCOUNT_PART_RE = re.compile(r"[a-z][a-z0-9-]+[a-z0-9]")
+
+
+def _is_account_name(name: str) -> bool:
+    # No lower bound on the length: every part is already at least three characters.
+    return len(name) <= 16 and all(_ACCOUNT_PART_RE.fullmatch(part) for part in name.split("."))
+
+
+def account_names(raw: str) -> tuple[str, ...]:
+    """Comma-separated Hive account names, or `-` for none. Any name no Hive account
+    could have is refused, so a typo stops the ranker rather than excluding nobody."""
+    if raw.strip() == "-":
+        return ()
+    names = tuple(sorted({name.strip() for name in raw.split(",") if name.strip()}))
+    if not all(_is_account_name(name) for name in names):
+        raise ValueError(raw)
+    return names
+
+
+# Authors whose posts are never recommended (#111): accounts that post only containers,
+# a daily or hourly root that short posts (Snaps, Waves, Threads) are replies to. The
+# container is a thread to post into, not something to read, and with hundreds of
+# replies it scores like a hit. Each of these posted nothing but containers in the 60
+# days to 2026-10-30 on testapi; liketu.moments is the same kind, quiet since. Setting
+# the variable replaces the list, so copy it to add to it; `-` excludes nobody (blank
+# means the default, as for every setting here).
+EXCLUDED_AUTHORS = _tuning(
+    "EXCLUDED_AUTHORS",
+    "ecency.waves,hscr-isrc,leothreads,liketu.moments,peak.snaps,slothbuzz.hangs",
+    account_names,
+)
+
+# A post whose net rshares are at or below this is left out of every feed (#112). Not
+# just below zero: one small downvote on a new post with no upvotes yet would take it
+# out of discovery, which costs the downvoter next to nothing. hivemind's own `gray`
+# does not look at rshares at all (only the author's reputation, mutes and community
+# mutes). -1e10 is about one full-strength downvote from a 310 HP account (a full vote
+# is roughly 3.2e7 rshares per HP at the chain's 1,605 VESTS per HP of 2026-10-31). On testapi (2026-10-30) the default left out 910 of
+# the 1,500 candidates below zero and kept 590, 25 of them above -1e9.
+# At most -1: at 0 every post nobody has voted on yet would go too.
+DOWNVOTED_AT_NET_RSHARES = _tuning("DOWNVOTED_AT_NET_RSHARES", "-9999999999", int, maximum=-1)
 
 # Personalized feeds are computed on demand, not bulk-precomputed for every
 # account that ever subscribed to a community (there can be tens of thousands,
@@ -289,6 +336,18 @@ _reads_reranked = 0
 # Readers taken by the last scheduled cycle, and the slots the lane had for them.
 _lane_taken = 0
 _lane_slots = 0
+
+# What the last scheduled cycle did, for its row in haf_fyp_app.ranker_cycles (#37).
+# run_cycle fills it, main() writes it, with the lane and read figures above.
+_CYCLE_COUNTS = ("candidates", "users_attempted", "users_ranked", "users_failed",
+                 "users_held", "readers_ahead")
+_cycle_stats: dict[str, int] = dict.fromkeys(_CYCLE_COUNTS, 0)
+# Days of cycles kept: about 2,000 rows at CYCLE_SECONDS.
+_CYCLE_RECORD_DAYS = 7
+# The record's write fails the same way on every cycle until someone acts (the SQL is
+# older than this ranker, a grant). What is failing ("missing", or the error's code), so
+# it is said once, again when it changes, and again after a write succeeds; None if not.
+_cycle_record_failure: str | None = None
 _feed_read_failure_logged_at = 0.0
 _missing_column_warned_at: float | None = None
 
@@ -786,6 +845,7 @@ def _fetch_candidates(conn) -> pd.DataFrame:
             SELECT
                 pc.post_id,
                 ha.name AS author,
+                ha.id AS author_id,  -- #118: the reader's mute and blacklist probes
                 pc.community_id,
                 pc.created_at,
                 COALESCE(em.unique_commenters, 0) AS unique_commenters,
@@ -799,12 +859,17 @@ def _fetch_candidates(conn) -> pd.DataFrame:
                    ON ha.id = hp.author_id
             LEFT JOIN haf_fyp_app.engagement_metrics em
                    ON em.post_id = pc.post_id
-            WHERE pc.payout_window = TRUE
-               OR pc.created_at >= NOW() - INTERVAL '30 days'
+            WHERE (pc.payout_window = TRUE
+                   OR pc.created_at >= NOW() - INTERVAL '30 days')
+              -- #112: downvoted past DOWNVOTED_AT_NET_RSHARES. The engagement signal
+              -- clips a negative total to 0, so it would otherwise score like an
+              -- unvoted post.
+              AND COALESCE(em.net_rshares, 0) > %s
+              AND ha.name <> ALL(%s::text[])  -- #111: EXCLUDED_AUTHORS
             ORDER BY pc.created_at DESC
             LIMIT %s
             """,
-            (CANDIDATE_LIMIT,),
+            (DOWNVOTED_AT_NET_RSHARES, list(EXCLUDED_AUTHORS), CANDIDATE_LIMIT),
         )
         rows = cur.fetchall()
     if not rows:
@@ -813,10 +878,19 @@ def _fetch_candidates(conn) -> pd.DataFrame:
     # #89: a post its community has muted goes into nobody's feed, the global one
     # included. Here rather than in the query so that a node whose hivemind cannot
     # be read still gets candidates (see haf_fyp/visibility.py).
-    muted = visibility.community_muted_post_ids(conn, candidates["post_id"].tolist())
+    post_ids = candidates["post_id"].tolist()
+    muted = visibility.community_muted_post_ids(conn, post_ids)
     if muted:
         log.info("%d candidate(s) left out: muted by their community", len(muted))
-    return visibility.without(candidates, post_ids=muted)
+    # #115: and one marked NSFW, from everyone's.
+    nsfw = visibility.nsfw_post_ids(conn, post_ids)
+    if nsfw:
+        log.info("%d candidate(s) left out: NSFW", len(nsfw))
+    # #112: and one whose author hivemind greys for a low reputation, from everyone's.
+    greyed = visibility.greyed_author_post_ids(conn, post_ids)
+    if greyed:
+        log.info("%d candidate(s) left out: author greyed for a low reputation", len(greyed))
+    return visibility.without(candidates, post_ids=muted | nsfw | greyed)
 
 
 def _fetch_author_credibility_safe(conn, authors: list[str]) -> dict:
@@ -1166,10 +1240,16 @@ def _rank_user(
     weights: dict,
 ) -> None:
     """Score and write feed_cache for a single user."""
-    # #89: nothing by an author this account has muted, directly or through a mute
-    # list it follows. Before scoring, so that the diversity cap and the 200-post cut
-    # are made over what the account can actually be shown.
-    candidates = visibility.without(candidates, authors=visibility.muted_authors(conn, username))
+    # #89, #113: nothing by an author this account has muted or blacklisted, directly
+    # or through a list it follows; never its own posts, even if a list it follows names
+    # it (as the global feed does, #114). Before scoring, so that the diversity cap and
+    # the 200-post cut are made over what the account can actually be shown. Asked only
+    # about the candidates' authors, so a long list costs no name lookups (#118).
+    author_ids = candidates["author_id"].unique().tolist()
+    hidden = (visibility.muted_authors(conn, username, author_ids)
+              | visibility.blacklisted_authors(conn, username, author_ids))
+    hidden.discard(username)
+    candidates = visibility.without(candidates, authors=hidden)
     # Explicit communities (on-chain subscriptions + declared interests) get the
     # full boost; engaged communities (top by interaction) get the smaller tier.
     subscribed = fetch_user_communities(conn, username) | fetch_user_interests(conn, username)
@@ -1187,6 +1267,15 @@ def _rank_user(
             if user_vector is not None:
                 write_user_vector(conn, username, user_vector, 0, sorted(engaged))
 
+    # #117: read and stored only where compute_scores applies it -- a version that sets
+    # author_affinity, and relevance computed (the same test as compute_scores') -- so
+    # a 1.4.0 feed ranked without embeddings leaves no affinity behind.
+    author_affinity = affinity.for_reader(
+        conn, username, weights,
+        relevance_computed=user_vector is not None and bool(post_vectors),
+        exclude=EXCLUDED_AUTHORS,
+    )
+
     scored = compute_scores(
         candidates=candidates,
         user_vector=user_vector,
@@ -1195,6 +1284,7 @@ def _rank_user(
         subscribed_communities=subscribed,
         engaged_communities=engaged,
         algorithm_weights=weights,
+        author_affinity=author_affinity,
     )
     write_feed_cache(conn, username, scored, algo_version)
 
@@ -1266,8 +1356,9 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
     account's time: the candidates are already loaded, where a targeted refresh after
     the cycle fetches them again (about 8 s on a full node).
     """
-    global _lane_taken, _lane_slots
+    global _lane_taken, _lane_slots, _cycle_stats
     _lane_taken = _lane_slots = 0  # a cycle that stops before the lane query took nobody
+    _cycle_stats = dict.fromkeys(_CYCLE_COUNTS, 0)
     register_vector_type(conn)
     _refresh_read_filter(conn)
 
@@ -1278,9 +1369,15 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
         log.info("no candidates to rank — skipping cycle")
         return set()
 
+    _cycle_stats["candidates"] = len(candidates)
     log.info("scoring %d candidates (algo %s)", len(candidates), algo_version)
 
     post_ids = candidates["post_id"].tolist()
+    # #115: for the feeds' `language` parameter. Only the scheduled cycle detects: a
+    # targeted refresh ranks the same candidates, give or take the newest few.
+    detected = language.detect_post_languages(conn, post_ids)
+    if detected:
+        log.info("languages detected for %d new candidate(s)", detected)
     post_vectors = fetch_post_vectors_safe(conn, post_ids, scope="candidates")
     log.info(
         "embeddings available for %d / %d candidates", len(post_vectors), len(post_ids)
@@ -1357,6 +1454,10 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
             ahead.update(early)
             waiting.extendleft(reversed(early))
             next_read_check = time.monotonic() + POLL_SECONDS
+        # Per account, so a cycle that raises part-way records what it had reached.
+        _cycle_stats.update(users_attempted=len(done), users_ranked=processed,
+                            users_failed=failed, users_held=held,
+                            readers_ahead=len(ahead & done))
         if not waiting:
             break
         username = waiting.popleft()
@@ -1381,13 +1482,13 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
             failed += 1
             _log_user_failure(username, exc)
 
+    taken = ahead & done  # not one a later check turned away before its turn came
     if done:
         log.info(
             "refreshed personalized feeds for %d/%d cached users (%d failed%s)",
             processed, len(done), failed,
             f", {held} held for a read session" if held else "",
         )
-        taken = ahead & done  # not one a later check turned away before its turn came
         if taken:
             log.info(
                 "%d of them were readers with a stale feed, taken ahead of their turn%s",
@@ -1565,6 +1666,63 @@ def _run_history_retention(conn) -> None:
     except Exception:
         conn.rollback()
         log.exception("history retention failed — skipping")
+
+
+_RECORD_CYCLE_SQL = """
+INSERT INTO haf_fyp_app.ranker_cycles
+    (finished_at, duration_seconds, ok, candidates, users_attempted, users_ranked, users_failed,
+     users_held, readers_ahead, lane_taken, lane_slots, reads_heard)
+VALUES (clock_timestamp(), %(duration_seconds)s, %(ok)s, %(candidates)s, %(users_attempted)s,
+        %(users_ranked)s, %(users_failed)s, %(users_held)s, %(readers_ahead)s,
+        %(lane_taken)s, %(lane_slots)s, %(reads_heard)s)
+"""
+_PRUNE_CYCLES_SQL = (
+    "DELETE FROM haf_fyp_app.ranker_cycles WHERE finished_at < now() - make_interval(days => %s)"
+)
+
+
+def _record_cycle(conn, duration_seconds: float, ok: bool) -> None:
+    """
+    Write the scheduled cycle that just ended into haf_fyp_app.ranker_cycles, for GET
+    /metrics (#37), and drop the rows older than _CYCLE_RECORD_DAYS. Before
+    _log_feed_read_summary, which resets the read count.
+
+    finished_at is clock_timestamp(), not now(): this transaction may have opened when the
+    cycle began (a cycle with no candidates commits nothing), and now() would date the
+    row from then.
+
+    Best-effort: the record must never cost a cycle. On SQL older than this ranker the
+    table is not there; that is said, with the remedy, and ranking goes on. Each failure
+    is said once while it lasts, and again when it changes, so a passing connection error
+    does not hide a missing table or a missing grant behind it.
+    """
+    global _cycle_record_failure
+    row = {**_cycle_stats, "duration_seconds": duration_seconds, "ok": ok,
+           "lane_taken": _lane_taken, "lane_slots": _lane_slots, "reads_heard": _reads_heard}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(_RECORD_CYCLE_SQL, row)
+            cur.execute(_PRUNE_CYCLES_SQL, (_CYCLE_RECORD_DAYS,))
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        _safe_rollback(conn)
+        message = getattr(getattr(exc, "diag", None), "message_primary", None) or str(exc)
+        missing = getattr(exc, "pgcode", None) == "42P01" and "ranker_cycles" in message
+        failure = "missing" if missing else (getattr(exc, "pgcode", None) or type(exc).__name__)
+        if failure != _cycle_record_failure:
+            if missing:
+                log.warning(
+                    "haf_fyp_app.ranker_cycles is missing: the installed SQL is older than "
+                    "this ranker, so GET /metrics cannot show its cycles. Ranking goes on. "
+                    "Re-run the install with the block processor and this ranker stopped."
+                )
+            else:
+                log.warning("could not record the cycle for GET /metrics (%s)", exc)
+        _cycle_record_failure = failure
+        return
+    if _cycle_record_failure:
+        log.info("the cycle record for GET /metrics is being written again")
+    _cycle_record_failure = None
 
 
 def _refresh_read_filter(conn) -> None:
@@ -1890,14 +2048,23 @@ def main() -> None:
         if time.monotonic() >= next_full_cycle:
             ranked: set[str] = set()
             handed.clear()
+            cycle_started, cycle_ok = time.monotonic(), False
+            cycle_seconds: float | None = None
             try:
                 ranked = run_cycle(conn, _reads_during_cycle) or set()
+                cycle_ok = True
             except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                # Timed before the reconnect, which waits as long as the database is
+                # down or an install holds HAF's lock: that is not the cycle's length.
+                cycle_seconds = time.monotonic() - cycle_started
                 log.warning("database connection lost — reconnecting")
                 conn = _reconnect(conn)
             except Exception:
                 log.exception("ranking cycle failed")
                 _safe_rollback(conn)
+            if cycle_seconds is None:
+                cycle_seconds = time.monotonic() - cycle_started
+            _record_cycle(conn, cycle_seconds, cycle_ok)
             # Waiting readers the cycle ranked are done. The rest keep waiting for the
             # next grouped re-rank, and so does everyone handed to the cycle that it did
             # not get to: a cycle that failed, an account whose ranking failed, a lane

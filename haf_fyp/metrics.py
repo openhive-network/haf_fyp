@@ -26,8 +26,11 @@ Unlike embedding coverage, this is NOT precomputed. That rollup is a table becau
 the candidate scan behind it is multi-second; the credibility probe is a single
 indexed catalog read, and an inline answer cannot go stale -- which matters here
 because a persisted row written by a dead daemon would keep reporting the last
-known-good state indefinitely. (The reader_first section at the end of this module is
-the one place the app reports whether the ranker is ranking: newest_feed_seconds.)
+known-good state indefinitely. (Two sections further down report whether the ranker is
+ranking: reader_first's newest_feed_seconds, read from the feeds, and the ranker
+section's last_cycle.finished_seconds_ago, read from the record the ranker writes after
+each cycle, #37. The second is a persisted row of exactly that kind, so it is read for
+its age, never as a state.)
 """
 
 from __future__ import annotations
@@ -866,6 +869,204 @@ def build_history_report(probe: dict | None) -> dict:
 
 
 # ---------------------------------------------------------------------------------------
+# ranker (#37): what the ranker's last scheduled cycles did, as it recorded them
+# ---------------------------------------------------------------------------------------
+#
+# The ranker writes one row per scheduled cycle into haf_fyp_app.ranker_cycles and deletes
+# rows older than seven days as it does (a stopped ranker deletes nothing, so its last row
+# stays). Until it did, these figures were only in its log, which is lost when
+# the container is recreated. Unlike reader_first, this is what the ranker REPORTED: a
+# stopped or wedged ranker reports nothing, so the age of the last row is the signal.
+# Both clocks are the database's (finished_at is clock_timestamp() at the insert), so the age does
+# not depend on the ranker container's clock.
+
+RANKER_OK = "ok"
+RANKER_NO_CYCLES = "no_cycles"
+RANKER_UNSUPPORTED = "unsupported"
+RANKER_UNKNOWN = STATE_UNKNOWN
+
+# A ranker that has recorded no successful cycle for this long is degraded. A healthy one
+# finishes a cycle every CYCLE_SECONDS (300) plus the cycle's length -- about a dozen an
+# hour at testapi's 20-30 s cycles -- and an install stops it only for the install
+# itself, a few minutes. So an hour says the ranker has stopped, is wedged or raises on
+# every cycle; a slow one reaches it only with a single cycle near an hour long. Fixed,
+# not derived from the node's own cycle times, which would loosen the threshold just as
+# a node slows down.
+RANKER_STALE_SECONDS = 3600
+
+_RANKER_SQL = """
+WITH last AS (
+    SELECT * FROM haf_fyp_app.ranker_cycles ORDER BY finished_at DESC LIMIT 1
+), day AS (
+    SELECT count(*) AS cycles,
+           count(*) FILTER (WHERE NOT ok) AS failed,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_seconds) AS median,
+           max(duration_seconds) AS longest
+      FROM haf_fyp_app.ranker_cycles
+     WHERE finished_at >= statement_timestamp() - interval '24 hours'
+), since_ok AS (
+    -- Since the last cycle that succeeded; with none in the record, since its first
+    -- cycle, so a record that has only ever failed ages from when it began.
+    SELECT EXTRACT(EPOCH FROM statement_timestamp()
+                   - coalesce(max(finished_at) FILTER (WHERE ok), min(finished_at))) AS seconds
+      FROM haf_fyp_app.ranker_cycles
+)
+SELECT EXTRACT(EPOCH FROM statement_timestamp() - last.finished_at),
+       last.duration_seconds, last.ok, last.candidates, last.users_attempted,
+       last.users_ranked, last.users_failed, last.users_held, last.readers_ahead,
+       last.lane_taken, last.lane_slots, last.reads_heard,
+       day.cycles, day.failed, day.median, day.longest, since_ok.seconds
+  FROM day CROSS JOIN since_ok LEFT JOIN last ON true
+"""
+
+_RANKER_SAVEPOINT = "haf_fyp_metrics_ranker"
+
+_LAST_CYCLE_KEYS = (
+    "finished_seconds_ago", "duration_seconds", "ok", "candidates", "users_attempted",
+    "users_ranked", "users_failed", "users_held", "readers_ahead", "reader_lane_taken",
+    "reader_lane_slots", "reads_heard",
+)
+
+
+def _rounded(value) -> float | None:
+    return None if value is None else round(float(value), 1)
+
+
+def fetch_ranker_cycles(conn) -> dict | None:
+    """
+    Read the ranker's last cycle and the last 24 hours of them, or None if they could not
+    be read. In a SAVEPOINT of its own, as fetch_reader_first.
+
+    `{"unsupported": True}` means there is no ranker_cycles table: the installed SQL is
+    older than this API image. `{"aborted": True}` means the SAVEPOINT itself was refused
+    (25P02): a probe before this one, which runs without a SAVEPOINT, has already aborted
+    the shared transaction, and its own section reports that.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SAVEPOINT {_RANKER_SAVEPOINT}")
+            try:
+                cur.execute(_RANKER_SQL)
+                row = cur.fetchone()
+            except Exception as exc:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {_RANKER_SAVEPOINT}")
+                message = getattr(getattr(exc, "diag", None), "message_primary", None) or str(exc)
+                if getattr(exc, "pgcode", None) == "42P01" and "ranker_cycles" in message:
+                    return {"unsupported": True}
+                raise
+            cur.execute(f"RELEASE SAVEPOINT {_RANKER_SAVEPOINT}")
+        last = dict(zip(_LAST_CYCLE_KEYS, row[:12]))
+        cycles, failed, median, longest, since_ok = row[12:]
+        return {
+            "last_cycle": None if last["duration_seconds"] is None else last,
+            "cycles": int(cycles),
+            "failed_cycles": int(failed),
+            "median_duration_seconds": median,
+            "max_duration_seconds": longest,
+            "seconds_since_ok_cycle": since_ok,
+        }
+    except Exception as exc:
+        # As the sibling probes: no rollback of the connection (the pool does that),
+        # and no exc_info, because monitors poll this route.
+        log.warning("ranker: cycles could not be read (%s) -- reporting unknown", exc)
+        if getattr(exc, "pgcode", None) == "25P02":
+            return {"aborted": True}
+        return None
+
+
+def build_ranker_report(probe: dict | None) -> dict:
+    """
+    The ranker section of GET /metrics.
+
+    last_cycle -- the most recent scheduled cycle the ranker recorded:
+        finished_seconds_ago -- the liveness figure. A ranker waits CYCLE_SECONDS (300,
+            fixed in the ranker) between cycles, so this stays under that plus one
+            cycle's length, plus any targeted re-rank or hourly maintenance pass still
+            running when the wait ends.
+            Well above CYCLE_SECONDS + last_24h.max_duration_seconds, the ranker is
+            stopped, or wedged inside a cycle. reader_first.newest_feed_seconds says the
+            same from the feeds, without the ranker's help.
+        duration_seconds -- how long the whole cycle took, as main() timed it (not the
+            reconnect after a lost connection).
+        ok -- false when the cycle raised: the ranker's log says `ranking cycle failed`
+            with the traceback, or `database connection lost` without one.
+        candidates, users_attempted, users_ranked, users_failed, users_held -- what it
+            scored and ranked. users_held are accounts in a read session (#104).
+        readers_ahead -- readers taken ahead of their turn during the cycle (#85).
+        reader_lane_taken, reader_lane_slots -- the reader lane (#81): taken equal to
+            slots, cycle after cycle, means the rest of the rotation runs slower.
+        reads_heard -- feed reads heard since the previous cycle ended.
+    last_24h -- cycles, failed_cycles, median and max duration over the last 24 hours.
+    seconds_since_ok_cycle -- since the last cycle that succeeded (ok true); with none
+        recorded, since the first cycle recorded. null with no cycle at all.
+    degraded -- true when the ranker is not ranking: seconds_since_ok_cycle is above
+        RANKER_STALE_SECONDS (an hour), which a stopped or wedged ranker and one whose
+        every cycle raises all reach; or this read failed (unknown). Not when an earlier
+        probe had already aborted the transaction (unknown too, but that probe's section
+        reports it: one cause, one alert). false for unsupported (the SQL predates the
+        record) and for no_cycles, which an empty record cannot tell from a ranker that
+        has not finished its first cycle; see the README for alerting on it.
+
+    A cycle that raised is recorded with ok false and the counts it had reached, up to
+    the account it was on. A cycle with no candidates is ok with every count 0. A
+    ranker that cannot write the record keeps ranking: a lasting no_cycles or a growing
+    age can mean that too, and newest_feed_seconds tells the two apart.
+    """
+    if probe is None:
+        return {
+            "state": RANKER_UNKNOWN,
+            "degraded": True,  # never "fine" when it does not know
+            "detail": "the ranker's cycles could not be read; see the API log",
+        }
+    if probe.get("aborted"):
+        return {
+            "state": RANKER_UNKNOWN,
+            "degraded": False,
+            "detail": (
+                "not read: an earlier probe of this request aborted the transaction, and "
+                "its own section reports it as degraded"
+            ),
+        }
+    if probe.get("unsupported"):
+        return {
+            "state": RANKER_UNSUPPORTED,
+            "degraded": False,
+            "detail": (
+                "haf_fyp_app.ranker_cycles does not exist: the installed SQL predates the "
+                "ranker's cycle record. Re-run the install, with the block processor and "
+                "the ranker stopped (it is skipped while either holds HAF's lock)."
+            ),
+        }
+    last = probe["last_cycle"]
+    if last is not None:
+        last = {
+            **last,
+            "finished_seconds_ago": _seconds(last["finished_seconds_ago"]),
+            "duration_seconds": _rounded(last["duration_seconds"]),
+        }
+    since_ok = _seconds(probe["seconds_since_ok_cycle"])
+    report = {
+        "state": RANKER_OK if last is not None else RANKER_NO_CYCLES,
+        "degraded": since_ok is not None and since_ok > RANKER_STALE_SECONDS,
+        "seconds_since_ok_cycle": since_ok,
+        "last_cycle": last,
+        "last_24h": {
+            "cycles": probe["cycles"],
+            "failed_cycles": probe["failed_cycles"],
+            "median_duration_seconds": _rounded(probe["median_duration_seconds"]),
+            "max_duration_seconds": _rounded(probe["max_duration_seconds"]),
+        },
+    }
+    if last is None:
+        report["detail"] = (
+            "the ranker has recorded no cycle: it has not finished one since the install "
+            "created the record, it is older than the record and does not write it, or it "
+            "cannot write it (see the ranker's log)"
+        )
+    return report
+
+
+# ---------------------------------------------------------------------------------------
 # feed_cache: whether the installed table is the compact row the ranker writes (#98)
 # ---------------------------------------------------------------------------------------
 #
@@ -921,4 +1122,77 @@ def build_feed_cache_report(probe: dict | None) -> dict:
             "processor and the ranker stopped (it is skipped while either holds HAF's "
             "lock)."
         ),
+    }
+
+
+# ---------------------------------------------------------------------------------------
+# redis (#51): can the refresh signal reach the ranker?
+# ---------------------------------------------------------------------------------------
+#
+# The API publishes haf_fyp:refresh after an interests write, and the ranker subscribes.
+# When the two talk to different Redis instances (a renamed compose service whose old
+# container kept the `redis` alias, a REDIS_HOST set on one side only), both report
+# success: the publish lands with nobody listening and the subscriber waits on a channel
+# nobody publishes to. The one place that state shows is the subscriber count on the
+# instance the API publishes to, which is zero.
+
+REDIS_OK = "ok"
+REDIS_NO_SUBSCRIBER = "no_subscriber"
+REDIS_UNREACHABLE = "unreachable"
+REDIS_UNKNOWN = STATE_UNKNOWN
+
+
+def build_redis_report(probe: dict | None, address: str) -> dict:
+    """
+    The redis section of GET /metrics, for the Redis the refresh signal is published
+    to (REDIS_HOST / REDIS_PORT, given as `address`). Not the rate limiter's store:
+    that is REDIS_URL, a separate setting.
+
+    States: `unreachable` when the PING fails or times out (0.3 s); `unknown` when the
+    probe did not finish within 1 s (typically name resolution) or the PING answered
+    but PUBSUB NUMSUB failed; `no_subscriber` when nobody listens on haf_fyp:refresh.
+
+    `degraded` is true unless the instance answers and at least one client listens.
+    NUMSUB counts any client, so the ranker should be one of them. Zero is a ranker that
+    is stopped (an install stops it on purpose), restarting, or listening on another
+    instance. Either way a refresh asked for now waits for the next scheduled cycle, and
+    an un-opt-in for the hourly sweep. Unlike reader_first and feed_cache, this section
+    sets `degraded`: zero listeners is a yes/no fact that does not depend on how big
+    the node is, which is what #51 asked to alert on.
+
+    maxmemory_policy is reported, not judged. It is the pub/sub instance's, so it
+    describes the limiter's store only when REDIS_URL points at the same instance. It
+    is null when CONFIG is not allowed, and a policy only takes effect when maxmemory is
+    set.
+    """
+    # Anything but the probe's dict is no answer: a wrong no_answer must not 500 the route.
+    answered = isinstance(probe, dict)
+    if not isinstance(probe, dict):
+        probe = {"reachable": False, "refresh_subscribers": None, "maxmemory_policy": None}
+    subscribers = probe["refresh_subscribers"]
+    if not answered:
+        state, detail = REDIS_UNKNOWN, "the Redis probe failed or did not answer within 1 s"
+    elif not probe["reachable"]:
+        state, detail = REDIS_UNREACHABLE, (
+            f"{address} does not answer a PING (the API log says why); force-refresh "
+            "and un-opt-in wait for the ranker's scheduled passes"
+        )
+    elif not isinstance(subscribers, int):
+        # None (NUMSUB failed), or a non-integer from something that is not quite Redis.
+        state, detail = REDIS_UNKNOWN, "PUBSUB NUMSUB failed; see the API log"
+    elif subscribers == 0:
+        state, detail = REDIS_NO_SUBSCRIBER, (
+            f"nobody is subscribed to haf_fyp:refresh on {address}: the ranker is down "
+            "or restarting, or it listens on another Redis (check REDIS_HOST / "
+            "REDIS_PORT on both containers, and for an orphaned `redis` container)"
+        )
+    else:
+        state, detail = REDIS_OK, None
+    return {
+        "state": state,
+        "degraded": state != REDIS_OK,
+        "address": address,
+        "refresh_subscribers": subscribers,
+        "maxmemory_policy": probe["maxmemory_policy"],
+        "detail": detail,
     }

@@ -49,7 +49,8 @@ MAINT_SQL = os.path.join(
 )
 TABLES = (
     "haf_fyp_app.active_users, haf_fyp_app.user_interests, haf_fyp_app.feed_cache, "
-    "haf_fyp_app.user_interactions, haf_fyp_app.user_profile_vectors"
+    "haf_fyp_app.user_interactions, haf_fyp_app.user_profile_vectors, "
+    "haf_fyp_app.user_author_affinity"
 )
 # A lock mistake in this file should fail a test, not hang the job until GitLab's
 # timeout: nothing here legitimately waits for a lock at all.
@@ -278,6 +279,7 @@ class _Cycle:
         monkeypatch.setattr(
             rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
         )
+        monkeypatch.setattr(rd.language, "detect_post_languages", lambda *a, **kw: 0)
         monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
         monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
         monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)

@@ -366,7 +366,7 @@ def test_a_dead_connection_is_reported_unknown_without_raising() -> None:
 # ---- the route ----------------------------------------------------------------------------
 
 
-def _route(monkeypatch: MonkeyPatch, reader_first):
+def _route(monkeypatch: MonkeyPatch, reader_first, ranker=None):
     from haf_fyp import api
 
     order, conns = [], []
@@ -390,7 +390,9 @@ def _route(monkeypatch: MonkeyPatch, reader_first):
     monkeypatch.setattr(api, "fetch_credibility_sources", _stub("credibility", None))
     monkeypatch.setattr(api, "fetch_reader_first", _stub("reader_first", reader_first))
     monkeypatch.setattr(api, "fetch_history", _stub("history", None))
-    monkeypatch.setattr(api, "fetch_feed_cache_shape", lambda conn: None)
+    monkeypatch.setattr(api, "fetch_ranker_cycles", _stub("ranker", ranker))
+    monkeypatch.setattr(api, "fetch_feed_cache_shape", _stub("feed_cache", None))
+    monkeypatch.setattr(api, "_channel_probe", api._BoundedProbe("c", lambda: None, no_answer=None))
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {"embedding_coverage": []})
     monkeypatch.setattr(api, "build_credibility_sources_report", lambda probe: {"c": 1})
     monkeypatch.setattr(api, "build_ranking_sources_report", lambda probe, serv: {"r": 1})
@@ -419,7 +421,8 @@ def test_the_route_reads_reader_first_after_the_others_and_on_the_same_connectio
     _report, order, conns = _route(monkeypatch, None)
 
     names = [name for name, _c in order]
-    assert names == ["coverage", "ranking", "servability", "credibility", "reader_first", "history"]
+    assert names == ["coverage", "ranking", "servability", "credibility", "reader_first", "history",
+                     "ranker", "feed_cache"]
     assert len(conns) == 1 and all(c is conns[0] for _n, c in order)
 
 
@@ -452,7 +455,9 @@ def test_the_route_reads_reader_first_while_it_still_holds_the_connection(monkey
     monkeypatch.setattr(api, "fetch_credibility_sources", lambda conn: None)
     monkeypatch.setattr(api, "fetch_reader_first", lambda conn: seen.append(conn in held))
     monkeypatch.setattr(api, "fetch_history", lambda conn: seen.append(conn in held))
+    monkeypatch.setattr(api, "fetch_ranker_cycles", lambda conn: seen.append(conn in held))
     monkeypatch.setattr(api, "fetch_feed_cache_shape", lambda conn: None)
+    monkeypatch.setattr(api, "_channel_probe", api._BoundedProbe("c", lambda: None, no_answer=None))
     monkeypatch.setattr(api, "build_coverage_report", lambda rows, today: {})
     monkeypatch.setattr(api, "build_credibility_sources_report", lambda probe: {})
     monkeypatch.setattr(api, "build_ranking_sources_report", lambda probe, serv: {})
@@ -461,4 +466,4 @@ def test_the_route_reads_reader_first_while_it_still_holds_the_connection(monkey
 
     api.metrics(MagicMock())
 
-    assert seen == [True, True]  # after the `with`, the connection is back in the pool
+    assert seen == [True, True, True]  # after the `with`, the connection is back in the pool

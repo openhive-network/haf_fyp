@@ -47,10 +47,10 @@ schemas:
         description: Position in the feed (1-based)
       final_score:
         type: number
-        description: Composite ranking score [0, 1]
+        description: Composite ranking score [0, 1]. From algorithm 1.3.0 every score is divided by 1 + the larger community boost instead of a boosted score being clipped at 1, so the top of a feed keeps its order
       score_relevance:
         type: [number, 'null']
-        description: Semantic relevance to the user's interest vector (null in the global feed)
+        description: Semantic relevance to the user's interest vector; from algorithm 1.4.0 raised for authors the reader engages with (null in the global feed)
       score_recency:
         type: number
       score_engagement:
@@ -254,14 +254,14 @@ DECLARE
           },
           "final_score": {
             "type": "number",
-            "description": "Composite ranking score [0, 1]"
+            "description": "Composite ranking score [0, 1]. From algorithm 1.3.0 every score is divided by 1 + the larger community boost instead of a boosted score being clipped at 1, so the top of a feed keeps its order"
           },
           "score_relevance": {
             "type": [
               "number",
               "null"
             ],
-            "description": "Semantic relevance to the user's interest vector (null in the global feed)"
+            "description": "Semantic relevance to the user's interest vector; from algorithm 1.4.0 raised for authors the reader engages with (null in the global feed)"
           },
           "score_recency": {
             "type": "number"
@@ -726,6 +726,19 @@ DECLARE
               "default": 0
             },
             "description": "Truncate each post body to this many characters (0 = full body)"
+          },
+          {
+            "in": "query",
+            "name": "language",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "description": "Only posts written in this language: a code, or several comma-separated (es or es,pt; case and spaces ignored, and a region cut off, so es-ES and pt_BR are es and pt). Codes are ISO 639-1 where the language has one, else ISO 639-3 (yue, ary); see README \"Languages\" for close languages to send together (no,nn; id,ms). The posts are left out before the page is cut, so pages are full until the feed runs out. It filters the feed as ranked, which holds the reader's top 200 posts (the global fallback, 200 too), so a language that is a small share of it gives a short feed. A post's languages are detected from its title and body when the ranker first reads it; a post written in two languages counts for both, and one too short to tell (a caption under a photo) counts for none; a language a post declares in its metadata is not read, and an edit does not change it. A code no post has returns an empty feed, not an error, so an empty first page means \"nothing in this language here\": offer the unfiltered feed. Blank means no filter. Nodes older than this parameter answer 404 when it is sent."
           }
         ],
         "responses": {
@@ -833,6 +846,32 @@ DECLARE
               "default": 0
             },
             "description": "Truncate each post body to this many characters (0 = full body)"
+          },
+          {
+            "in": "query",
+            "name": "observer",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "description": "Hive account the feed is shown to (optional; a leading @ is ignored). Posts by authors it has muted or blacklisted, directly or through a list it follows, are left out before the page is cut, so pages are full until the feed runs out; it holds at most 200 posts, so a reader who hides many authors reaches the end sooner. Cached posts carry no observer context; a post not yet in the render cache is rendered for this account. An unknown account is served as if none was given. Not authenticated: it filters for whoever is named. Nodes older than this parameter answer 404 when it is sent."
+          },
+          {
+            "in": "query",
+            "name": "language",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "description": "Only posts written in this language: a code, or several comma-separated (es or es,pt; case and spaces ignored, and a region cut off, so es-ES and pt_BR are es and pt). Codes are ISO 639-1 where the language has one, else ISO 639-3 (yue, ary); see README \"Languages\" for close languages to send together (no,nn; id,ms). The posts are left out before the page is cut, so pages are full until the feed runs out. It filters the feed as ranked, which holds 200 posts, so a language that is a small share of it gives a short feed. A post's languages are detected from its title and body when the ranker first reads it; a post written in two languages counts for both, and one too short to tell (a caption under a photo) counts for none; a language a post declares in its metadata is not read, and an edit does not change it. A code no post has returns an empty feed, not an error, so an empty first page means \"nothing in this language here\": offer the unfiltered feed. Blank means no filter. Nodes older than this parameter answer 404 when it is sent."
           }
         ],
         "responses": {
@@ -1590,6 +1629,55 @@ $$;
 
 GRANT EXECUTE ON FUNCTION haf_fyp_app.get_bridge_post(int, int, int) TO haf_fyp_user;
 
+-- Posts in global_feed_cache that an observer is not to be shown (#114): by authors it
+-- has muted or blacklisted, directly or through a mute list or blacklist it follows (one
+-- level, as hivemind's own muted_accounts_by_id_view and get_blacklisted_by_observer
+-- read them). haf_fyp.visibility leaves the same authors out of a personal feed when the
+-- ranker writes it (#89, #113).
+--
+-- Applied to the whole cache (at most 200 posts) before the page is cut, so the hidden
+-- posts are skipped, not blanked: pages are full until the cache runs out, which for a
+-- reader who hides many authors is sooner. The reader's own posts are never hidden.
+-- Primary-key probes per post (all four tables are keyed (follower, following)): the
+-- size of a list does not matter, the number of lists the observer follows does.
+-- Observer 0 or below is anonymous: nothing hidden, and hivemind not read.
+-- When those tables cannot be read (not there, or no grant), nothing is hidden and the
+-- feed is served, as the ranker writes feeds without a filter it cannot read.
+-- plpgsql so that it binds to hivemind's tables when called (see hivemind_post_identity).
+CREATE OR REPLACE FUNCTION haf_fyp_app.global_feed_hidden_for(_observer_id int)
+RETURNS int[]
+LANGUAGE plpgsql
+STABLE
+AS $$
+BEGIN
+    IF COALESCE(_observer_id, 0) <= 0 THEN
+        RETURN '{}'::int[];
+    END IF;
+    RETURN COALESCE((
+        SELECT array_agg(gfc.post_id::int)
+        FROM haf_fyp_app.global_feed_cache AS gfc
+        JOIN hivemind_app.hive_posts AS hp ON hp.id = gfc.post_id
+        WHERE hp.author_id <> _observer_id
+          AND (EXISTS (SELECT 1 FROM hivemind_app.muted AS m
+                      WHERE m.follower = _observer_id AND m.following = hp.author_id)
+           OR EXISTS (SELECT 1 FROM hivemind_app.follow_muted AS fm
+                      JOIN hivemind_app.muted AS m ON m.follower = fm.following
+                      WHERE fm.follower = _observer_id AND m.following = hp.author_id)
+           OR EXISTS (SELECT 1 FROM hivemind_app.blacklisted AS b
+                      WHERE b.follower = _observer_id AND b.following = hp.author_id)
+           OR EXISTS (SELECT 1 FROM hivemind_app.follow_blacklisted AS fb
+                      JOIN hivemind_app.blacklisted AS b ON b.follower = fb.following
+                      WHERE fb.follower = _observer_id AND b.following = hp.author_id))
+    ), '{}'::int[]);
+EXCEPTION
+    -- The same SQLSTATEs as haf_fyp.visibility._NOT_THERE.
+    WHEN invalid_schema_name OR undefined_table OR undefined_column OR insufficient_privilege THEN
+        RETURN '{}'::int[];
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION haf_fyp_app.global_feed_hidden_for(int) TO haf_fyp_user;
+
 -- A post's author, permlink and title, which haf_fyp does not copy (#97): read from
 -- hivemind when an endpoint names them. No row for a post hivemind does not have.
 -- plpgsql so that it binds to hivemind's tables when called, not when created: a SQL
@@ -1666,6 +1754,28 @@ GRANT EXECUTE ON FUNCTION haf_fyp_app.hivemind_post_identity(int) TO haf_fyp_use
           type: integer
           default: 0
         description: Truncate each post body to this many characters (0 = full body)
+      - in: query
+        name: language
+        required: false
+        schema:
+          type: [string, 'null']
+          default: null
+        description: >-
+          Only posts written in this language: a code, or several comma-separated
+          (es or es,pt; case and spaces ignored, and a region cut off, so es-ES and
+          pt_BR are es and pt). Codes are ISO 639-1 where the language has one, else
+          ISO 639-3 (yue, ary); see README "Languages" for close languages to send
+          together (no,nn; id,ms). The posts are left out before the page is cut, so
+          pages are full until the feed runs out.
+          It filters the feed as ranked, which holds the reader's top 200 posts (the global fallback, 200 too), so a language that is a
+          small share of it gives a short feed. A post's languages are detected from
+          its title and body when the ranker first reads it; a post written in two
+          languages counts for both, and one too short to tell (a caption under a
+          photo) counts for none; a language a post declares in its metadata is not
+          read, and an edit does not change it. A code no post has returns an empty
+          feed, not an error, so an empty first page means "nothing in this language
+          here": offer the unfiltered feed. Blank means no filter. Nodes older than
+          this parameter answer 404 when it is sent.
     responses:
       '200':
         description: Ranked post list (empty array before first ranker cycle)
@@ -1683,7 +1793,8 @@ CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_personalized_feed(
     "username" TEXT,
     "page" INT = 1,
     "page-size" INT = 20,
-    "truncate_body" INT = 0
+    "truncate_body" INT = 0,
+    "language" TEXT = NULL
 )
 RETURNS jsonb
 -- openapi-generated-code-end
@@ -1691,6 +1802,14 @@ LANGUAGE plpgsql STABLE
 AS $$
 DECLARE
     _observer_id int;
+    _hidden int[];
+    -- #115: the languages asked for, or NULL for any: lowercased, spaces dropped, and a
+    -- region cut off (es-ES and pt_BR are es and pt), as a client may send its locale.
+    _languages text[] := NULLIF(array_remove(string_to_array(lower(regexp_replace(
+        regexp_replace(COALESCE(get_personalized_feed.language, ''), '\s', '', 'g'), '[-_][^,]*', '', 'g')), ','), ''), '{}');
+    -- The cached posts written in one of them. Read only when a language is asked
+    -- for, so a feed read without one never touches post_language.
+    _in_language int[];
     _result jsonb;
     -- Pagination uses page / page-size (not limit / offset, which PostgREST
     -- reserves for result-set slicing and would not forward as arguments).
@@ -1764,6 +1883,15 @@ BEGIN
             (SELECT ha.id FROM hivemind_app.hive_accounts ha
              WHERE ha.name = get_personalized_feed.username), 0
         );
+        IF _languages IS NOT NULL THEN
+            _in_language := ARRAY(
+                SELECT pl.post_id
+                FROM haf_fyp_app.feed_cache fc
+                JOIN haf_fyp_app.post_language pl ON pl.post_id = fc.post_id
+                WHERE fc.username = get_personalized_feed.username
+                  AND pl.languages && _languages
+            );
+        END IF;
         SELECT COALESCE(
             jsonb_agg(s.post ORDER BY s.rank) FILTER (WHERE s.post IS NOT NULL),
             '[]'::jsonb
@@ -1821,6 +1949,7 @@ BEGIN
                 LEFT JOIN haf_fyp_app.feed_cache_labels lb ON lb.code = fc.boost_source
                 LEFT JOIN haf_fyp_app.feed_cache_labels la ON la.code = fc.algorithm_version
                 WHERE fc.username = get_personalized_feed.username
+                  AND (_in_language IS NULL OR fc.post_id = ANY (_in_language))
                 ORDER BY fc.rank
                 LIMIT _limit
                 OFFSET _offset
@@ -1842,6 +1971,17 @@ BEGIN
             (SELECT ha.id FROM hivemind_app.hive_accounts ha
              WHERE ha.name = get_personalized_feed.username), 0
         );
+        -- The reader's muted and blacklisted authors are left out (#114): this is
+        -- the feed a new account reads until the ranker has built one of its own.
+        _hidden := haf_fyp_app.global_feed_hidden_for(_observer_id);
+        IF _languages IS NOT NULL THEN
+            _in_language := ARRAY(
+                SELECT pl.post_id
+                FROM haf_fyp_app.global_feed_cache gfc
+                JOIN haf_fyp_app.post_language pl ON pl.post_id = gfc.post_id
+                WHERE pl.languages && _languages
+            );
+        END IF;
         SELECT COALESCE(
             jsonb_agg(s.post ORDER BY s.rank) FILTER (WHERE s.post IS NOT NULL),
             '[]'::jsonb
@@ -1894,6 +2034,8 @@ BEGIN
                     ) AS fyp
                 FROM haf_fyp_app.global_feed_cache gfc
                 LEFT JOIN haf_fyp_app.post_bridge_cache pbc ON pbc.post_id = gfc.post_id
+                WHERE gfc.post_id <> ALL (_hidden)
+                  AND (_in_language IS NULL OR gfc.post_id = ANY (_in_language))
                 ORDER BY gfc.rank
                 LIMIT _limit
                 OFFSET _offset
@@ -2025,6 +2167,43 @@ $$;
           type: integer
           default: 0
         description: Truncate each post body to this many characters (0 = full body)
+      - in: query
+        name: observer
+        required: false
+        schema:
+          type: [string, 'null']
+          default: null
+        description: >-
+          Hive account the feed is shown to (optional; a leading @ is ignored).
+          Posts by authors it has muted or blacklisted, directly or through a list
+          it follows, are left out before the page is cut, so pages are full until
+          the feed runs out; it holds at most 200 posts, so a reader who hides many
+          authors reaches the end sooner. Cached posts carry no observer context; a
+          post not yet in the render cache is rendered for this account. An unknown
+          account is served as if none was given. Not authenticated: it filters for
+          whoever is named. Nodes older than this parameter answer 404 when it is sent.
+      - in: query
+        name: language
+        required: false
+        schema:
+          type: [string, 'null']
+          default: null
+        description: >-
+          Only posts written in this language: a code, or several comma-separated
+          (es or es,pt; case and spaces ignored, and a region cut off, so es-ES and
+          pt_BR are es and pt). Codes are ISO 639-1 where the language has one, else
+          ISO 639-3 (yue, ary); see README "Languages" for close languages to send
+          together (no,nn; id,ms). The posts are left out before the page is cut, so
+          pages are full until the feed runs out.
+          It filters the feed as ranked, which holds 200 posts, so a language that is a
+          small share of it gives a short feed. A post's languages are detected from
+          its title and body when the ranker first reads it; a post written in two
+          languages counts for both, and one too short to tell (a caption under a
+          photo) counts for none; a language a post declares in its metadata is not
+          read, and an edit does not change it. A code no post has returns an empty
+          feed, not an error, so an empty first page means "nothing in this language
+          here": offer the unfiltered feed. Blank means no filter. Nodes older than
+          this parameter answer 404 when it is sent.
     responses:
       '200':
         description: Global ranked post list
@@ -2042,21 +2221,49 @@ CREATE OR REPLACE FUNCTION haf_fyp_endpoints.get_global_feed(
     "page" INT = 1,
     "page-size" INT = 20,
     "community_id" INT = NULL,
-    "truncate_body" INT = 0
+    "truncate_body" INT = 0,
+    "observer" TEXT = NULL,
+    "language" TEXT = NULL
 )
 RETURNS jsonb
 -- openapi-generated-code-end
 LANGUAGE plpgsql STABLE
 AS $$
 DECLARE
+    _observer_id int := 0;
+    _hidden int[];
+    -- #115: the languages asked for, or NULL for any: lowercased, spaces dropped, and a
+    -- region cut off (es-ES and pt_BR are es and pt), as a client may send its locale.
+    _languages text[] := NULLIF(array_remove(string_to_array(lower(regexp_replace(
+        regexp_replace(COALESCE(get_global_feed.language, ''), '\s', '', 'g'), '[-_][^,]*', '', 'g')), ','), ''), '{}');
+    -- The cached posts written in one of them. Read only when a language is asked
+    -- for, so a feed read without one never touches post_language.
+    _in_language int[];
     _result jsonb;
     -- See get_personalized_feed: page / page-size, capped, windowed in-query.
     _limit int := LEAST(GREATEST(get_global_feed."page-size", 1), 20);
     _offset int := (GREATEST(get_global_feed."page", 1) - 1) * _limit;
 BEGIN
-    -- Global feed is unauthenticated, so observer_id is 0 (no account-specific
-    -- vote / mute context). Hivemind is only joined when the cache has rows.
+    -- Without an observer the feed is anonymous (observer 0) and hivemind is read
+    -- only to render a cache miss. With one (#114), the posts global_feed_hidden_for
+    -- names are skipped before the page is cut. Not authentication: it filters for
+    -- whoever is named, as hivemind's bridge does with its own observer parameter.
     IF EXISTS (SELECT 1 FROM haf_fyp_app.global_feed_cache) THEN
+        IF NULLIF(btrim(get_global_feed.observer), '') IS NOT NULL THEN
+            _observer_id := COALESCE(
+                (SELECT ha.id FROM hivemind_app.hive_accounts ha
+                 WHERE ha.name = ltrim(lower(btrim(get_global_feed.observer)), '@')), 0
+            );
+        END IF;
+        _hidden := haf_fyp_app.global_feed_hidden_for(_observer_id);
+        IF _languages IS NOT NULL THEN
+            _in_language := ARRAY(
+                SELECT pl.post_id
+                FROM haf_fyp_app.global_feed_cache gfc
+                JOIN haf_fyp_app.post_language pl ON pl.post_id = gfc.post_id
+                WHERE pl.languages && _languages
+            );
+        END IF;
         SELECT COALESCE(
             jsonb_agg(s.post ORDER BY s.rank) FILTER (WHERE s.post IS NOT NULL),
             '[]'::jsonb
@@ -2081,7 +2288,7 @@ BEGIN
                              )
                         ELSE page.cached
                     END,
-                    haf_fyp_app.get_bridge_post(page.post_id, 0, get_global_feed.truncate_body)
+                    haf_fyp_app.get_bridge_post(page.post_id, _observer_id, get_global_feed.truncate_body)
                 )
                 || jsonb_build_object('fyp', page.fyp) AS post
             FROM (
@@ -2113,12 +2320,14 @@ BEGIN
                 -- capped at the top ~200 posts, so this is a tiny PK-probed scan).
                 FROM haf_fyp_app.global_feed_cache gfc
                 LEFT JOIN haf_fyp_app.post_bridge_cache pbc ON pbc.post_id = gfc.post_id
-                WHERE get_global_feed.community_id IS NULL
-                   OR EXISTS (
-                       SELECT 1 FROM haf_fyp_app.post_candidates pc
-                       WHERE pc.post_id = gfc.post_id
-                         AND pc.community_id = get_global_feed.community_id
-                   )
+                WHERE gfc.post_id <> ALL (_hidden)
+                  AND (_in_language IS NULL OR gfc.post_id = ANY (_in_language))
+                  AND (get_global_feed.community_id IS NULL
+                       OR EXISTS (
+                           SELECT 1 FROM haf_fyp_app.post_candidates pc
+                           WHERE pc.post_id = gfc.post_id
+                             AND pc.community_id = get_global_feed.community_id
+                       ))
                 ORDER BY gfc.rank
                 LIMIT _limit
                 OFFSET _offset

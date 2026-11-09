@@ -1,4 +1,4 @@
-"""haf_fyp.visibility (#89): what a reader must not be shown, and how the ranker uses it.
+"""haf_fyp.visibility (#89, #113): what a reader must not be shown, and how the ranker uses it.
 
 The queries themselves run against a real database in
 tests/integration/test_visibility_db.py; here: the frame filter, what happens when
@@ -6,6 +6,10 @@ hivemind cannot be read, and that the ranker applies both filters where it shoul
 """
 
 import logging
+import os
+import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -22,7 +26,8 @@ def _fresh_warnings():
 
 
 def _frame():
-    return pd.DataFrame({"post_id": [1, 2, 3, 4], "author": ["alice", "bob", "carol", "bob"]})
+    return pd.DataFrame({"post_id": [1, 2, 3, 4], "author": ["alice", "bob", "carol", "bob"],
+                         "author_id": [11, 12, 13, 12]})
 
 
 def _conn(rows=None, error=None, closed=False):
@@ -84,15 +89,48 @@ def test_no_posts_no_query():
     cur.execute.assert_not_called()
 
 
-def test_muted_authors_are_asked_for_the_reader():
+def test_muted_authors_are_asked_for_the_reader_and_the_candidates_authors():
     conn, cur = _conn(rows=[("bob",), ("carol",)])
-    assert visibility.muted_authors(conn, "alice") == {"bob", "carol"}
+    assert visibility.muted_authors(conn, "alice", [7, 8, 9]) == {"bob", "carol"}
     query, params = cur.execute.call_args.args
-    assert params == {"username": "alice"}
-    # Both halves: the reader's own mutes, and the lists the reader follows.
-    assert "hivemind_app.muted AS m ON m.follower = reader.id" in query
-    assert "hivemind_app.follow_muted AS fm ON fm.follower = reader.id" in query
-    assert "JOIN hivemind_app.muted AS m ON m.follower = fm.following" in query
+    assert params == {"username": "alice", "author_ids": [7, 8, 9]}
+    # #118: only the candidates' authors, among the reader's own mutes and those of the
+    # lists the reader follows.
+    assert "m.following IN (SELECT unnest(%(author_ids)s::int[]))" in query
+    assert "m.follower = ANY(ARRAY(" in query
+    assert "JOIN hivemind_app.follow_muted AS fm ON fm.follower = reader.id" in query
+    assert "SELECT fm.following" in query
+    assert "blacklisted" not in query
+
+
+def test_blacklisted_authors_are_asked_for_the_reader_and_the_candidates_authors():
+    conn, cur = _conn(rows=[("bob",), ("carol",)])
+    assert visibility.blacklisted_authors(conn, "alice", [7, 8]) == {"bob", "carol"}
+    query, params = cur.execute.call_args.args
+    assert params == {"username": "alice", "author_ids": [7, 8]}
+    assert "b.following IN (SELECT unnest(%(author_ids)s::int[]))" in query
+    assert "b.follower = ANY(ARRAY(" in query
+    assert "JOIN hivemind_app.follow_blacklisted AS fb ON fb.follower = reader.id" in query
+    assert "SELECT fb.following" in query
+    assert "muted" not in query
+
+
+@pytest.mark.parametrize("read", [visibility.muted_authors, visibility.blacklisted_authors])
+def test_ids_taken_from_a_frame_are_sent_as_ints_psycopg2_can_adapt(read):
+    import psycopg2.extensions
+
+    conn, cur = _conn()
+    read(conn, "alice", _frame()["author_id"].unique())
+    ids = cur.execute.call_args.args[1]["author_ids"]
+    assert ids == [11, 12, 13] and all(type(i) is int for i in ids)
+    psycopg2.extensions.adapt(ids).getquoted()  # numpy integers raise here
+
+
+@pytest.mark.parametrize("read", [visibility.muted_authors, visibility.blacklisted_authors])
+def test_no_candidate_authors_no_query(read):
+    conn, cur = _conn()
+    assert read(conn, "alice", []) == set()
+    cur.execute.assert_not_called()
 
 
 class _PgError(Exception):
@@ -106,7 +144,8 @@ class _PgError(Exception):
 @pytest.mark.parametrize("pgcode", ["3F000", "42P01", "42703", "42501"])
 @pytest.mark.parametrize("read", [
     lambda conn: visibility.community_muted_post_ids(conn, [1]),
-    lambda conn: visibility.muted_authors(conn, "alice"),
+    lambda conn: visibility.muted_authors(conn, "alice", [1]),
+    lambda conn: visibility.blacklisted_authors(conn, "alice", [1]),
 ])
 def test_no_hivemind_to_read_filters_nothing_and_rolls_back(read, pgcode, caplog):
     conn, _cur = _conn(error=_PgError(pgcode, 'relation "hivemind_app.muted" does not exist'))
@@ -127,35 +166,38 @@ def test_any_other_failure_is_raised_not_written_unfiltered(error):
     # the ranker keeps the feed the account had (or abandons the cycle).
     conn, _cur = _conn(error=error)
     with pytest.raises(type(error)):
-        visibility.muted_authors(conn, "alice")
+        visibility.muted_authors(conn, "alice", [1])
     with pytest.raises(type(error)):
         visibility.community_muted_post_ids(conn, [1])
+    with pytest.raises(type(error)):
+        visibility.blacklisted_authors(conn, "alice", [1])
 
 
 def test_the_warning_is_given_once_per_process_not_once_per_account(caplog):
     conn, _cur = _conn(error=_PgError("42501", "permission denied for schema hivemind_app"))
     with caplog.at_level(logging.WARNING, logger="haf_fyp.visibility"):
         for name in ("a", "b", "c"):
-            visibility.muted_authors(conn, name)
+            visibility.muted_authors(conn, name, [1])
     assert sum("WITHOUT that filter" in r.getMessage() for r in caplog.records) == 1
 
 
-def test_the_two_filters_warn_separately(caplog):
+def test_each_filter_warns_separately(caplog):
     conn, _cur = _conn(error=_PgError("3F000", "schema hivemind_app does not exist"))
     with caplog.at_level(logging.WARNING, logger="haf_fyp.visibility"):
-        visibility.muted_authors(conn, "a")
+        visibility.muted_authors(conn, "a", [1])
         visibility.community_muted_post_ids(conn, [1])
-    assert sum("WITHOUT that filter" in r.getMessage() for r in caplog.records) == 2
+        visibility.blacklisted_authors(conn, "a", [1])
+    assert sum("WITHOUT that filter" in r.getMessage() for r in caplog.records) == 3
 
 
 def test_filtering_that_works_again_says_so_and_a_later_outage_warns_again(caplog):
     broken, _ = _conn(error=_PgError("42P01", "no hivemind yet"))
     working, _ = _conn(rows=[("bob",)])
     with caplog.at_level(logging.WARNING, logger="haf_fyp.visibility"):
-        visibility.muted_authors(broken, "a")
-        assert visibility.muted_authors(working, "a") == {"bob"}
-        visibility.muted_authors(working, "a")      # nothing more to say
-        visibility.muted_authors(broken, "a")
+        visibility.muted_authors(broken, "a", [1])
+        assert visibility.muted_authors(working, "a", [1]) == {"bob"}
+        visibility.muted_authors(working, "a", [1])      # nothing more to say
+        visibility.muted_authors(broken, "a", [1])
     messages = [r.getMessage() for r in caplog.records]
     assert sum("WITHOUT that filter" in m for m in messages) == 2
     assert sum("filtered from now on" in m for m in messages) == 1
@@ -166,7 +208,9 @@ def test_a_closed_session_is_not_swallowed():
     # returned "nothing muted" would hide it.
     conn, _cur = _conn(error=_PgError("42P01", "server closed the connection"), closed=True)
     with pytest.raises(_PgError):
-        visibility.muted_authors(conn, "alice")
+        visibility.muted_authors(conn, "alice", [1])
+    with pytest.raises(_PgError):
+        visibility.blacklisted_authors(conn, "alice", [1])
     conn.rollback.assert_not_called()
 
 
@@ -193,8 +237,19 @@ def test_rank_user_scores_only_what_the_reader_can_be_shown(monkeypatch):
         seen["candidates"] = kw["candidates"]
         return pd.DataFrame()
 
-    monkeypatch.setattr(rd.visibility, "muted_authors",
-                        lambda _c, u: {"bob", "carol"} if u == "alice" else set())
+    asked = []
+
+    def _muted(_c, u, author_ids):
+        asked.append(author_ids)
+        return {"bob"} if u == "alice" else set()
+
+    def _blacklisted(_c, u, author_ids):
+        asked.append(author_ids)
+        # A list alice follows names alice herself: her own posts stay.
+        return {"carol", "alice"} if u == "alice" else set()
+
+    monkeypatch.setattr(rd.visibility, "muted_authors", _muted)
+    monkeypatch.setattr(rd.visibility, "blacklisted_authors", _blacklisted)
     monkeypatch.setattr(rd, "fetch_user_communities", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_user_interests", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_top_communities", lambda _c, _u: [])
@@ -205,32 +260,129 @@ def test_rank_user_scores_only_what_the_reader_can_be_shown(monkeypatch):
 
     rd._rank_user(MagicMock(), "alice", _frame(), {}, {}, "1.2.0", {})
     assert seen["candidates"]["author"].tolist() == ["alice"]
+    # #118: both lists are asked about the candidates' distinct authors, once each.
+    assert asked == [[11, 12, 13], [11, 12, 13]]
 
     rd._rank_user(MagicMock(), "dave", _frame(), {}, {}, "1.2.0", {})
     assert seen["candidates"]["post_id"].tolist() == [1, 2, 3, 4]
 
 
-def test_the_cycle_candidates_leave_out_community_muted_posts(monkeypatch):
+def test_the_cycle_candidates_leave_out_community_muted_nsfw_and_greyed_posts(monkeypatch):
     conn = MagicMock()
     cur = conn.cursor.return_value.__enter__.return_value
     cur.fetchall.return_value = [
-        {"post_id": 1, "author": "alice"}, {"post_id": 2, "author": "bob"}, {"post_id": 3, "author": "carol"},
+        {"post_id": 1, "author": "alice"}, {"post_id": 2, "author": "bob"},
+        {"post_id": 3, "author": "carol"}, {"post_id": 4, "author": "dave"},
+        {"post_id": 5, "author": "erin"},
     ]
     asked = {}
 
     def _muted(_c, post_ids):
-        asked["post_ids"] = post_ids
+        asked["muted"] = post_ids
         return {2}
 
+    def _greyed(_c, post_ids):
+        asked["greyed"] = post_ids
+        return {3}
+
+    def _nsfw(_c, post_ids):
+        asked["nsfw"] = post_ids
+        return {5}
+
     monkeypatch.setattr(rd.visibility, "community_muted_post_ids", _muted)
+    monkeypatch.setattr(rd.visibility, "greyed_author_post_ids", _greyed)
+    monkeypatch.setattr(rd.visibility, "nsfw_post_ids", _nsfw)
     out = rd._fetch_candidates(conn)
-    assert asked["post_ids"] == [1, 2, 3]
-    assert out["post_id"].tolist() == [1, 3]
+    every = [1, 2, 3, 4, 5]
+    assert asked == {"muted": every, "greyed": every, "nsfw": every}
+    assert out["post_id"].tolist() == [1, 4]
+
+
+def test_the_candidate_query_is_given_the_excluded_authors(monkeypatch):
+    conn = MagicMock()
+    cur = conn.cursor.return_value.__enter__.return_value
+    cur.fetchall.return_value = []
+    monkeypatch.setattr(rd, "EXCLUDED_AUTHORS", ("leothreads", "peak.snaps"))
+    rd._fetch_candidates(conn)
+    # A list, which psycopg2 sends as an array; a tuple would go as a row.
+    assert cur.execute.call_args.args[1] == (
+        rd.DOWNVOTED_AT_NET_RSHARES, ["leothreads", "peak.snaps"], rd.CANDIDATE_LIMIT)
 
 
 def test_no_candidates_asks_nothing(monkeypatch):
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value.fetchall.return_value = []
-    monkeypatch.setattr(rd.visibility, "community_muted_post_ids",
-                        lambda *_a: pytest.fail("asked about no posts"))
+    for name in ("community_muted_post_ids", "greyed_author_post_ids", "nsfw_post_ids"):
+        monkeypatch.setattr(rd.visibility, name, lambda *_a: pytest.fail("asked about no posts"))
     assert rd._fetch_candidates(conn).empty
+
+
+def test_no_post_ids_reads_no_reputations():
+    conn, cur = _conn()
+    assert visibility.greyed_author_post_ids(conn, []) == set()
+    cur.execute.assert_not_called()
+
+
+def test_no_post_ids_reads_no_tags():
+    conn, cur = _conn()
+    assert visibility.nsfw_post_ids(conn, []) == set()
+    cur.execute.assert_not_called()
+
+
+# ---- EXCLUDED_AUTHORS (#111)
+
+def test_account_names_are_trimmed_deduplicated_and_sorted():
+    assert rd.account_names(" peak.snaps,leothreads , peak.snaps,,") == ("leothreads", "peak.snaps")
+    # Enough names that a set's order cannot match the sorted one by chance.
+    assert rd.account_names("zed,yak,xray,wolf,vole,umber") == ("umber", "vole", "wolf", "xray", "yak", "zed")
+
+
+@pytest.mark.parametrize("raw", [
+    "Peak.Snaps", "pEak", "peak.Snaps", "peak_snaps", "peak snaps", "ab", "a" * 17, "1abc",
+    "peak.snaps;drop", "abc-", "ab..cd", "a.bcd", "abc.de", ".abc", "abc.",
+    # A part other than the last: a digit first, a dash last, two characters.
+    "abc.1de", "abc-.def", "ab.cde",
+    # `-` alone means none; anywhere else it is no name.
+    "-abc", "-,leothreads", "leothreads,-",
+    # One bad name in a list refuses the whole list.
+    "leothreads,Peak.Snaps", "leothreads,ab", "peak.snaps,x;drop",
+])
+def test_a_name_that_cannot_be_an_account_is_refused(raw):
+    with pytest.raises(ValueError):
+        rd.account_names(raw)
+
+
+@pytest.mark.parametrize("name", ["abc", "a1b", "hscr-isrc", "peak.snaps", "ecency.waves", "a" * 16, "abc.def.ghi"])
+def test_names_a_hive_account_can_have_are_accepted(name):
+    assert rd.account_names(name) == (name,)
+
+
+@pytest.mark.parametrize("value, ok", [("-1", True), ("0", False), ("5", False)])
+def test_the_downvote_line_is_below_zero(value, ok):
+    """Through the module's own line: at 0 every post nobody has voted on would go."""
+    repo = str(Path(__file__).resolve().parents[2])
+    env = {k: v for k, v in os.environ.items() if k != "DOWNVOTED_AT_NET_RSHARES"}
+    out = subprocess.run(
+        [sys.executable, "-c", "import haf_fyp.ranker_daemon as rd; print(rd.DOWNVOTED_AT_NET_RSHARES)"],
+        cwd=repo, env={**env, "PYTHONPATH": repo, "DOWNVOTED_AT_NET_RSHARES": value},
+        capture_output=True, text=True,
+    )
+    if ok:
+        assert out.returncode == 0 and out.stdout.strip() == value, out.stderr[-300:]
+    else:
+        assert f"ValueError: DOWNVOTED_AT_NET_RSHARES='{value}' is above its maximum, -1" in out.stderr
+
+
+def test_a_dash_excludes_nobody():
+    assert rd.account_names("-") == ()
+    assert rd.account_names(" - ") == ()
+
+
+def test_the_setting_replaces_the_default_and_blank_keeps_it(monkeypatch):
+    monkeypatch.setenv("EXCLUDED_AUTHORS", "alice")
+    assert rd._tuning("EXCLUDED_AUTHORS", "peak.snaps", rd.account_names) == ("alice",)
+    monkeypatch.setenv("EXCLUDED_AUTHORS", "  ")
+    assert rd._tuning("EXCLUDED_AUTHORS", "peak.snaps", rd.account_names) == ("peak.snaps",)
+    monkeypatch.setenv("EXCLUDED_AUTHORS", "Alice")
+    with pytest.raises(ValueError, match="EXCLUDED_AUTHORS='Alice' is not a valid account_names"):
+        rd._tuning("EXCLUDED_AUTHORS", "peak.snaps", rd.account_names)

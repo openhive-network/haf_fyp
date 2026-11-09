@@ -25,7 +25,8 @@ from haf_fyp import ranker_daemon as rd
 MAINT_SQL = os.path.join(
     os.path.dirname(__file__), "..", "..", "db", "active_users_maintenance.sql"
 )
-TABLES = "haf_fyp_app.active_users, haf_fyp_app.user_interests, haf_fyp_app.feed_cache"
+TABLES = ("haf_fyp_app.active_users, haf_fyp_app.user_interests, haf_fyp_app.feed_cache, "
+          "haf_fyp_app.user_author_affinity")
 
 
 def _connect() -> Connection:
@@ -242,6 +243,30 @@ def test_the_feed_of_an_account_that_never_read_goes_and_its_rotation_row_stays(
 
     assert _feed_rows(conn, "voter") == 0
     assert _members(conn) == ["voter"], "an unread feed is dropped, the account is not evicted"
+
+
+def _affinity_rows(conn: Connection, name: str) -> int:
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM haf_fyp_app.user_author_affinity WHERE username = %s", (name,))
+        row = cur.fetchone()
+        assert row is not None
+        n = int(row[0])
+    conn.commit()
+    return n
+
+
+def test_an_unread_feeds_affinity_goes_with_it_and_a_kept_ones_stays(conn: Connection) -> None:
+    # #117: rebuilt when the account is ranked again.
+    _account(conn, "voter")
+    _account(conn, "reader", read="1 minute")
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO haf_fyp_app.user_author_affinity VALUES "
+                    "('voter', 'bob', 0.5, 3, now()), ('reader', 'bob', 0.5, 3, now())")
+    conn.commit()
+
+    assert _drop(conn) == 1
+    assert _affinity_rows(conn, "voter") == 0
+    assert _affinity_rows(conn, "reader") == 1
 
 
 def test_the_feed_of_a_read_older_than_the_window_goes(conn: Connection) -> None:

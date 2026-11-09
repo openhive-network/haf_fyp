@@ -57,7 +57,8 @@ def conn():
         cur.execute(
             "TRUNCATE haf_fyp_app.active_users, haf_fyp_app.user_interests, "
             "haf_fyp_app.feed_cache, "
-            "haf_fyp_app.user_interactions, haf_fyp_app.user_profile_vectors"
+            "haf_fyp_app.user_interactions, haf_fyp_app.user_profile_vectors, "
+            "haf_fyp_app.user_author_affinity"
         )
     try:
         yield c
@@ -260,6 +261,40 @@ def test_unsub_evicts_a_cleared_account_with_its_feed_and_vector(conn) -> None:
         assert cur.fetchone()[0] == 0
         cur.execute("SELECT count(*) FROM haf_fyp_app.user_profile_vectors WHERE username='alice'")
         assert cur.fetchone()[0] == 0
+
+
+def _affinity(cur, name) -> int:
+    cur.execute("SELECT count(*) FROM haf_fyp_app.user_author_affinity WHERE username = %s", (name,))
+    return cur.fetchone()[0]
+
+
+def _add_affinity(cur, name) -> None:
+    cur.execute("INSERT INTO haf_fyp_app.user_author_affinity VALUES (%s, 'bob', 0.5, 3, now())", (name,))
+
+
+def test_unsub_drops_the_accounts_affinity_and_spares_anothers(conn) -> None:
+    # #117: affinity is derived personal data like the vector.
+    with conn.cursor() as cur:
+        _active_user(cur, "alice", scored="1 hour")
+        _active_user(cur, "dave", scored="1 hour")
+        _interest(cur, "dave")
+        _add_affinity(cur, "alice")
+        _add_affinity(cur, "dave")
+        assert _unsub(cur, ["alice", "dave"]) == {"alice"}
+        assert _affinity(cur, "alice") == 0
+        assert _affinity(cur, "dave") == 1, "a spared account keeps its affinity"
+
+
+def test_sweep_drops_the_evicted_accounts_affinity(conn) -> None:
+    with conn.cursor() as cur:
+        _active_user(cur, "alice", scored="1 hour")
+        _active_user(cur, "bob", scored="1 hour")
+        _interest(cur, "bob")                # kept: it opted in
+        _add_affinity(cur, "alice")
+        _add_affinity(cur, "bob")
+        assert _evict(cur) == 1
+        assert _affinity(cur, "alice") == 0
+        assert _affinity(cur, "bob") == 1, "a kept account keeps its affinity"
 
 
 def test_unsub_keeps_an_account_that_still_has_interests(conn) -> None:

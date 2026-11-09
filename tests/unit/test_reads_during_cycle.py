@@ -45,11 +45,11 @@ class _Reads:
 
 def _cycle(
     monkeypatch, users, reads, *, per_account=0.0, clock=None, evict=(), fail=(),
-    absent=(), closed=0, members=None, seen=None,
+    absent=(), closed=0, members=None, seen=None, raises=None,
 ):
     """run_cycle with everything around the per-account loop stubbed. Each account
     takes `per_account` seconds of the clock. Returns (result, order ranked, conn,
-    reconcile calls).
+    reconcile calls). `raises` maps an account to the exception its ranking raises.
 
     The rotation is modelled as the database has it: `evict` names accounts that have
     opted out, and the reconcile deletes such a row ONCE, answering nothing for it
@@ -72,6 +72,8 @@ def _cycle(
         clock.now += per_account
         if username in fail:
             raise RuntimeError(f"cannot rank {username}")
+        if raises and username in raises:
+            raise raises[username]
         order.append(username)
 
     evictions = []
@@ -100,6 +102,7 @@ def _cycle(
         rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
     )
     monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
+    monkeypatch.setattr(rd.language, "detect_post_languages", lambda *a, **kw: 0)
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
     monkeypatch.setattr(rd, "write_global_feed_cache",
                         lambda *a, **k: seen.setdefault("global", []).append(a))
@@ -276,6 +279,7 @@ def test_a_cycle_run_without_reads_never_looks_at_the_clock(monkeypatch):
         rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
     )
     monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
+    monkeypatch.setattr(rd.language, "detect_post_languages", lambda *a, **kw: 0)
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
     monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)
     monkeypatch.setattr(rd, "compute_scores", lambda **k: pd.DataFrame())
@@ -825,6 +829,7 @@ def test_the_real_cycle_and_the_real_loop_do_not_re_enrol_a_waiting_reader(monke
         rd, "_fetch_candidates", lambda _c: pd.DataFrame({"post_id": [1], "author": ["a"]})
     )
     monkeypatch.setattr(rd, "fetch_post_vectors_safe", lambda *a, **kw: {})
+    monkeypatch.setattr(rd.language, "detect_post_languages", lambda *a, **kw: 0)
     monkeypatch.setattr(rd, "_fetch_author_credibility_safe", lambda _c, _a: {})
     monkeypatch.setattr(rd, "write_global_feed_cache", lambda *a, **k: None)
     monkeypatch.setattr(rd, "compute_scores", lambda **k: pd.DataFrame())

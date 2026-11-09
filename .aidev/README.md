@@ -153,9 +153,9 @@ The checks run in a container with your uid, built from `runtime/Dockerfile` and
 run in that image in CI, so its Python 3.14 is theirs, and beside `/python_venv` it carries
 the python jobs' environment in `/opt/python-tests`, first on PATH: `requirements.txt` and
 `pytest`/`pytest-cov`/`httpx`/`pyyaml`/`tavern`, pytest and tavern at `/python_venv`'s
-versions, as CI holds what it installs to them; the lint tools in `/opt/lint`
-(requirements.txt deliberately not there, as in `python-lint`); and the openapi generator
-and validator in `/opt/openapi`. Then ShellCheck 0.11.0, hadolint 2.12.0, the docker CLI
+versions, as CI holds what it installs to them; the lint tools in `/opt/lint`, with
+requirements.txt and the pinned packages mypy reads, as `python-lint` installs them; and
+the openapi generator and validator in `/opt/openapi`. Then ShellCheck 0.11.0, hadolint 2.12.0, the docker CLI
 with compose (for `config` only), PostgREST 12.2.3, and `install_with_app_lock.py` and
 `haf_app_driver.py` from `Dockerfile.sql`'s base image. Every base is pinned by digest.
 

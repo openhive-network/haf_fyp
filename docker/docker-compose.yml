@@ -165,6 +165,9 @@ services:
       POSTGRES_HOST: haf
       POSTGRES_USER: haf_fyp_owner
       POSTGRES_DB:   haf_block_log
+      # The healthcheck's window (docker/block-processing-healthcheck.sh, MAX_AGE). Read
+      # when the container is created, so a change needs `up -d` to recreate it.
+      HAF_FYP_HEALTHCHECK_MAX_AGE_SECONDS: ${HAF_FYP_HEALTHCHECK_MAX_AGE_SECONDS:-300}
     depends_on:
       haf-fyp-setup:
         condition: service_completed_successfully
@@ -192,22 +195,22 @@ services:
     # said nothing about whether haf_fyp_app.main() was still advancing. The loop is
     # infinite; when it wedged, that check kept reporting healthy.
     #
-    # start_period covers a first run against a fresh HAF, which replays the whole
-    # chain in MASSIVE iterations of up to 10,000 blocks -- and the heartbeat does not
-    # move until an iteration finishes, so a long batch can exceed MAX_AGE on a replay
-    # that is perfectly healthy.
+    # start_period covers a first run's one long batch: since #97 there is no replay,
+    # and the first batch copies the history window from hivemind (676s for a year on
+    # testapi, #37). The heartbeat does not move until a batch finishes, so that batch
+    # can exceed MAX_AGE on a perfectly healthy sync. The cover lasts only until a check
+    # first passes, so it does not help when haf_fyp waited for hivemind first.
     #
     # 72h is inherited from the SELECT 1 check this replaces and is NOT a considered
     # number for the new one. Docker stops forgiving failures at the first SUCCESSFUL
-    # check, so it does not in fact cover a whole replay; but a container that never
+    # check, so it covers no batch after that one; but a container that never
     # succeeds -- one that parks at start (#76) -- stays `health: starting` for the full
     # three days, and every restart opens a fresh window. Inside it, Docker >= 25 probes
     # every 5s (the default start_interval); cheap here, since a parked check exits
     # before psql. That is the silent window #27 exists to close. It is left alone here
     # because nothing yet consumes this
     # service's health -- no depends_on keys on it, and the node's status page uses the
-    # HAProxy agent-check instead -- so tuning it without a measured MASSIVE batch
-    # duration would be guessing twice.
+    # HAProxy agent-check instead -- so there is nothing yet to tune it for.
     healthcheck:
       test: ["CMD", "/app/block-processing-healthcheck.sh"]
       interval: 60s
@@ -307,6 +310,8 @@ services:
       READ_REFRESH_BATCH_SECONDS:
       READER_ACTIVE_WITHIN_DAYS:
       FEED_SESSION_SECONDS:
+      EXCLUDED_AUTHORS:
+      DOWNVOTED_AT_NET_RSHARES:
       # Retention and maintenance (README, "Retention and maintenance"), the same way. A
       # ranker image from before they were passed reads a blank one with int() and stops.
       FEED_EVENTS_MAINT_SECONDS:

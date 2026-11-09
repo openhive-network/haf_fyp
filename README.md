@@ -100,7 +100,7 @@ hived ──► sql_serializer ──► HAF PostgreSQL
   waits: it copies nothing, a fresh install skips the community operations too, and
   `GET /sync-status` and `GET /metrics` report `history: waiting_for_hivemind`. The
   first batch that finds hivemind there backfills the whole window in one set-based
-  pass (about a minute for a year on a full node: 71.1M interactions, 556k root posts),
+  pass (a year took 274 s and 673 s on two full nodes; see "Disk and sync time"),
   takes `user_communities` from hivemind's subscriptions on a fresh install, and from
   then on every batch follows hivemind by `block_num`. `history: following_hivemind`
   says it has. The ranker's hourly maintenance deletes what has aged out of the window
@@ -118,6 +118,27 @@ hived ──► sql_serializer ──► HAF PostgreSQL
   the replayed tables (moving the cached feeds' post ids to hivemind's first), and the
   first batch backfills the window from hivemind. The time is the backfill's, whatever
   the size of the old tables.
+
+### Disk and sync time
+
+Measured on two full nodes near the chain head (block 111.2M), with the default one-year window
+([#37](https://gitlab.syncad.com/hive/haf_fyp/-/issues/37)):
+
+| | testapi, 2026-10-28 | steem-19 (blocktrades), 2026-10-26 |
+|---|---|---|
+| `haf_fyp_app` on disk | 7.5 GB (3.7 GB of it indexes) | 7.4 GB |
+| One-year backfill from hivemind | 673 s: 70.7M interactions, 535k root posts, 1.17M commenter pairs | 274 s |
+| Install to `following_hivemind` | about 14 min (install 21:42, backfill done 21:54:41, healthy 21:55:49 UTC) | not measured |
+
+Almost all of it is `user_interactions`: 7.2 GB and 70.7M rows of the 7.5 GB on testapi.
+The other tables share the remaining 0.3 GB. The size follows `FYP_HISTORY_DAYS`, not the
+length of the chain: the hourly maintenance deletes what ages out. For comparison, the
+replayed build this replaced held 259-305 GB after a 34-hour sync from genesis.
+
+There is no replay. Once hivemind is live, the whole time is the backfill, and it runs
+as the first block-processing batch. After that, live blocks take about 20-25 ms each
+on testapi, and the ranker's scheduled cycle there (122 accounts, about 5,000
+candidates) takes about 20-30 s.
 
 ### External HAF Apps (optional)
 
@@ -286,12 +307,13 @@ built per feed entry, so an empty response carries no `fyp` object at all and
 `fyp.source` cannot be read from it. (An earlier version of this section said to
 read `fyp.source`; that state is not observable.)
 
-There is also no staleness check: a ranker that stopped days ago leaves its last
+There is also no staleness check here: a ranker that stopped days ago leaves its last
 good 200 rows in place, and they keep resolving, so `global_feed` reads servable.
 **`/sync-status` does not answer this** — it reports the HAF context advanced by the
-`haf-fyp-sync` service, which keeps running when `haf-fyp-ranker` dies. The signal
-that does move with the ranker is the top-level `computed_at` in this same
-`/metrics` payload, refreshed on the ranker's hourly maintenance pass.
+`haf-fyp-sync` service, which keeps running when `haf-fyp-ranker` dies. The signals
+that do move with the ranker are elsewhere in this `/metrics` payload:
+`ranker.last_cycle.finished_seconds_ago` (#37) and `reader_first.newest_feed_seconds`
+(see "How fresh a feed is").
 
 After installing each external app, run:
 ```bash
@@ -475,9 +497,9 @@ below).
 | GET | `/version` | `/rpc/get_version` | Build version of the running app |
 | GET | `/v1/fyp/algorithm` | `/rpc/get_algorithm` | Active algorithm version and weights |
 | GET | `/v1/fyp/algorithms` | `/rpc/list_algorithm_versions` | All registered algorithm versions |
-| GET | `/v1/fyp/feed/{username}?page-size=20` | `/rpc/get_personalized_feed` | Ranked feed for a user; pages of one read session are stable (see [Read sessions](#read-sessions-stable-pages)) |
+| GET | `/v1/fyp/feed/{username}?page-size=20` | `/rpc/get_personalized_feed` | Ranked feed for a user; pages of one read session are stable (see [Read sessions](#read-sessions-stable-pages)). With `language=es` (or `es,pt`), only posts in those languages; see [Languages](#languages) |
 | GET | `/v1/fyp/warmup/{username}` | `/rpc/warm_up_feed` | Ask for a fresh feed before the user opens it; 204, no body (see [Read sessions](#read-sessions-stable-pages)) |
-| GET | `/v1/fyp/global?page-size=20` | `/rpc/get_global_feed` | Unauthenticated global feed |
+| GET | `/v1/fyp/global?page-size=20` | `/rpc/get_global_feed` | Global feed. With `observer=<account>`, posts by authors that account muted or blacklisted (directly or through a list it follows) are left out before paging (#114); the feed holds at most 200 posts, so it ends sooner for a reader who hides many. `language` as on the user feed. Unauthenticated |
 | GET | `/v1/fyp/profile/{username}` | `/rpc/get_user_profile` | User vector status and top communities |
 | GET | `/v1/fyp/explain/{username}/{post_id}` | `/rpc/get_score_explanation` | Per-signal score breakdown |
 | GET | `/v1/fyp/feed-metrics` | `/rpc/get_feed_metrics` | Feed performance analytics per algorithm version (#13) — product metrics, not service health |
@@ -497,7 +519,7 @@ Every feed entry carries a nested `fyp.source` field — `personalized` when the
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Can this container serve: `503` when the database pool does not answer a query within 1.5 s. Redis is reported in the body (`redis`, `rate_limit_store`) and never fails it: the app serves without Redis. A probe slower than its deadline (1.5 s database, 1.0 s Redis) counts as no answer. Not sync-aware (#61) |
-| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), reader-first figures (#86, under `reader_first`: whether the ranker is ranking, readers in the last day, their stalest feed, rotation age; see "How fresh a feed is"), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why), whether the installed `feed_cache` is the one the ranker writes (#99, under `feed_cache`: `ok`, or `outdated` with both shapes) — not feed analytics |
+| GET | `/metrics` | Operational health: embedding coverage (#15), credibility source health (#8), reader-first figures (#86, under `reader_first`: whether the ranker is ranking, readers in the last day, their stalest feed, rotation age; see "How fresh a feed is"), ranking sources + global-feed servability (#36, #43 — alert on `ranking_sources.degraded`, `state` and `detail` say why), whether the installed `feed_cache` is the one the ranker writes (#99, under `feed_cache`: `ok`, or `outdated` with both shapes), whether the ranker is subscribed on the refresh-signal Redis (#51, under `redis`: how many clients listen on the refresh channel, the ranker among them; alert on `redis.degraded`), the ranker's last cycle and the last 24 h of them (#37, under `ranker`: how long ago the last one ended, how long cycles take, accounts ranked and failed; alert on `ranker.degraded`, set after an hour without a successful cycle; see "How fresh a feed is") — not feed analytics |
 | GET | `/sync-status` | Last block processed by the `haf_fyp` HAF context + its UTC timestamp (#16) |
 | POST | `/v1/fyp/interests` | Declare cold-start community interests, signed (10/min per IP, 60/min total) |
 | DELETE | `/v1/fyp/interests` | Un-opt-in: clear declared interests, signed (5/min per IP, 30/min total) |
@@ -513,7 +535,8 @@ once at import, so it takes a restart.
 
 The two metrics endpoints are unrelated and answer different questions. This one, on the
 FastAPI overlay, is the *operational* read — embedding coverage, credibility source
-health, ranking source health and the reader-first figures — and is what an
+health, ranking source health, the reader-first figures, the feed_cache shape and the
+refresh-signal Redis — and is what an
 embedding-gap, lost-grant, empty-feed or stopped-ranker alert should watch. It carries no block
 height, so it is not a freshness check: for that, watch `GET /sync-status` below. Feed
 *performance* analytics are a separate, product-facing read, served by PostgREST itself as
@@ -621,7 +644,7 @@ or `IMMUTABLE`.
 
 ## Ranking Algorithm
 
-**Version 1.0.0** — four-signal weighted sum with community boost:
+**Version 1.3.0** (active on a new install) — four-signal weighted sum with a tiered community boost:
 
 ```
 final_score = 0.40 × relevance
@@ -629,29 +652,131 @@ final_score = 0.40 × relevance
             + 0.20 × engagement
             + 0.10 × credibility
 
-if post.community_id ∈ user_subscribed_communities:
-    final_score = min(1.0, final_score × 1.20)
+if post.community_id ∈ subscribed or declared communities:
+    final_score = final_score × 1.20
+elif post.community_id ∈ the reader's most-engaged communities:
+    final_score = final_score × 1.10
+
+final_score = final_score / 1.20               (1 + the larger boost; every post, every feed)
 ```
+
+`final_score` stays in [0, 1], and every feed, the global one included, is on one scale:
+a post's score depends on that post alone. Versions 1.0.0 to 1.2.0 clip a boosted score
+at 1 instead and do not divide, so every boosted post with a base score above
+1 / (1 + boost) reads exactly 1 and the top of the feed ties (#116). 1.3.0 has the
+node's 1.1.0 weights plus `"boost_rescale": true`. An install that registers 1.3.0
+activates it only where 1.1.0 was the one active version; a version the operator chose
+stays active.
+
+**Version 1.4.0** (registered inactive, #117) — 1.3.0 plus reader-to-author affinity.
+For a personal feed, relevance is raised for the authors the reader has lately engaged
+with:
+
+```
+relevance = relevance + 0.30 × (1 − relevance) × affinity(reader, author)
+
+affinity  = raw / (raw + 3)                     in [0, 1); 0.5 at raw = 3
+raw       = Σ weight × 0.5 ^ (age_days / 7)      the reader's last 30 days of
+            upvote 1.0, reblog 1.5, reply 1.5    actions on the author's posts
+```
+
+An author the reader has not engaged with keeps the relevance it had, so 1.4.0 only
+reorders a feed in favour of authors the reader keeps coming back to. Upvotes and
+reblogs are those haf_fyp keeps (root posts in its history window; a downvote or a vote
+withdrawn to 0% does not count); replies are read from hivemind, to posts and comments
+alike, counted once per thread and author (a back-and-forth in one thread is one reply).
+Ages are measured from the reader's latest vote, reblog or reply. The reader's own
+posts and replies are not counted, nor the authors never recommended (`EXCLUDED_AUTHORS`).
+Every author the reader engaged with is scored. Affinity rides on relevance, so a reader
+ranked without relevance (no interest vector, or no post embeddings from HiveSense) gets
+none, and none is read or stored for it. If the read fails the reader is ranked without
+it, as under 1.3.0, and the failure is logged. The stored and served `score_relevance`
+is the raised one. Each time affinity is applied it is stored in
+`haf_fyp_app.user_author_affinity` (the strongest 200 authors); other versions neither
+read nor write it. Every setting is in the version's
+weights (`author_affinity`, `affinity_days`, `affinity_half_life_days`,
+`affinity_half_at`, `affinity_max_authors`). Activate it with
+`POST /v1/fyp/admin/algorithm` to compare it with 1.3.0 on `feed_metrics_daily`, and
+only once the ranker runs this release: an older ranker ignores `author_affinity`, ranks
+exactly as 1.3.0 and labels its feeds 1.4.0. One version is active at a time, so the
+comparison is of one period against another. The table is never read back by the
+ranker; it keeps each reader's set from its last ranking under a version that sets
+`author_affinity` (1.4.0, 1.4.1).
+
+**Version 1.4.1** (registered inactive, #117) — 1.4.0 with the affinity share doubled:
+`author_affinity` 0.60 instead of 0.30, everything else as the node's 1.4.0. Relevance
+at the top of a feed is already about 0.7, so 0.30 of the headroom moves little. In a
+dry run over the 136 cached readers with affinity data on testapi, 1.4.0 kept the same
+20 posts as 1.3.0 in 79 top-20s, and 0.60 in 54; the posts swapped into top-20s about
+doubled (101 to 214). Like 1.4.0 it is activated with `POST /v1/fyp/admin/algorithm`
+and stores affinity in the same table. It needs a ranker that runs 1.4.0's code or
+later: an older one ranks exactly as 1.3.0 and labels its feeds 1.4.1.
 
 | Signal | Range | Source |
 |--------|-------|--------|
-| `relevance` | [0, 1] | Cosine similarity: post embedding vs user interest vector (HiveSense 1024-dim) |
+| `relevance` | [0, 1] | Cosine similarity: post embedding vs user interest vector (HiveSense 1024-dim); under 1.4.0 and 1.4.1 raised by author affinity |
 | `recency` | [0, 1] | `exp(−ln2 × age_hours / 24)` — 24-hour half-life |
 | `engagement` | [0, 1] | Sigmoid-normalised unique commenters + reblogs + net rshares |
 | `credibility` | [0, 1] | 0.6 × normalised reputation + 0.4 × log-normalised VESTS |
-| `community_boost` | ×1.20 | Applied post-sum for on-chain subscribed community posts |
+| `community_boost` | ×1.20 | Applied post-sum for subscribed or declared community posts |
+| `community_boost_engaged` | ×1.10 | Applied post-sum for the reader's most-engaged communities, when not subscribed |
+| `boost_rescale` | true | 1.3.0: every score is divided by 1 + the larger boost, so a boosted one is not clipped at 1 |
+| `author_affinity` | 0.30 / 0.60 | 1.4.0 / 1.4.1: share of relevance's headroom given to the reader's affinity for the post's author |
 
 All weights are stored in `haf_fyp_app.algorithm_versions` and activated via `POST /v1/fyp/admin/algorithm`. The active version and its weights are returned by `/rpc/get_algorithm`. Every feed response includes per-signal component scores for full transparency; use `/rpc/get_score_explanation` for a detailed breakdown of any individual post.
 
-**Left out before scoring (#89).** Posts their community muted, and posts by authors the
-community muted (all feeds, the global one included); and, for each account, posts by
-authors it muted directly or through a mute list it follows. hivemind's own ranked lists
-return such posts greyed; a recommendation leaves them out. Not filtered: blacklists
-(front ends show them as a badge), authors hivemind greys for a low reputation, the
-account's own posts. The filter takes effect when an account is next ranked (see "How
-fresh a feed is"), and an account still on the cold-start global feed gets the community
-filters but not its own mutes. Read from hivemind; on a node where hivemind cannot be read
-the ranker writes feeds unfiltered and logs a warning until it can.
+**Left out before scoring (#89, #111, #112, #113, #115).** Posts their community muted, and posts by
+authors the community muted (all feeds, the global one included); and, for each account,
+posts by authors it muted or blacklisted, directly or through a mute list or blacklist it
+follows. hivemind's own ranked lists return such posts greyed or badged; a recommendation
+leaves them out. Also left out of
+every feed: posts tagged `nsfw` or in a community marked NSFW (there is no opt-in yet),
+posts by authors hivemind greys for a low reputation, posts downvoted to
+`DOWNVOTED_AT_NET_RSHARES` net rshares or below, and posts by the accounts in
+`EXCLUDED_AUTHORS` (see **Ranker settings**, under "How fresh a feed is"). The NSFW and
+grey-author filters have no setting: the grey line is hivemind's, and the NSFW marks are
+read from hivemind's tags and communities. A community marked NSFW is left out whole, so
+`/v1/fyp/global?community_id=` for one returns an empty feed.
+Not filtered: the account's own posts, and other NSFW-like tags (`adult`, `18+`,
+`nsfw18`): front ends hide only `nsfw`.
+The filters take effect when a feed is next written (see "How fresh a feed is"): a post
+downvoted or muted after that stays in the feed until then. An account still on the
+cold-start global feed gets every filter, and its own mutes and blacklists are left out
+when it is served (#114). The mutes, blacklists, NSFW marks and grey authors are read from
+hivemind; on a node where one cannot be read the ranker writes feeds
+without that filter and logs a warning until it can. The downvote and `EXCLUDED_AUTHORS`
+filters are haf_fyp's own and always apply.
+
+#### Languages
+
+Both feeds take `language`: a code, or several comma-separated (`es`, `es,pt`; case and
+spaces ignored, a region cut off so `es-ES` and `pt_BR` are `es` and `pt`), and return only
+posts written in one of them (#115). Hive posts
+rarely say what language they are in (7 of 5,000 testapi candidates on 2026-11-03 had one
+in their metadata), and a community's `lang` is `en` for most of them whatever they hold,
+so the ranker detects it from each post's title and body with
+[py3langid](https://pypi.org/project/py3langid/) when it first reads the post, and stores
+it in `post_language`; a language a post declares in its metadata is not read. A post
+keeps up to two languages, so one written in Spanish and English (the "[ENG|ESP]" posts)
+is in both feeds: the whole text's language, and a second language that one section of
+the post is written in (12% of 2,000 testapi candidates got two, mostly Spanish and
+English). A post with none (a caption under a photo, a bare video link: 2%)
+is in no language's feed. Edits do not change a post's languages.
+
+The parameter filters the feed as ranked, before the page is cut: pages are full until it
+runs out, and a reader's feed holds their top 200 posts (the global one, 200), so a
+language that is a small share of it gives a short feed, or an empty one: a code no post
+has returns an empty feed, not an error, so a client should offer the unfiltered feed when
+the first page is empty. A blank `language` filters nothing.
+
+The codes are the detector's ([py3langid](https://pypi.org/project/py3langid/)'s 140):
+ISO 639-1 where a language has one (`en`, `es`, `zh`, `ko`), else ISO 639-3 (`yue`
+Cantonese, `ary` Moroccan Arabic). Close languages are told apart, and a post may land in
+either, so send them together: `no,nn`; `id,ms`; `sr,hr,bs`; `zh,yue,wuu`; `ar,ary,arz`. On testapi 76% of candidates were
+English, 11% Spanish, then Chinese, Korean, Polish and German. A post the ranker has not
+read yet, or has read since the last cycle only through a targeted refresh, is in no
+language's feed until the next cycle. Detection costs about 2 ms a post, and a cycle
+detects only posts it has not seen; a failure is logged and the cycle ranks on.
 
 **Cold start:** for new users without an interest vector, relevance is dropped and the remaining three weights are renormalised to sum to 1.0. Bootstrap priority:
 
@@ -771,7 +896,7 @@ session is open is held until the session ends, so warming up after the first pa
 too late for that visit. Like the feed itself it takes any username: it is a request,
 not an authenticated action.
 
-These are environment variables of the `haf-fyp-ranker` service.
+**Ranker settings.** These are environment variables of the `haf-fyp-ranker` service.
 `docker/docker-compose.yml` passes each one to the ranker when it is set, so add the
 line to your `docker/.env.local` (`MAX_USERS_PER_CYCLE=3000`; a copy made before this
 existed has no line for it) and recreate the ranker with the same `--env-file` as every
@@ -792,8 +917,10 @@ the next `up` of the ranker without it puts the ranker back. haf_api_node's
 `haf_fyp.yaml` does not pass them yet (#87): there, add them to that service's
 `environment:`.
 
-A value that is not a number, or a negative `MAX_USERS_PER_CYCLE`, stops the ranker at
-start with a log line naming the variable. The others are held to their range.
+A value that is not a number (for `EXCLUDED_AUTHORS`, not a list of account names), a
+negative `MAX_USERS_PER_CYCLE`, a `FEED_SESSION_SECONDS` under 600, a
+`READER_ACTIVE_WITHIN_DAYS` over 36500 or a `DOWNVOTED_AT_NET_RSHARES` above -1 stops the
+ranker at start with a log line naming the variable. The others are held to their range.
 
 | Variable | Default | What it bounds |
 |---|---|---|
@@ -804,6 +931,8 @@ start with a log line naming the variable. The others are held to their range.
 | `READ_REFRESH_MAX_PER_CYCLE` | `MAX_USERS_PER_CYCLE` x `READER_CYCLE_SHARE`, at most 300 | Re-ranks on read per cycle period: between two scheduled cycles, and ahead of their turn during one (a cycle grows by at most this many accounts). 0 turns them off. Between cycles they run in the 300 s the ranker waits: keep this times seconds-per-account well under `CYCLE_SECONDS`, or they start delaying the cycle. |
 | `READ_REFRESH_BATCH_SECONDS` | 30 | After one read-triggered re-rank, the next waits this long and takes everyone who became due meanwhile. Each one fetches the candidates before ranking anyone (about 8 s on a full node), so they are grouped. 0 turns the grouping off. |
 | `FEED_SESSION_SECONDS` | 900 | How long a read session keeps an account's feed from being rewritten after its last renewal (#104). At least 600: the feed function's signal is rationed to one per half window per account. Longer holds a reader's feed still longer, and delays the re-rank their read asked for by as much. |
+| `EXCLUDED_AUTHORS` | ecency.waves,hscr-isrc,leothreads,liketu.moments,peak.snaps,slothbuzz.hangs | Authors no feed recommends (#111; see "Left out before scoring"): comma-separated account names, or `-` for none. The default is the accounts that post only Snaps/Waves/Threads-style containers, roots that short posts reply to, which score like hits on their reply count. Setting it replaces the list, so copy the default to add to it. A name no Hive account could have stops the ranker at start: uppercase, over 16 characters, or any part (between dots) under three characters, starting with a digit or ending in a dash. In a compose file's `environment:` write it quoted, `"-"`. |
+| `DOWNVOTED_AT_NET_RSHARES` | -9999999999 | A post downvoted to this many net rshares or below is in no feed (#112). At most -1: at 0 every post nobody has voted on yet would go. The default is far below zero because one small downvote on a new post with no upvotes would otherwise take it out of discovery; it is about one full-strength downvote from a 310 HP account (at 1,605 VESTS per HP, 2026-10-31). On testapi (2026-10-30) it left out 910 of the 1,500 candidates below zero. A very low value turns the filter off. |
 | `READER_ACTIVE_WITHIN_DAYS` | 0 | Off at 0; at most 36500. Otherwise a read earns a lane slot, an early re-rank or a place ahead of other readers in the scheduled cycle only for an account that voted on or reblogged a post this app tracks within this many days (posting or commenting alone does not count), or that saved interests (interests do not lapse). A forged read for any other account then gets ranked only with what a cycle has left; it is still recorded. It narrows a flood, it does not stop one: 12,888 accounts had voted or reblogged within 30 days on testapi. At 30 days it would have turned away at most 1 of the 16 readers seen there on 2026-10-12. Off by itself while block processing is more than `ACTIVE_USERS_EVICT_SYNC_LAG_BLOCKS` behind, when every account looks lapsed, or while that cannot be told; the ranker logs when it turns on and off, and how many reads earned nothing. |
 
 What to expect, and what this does not do:
@@ -892,6 +1021,54 @@ lane it took and how many reads earned nothing.
 install with the block processor and the ranker stopped) or `unknown` (the figures
 could not be read; the API log says why). The section never sets a `degraded` flag:
 every threshold above depends on the node.
+
+The ranker's own figures for each cycle are under `ranker` (#37). The ranker writes one
+row per scheduled cycle into `haf_fyp_app.ranker_cycles` and keeps seven days of them
+(about 2,000 rows), so they outlive its container and its log. A cycle that raised is
+recorded with `ok` false and the counts it had reached, up to the account it was on; a
+cycle with no candidates is `ok` with every count 0. Ages are whole seconds, durations
+are rounded to 0.1 s:
+
+| Field | What it is | What to watch |
+|---|---|---|
+| `last_cycle.finished_seconds_ago` | How long ago the last scheduled cycle ended, by the database's clock | **Is the ranker cycling.** It waits `CYCLE_SECONDS` (300, fixed in the ranker) between cycles, so this stays under 300 plus one cycle, plus any targeted re-rank or hourly maintenance pass still running when the wait ends. Well above `CYCLE_SECONDS` + `last_24h.max_duration_seconds`: the ranker is stopped or wedged inside a cycle. A stopped ranker writes nothing, so its last row stays and this keeps growing |
+| `last_cycle.duration_seconds` | How long that cycle took (not counting the reconnect after a lost connection) | Swings with load; compare with `last_24h` |
+| `last_cycle.ok` | `false` when the cycle raised | The ranker's log says `ranking cycle failed` with the traceback, or `database connection lost` without one |
+| `last_cycle.candidates`, `users_attempted`, `users_ranked`, `users_failed`, `users_held` | Posts scored, and the accounts the cycle took, ranked, failed to rank, and held for a read session | `users_failed` above 0 cycle after cycle: an account fails every time (`failed to rank user` in the log) |
+| `last_cycle.reader_lane_taken`, `reader_lane_slots` | The reader lane, as in the log line above | Taken equal to slots cycle after cycle: the lane is full |
+| `last_cycle.readers_ahead`, `reads_heard` | Readers ranked ahead of their turn during the cycle; reads heard since the previous cycle ended | As in the log lines above |
+| `last_24h` | `cycles`, `failed_cycles`, `median_duration_seconds`, `max_duration_seconds` over the last 24 h | A median creeping towards `CYCLE_SECONDS` or beyond: the rotation is slowing |
+| `seconds_since_ok_cycle` | Since the last cycle that succeeded; if none has, since the first one recorded. `null` with no cycle | Above 3600 sets `degraded` |
+| `degraded` | `true` when no cycle has succeeded for an hour, or this read failed | **Alert on this**, and also on a `no_cycles` that lasts over an hour (below). A healthy ranker finishes a cycle about every five minutes, and an install stops it for a few, so an hour means it has stopped, is wedged or raises on every cycle. Which: `last_cycle.finished_seconds_ago` small with `last_cycle.ok` false is failing (`ranking cycle failed` in the ranker's log); large is stopped (check the container) or wedged; `state: unknown` is the read (API log). A stopped ranker also sets `redis.degraded` within minutes, so expect both |
+
+`state` is `ok`, `no_cycles` (no row yet: the ranker has not finished a cycle since the
+install, it is older than the record, or it cannot write the record), `unsupported` (the
+installed SQL has no `ranker_cycles`: re-run the install as above) or `unknown` (the figures could not be read; the section
+then has only `state`, `degraded` and `detail`). A ranker older than the record runs as before on the new SQL; it just writes nothing here.
+A ranker that cannot write the record (older SQL, a missing grant) logs `could not
+record the cycle` or `ranker_cycles is missing`, once for each kind of failure, and goes
+on ranking, so a growing `finished_seconds_ago` or a lasting `no_cycles` can also mean
+that: `reader_first.newest_feed_seconds` tells the two apart.
+
+`degraded` and the record's gaps, stated rather than hidden:
+
+* **`no_cycles` never sets it.** An empty record cannot tell a fresh install, whose
+  first cycle is minutes away, from a ranker that never started or cannot write the
+  record. Alert on `no_cycles` lasting over an hour, or on `reader_first.newest_feed_seconds`
+  being `null` while `rotation_size` is above 0.
+* **It can fire on a ranker that is ranking**, once rows exist and the ranker stops
+  writing them: an image rolled back to one older than the record, or a lost INSERT
+  grant (`could not record the cycle` in the ranker's log). Check
+  `reader_first.newest_feed_seconds` before acting.
+* **It counts cycles that raised, not accounts.** A cycle in which every account fails
+  to rank is still recorded as ok; `users_failed` and `rotation_age_seconds` show that.
+* **An earlier probe's failure does not set it.** If a probe before this one aborted the
+  request's transaction, this section reads `unknown` without `degraded`; the section
+  that failed raises it.
+
+`unsupported` does not set it either (the SQL predates the record). It never depends
+on how long cycles take, which depends on the node; the hour is fixed
+(`RANKER_STALE_SECONDS`) so that it does not loosen as a node slows down.
 
 **What a notifying request costs.** It takes a transaction id and a brief cluster-wide
 lock at commit, so the feed function rations it by the read session *once the ranker
@@ -1002,15 +1179,18 @@ idempotent).
 haf_fyp_app
 ├── post_candidates       — root posts of the history window, by hivemind post id
 ├── post_commenters       — unique (post, commenter) pairs, hivemind ids
+├── post_language         — detected languages per candidate, for `language` (#115)
 ├── engagement_metrics    — comment/reblog/vote counts, net rshares, counted from hivemind
 ├── user_interactions     — strongest vote/reblog per (account, post), hivemind ids
 ├── hivemind_follow       — where the copy of hivemind's history stands (one row)
 ├── user_profile_vectors  — 1024-dim interest vector per user (pgvector)
+├── user_author_affinity  — per (reader, author) affinity, written under 1.4.0 (#117)
 ├── feed_cache            — precomputed top-200 ranked feeds
 ├── global_feed_cache     — unauthenticated global feed
 ├── user_communities      — on-chain community subscriptions
 ├── user_interests        — cold-start picker declarations
-└── algorithm_versions    — weight registry with is_active flag
+├── algorithm_versions    — weight registry with is_active flag
+└── ranker_cycles         — one row per scheduled ranker cycle, seven days (#37)
 
 haf_fyp_endpoints
 └── feed_post_row         — composite type returned by feed functions
@@ -1238,10 +1418,23 @@ What it adds over the block pointer is the other case: at the chain tip the loop
 iterating while waiting for a block, so the heartbeat ticks even though nothing was
 processed, which separates "idle" from "wedged".
 
-The consequence, stated rather than hidden: on a long MASSIVE batch this check **can
-report unhealthy on a healthy replay**. The 300s default (upstream uses 60s) is a wide
-guess, not a measurement — and because of the one-iteration lag it tolerates iterations
-of roughly 150s, not 300s. It is explicitly *not* justified by this app's 360s HAProxy
+The consequence, stated rather than hidden: on a long batch this check **can report
+unhealthy on a healthy sync**. Because of the one-iteration lag, the 300s default
+(upstream uses 60s) tolerates iterations of roughly 150s, not 300s. Since #97 there is
+no replay, and one batch is long: the first, which backfills the history window from
+hivemind. On testapi (2026-10-28) that batch took 676 s: the 673 s backfill plus the
+batch's other work. There hivemind was already live at install, so the batch ran inside
+the 72-hour `start_period` before any check had passed: the container showed
+`health: starting` throughout and turned healthy 68 s after the backfill ended. If
+haf_fyp first waits for hivemind to catch up, the loop iterates meanwhile, a check
+passes and the `start_period` cover ends: expect the container to report unhealthy for
+the last few minutes of the backfill (failures start once it has run `MAX_AGE`, and
+Docker counts three of them a minute apart). The same holds for a backfill started later
+in a running container (after clearing `hivemind_follow.backfilled_at` to widen the
+window). To avoid it, set `HAF_FYP_HEALTHCHECK_MAX_AGE_SECONDS` in `.env` above the
+batch's length (900 covers testapi's 676 s), which compose passes to `haf-fyp-sync`, and
+recreate that container (`up -d`) before the backfill starts. Live batches afterwards
+take well under a second. It is explicitly *not* justified by this app's 360s HAProxy
 agent-check, which measures how old the last processed *block* is, a different quantity.
 
 `SET TIME ZONE 'UTC'` is deliberately absent, diverging from upstream.
@@ -1476,6 +1669,24 @@ only `REDIS_URL` and rate limiting moves while **pub/sub stays on `haf-fyp-redis
 which is silent by construction: `_publish_refresh` wraps its call in
 `except Exception: pass`. Set all three, and keep the `noeviction` policy on whatever
 you point them at.
+
+`GET /metrics` → `redis` is where a split shows (#51). It asks the instance the api
+publishes to (`address`, echoing `REDIS_HOST`:`REDIS_PORT`) how many clients listen on
+`haf_fyp:refresh`. A healthy stack reads `state: ok` with `refresh_subscribers` ≥ 1, one
+of them the ranker.
+
+| `state` | meaning |
+|---|---|
+| `no_subscriber` | nobody listens: the ranker is stopped (an install or upgrade stops it on purpose), restarting, or listening on another instance |
+| `unreachable` | the PING failed or timed out (0.3 s); the API log says why, e.g. a refused connection or `NOAUTH` |
+| `unknown` | the probe did not finish within 1 s (typically name resolution), or the instance answered but `PUBSUB NUMSUB` failed |
+
+Alert on `redis.degraded` held for a few minutes, not on a single scrape. A restarted
+ranker subscribes as it starts, and after a Redis error it retries every 10 s.
+`maxmemory_policy` is reported but not judged (null where `CONFIG` is not allowed). It is
+the pub/sub instance's, so it describes the limiter's store only when `REDIS_URL` points
+at the same instance, which is the default. `GET /health` reports only whether that store
+answers (`rate_limit_store`).
 
 **Deploying a change to this file's limits:** `requirements.txt` is part of the image,
 so rebuild it, not a bare `up -d`, which silently reuses the cached image:

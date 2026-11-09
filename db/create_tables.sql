@@ -185,6 +185,24 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.user_profile_vectors (
 );
 
 -- ---------------------------------------------------------------------------
+-- Reader-to-author affinity (#117): what the ranker last computed for a reader, one
+-- row per author it engaged with (haf_fyp/affinity.py), the reader's whole set
+-- replaced each time it is applied, its strongest affinity_max_authors kept. Written
+-- only under an algorithm version that sets author_affinity; a reader's rows stay from
+-- its last ranking under one until it is dropped. affinity is in [0, 1), raw the
+-- decayed sum. Never read back by the ranker: it is there to inspect.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS haf_fyp_app.user_author_affinity (
+    username varchar(16) NOT NULL,
+    author varchar(16) NOT NULL,
+    affinity real NOT NULL,
+    raw real NOT NULL,
+    updated_at timestamp NOT NULL,
+    PRIMARY KEY (username, author)
+);
+
+-- ---------------------------------------------------------------------------
 -- User interactions — each account's votes and reblogs of root posts within the
 -- window, one row per (account, post): the strongest action (reblog > vote) and the
 -- time of the latest. The ranker reads one account's most recent rows to build its
@@ -505,6 +523,21 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.post_bridge_cache (
 );
 
 -- ---------------------------------------------------------------------------
+-- Post languages (#115) — the languages a candidate is written in, detected by the
+-- ranker from its title and body (haf_fyp/language.py), for the feeds' `language`
+-- parameter. Up to two ISO 639-1 codes; empty when none could be told (a few words
+-- under a photo). Written once per post, keyed and pruned like post_bridge_cache.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS haf_fyp_app.post_language (
+    post_id int NOT NULL,                       -- hivemind_app.hive_posts.id
+    languages text[] NOT NULL,
+    detected_at timestamp NOT NULL DEFAULT now(),
+    PRIMARY KEY (post_id),
+    FOREIGN KEY (post_id) REFERENCES haf_fyp_app.post_candidates (post_id) ON DELETE CASCADE
+);
+
+-- ---------------------------------------------------------------------------
 -- User communities — on-chain subscription state (synced from custom_json)
 -- NOTE (T-0.7): verify community custom_json_operation format on live node.
 -- ---------------------------------------------------------------------------
@@ -660,6 +693,35 @@ CREATE TABLE IF NOT EXISTS haf_fyp_app.embedding_coverage_daily (
 );
 
 -- ---------------------------------------------------------------------------
+-- Ranker cycles (#37)
+--
+-- One row per scheduled ranker cycle, written by the ranker when the cycle ends
+-- (haf_fyp/ranker_daemon.py _record_cycle), which also deletes rows older than seven
+-- days. GET /metrics reports the last one and the last 24 hours (the ranker section).
+-- Until this the figures were only in the ranker's log, lost with its container.
+-- finished_at is the database's clock at the insert (clock_timestamp(), not now(): the
+-- ranker's transaction may have opened when the cycle began), so its age does not
+-- depend on the ranker's clock. About 2,000 rows at one cycle per five minutes.
+-- A ranker older than this table writes nothing here; nothing but GET /metrics reads it.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS haf_fyp_app.ranker_cycles (
+    finished_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    duration_seconds real NOT NULL,
+    ok boolean NOT NULL,
+    candidates int NOT NULL,
+    users_attempted int NOT NULL,
+    users_ranked int NOT NULL,
+    users_failed int NOT NULL,
+    users_held int NOT NULL,
+    readers_ahead int NOT NULL,
+    lane_taken int NOT NULL,
+    lane_slots int NOT NULL,
+    reads_heard int NOT NULL,
+    PRIMARY KEY (finished_at)
+);
+
+-- ---------------------------------------------------------------------------
 -- Roles & privileges (#14) — least-privilege split
 --
 -- Two roles share the app schema:
@@ -731,8 +793,10 @@ REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.feed_cache           FROM haf_fyp_u
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.global_feed_cache    FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.post_bridge_cache    FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.user_profile_vectors FROM haf_fyp_user;
+REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.user_author_affinity FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.feed_metrics_daily   FROM haf_fyp_user;
 REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.embedding_coverage_daily FROM haf_fyp_user;
+REVOKE INSERT, UPDATE, DELETE ON haf_fyp_app.ranker_cycles        FROM haf_fyp_user;
 REVOKE UPDATE               ON haf_fyp_app.feed_events_rollup_state FROM haf_fyp_user;
 REVOKE DELETE               ON haf_fyp_app.feed_events            FROM haf_fyp_user;
 -- active_users: UPDATE is the ranker's (last_scored_at, last_read_at and the read
