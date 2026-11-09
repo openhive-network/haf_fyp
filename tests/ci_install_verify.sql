@@ -174,6 +174,19 @@ BEGIN
         RAISE EXCEPTION 'endpoint functions not owned by haf_fyp_owner: %', _strays;
     END IF;
 
+    -- The rewriter (docker/haf_fyp_nginx.conf.template) turns every GET into a form
+    -- POST, and its catch-all /rpc/$1 reaches the whole schema. PostgREST runs a POST
+    -- to a VOLATILE function READ WRITE, so one here -- or one with no volatility
+    -- keyword, which defaults to VOLATILE -- is writable by any anonymous GET.
+    -- Checked before section 3's fingerprints so this is the message it fails with.
+    SELECT string_agg(p.oid::regprocedure::text, ', ' ORDER BY p.oid::regprocedure::text) INTO _strays
+    FROM pg_proc AS p
+    INNER JOIN pg_namespace AS n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'haf_fyp_endpoints' AND p.provolatile NOT IN ('s', 'i');
+    IF _strays IS NOT NULL THEN
+        RAISE EXCEPTION 'endpoint functions are VOLATILE, so PostgREST would run them READ WRITE for an anonymous GET (declare them STABLE or IMMUTABLE): %', _strays;
+    END IF;
+
     -- No SECURITY DEFINER function may belong to anyone but haf_fyp_owner, there is
     -- exactly one of them (the sync-status reader), and it pins its own search_path:
     -- without that, whoever calls it chooses which objects its unqualified names find.

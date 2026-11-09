@@ -1292,6 +1292,7 @@ REWRITER_FINAL_STAGE = [
     "COPY docker/haf_fyp_nginx.conf.template /usr/local/openresty/nginx/conf/nginx.conf.template",
     "COPY docker/rewriter_entrypoint.sh /entrypoint.sh",
     "COPY endpoints/rewrite_rules.conf /usr/local/openresty/nginx/conf/rewrite_rules.conf",
+    "COPY endpoints/rpc_arguments.lua /usr/local/openresty/nginx/conf/rpc_arguments.lua",
     "RUN chmod +x /entrypoint.sh",
     'CMD ["/entrypoint.sh"]',
 ]

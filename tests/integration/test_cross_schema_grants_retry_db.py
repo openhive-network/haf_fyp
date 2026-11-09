@@ -1,21 +1,24 @@
-"""db/cross_schema_grants.sql survives a concurrent catalog writer (#90).
+"""db/cross_schema_grants.sql survives a concurrent catalog writer (#90, #119).
 
 `GRANT ... ON ALL TABLES IN SCHEMA s` rewrites the pg_class row of every table in s. When
 another session updates one of those rows at the same moment, PostgreSQL raises XX000
 "tuple concurrently updated", and with ON_ERROR_STOP the whole haf-fyp-install used to exit
 3. On PostgreSQL 17 the same race can also end in 40P01 "deadlock detected", when the two
-sessions reach the rows in a different order. Every schema-guarded block now retries those
-two errors -- and only those -- up to 5 times with a 0.5 s, 1 s, 2 s, 4 s backoff.
+sessions reach the rows in a different order. When the other session DROPs one of those
+tables instead, the same race raises XX000 "tuple concurrently deleted" or, when the drop
+committed before GRANT looked the table up, XX000 "cache lookup failed for relation N"
+(#119). Every schema-guarded block now retries those conflicts -- and only those -- up to 5
+times with a 0.5 s, 1 s, 2 s, 4 s backoff.
 
 Two halves:
 
-* The race itself. A background session loops GRANT/REVOKE on a schema of 400 tables while
-  the shipped file runs. A bare GRANT under the same churn is the negative control: it must
-  fail (conflict or deadlock) at least once, or the harness is not reproducing the race and
-  proves nothing. The shipped file must pass every round.
+* The race itself. A background session loops GRANT/REVOKE -- or DROP/CREATE TABLE -- on a
+  schema of 400 tables while the shipped file runs. A bare GRANT under the same churn is the
+  negative control: it must fail (conflict or deadlock) at least once, or the harness is not
+  reproducing the race and proves nothing. The shipped file must pass every round.
 * The handler. Each retry loop is cut out of the shipped file and its grants replaced by an
-  injected error, so the matching is pinned exactly: XX000 + 'tuple concurrently updated' is
-  retried with backoff and re-raised after the 5th attempt, and so is 40P01; the conflict
+  injected error, so the matching is pinned exactly: XX000 + each conflict message is
+  retried with backoff and re-raised after the 5th attempt, and so is 40P01; a conflict
   message under another SQLSTATE, and XX000 with another message, fail on the first attempt.
 
 Everything runs in a throwaway database created and dropped here (roles are cluster-wide;
@@ -28,8 +31,10 @@ import re
 import threading
 import time
 import warnings
+from collections.abc import Callable
 
 import psycopg2
+from psycopg2.extensions import connection
 import pytest
 
 HERE = os.path.dirname(__file__)
@@ -37,9 +42,11 @@ GRANTS_SQL = os.path.join(HERE, "..", "..", "db", "cross_schema_grants.sql")
 TEST_DB = "haf_fyp_test_grants_retry"
 CHURN_ROLE = "haf_fyp_test_churn_reader"
 CONFLICT = "tuple concurrently updated"
+DELETED = "tuple concurrently deleted"
+LOOKUP = "cache lookup failed for relation"
 DEADLOCK = "deadlock detected"
 # (SQLSTATE, message) pairs the handler must retry.
-RETRIED = [("XX000", CONFLICT), ("40P01", DEADLOCK)]
+RETRIED = [("XX000", CONFLICT), ("XX000", DELETED), ("XX000", f"{LOOKUP} 16384"), ("40P01", DEADLOCK)]
 MAX_ATTEMPTS = 5
 TOTAL_BACKOFF = 0.5 + 1 + 2 + 4
 CHURN_TABLES = 400
@@ -62,7 +69,7 @@ LOOP_SCHEMAS = [
 ]
 
 
-def _connect(dbname=None):
+def _connect(dbname: str | None = None) -> connection:
     return psycopg2.connect(
         host=os.environ.get("POSTGRES_HOST", "haf"),
         port=os.environ.get("POSTGRES_PORT", "5432"),
@@ -73,7 +80,7 @@ def _connect(dbname=None):
     )
 
 
-def _statements(sql):
+def _statements(sql: str) -> list[str]:
     """The file as psql runs it: one autocommit statement at a time. Sending the whole file
     in one execute() would run it as ONE implicit transaction, which is not what the
     installer does."""
@@ -137,7 +144,7 @@ def conn(db):
 # The race, against the shipped file
 # ---------------------------------------------------------------------------
 
-def _churn(stop_at):
+def _churn(stop_at) -> None:
     """GRANT/REVOKE on every hivemind_app table until stop_at, as another app's installer
     or maintenance would. Its own conflicts are expected and ignored."""
     c = _connect(TEST_DB)
@@ -154,13 +161,35 @@ def _churn(stop_at):
         c.close()
 
 
-def _under_churn(conn, statements):
-    """Run statements while _churn runs; return the error raised, or None."""
+def _drop_churn(stop_at: float) -> None:
+    """DROP and re-CREATE random hivemind_app tables until stop_at, as an app's block
+    processing would. Looped server-side, committing each statement: fast enough that a
+    GRANT walking the schema meets a table dropped under it."""
+    c = _connect(TEST_DB)
+    c.autocommit = True
+    try:
+        with c.cursor() as cur:
+            cur.execute(
+                "DO $$ DECLARE t timestamptz := clock_timestamp() + %s * interval '1 s'; i int; "
+                "BEGIN LOOP "
+                "i := 1 + floor(random() * %s)::int; "
+                "EXECUTE format('DROP TABLE hivemind_app.t%%s', i); COMMIT; "
+                "EXECUTE format('CREATE TABLE hivemind_app.t%%s (id int)', i); COMMIT; "
+                "EXIT WHEN clock_timestamp() > t; END LOOP; END $$"
+                % (max(stop_at - time.monotonic(), 0), CHURN_TABLES))
+    finally:
+        c.close()
+
+
+def _under_churn(
+        conn: connection, statements: list[str], churn: Callable[[float], None] = _churn,
+) -> psycopg2.Error | None:
+    """Run statements while churn runs; return the error raised, or None."""
     stop_at = time.monotonic() + CHURN_SECONDS
-    t = threading.Thread(target=_churn, args=(stop_at,))
+    t = threading.Thread(target=churn, args=(stop_at,))
     t.start()
     time.sleep(0.3)  # let the churner reach its loop
-    error = None
+    error: psycopg2.Error | None = None
     try:
         with conn.cursor() as cur:
             for stmt in statements:
@@ -172,12 +201,12 @@ def _under_churn(conn, statements):
     return error
 
 
-def _report(line):
+def _report(line: str) -> None:
     print(line)
     warnings.warn(line, stacklevel=2)
 
 
-def _many_tables(conn):
+def _many_tables(conn: connection) -> None:
     with conn.cursor() as cur:
         cur.execute("CREATE SCHEMA hivemind_app")
         cur.execute(
@@ -186,7 +215,7 @@ def _many_tables(conn):
             % CHURN_TABLES)
 
 
-def test_negative_control_bare_grant_hits_the_conflict(conn):
+def test_negative_control_bare_grant_hits_the_conflict(conn) -> None:
     """Without a retry, the same churn breaks a bare GRANT. If this ever passes, the
     harness has stopped reproducing #90 and the test below proves nothing. Both ways the
     race ends count: the conflict, and (PostgreSQL 17) a deadlock."""
@@ -208,7 +237,7 @@ def test_negative_control_bare_grant_hits_the_conflict(conn):
     assert conflicts + deadlocks >= 1
 
 
-def test_shipped_file_survives_a_concurrent_grant_writer(conn):
+def test_shipped_file_survives_a_concurrent_grant_writer(conn) -> None:
     _many_tables(conn)
     statements = _statements(open(GRANTS_SQL, encoding="utf-8").read())
     retries = 0
@@ -228,6 +257,41 @@ def test_shipped_file_survives_a_concurrent_grant_writer(conn):
             "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
             "WHERE n.nspname = 'hivemind_app' AND has_table_privilege('haf_fyp_owner', c.oid, 'SELECT')")
         assert cur.fetchone()[0] == CHURN_TABLES
+
+
+def _is_drop_conflict(err: psycopg2.Error) -> bool:
+    return err.pgcode == "XX000" and (DELETED in str(err) or LOOKUP in str(err))
+
+
+def test_negative_control_bare_grant_hits_a_dropped_table(conn: connection) -> None:
+    """Without a retry, a concurrent DROP TABLE breaks a bare GRANT -- the #119 failure."""
+    _many_tables(conn)
+    failures = []
+    for _ in range(ROUNDS):
+        err = _under_churn(
+            conn, ["GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_app TO haf_fyp_user, haf_fyp_owner"],
+            churn=_drop_churn)
+        if err is not None:
+            assert _is_drop_conflict(err), err
+            failures.append(str(err).splitlines()[0])
+    _report(f"negative control (drop): {len(failures)}/{ROUNDS} bare GRANTs failed: {failures}")
+    assert failures
+
+
+def test_shipped_file_survives_a_concurrent_table_dropper(conn: connection) -> None:
+    _many_tables(conn)
+    statements = _statements(open(GRANTS_SQL, encoding="utf-8").read())
+    retries = 0
+    for round_no in range(ROUNDS):
+        del conn.notices[:]
+        err = _under_churn(conn, statements, churn=_drop_churn)
+        assert err is None, f"round {round_no}: {err.pgcode} {err}"
+        notices = "".join(conn.notices)
+        retries += len(re.findall(
+            rf"hivemind_app: ({DELETED}|{LOOKUP} \d+) \(attempt \d of 5\), retrying", notices))
+        assert notices.count("hivemind_app: granted SELECT + EXECUTE") == 1, notices
+    _report(f"shipped file (drop): {ROUNDS}/{ROUNDS} runs passed, {retries} retried attempts")
+    assert retries >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +351,7 @@ def _run_injected(conn, schema, code, message, fail_times):
 
 @pytest.mark.parametrize("schema", LOOP_SCHEMAS)
 @pytest.mark.parametrize("code,message", RETRIED)
-def test_conflict_is_retried_with_backoff_then_succeeds(conn, schema, code, message):
+def test_conflict_is_retried_with_backoff_then_succeeds(conn, schema, code, message) -> None:
     err, attempts, elapsed, notices = _run_injected(conn, schema, code, message, fail_times=2)
     assert err is None, err
     assert attempts == 3
@@ -298,7 +362,7 @@ def test_conflict_is_retried_with_backoff_then_succeeds(conn, schema, code, mess
 
 @pytest.mark.parametrize("schema", LOOP_SCHEMAS)
 @pytest.mark.parametrize("code,message", RETRIED)
-def test_conflict_is_reraised_after_the_last_attempt(conn, schema, code, message):
+def test_conflict_is_reraised_after_the_last_attempt(conn, schema, code, message) -> None:
     err, attempts, elapsed, _ = _run_injected(conn, schema, code, message, fail_times=99)
     assert err is not None and err.pgcode == code and message in str(err)
     assert attempts == MAX_ATTEMPTS
@@ -307,12 +371,13 @@ def test_conflict_is_reraised_after_the_last_attempt(conn, schema, code, message
 
 @pytest.mark.parametrize("schema", LOOP_SCHEMAS)
 @pytest.mark.parametrize("code,message", [
-    ("XX000", "cache lookup failed for relation 1"),  # right SQLSTATE, other message
+    ("XX000", "cache lookup failed for type 1"),      # right SQLSTATE, other message
+    ("XX000", "could not open relation with OID 1"),
     ("40001", CONFLICT),                              # right message, other SQLSTATE
     ("55P03", CONFLICT),
     ("42501", "permission denied for table t1"),
 ])
-def test_any_other_error_fails_on_the_first_attempt(conn, schema, code, message):
+def test_any_other_error_fails_on_the_first_attempt(conn, schema, code, message) -> None:
     err, attempts, elapsed, notices = _run_injected(conn, schema, code, message, fail_times=99)
     assert err is not None and err.pgcode == code, err
     assert attempts == 1
@@ -320,7 +385,7 @@ def test_any_other_error_fails_on_the_first_attempt(conn, schema, code, message)
     assert elapsed < 0.5
 
 
-def test_second_guard_in_the_balance_block_counts_its_own_attempts(conn):
+def test_second_guard_in_the_balance_block_counts_its_own_attempts(conn) -> None:
     """btracker_backend and hafbe_bal share one DO block. A conflict retried in the first
     loop must not eat into the second loop's five attempts."""
     sql = open(GRANTS_SQL, encoding="utf-8").read()

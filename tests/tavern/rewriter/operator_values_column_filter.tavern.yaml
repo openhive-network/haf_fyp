@@ -1,0 +1,30 @@
+---
+test_name: rewriter - a column filter beside an argument stays a filter
+
+includes:
+  - !include ../common.yaml
+
+# The argument (username, from the path) goes to the form body; has_feed is a COLUMN of
+# get_user_profile's result, not a parameter, so it must stay in the query where
+# PostgREST applies it to the row. Sent as an argument it would be PGRST202 -> 404; dropped,
+# the non-matching probe would answer the row instead of [].
+
+stages:
+  - name: a matching column filter keeps the row
+    request:
+      url: "{rewriter_url}/v1/fyp/profile/blocktrades"
+      method: GET
+      params: {has_feed: "eq.false", select: "has_feed,posts_sampled"}
+    response:
+      status_code: 200
+      json:
+        - {has_feed: false, posts_sampled: 0}
+
+  - name: a non-matching column filter removes it
+    request:
+      url: "{rewriter_url}/v1/fyp/profile/blocktrades"
+      method: GET
+      params: {has_feed: "eq.true"}
+    response:
+      status_code: 200
+      json: []

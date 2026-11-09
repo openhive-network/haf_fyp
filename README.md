@@ -632,6 +632,16 @@ own container-liveness `/health` on port 81 (a bare 204). The catch-all is why a
 matching no rule above — including the retired `/v1/fyp/metrics` — is rewritten to
 `/rpc/<path>` and comes back 404 rather than as a routing error.
 
+After the rewrite, the rewriter forwards a GET (or HEAD) of a function as a form POST
+whose body holds the parameters that function declares (`endpoints/rpc_arguments.lua`,
+generated beside the rewrite rules by `scripts/openapi_rewrite.sh`, read by the
+`hive.rpc_form` module of the common-ci-configuration nginx image). So an account named
+`not.blocktrades` reaches `get_user_profile` as its argument rather than being read by
+PostgREST as a `not.` filter, while column filters, `select`, `order`, `limit` and
+`offset` stay in the query and keep their PostgREST meaning. PostgREST runs a POST to a
+`VOLATILE` function read-write, so every function behind the rewriter must stay `STABLE`
+or `IMMUTABLE`.
+
 ## Ranking Algorithm
 
 **Version 1.3.0** (active on a new install) — four-signal weighted sum with a tiered community boost:

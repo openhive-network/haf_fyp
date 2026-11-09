@@ -21,6 +21,7 @@ tests/integration/. Skipped when no database is reachable, so the unit run is un
 import os
 
 import psycopg2
+from psycopg2.extensions import connection
 import pytest
 
 HERE = os.path.dirname(__file__)
@@ -100,19 +101,51 @@ def registered(conn) -> bool:
         return cur.fetchone()[0]
 
 
-def test_it_registers_and_declares_the_dependency(conn):
-    """The ordinary path: the row lands, hivemind is gated on, and it says so."""
+@pytest.mark.parametrize("hivemind_name", [
+    # hivemind#445 renamed the registry row to its lock name; the context kept its name.
+    "hivemind",
+    "hivemind_app",
+])
+def test_it_registers_and_declares_the_dependency(
+    conn: connection, hivemind_name: str,
+) -> None:
+    """The ordinary path: the row lands, hivemind is gated on, and it says so.
+
+    hivemind is found by its context, so the dependency names whatever its row is called.
+    """
     with conn.cursor() as cur:
         cur.execute("INSERT INTO hafd.applications(name, contexts) "
-                    "VALUES ('hivemind_app', ARRAY['hivemind_app'])")
+                    "VALUES (%s, ARRAY['hivemind_app'])", (hivemind_name,))
     notices = run_register(conn)
     assert registered(conn), notices
-    assert ("app_add_dependency", "hivemind_app") in calls(conn), notices
+    deps = [c for c in calls(conn) if c[0] == "app_add_dependency"]
+    assert deps == [("app_add_dependency", hivemind_name)], (deps, notices)
     assert any("registered in the HAF application registry" in n for n in notices), notices
     assert not [n for n in notices if "WARNING" in n], notices
 
 
-def test_a_refused_registration_is_not_reported_as_a_success(conn):
+def test_no_hivemind_registers_without_the_gate_and_warns(
+    conn: connection,
+) -> None:
+    """No application lists the hivemind_app context: register anyway, and say the gate is off.
+
+    An application merely NAMED hivemind_app, without the context, is not hivemind.
+    """
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO hafd.applications(name, contexts) "
+                    "VALUES ('hivemind_app', ARRAY['hivemind_app_other']), "
+                    "       ('btracker_app', ARRAY['btracker_app'])")
+    notices = run_register(conn)
+    assert registered(conn), notices
+    assert not [c for c in calls(conn) if c[0] == "app_add_dependency"], calls(conn)
+    warnings = [n for n in notices if "WARNING" in n]
+    assert len(warnings) == 1, notices
+    assert "hivemind_app context" in warnings[0], warnings
+    assert "without the hivemind dependency gate" in warnings[0], warnings
+    assert any("registered in the HAF application registry" in n for n in notices), notices
+
+
+def test_a_refused_registration_is_not_reported_as_a_success(conn) -> None:
     """haf#345's quiet path: NOTHING is registered, and the file must not claim otherwise.
 
     This is #62. Before the fix the run ended `NOTICE: haf_fyp registered in the HAF
@@ -136,7 +169,7 @@ def test_a_refused_registration_is_not_reported_as_a_success(conn):
         f"{calls(conn)}")
 
 
-def test_the_dependency_is_not_attempted_when_the_registration_was_refused(conn):
+def test_the_dependency_is_not_attempted_when_the_registration_was_refused(conn) -> None:
     """The same path with hivemind present -- the combination that FAILS the install today.
 
     With hivemind registered, the unguarded file reached app_add_dependency, which raises.
@@ -151,7 +184,7 @@ def test_the_dependency_is_not_attempted_when_the_registration_was_refused(conn)
     assert not [c for c in calls(conn) if c[0] == "app_add_dependency"], notices
 
 
-def test_a_paused_registration_says_so(conn):
+def test_a_paused_registration_says_so(conn) -> None:
     """Registered but paused: the row is there and no block will ever be handed to it.
 
     app_register's ON CONFLICT keeps the paused flag by design, so a re-install of a paused
@@ -166,7 +199,7 @@ def test_a_paused_registration_says_so(conn):
         f"the warning does not say how to undo it; {notices}")
 
 
-def test_a_haf_without_the_registry_is_tolerated(conn):
+def test_a_haf_without_the_registry_is_tolerated(conn) -> None:
     """Pre-haf#341 (e.g. 1.28.7): warn, return, leave the node on the legacy loop.
 
     Nothing may raise here -- psql_cmd runs with ON_ERROR_STOP=on, so a raise fails the
@@ -209,7 +242,7 @@ def _old_guard_raises(conn) -> bool:
 
 
 @pytest.mark.parametrize("missing", ["the type", "the schema"])
-def test_a_database_without_the_registrys_types_is_tolerated(conn, missing):
+def test_a_database_without_the_registrys_types_is_tolerated(conn, missing) -> None:
     """#68: neither a missing hive.contexts_group nor a missing `hive` schema may raise.
 
     On PostgreSQL 15 and older, to_regprocedure cannot resolve the argument type and
@@ -246,7 +279,7 @@ def test_a_database_without_the_registrys_types_is_tolerated(conn, missing):
         f"a database with no registry was told it had registered; {notices}")
 
 
-def test_a_changed_app_register_signature_is_not_called(conn):
+def test_a_changed_app_register_signature_is_not_called(conn) -> None:
     """The type exists, the function exists, the signature is not the one this file calls.
 
     The probe names the whole signature so that drift lands on the tolerant path, not on
@@ -266,7 +299,7 @@ def test_a_changed_app_register_signature_is_not_called(conn):
     assert not registered(conn), notices
 
 
-def test_a_raising_refusal_still_fails_the_install(conn):
+def test_a_raising_refusal_still_fails_the_install(conn) -> None:
     """The refusals that DO raise must keep raising: no EXCEPTION handler may appear here.
 
     Every other way app_register can refuse -- a missing context, a context owned by

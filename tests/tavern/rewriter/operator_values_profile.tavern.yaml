@@ -1,0 +1,42 @@
+---
+# VALUES THAT LOOK LIKE POSTGREST OPERATORS REACH THE FUNCTION AS ARGUMENTS.
+#
+# PostgREST reads a GET query value that starts with an operator prefix (`not.`, `eq.`,
+# ...) as a filter on the result, never as an argument. The rewrite rules move a path
+# segment into the query (/v1/fyp/profile/X -> /rpc/get_user_profile?username=X), so
+# before the rewriter forwarded declared arguments as a form POST (hive.rpc_form), the
+# account "not.blocktrades" never reached get_user_profile: PostgREST answered PGRST100 or
+# PGRST202 instead of the function's own result. Every stage below asserts the function's
+# answer, so an error status from PostgREST fails it.
+#
+# The CI fixture has no profile or feed-cache rows, so every account here, real or not,
+# gets the function's "no profile yet" answer: one row of defaults from get_user_profile,
+# an empty array from get_score_explanation. That is the answer the app gives for an
+# account it does not know, and the value is asserted, not just the status.
+
+test_name: rewriter - operator-prefixed account names reach get_user_profile
+
+includes:
+  - !include ../common.yaml
+
+stages:
+  - name: not.blocktrades is an account name, not a filter
+    request: {url: "{rewriter_url}/v1/fyp/profile/not.blocktrades", method: GET}
+    response:
+      status_code: 200
+      json:
+        - {has_feed: false, has_vector: false, posts_sampled: 0, top_communities: null, updated_at: null}
+
+  - name: eq.blocktrades is an account name, not a filter
+    request: {url: "{rewriter_url}/v1/fyp/profile/eq.blocktrades", method: GET}
+    response:
+      status_code: 200
+      json:
+        - {has_feed: false, has_vector: false, posts_sampled: 0, top_communities: null, updated_at: null}
+
+  - name: a plain account name still answers as it did
+    request: {url: "{rewriter_url}/v1/fyp/profile/blocktrades", method: GET}
+    response:
+      status_code: 200
+      json:
+        - {has_feed: false, has_vector: false, posts_sampled: 0, top_communities: null, updated_at: null}
