@@ -411,7 +411,7 @@ def test_the_haf_the_real_lane_runs_is_the_one_find_haf_image_found(ci) -> None:
         assert not [k for k in ci[flavour.job]["variables"]
                     if k.startswith(("HAF_REGISTRY", "HAF_VERSION", "HAF_UPSTREAM", "COMPOSE_"))]
     text = (ROOT / "docker" / ".env").read_text(encoding="utf-8")
-    assert not re.search(r"^[ \t]*(?:export[ \t]+)?HAF_UPSTREAM_IMAGE[ \t]*[=:]", text, re.M)
+    assert not re.search(r"^[ \t]*(?:export[ \t]+)?HAF_UPSTREAM_IMAGE[ \t]*[=:]", text, re.MULTILINE)
 
 
 def test_the_include_sets_nothing_a_compose_file_reads(ci) -> None:
