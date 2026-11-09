@@ -21,6 +21,7 @@ tests/integration/. Skipped when no database is reachable, so the unit run is un
 import os
 
 import psycopg2
+from psycopg2.extensions import connection
 import pytest
 
 HERE = os.path.dirname(__file__)
@@ -100,16 +101,48 @@ def registered(conn) -> bool:
         return cur.fetchone()[0]
 
 
-def test_it_registers_and_declares_the_dependency(conn):
-    """The ordinary path: the row lands, hivemind is gated on, and it says so."""
+@pytest.mark.parametrize("hivemind_name", [
+    # hivemind#445 renamed the registry row to its lock name; the context kept its name.
+    "hivemind",
+    "hivemind_app",
+])
+def test_it_registers_and_declares_the_dependency(
+    conn: connection, hivemind_name: str,
+) -> None:
+    """The ordinary path: the row lands, hivemind is gated on, and it says so.
+
+    hivemind is found by its context, so the dependency names whatever its row is called.
+    """
     with conn.cursor() as cur:
         cur.execute("INSERT INTO hafd.applications(name, contexts) "
-                    "VALUES ('hivemind_app', ARRAY['hivemind_app'])")
+                    "VALUES (%s, ARRAY['hivemind_app'])", (hivemind_name,))
     notices = run_register(conn)
     assert registered(conn), notices
-    assert ("app_add_dependency", "hivemind_app") in calls(conn), notices
+    deps = [c for c in calls(conn) if c[0] == "app_add_dependency"]
+    assert deps == [("app_add_dependency", hivemind_name)], (deps, notices)
     assert any("registered in the HAF application registry" in n for n in notices), notices
     assert not [n for n in notices if "WARNING" in n], notices
+
+
+def test_no_hivemind_registers_without_the_gate_and_warns(
+    conn: connection,
+) -> None:
+    """No application lists the hivemind_app context: register anyway, and say the gate is off.
+
+    An application merely NAMED hivemind_app, without the context, is not hivemind.
+    """
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO hafd.applications(name, contexts) "
+                    "VALUES ('hivemind_app', ARRAY['hivemind_app_other']), "
+                    "       ('btracker_app', ARRAY['btracker_app'])")
+    notices = run_register(conn)
+    assert registered(conn), notices
+    assert not [c for c in calls(conn) if c[0] == "app_add_dependency"], calls(conn)
+    warnings = [n for n in notices if "WARNING" in n]
+    assert len(warnings) == 1, notices
+    assert "hivemind_app context" in warnings[0], warnings
+    assert "without the hivemind dependency gate" in warnings[0], warnings
+    assert any("registered in the HAF application registry" in n for n in notices), notices
 
 
 def test_a_refused_registration_is_not_reported_as_a_success(conn):

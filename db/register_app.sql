@@ -11,8 +11,8 @@
 -- it warns and returns, and scripts/process_blocks.sh probes the registry before
 -- exec'ing the driver, so such a node keeps running the legacy CALL main() loop;
 -- against a HAF that refuses the registration because another application owns
--- the context it warns and returns the same way; and against an unregistered
--- hivemind it warns and registers without the dependency gate.
+-- the context it warns and returns the same way; and when no application lists
+-- the hivemind_app context it warns and registers without the dependency gate.
 --
 -- Nothing in this repo used to execute this file at all: docker/docker-compose-ci.yml
 -- mounts a NAMED LIST of db/*.sql and this is not on it, and sqlfluff never
@@ -29,6 +29,7 @@
 DO $$
 DECLARE
     __taken_by TEXT;
+    __hivemind_app TEXT;
 BEGIN
     -- The type first, as a statement of its own (#68). On PostgreSQL 15 and older
     -- to_regprocedure resolves the argument types before it can report the function
@@ -112,10 +113,18 @@ BEGIN
     -- position and halt ingestion whenever hivesense stalls - silently, since
     -- app_next_iteration commits the last_active_at heartbeat before it applies
     -- the dependency limit, so the container healthcheck would stay green.
-    IF EXISTS (SELECT 1 FROM hafd.applications WHERE name = 'hivemind_app') THEN
-        PERFORM hive.app_add_dependency('haf_fyp', 'hivemind_app');
+    --
+    -- hivemind is found by its context, not its registry name: the name is
+    -- hivemind's lock name and changed from hivemind_app to hivemind (hivemind#445),
+    -- while the context stayed hivemind_app. A context belongs to one application,
+    -- but ORDER BY/LIMIT keeps a second match from raising "more than one row".
+    __hivemind_app := (SELECT name FROM hafd.applications
+                       WHERE contexts @> ARRAY['hivemind_app']
+                       ORDER BY name LIMIT 1);
+    IF __hivemind_app IS NOT NULL THEN
+        PERFORM hive.app_add_dependency('haf_fyp', __hivemind_app);
     ELSE
-        RAISE WARNING 'hivemind_app is not registered; haf_fyp runs without the hivemind dependency gate';
+        RAISE WARNING 'no application with the hivemind_app context is registered; haf_fyp runs without the hivemind dependency gate';
     END IF;
 
     RAISE NOTICE 'haf_fyp registered in the HAF application registry';
