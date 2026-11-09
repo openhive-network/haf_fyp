@@ -25,7 +25,9 @@
 #
 # WHAT IT STILL DOES NOT COVER: hivemind, HiveSense, reputation_tracker and
 # balance_tracker are absent, so the foreign-application half of
-# db/cross_schema_grants.sql finds nothing to grant; all three installs are one
+# db/cross_schema_grants.sql finds nothing to grant (hivemind is there only as a
+# registry entry, tests/ci_install_setup.sql's stand-in, so that haf_fyp's dependency
+# on it is declared through HAF's own app_add_dependency); all three installs are one
 # commit, so an upgrade from an older one is not exercised; and the installer's
 # refusals and the uninstaller's prompt are not reached.
 #

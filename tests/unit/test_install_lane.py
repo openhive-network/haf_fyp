@@ -158,6 +158,7 @@ class Flavour:
                 f'{f} logs {LAST} | grep -c "haf_fyp is gone and nothing else was touched"',
                 f'{f} logs install-locked | grep -c "Skipping haf_fyp install"',
                 f'{f} logs install-again | grep -c "Acquired install lock for haf_fyp"',
+                f'test "$({f} logs install install-again | grep -c \'without the hivemind dependency gate\')" = 0',
             ],
             "after_script": [
                 f"{f} ps -a || true",
@@ -476,7 +477,7 @@ def test_compose_validate_parses_the_lane(ci, flavour) -> None:
 # many could be deleted, or turned into notices, with every test and both lanes green.
 # Adding a check means changing its file's number; so does removing one, which is the
 # point.
-RAISES = {"ci_install_verify.sql": 93, "ci_uninstall_verify.sql": 19, "ci_install_lock_holder.sql": 12,
+RAISES = {"ci_install_verify.sql": 94, "ci_uninstall_verify.sql": 20, "ci_install_lock_holder.sql": 12,
           "ci_install_haf_model.sql": 9, "ci_install_age.sql": 1, "ci_install_setup.sql": 0, "ci_install_release.sql": 0}
 LANE_SQL = sorted({"ci_install_haf_model.sql", "ci_install_setup.sql", "ci_install_verify.sql",
                    "ci_install_age.sql", "ci_install_lock_holder.sql", "ci_install_release.sql",
@@ -523,6 +524,9 @@ def test_the_sentences_the_jobs_grep_for_are_the_ones_the_files_print() -> None:
     gone = (ROOT / "tests" / "ci_uninstall_verify.sql").read_text(encoding="utf-8")
     # The last statement of the file, after every check that can raise.
     assert gone.rstrip().endswith("RAISE NOTICE 'haf_fyp is gone and nothing else was touched';\nEND\n$$;")
+    # Counted, by the jobs, to be absent: reworded, it would be absent always.
+    register = (ROOT / "db" / "register_app.sql").read_text(encoding="utf-8")
+    assert "haf_fyp runs without the hivemind dependency gate';" in register
 
 
 def test_the_database_does_not_arrive_with_pgvector_created() -> None:
