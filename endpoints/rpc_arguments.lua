@@ -2,9 +2,9 @@
 return {
     ["get_algorithm"] = {},
     ["get_feed_metrics"] = { ["algorithm_version"] = true, ["from_date"] = true, ["source"] = true, ["to_date"] = true },
-    ["get_global_feed"] = { ["community_id"] = true, ["page"] = true, ["page-size"] = true, ["truncate_body"] = true },
+    ["get_global_feed"] = { ["community_id"] = true, ["language"] = true, ["observer"] = true, ["page"] = true, ["page-size"] = true, ["truncate_body"] = true },
     ["get_health"] = {},
-    ["get_personalized_feed"] = { ["page"] = true, ["page-size"] = true, ["truncate_body"] = true, ["username"] = true },
+    ["get_personalized_feed"] = { ["language"] = true, ["page"] = true, ["page-size"] = true, ["truncate_body"] = true, ["username"] = true },
     ["get_score_explanation"] = { ["post_id"] = true, ["username"] = true },
     ["get_sync_status"] = {},
     ["get_user_profile"] = { ["username"] = true },
