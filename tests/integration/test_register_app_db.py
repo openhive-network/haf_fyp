@@ -282,8 +282,8 @@ def test_a_database_without_the_registrys_types_is_tolerated(conn, missing) -> N
 def test_a_changed_app_register_signature_is_not_called(conn) -> None:
     """The type exists, the function exists, the signature is not the one this file calls.
 
-    The probe names the whole signature so that drift lands on the tolerant path, not on
-    a call that fails to resolve.
+    The probe pins the first four parameters so that drift lands on the tolerant path, not
+    on a call that fails to resolve.
     """
     with conn.cursor() as cur:
         cur.execute("DROP FUNCTION hive.app_register(TEXT, hive.contexts_group, TEXT, TEXT)")
@@ -297,6 +297,30 @@ def test_a_changed_app_register_signature_is_not_called(conn) -> None:
     assert any("registry not available (hive.app_register)" in n and "WARNING" in n
                for n in notices), notices
     assert not registered(conn), notices
+
+
+def test_app_register_with_haf454s_fifth_parameter_is_registered_in(conn: connection) -> None:
+    """haf#454 appended `_health_function TEXT = NULL`; the 4-argument function is gone.
+
+    The probe used to name the 4-argument signature exactly, so on every HAF since haf#454
+    it reported no registry and left haf_fyp on the legacy loop. The stub's behaviour is
+    kept by renaming it out of the way and delegating to it.
+    """
+    with conn.cursor() as cur:
+        cur.execute("ALTER FUNCTION hive.app_register(TEXT, hive.contexts_group, TEXT, TEXT) "
+                    "RENAME TO ci_app_register_4")
+        cur.execute("CREATE FUNCTION hive.app_register("
+                    "_name TEXT, _contexts hive.contexts_group, "
+                    "_process_procedure TEXT DEFAULT NULL, "
+                    "_completed_block_function TEXT DEFAULT NULL, "
+                    "_health_function TEXT DEFAULT NULL) RETURNS void "
+                    "LANGUAGE sql AS $f$ SELECT hive.ci_app_register_4("
+                    "_name, _contexts, _process_procedure, _completed_block_function) $f$")
+    notices = run_register(conn)
+    assert registered(conn), notices
+    assert ("app_register", "haf_fyp") in calls(conn), calls(conn)
+    assert not any("registry not available" in n for n in notices), notices
+    assert any("registered in the HAF application registry" in n for n in notices), notices
 
 
 def test_a_raising_refusal_still_fails_the_install(conn) -> None:

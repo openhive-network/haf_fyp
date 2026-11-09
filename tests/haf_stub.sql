@@ -126,8 +126,8 @@ INSERT INTO hive.ci_register_behaviour (only_row) VALUES (TRUE) ON CONFLICT DO N
 CREATE TABLE IF NOT EXISTS hive.ci_register_calls (seq BIGSERIAL, called TEXT, arg TEXT);
 
 CREATE OR REPLACE FUNCTION hive.app_register(
-    -- The domain, not TEXT[]: db/register_app.sql probes for this exact signature
-    -- with to_regprocedure, and a TEXT[] parameter would make every scenario below
+    -- The domain, not TEXT[]: db/register_app.sql probes for these parameter types
+    -- in pg_proc, and a TEXT[] parameter would make every scenario below
     -- take the "no registry" path instead. noqa: the name is lower case because it
     -- is one, and this file is not in sql-lint's scope.
     _name TEXT, _contexts hive.contexts_group, --noqa: CP05
