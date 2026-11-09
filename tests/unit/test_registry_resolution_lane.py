@@ -105,7 +105,7 @@ def _running(env: dict) -> set:
 # When the lane runs
 # --------------------------------------------------------------------------------------
 
-def test_a_scheduled_pipeline_runs_this_job():
+def test_a_scheduled_pipeline_runs_this_job() -> None:
     """And runs it BY ITSELF -- the outcome is asserted exactly, not merely "not never".
 
     `when: manual` creates the job and waits for a human who is not there at 03:00. An
@@ -120,7 +120,7 @@ def test_a_scheduled_pipeline_runs_this_job():
     )
 
 
-def test_a_scheduled_pipeline_runs_NOTHING_else():
+def test_a_scheduled_pipeline_runs_NOTHING_else() -> None:
     """The expensive half. `docker push` on a timer is the outcome being prevented."""
     running = _running(_schedule_pipeline())
     assert running == SCHEDULED, (
@@ -131,7 +131,7 @@ def test_a_scheduled_pipeline_runs_NOTHING_else():
     )
 
 
-def test_a_schedule_on_another_branch_is_still_only_this_job():
+def test_a_schedule_on_another_branch_is_still_only_this_job() -> None:
     """A schedule may be pointed at any ref, and often is while it is being set up."""
     running = _running(_schedule_pipeline("fix/something"))
     assert running == SCHEDULED, sorted(running)
@@ -142,7 +142,7 @@ def test_a_schedule_on_another_branch_is_still_only_this_job():
     (_push_pipeline(), "a push to the default branch"),
     (_push_pipeline("feature/x"), "a push to a feature branch"),
 ])
-def test_ordinary_pipelines_do_not_run_it(env, label):
+def test_ordinary_pipelines_do_not_run_it(env, label) -> None:
     """Not per-MR, deliberately: #71 (and #63 before it) asked for a schedule.
 
     Reaching a registry is not something review should block on, and the question it
@@ -154,7 +154,7 @@ def test_ordinary_pipelines_do_not_run_it(env, label):
     )
 
 
-def test_the_default_branch_still_runs_everything_it_did():
+def test_the_default_branch_still_runs_everything_it_did() -> None:
     """The schedule exclusion must not have switched off ordinary CI.
 
     `when: never` placed first is a blunt instrument: one rule written against
@@ -168,7 +168,7 @@ def test_the_default_branch_still_runs_everything_it_did():
         )
 
 
-def test_a_tag_pipeline_does_not_run_it():
+def test_a_tag_pipeline_does_not_run_it() -> None:
     """A release tag publishes images; it does not need the registry sweep."""
     ci = _ci()
     tag_env = _pipeline(CI_COMMIT_TAG="1.29.0-rc3", CI_COMMIT_REF_NAME="1.29.0-rc3",
@@ -180,7 +180,7 @@ def test_a_tag_pipeline_does_not_run_it():
 # What the job is
 # --------------------------------------------------------------------------------------
 
-def test_it_runs_the_tracked_script_rather_than_an_inline_program():
+def test_it_runs_the_tracked_script_rather_than_an_inline_program() -> None:
     """The logic lives in scripts/, where shell-lint reads it and the tests can run it."""
     program = _program(_ci(), JOB)
     assert SCRIPT in program, (
@@ -189,7 +189,7 @@ def test_it_runs_the_tracked_script_rather_than_an_inline_program():
     )
 
 
-def test_it_needs_no_docker_daemon():
+def test_it_needs_no_docker_daemon() -> None:
     """No dind service, because manifest resolution is client-side -- verified in docker:24.
 
     A `docker:24-dind` service would make this the most expensive job in the file, for a
@@ -202,7 +202,7 @@ def test_it_needs_no_docker_daemon():
     )
 
 
-def test_it_does_not_authenticate():
+def test_it_does_not_authenticate() -> None:
     """Anonymous on purpose: a login hides the failure this exists to catch.
 
     These are public repositories. Authenticating would keep the job green for a repository
@@ -221,7 +221,7 @@ def test_it_does_not_authenticate():
         )
 
 
-def test_nothing_is_forgiven():
+def test_nothing_is_forgiven() -> None:
     """No allow_failure in ANY form (#71).
 
     !77 excused its "inconclusive" exit code, narrowly, and it still forgave dead pins:
@@ -241,7 +241,7 @@ def test_nothing_is_forgiven():
         )
 
 
-def test_a_push_after_the_cron_tick_cannot_cancel_the_sweep():
+def test_a_push_after_the_cron_tick_cannot_cancel_the_sweep() -> None:
     """auto-cancel-redundant-pipelines is on, so an interruptible sweep is cancelled by a push
     to the default branch shortly after the tick: no answer, no red, nothing."""
     assert _ci()[JOB].get("interruptible") is False, (
@@ -266,7 +266,7 @@ def _script_default(name: str) -> int:
     return int(match.group(1))
 
 
-def test_the_job_outlives_the_script_s_own_budget():
+def test_the_job_outlives_the_script_s_own_budget() -> None:
     """The script stops asking at its deadline and reports what it proved; the job must not
     be killed first, or a hung registry arrives as a bare "job timed out" -- how !77's
     32-minute worst case met a 10-minute limit.
@@ -293,7 +293,7 @@ def test_the_job_outlives_the_script_s_own_budget():
     )
 
 
-def test_the_job_installs_what_the_script_calls():
+def test_the_job_installs_what_the_script_calls() -> None:
     """curl makes the requests and jq reads compose's JSON and the token; docker:24 has
     neither, and a missing one fails every reference in a way that looks like the network."""
     program = " ".join(_flatten(_resolve(_ci(), JOB, "before_script"), "before_script"))
@@ -303,7 +303,7 @@ def test_the_job_installs_what_the_script_calls():
         )
 
 
-def test_a_schedule_pointed_at_a_tag_does_not_republish_a_release():
+def test_a_schedule_pointed_at_a_tag_does_not_republish_a_release() -> None:
     """GitLab schedules can target a TAG, and publish_tag is not a branch lane.
 
     Without its own exclusion, a schedule on a release tag re-pulls `:<short-sha>` and
@@ -319,7 +319,7 @@ def test_a_schedule_pointed_at_a_tag_does_not_republish_a_release():
     )
 
 
-def test_no_lane_carries_a_private_copy_of_the_shared_rules():
+def test_no_lane_carries_a_private_copy_of_the_shared_rules() -> None:
     """Ten copies is how one of them silently drifts.
 
     Not style: the schedule exclusion is only correct if EVERY lane has it, and the anchor is
@@ -346,7 +346,7 @@ def test_no_lane_carries_a_private_copy_of_the_shared_rules():
     )
 
 
-def test_the_on_demand_hatch_works_and_is_off_by_default():
+def test_the_on_demand_hatch_works_and_is_off_by_default() -> None:
     """Without it the job's first run would be a cron tick on develop after merge.
 
     "Run pipeline" creates a `web` pipeline, not a `schedule` one, so with only the schedule
@@ -384,7 +384,7 @@ def test_the_on_demand_hatch_works_and_is_off_by_default():
                CI_COMMIT_REF_NAME="1.29.0-rc2", CI_COMMIT_REF_PROTECTED="true",
                RUN_REGISTRY_RESOLUTION="true"), "a tag via the API"),
 ])
-def test_asking_for_the_sweep_runs_the_sweep_and_nothing_else(env, label):
+def test_asking_for_the_sweep_runs_the_sweep_and_nothing_else(env, label) -> None:
     """"Run pipeline" with RUN_REGISTRY_RESOLUTION=true is a `web` pipeline, which on develop
     sets CI_COMMIT_BRANCH -- so without its own exclusion it matched every lane's default-
     branch rule, rerunning the whole pipeline and republishing :develop (found by review).
@@ -392,7 +392,7 @@ def test_asking_for_the_sweep_runs_the_sweep_and_nothing_else(env, label):
     assert _running(env) == SCHEDULED, "on %s: %s" % (label, sorted(_running(env)))
 
 
-def test_a_workflow_that_excludes_schedules_is_not_invisible():
+def test_a_workflow_that_excludes_schedules_is_not_invisible() -> None:
     """A `workflow:` kills the pipeline whole, and job rules cannot see it.
 
     test_publish_tag_lane carries this guard for tag pipelines; the model was imported here
@@ -410,7 +410,7 @@ def test_a_workflow_that_excludes_schedules_is_not_invisible():
     )
 
 
-def test_the_include_hides_no_rules_from_this_model():
+def test_the_include_hides_no_rules_from_this_model() -> None:
     """Same class: an `include:` can bring in rules, defaults or a workflow nothing here
     reads. The one there is, is pinned and stated in common_ci_include: hidden templates, no
     workflow, and a `default:` whose interruptible and timeout this job sets for itself."""
@@ -421,7 +421,7 @@ def test_the_include_hides_no_rules_from_this_model():
     assert {"interruptible", "timeout"} <= set(_ci()[JOB]), "the included default would decide"
 
 
-def test_the_job_uses_only_keys_this_suite_models():
+def test_the_job_uses_only_keys_this_suite_models() -> None:
     """Fail closed, as the release lane does. `services:` alone would change what this costs."""
     job = _ci()[JOB]
     unknown = set(job) - JOB_KEYS
@@ -432,7 +432,7 @@ def test_the_job_uses_only_keys_this_suite_models():
     )
 
 
-def test_the_model_actually_reasoned_about_this_job():
+def test_the_model_actually_reasoned_about_this_job() -> None:
     """Guard against the tests above passing vacuously.
 
     Every assertion here runs through _outcome, which returns None for a job whose rules it
@@ -451,7 +451,7 @@ def test_the_model_actually_reasoned_about_this_job():
         pytest.fail("the rules model cannot evaluate %s: %s" % (JOB, exc))
 
 
-def test_the_job_runs_the_script_and_nothing_can_soften_its_exit():
+def test_the_job_runs_the_script_and_nothing_can_soften_its_exit() -> None:
     """Exactly the script, as the whole program: `... || true`, an `echo` of its name, or a
     second line that exits 0 would each turn the lane green without the check -- forgiveness
     written into the script line instead of allow_failure (found by review)."""
@@ -459,7 +459,7 @@ def test_the_job_runs_the_script_and_nothing_can_soften_its_exit():
     assert program == ["sh %s" % SCRIPT], program
 
 
-def test_nothing_narrows_or_stretches_what_the_script_checks():
+def test_nothing_narrows_or_stretches_what_the_script_checks() -> None:
     """The script's HAF_FYP_* knobs exist for its tests. Set on the job or the pipeline, one
     can check fewer images than the job claims (HAF_FYP_COMPOSE_FILES, HAF_FYP_DOCKERFILES)
     or move its budget past the job's timeout (HAF_FYP_RESOLVE_DEADLINE)."""
@@ -470,19 +470,19 @@ def test_nothing_narrows_or_stretches_what_the_script_checks():
         assert not knobs, "%s-level variables set %s" % (scope, knobs)
 
 
-def test_the_job_uses_the_image_it_was_verified_in():
+def test_the_job_uses_the_image_it_was_verified_in() -> None:
     """docker:24 carries the docker CLI and the compose plugin the extraction needs; an
     image without them makes the lane red on every run."""
     assert _ci()[JOB]["image"] == "docker:24"
 
 
-def test_the_job_is_retried_only_when_the_runner_fails():
+def test_the_job_is_retried_only_when_the_runner_fails() -> None:
     """A retry on a real failure prints the same dead pin three times; the script already
     retries each request itself."""
     assert _ci()[JOB].get("retry") == {"max": 2, "when": "runner_system_failure"}
 
 
-def test_only_true_asks_for_the_sweep():
+def test_only_true_asks_for_the_sweep() -> None:
     """A variable left as "false" (or anything else) must not start it."""
     for value in ("false", "0", "yes"):
         env = _pipeline(CI_PIPELINE_SOURCE="web", CI_COMMIT_BRANCH="feature/x",
@@ -491,7 +491,7 @@ def test_only_true_asks_for_the_sweep():
 
 
 
-def test_before_script_only_installs_the_tools():
+def test_before_script_only_installs_the_tools() -> None:
     """before_script shares the script's shell: an `export HAF_FYP_COMPOSE_FILES=...` there
     narrows the check exactly as a variable would (found by review). It holds the install and
     its retries, and is pinned EXACTLY: a tokenising check let `|| sleep 0`, a dead first
@@ -502,7 +502,7 @@ def test_before_script_only_installs_the_tools():
         "%s || { sleep 15; %s; } || { sleep 30; %s; }" % (install, install, install)]
 
 
-def test_the_install_survives_a_mirror_blip():
+def test_the_install_survives_a_mirror_blip() -> None:
     """The first real run of this job died in `apk add` on a mirror "temporary error"; a
     single try turns develop red for a reason that has nothing to do with the pins."""
     line = _flatten(_resolve(_ci(), JOB, "before_script"), "before_script")[0]
@@ -513,7 +513,7 @@ def test_the_install_survives_a_mirror_blip():
     assert re.search(r"\|\|\s*\{\s*sleep \d+", line), "the retries do not wait: %s" % line
 
 
-def test_a_variable_that_is_not_true_leaves_every_lane_as_it_was():
+def test_a_variable_that_is_not_true_leaves_every_lane_as_it_was() -> None:
     """.standard-rules' exclusion is `== "true"`, not truthiness: a project-level
     RUN_REGISTRY_RESOLUTION=false must not stop every lane on develop."""
     push = _push_pipeline()
@@ -522,19 +522,19 @@ def test_a_variable_that_is_not_true_leaves_every_lane_as_it_was():
 
 
 
-def test_a_merge_request_still_runs_every_lane():
+def test_a_merge_request_still_runs_every_lane() -> None:
     """The schedule and hatch exclusions must not cost the review pipeline its lanes."""
     lanes = {"sql-lint", "shell-lint", "python-lint", "hadolint", "compose-validate",
              "openapi-drift", "python-tests", "fastapi-tests", "postgrest-tests"}
     assert lanes <= _running(_mr_pipeline()), sorted(lanes - _running(_mr_pipeline()))
 
 
-def test_the_job_s_stage_exists():
+def test_the_job_s_stage_exists() -> None:
     ci = _ci()
     assert ci[JOB]["stage"] in ci.get("stages", []), (ci[JOB]["stage"], ci.get("stages"))
 
 
-def test_no_workflow_can_drop_the_hatch_or_the_schedule():
+def test_no_workflow_can_drop_the_hatch_or_the_schedule() -> None:
     """A top-level `workflow:` decides whether a pipeline is created at all, before any job
     rule; this model does not evaluate one, so none may appear unannounced."""
     assert "workflow" not in _ci(), _ci()["workflow"]

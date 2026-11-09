@@ -101,7 +101,7 @@ class Unmodelled(AssertionError):
 class _Reference:
     """A parsed `!reference [...]` -- opaque on purpose; see _Loader."""
 
-    def __init__(self, path):
+    def __init__(self, path) -> None:
         self.path = path
 
 
@@ -231,7 +231,7 @@ def _matches(condition, env: dict) -> bool:
         raise Unmodelled("rule condition %r is not a string" % (condition,))
     regexes = []
 
-    def stash(match):
+    def stash(match) -> str:
         pattern, flags = match.group(1), match.group(2)
         if flags:
             raise Unmodelled("regex flags /%s are not modelled: %r" % (flags, condition))
@@ -406,7 +406,7 @@ def _build_images(ci: dict | None = None) -> set[str]:
 # It runs at all -- the #57 defect
 # --------------------------------------------------------------------------------------
 
-def test_the_file_uses_only_what_this_suite_can_reason_about():
+def test_the_file_uses_only_what_this_suite_can_reason_about() -> None:
     """Fail closed: anything that could change whether the lane runs must be modelled."""
     ci = _ci()
     # The one include there is, is pinned and stated in common_ci_include: hidden templates,
@@ -451,7 +451,7 @@ def test_the_file_uses_only_what_this_suite_can_reason_about():
     assert not extra, "publish_tag defines %s, which this suite does not model" % sorted(extra)
 
 
-def test_a_release_tag_reaches_this_job_and_runs_it():
+def test_a_release_tag_reaches_this_job_and_runs_it() -> None:
     """Evaluated in order, because the first matching rule is the one that decides."""
     job = _job()
     for tag in RELEASE_TAGS:
@@ -461,7 +461,7 @@ def test_a_release_tag_reaches_this_job_and_runs_it():
         )
 
 
-def test_nothing_else_triggers_a_release():
+def test_nothing_else_triggers_a_release() -> None:
     rules = _job()["rules"]
     for ref in NOT_RELEASES:
         assert _outcome(rules, _tag_pipeline(ref)) in (None, ("never", False)), (
@@ -471,7 +471,7 @@ def test_nothing_else_triggers_a_release():
         assert _outcome(rules, env) in (None, ("never", False)), "a non-tag pipeline would publish"
 
 
-def test_the_kill_switch_only_fires_when_it_is_set():
+def test_the_kill_switch_only_fires_when_it_is_set() -> None:
     """`==` -> `!=` here is one character and disables every release, forever."""
     rules = _job()["rules"]
     assert _outcome(rules, _tag_pipeline(TAG)) == ("on_success", False)
@@ -480,7 +480,7 @@ def test_the_kill_switch_only_fires_when_it_is_set():
     assert _outcome(rules, stopped) in (None, ("never", False)), "the kill switch does not stop the job"
 
 
-def test_the_gate_is_the_tag_shape_not_protection():
+def test_the_gate_is_the_tag_shape_not_protection() -> None:
     conditions = " ".join(str(rule.get("if", "")) for rule in _job()["rules"])
     assert "CI_COMMIT_REF_PROTECTED" not in conditions, (
         "hive/haf_fyp protects only `1.*` and `v*`, so gating on protection would silently "
@@ -516,7 +516,7 @@ def test_the_tag_pipeline_is_created():
             )
 
 
-def test_the_release_stage_comes_after_the_images_are_built():
+def test_the_release_stage_comes_after_the_images_are_built() -> None:
     ci = _ci()
     stages = ci["stages"]
     assert "release" in stages
@@ -528,14 +528,14 @@ def test_the_release_stage_comes_after_the_images_are_built():
 # What it publishes
 # --------------------------------------------------------------------------------------
 
-def test_it_publishes_every_image_the_build_stage_produces(tmp_path):
+def test_it_publishes_every_image_the_build_stage_produces(tmp_path: Path) -> None:
     rc, calls = _run(tmp_path)
     assert rc == 0
     pushed = {c[-1].rsplit(":", 1)[0] for c in calls if c[0] == "push"}
     assert pushed == _build_images()
 
 
-def test_this_is_the_only_job_that_publishes_in_the_release_stage():
+def test_this_is_the_only_job_that_publishes_in_the_release_stage() -> None:
     """A second release job that rebuilds would undo what this lane guarantees."""
     ci = _ci()
     for name, _ in _jobs(ci):
@@ -546,7 +546,7 @@ def test_this_is_the_only_job_that_publishes_in_the_release_stage():
         )
 
 
-def test_it_publishes_the_tested_image_rather_than_rebuilding(tmp_path):
+def test_it_publishes_the_tested_image_rather_than_rebuilding(tmp_path: Path) -> None:
     rc, calls = _run(tmp_path)
     assert rc == 0
     assert "build" not in [c[0] for c in calls], "the release lane must not rebuild the images"
@@ -562,7 +562,7 @@ def test_it_publishes_the_tested_image_rather_than_rebuilding(tmp_path):
     assert {c[-1] for c in calls if c[0] == "push"} == {"%s:%s" % (r, TAG) for r in images}
 
 
-def test_nothing_is_published_until_every_image_is_in_hand(tmp_path):
+def test_nothing_is_published_until_every_image_is_in_hand(tmp_path: Path) -> None:
     rc, calls = _run(tmp_path)
     assert rc == 0
     verbs = [c[0] for c in calls]
@@ -572,7 +572,7 @@ def test_nothing_is_published_until_every_image_is_in_hand(tmp_path):
     ), "a push happened before the last pull, so a missing image could publish a partial set"
 
 
-def test_it_authenticates_to_the_project_registry(tmp_path):
+def test_it_authenticates_to_the_project_registry(tmp_path: Path) -> None:
     rc, calls = _run(tmp_path)
     assert rc == 0
     logins = [c for c in calls if c[0] == "login"]
@@ -589,18 +589,18 @@ def test_it_authenticates_to_the_project_registry(tmp_path):
 # How it fails
 # --------------------------------------------------------------------------------------
 
-def test_a_tag_on_an_unbuilt_commit_fails_before_publishing_anything(tmp_path):
+def test_a_tag_on_an_unbuilt_commit_fails_before_publishing_anything(tmp_path: Path) -> None:
     rc, calls = _run(tmp_path, fail="pull")
     assert rc != 0, "a failed pull must fail the job"
     assert not [c for c in calls if c[0] == "push"], "nothing may be published after a failed pull"
 
 
-def test_a_failed_push_fails_the_job(tmp_path):
+def test_a_failed_push_fails_the_job(tmp_path: Path) -> None:
     rc, _ = _run(tmp_path, fail="push")
     assert rc != 0
 
 
-def test_a_tag_docker_cannot_express_is_refused(tmp_path):
+def test_a_tag_docker_cannot_express_is_refused(tmp_path: Path) -> None:
     rc, calls = _run(tmp_path, tag="1.29/rc2")
     assert rc != 0, "a tag docker cannot express must not be attempted"
     assert not [c for c in calls if c[0] == "push"]
@@ -614,14 +614,14 @@ def _image_name(value) -> str:
     return value["name"] if isinstance(value, dict) else value
 
 
-def test_the_release_tag_is_not_cancellable_mid_publish():
+def test_the_release_tag_is_not_cancellable_mid_publish() -> None:
     job = _job()
     assert job["interruptible"] is False
     assert job["variables"]["GIT_STRATEGY"] == "none"
     assert job["dependencies"] == []
 
 
-def test_it_runs_against_a_docker_daemon():
+def test_it_runs_against_a_docker_daemon() -> None:
     job = _job()
     assert _image_name(job["image"]).startswith("docker:")
     assert any("dind" in _image_name(service) for service in job["services"]), (
@@ -633,7 +633,7 @@ def test_it_runs_against_a_docker_daemon():
     )
 
 
-def test_the_program_is_posix_shell():
+def test_the_program_is_posix_shell() -> None:
     """docker:24 is Alpine: /bin/sh is BusyBox ash and there is no bash."""
     program = "\n".join(
         line for line in _program().split("\n") if not line.lstrip().startswith("#")
@@ -657,12 +657,12 @@ def test_the_program_is_posix_shell():
     '$CI_COMMIT_TAG =~ /^(?!x)/',      # lookaround, which RE2 rejects
     '$A == "x" && $B ~= "y"',          # an unknown operator after a clause that fails
 ])
-def test_the_model_refuses_what_it_cannot_evaluate(condition):
+def test_the_model_refuses_what_it_cannot_evaluate(condition) -> None:
     with pytest.raises(Unmodelled):
         _matches(condition, _tag_pipeline(TAG))
 
 
-def test_an_undefined_variable_is_not_the_empty_string():
+def test_an_undefined_variable_is_not_the_empty_string() -> None:
     """`$UNSET != ""` is true in GitLab; reading it as "" hid a dead kill switch."""
     env = _tag_pipeline(TAG)
     assert _matches('$SKIP_DOCKER_PUBLISH != ""', env) is True
@@ -671,7 +671,7 @@ def test_an_undefined_variable_is_not_the_empty_string():
     assert _matches("$SKIP_DOCKER_PUBLISH =~ /^(true)?$/", env) is True  # "" for =~
 
 
-def test_null_means_undefined():
+def test_null_means_undefined() -> None:
     """`!= null` is true for a variable set to "" -- the reason the mirror's gate also
     compares `!= ""` (#72)."""
     env = _tag_pipeline(TAG)
@@ -682,7 +682,7 @@ def test_null_means_undefined():
     assert _matches("$BLOG_REGISTRY_USER != null", env) is True
 
 
-def test_a_bare_variable_before_and_is_refused():
+def test_a_bare_variable_before_and_is_refused() -> None:
     """GitLab (measured with ci/lint): with an empty user, `$BLOG_REGISTRY_USER && ...` is
     TRUE -- the haf_stats trap. Only the last operand of `&&` reads as "non-empty"."""
     env = dict(_tag_pipeline(TAG), BLOG_REGISTRY_USER="")
@@ -692,6 +692,6 @@ def test_a_bare_variable_before_and_is_refused():
     assert _matches("$BLOG_REGISTRY_USER", env) is False
 
 
-def test_a_rule_key_the_model_ignores_is_refused():
+def test_a_rule_key_the_model_ignores_is_refused() -> None:
     with pytest.raises(Unmodelled):
         _outcome([{"if": "$CI_COMMIT_TAG", "exists": ["Dockerfile"]}], _tag_pipeline(TAG))

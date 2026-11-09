@@ -100,7 +100,7 @@ class Registry:
 
     HANG = 20
 
-    def __init__(self, host: str, auth_host: str, auth_path: str, lower: bool, service: str):
+    def __init__(self, host: str, auth_host: str, auth_path: str, lower: bool, service: str) -> None:
         self.host, self.auth_host, self.auth_path, self.lower = host, auth_host, auth_path, lower
         self.service = service
         self.answers: dict[tuple[str, str], list[tuple]] = {}
@@ -121,10 +121,10 @@ class Registry:
             # an HTTP/1.0 close would end it at once and hide the fault.
             protocol_version = "HTTP/1.1"
 
-            def log_message(self, *args):
+            def log_message(self, *args) -> None:
                 pass
 
-            def _plain(self, code: int, headers: dict | None = None, api: bool = True):
+            def _plain(self, code: int, headers: dict | None = None, api: bool = True) -> None:
                 self.send_response(code)
                 for k, v in (headers or {}).items():
                     self.send_header(h(k), v)
@@ -185,17 +185,17 @@ class Registry:
                     return self._plain(503)
                 return self._plain(500)
 
-            def do_HEAD(self):  # noqa: N802
+            def do_HEAD(self) -> None:  # noqa: N802
                 self._manifest()
 
-            def do_GET(self):  # noqa: N802
+            def do_GET(self) -> None:  # noqa: N802
                 self._manifest()
 
         class AuthHandler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, *args):
+            def log_message(self, *args) -> None:
                 pass
 
-            def do_GET(self):  # noqa: N802
+            def do_GET(self) -> None:  # noqa: N802
                 parsed = urlparse(self.path)
                 query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
                 reg.token_requests.append(dict(query, path=parsed.path))
@@ -254,7 +254,7 @@ class Registry:
     def asked(self) -> set[tuple[str, str]]:
         return {(repo, ref) for repo, ref, _ in self.heads}
 
-    def close(self):
+    def close(self) -> None:
         for s in (self.server, self.auth):
             s.shutdown()
             s.server_close()
@@ -375,7 +375,7 @@ class Repo:
     """A throwaway repository: the script under scripts/, docker/.env, compose files and
     Dockerfiles at the root -- so REPO_ROOT, and the Dockerfile.* search, are ours."""
 
-    def __init__(self, tmp_path: Path, registries: list[Registry]):
+    def __init__(self, tmp_path: Path, registries: list[Registry]) -> None:
         self.root = tmp_path / "repo"
         (self.root / "scripts").mkdir(parents=True)
         (self.root / "docker").mkdir()
@@ -405,18 +405,18 @@ class Repo:
         self.compose("docker-compose.yml", {"app": {"image": f"{gl.host}/app:1"}})
         self.dockerfile("Dockerfile.app", f"FROM {gl.host}/base:1\n")
 
-    def stub_config(self, **flags):
+    def stub_config(self, **flags) -> None:
         (self.bin / "stub.json").write_text(json.dumps({"log": self.stub_log.as_posix(), **flags}))
 
-    def env_file(self, text: str):
+    def env_file(self, text: str) -> None:
         (self.root / "docker" / ".env").write_text(text, newline="\n")
 
-    def compose(self, name: str, services: dict):
+    def compose(self, name: str, services: dict) -> None:
         import yaml
         (self.root / "docker" / name).write_text(
             yaml.safe_dump({"services": services}), newline="\n")
 
-    def dockerfile(self, name: str, text: str):
+    def dockerfile(self, name: str, text: str) -> None:
         (self.root / name).write_text(text, newline="\n")
 
     def run(self, extra_env: dict | None = None, compose_files: list[str] | None = None,
@@ -441,7 +441,7 @@ class Repo:
 
 
 @pytest.fixture
-def repo(tmp_path, registry, hub):
+def repo(tmp_path: Path, registry, hub):
     _require("curl")
     _require("jq")
     _require("python3")
@@ -483,7 +483,7 @@ BASE = "registry.test/base:1"
 # Verdicts
 # --------------------------------------------------------------------------------------
 
-def test_every_pin_resolved_passes_and_reports_the_registry_s_digest(repo, registry):
+def test_every_pin_resolved_passes_and_reports_the_registry_s_digest(repo, registry) -> None:
     r = repo.run()
     assert r.returncode == 0, r.stderr
     assert resolved(r) == {APP: DIGEST, BASE: OTHER_DIGEST}, r.stdout
@@ -494,14 +494,14 @@ def test_every_pin_resolved_passes_and_reports_the_registry_s_digest(repo, regis
     assert r.seconds < 10, f"took {r.seconds:.1f}s to resolve two images"
 
 
-def test_it_asks_with_head_not_get(repo, registry):
+def test_it_asks_with_head_not_get(repo, registry) -> None:
     """Docker Hub does not count HEADs against the anonymous rate limit, and a limited GET
     cannot be told from a missing tag."""
     repo.run()
     assert registry.methods and set(registry.methods) == {"HEAD"}, registry.methods
 
 
-def test_a_missing_tag_fails(repo, registry):
+def test_a_missing_tag_fails(repo, registry) -> None:
     registry.answers[("app", "1")] = [("missing",)]
     r = repo.run()
     assert r.returncode == 1
@@ -509,7 +509,7 @@ def test_a_missing_tag_fails(repo, registry):
     assert summary(r) == (1, 2, 1, 0)
 
 
-def test_a_repository_nobody_may_read_fails(repo, registry):
+def test_a_repository_nobody_may_read_fails(repo, registry) -> None:
     """401 even WITH a token, on every try: gone, renamed or private."""
     registry.answers[("app", "1")] = [("private",)]
     r = repo.run()
@@ -518,7 +518,7 @@ def test_a_repository_nobody_may_read_fails(repo, registry):
     assert summary(r) == (1, 2, 1, 0)
 
 
-def test_a_rate_limited_answer_is_asked_again(repo, registry):
+def test_a_rate_limited_answer_is_asked_again(repo, registry) -> None:
     registry.answers[("app", "1")] = [("limited",), ("limited",), ("ok", DIGEST)]
     r = repo.run()
     assert r.returncode == 0, r.stderr
@@ -526,7 +526,7 @@ def test_a_rate_limited_answer_is_asked_again(repo, registry):
     assert repo.sleeps.read_text().split() == ["5", "10"]
 
 
-def test_an_answer_that_never_comes_fails_it_is_never_forgiven(repo, registry):
+def test_an_answer_that_never_comes_fails_it_is_never_forgiven(repo, registry) -> None:
     """#71's first constraint. !77 excused this outcome and so excused dead pins."""
     registry.answers[("app", "1")] = [("limited",)]
     r = repo.run()
@@ -536,7 +536,7 @@ def test_an_answer_that_never_comes_fails_it_is_never_forgiven(repo, registry):
     assert summary(r) == (1, 2, 0, 1)
 
 
-def test_a_server_error_is_never_a_resolution(repo, registry):
+def test_a_server_error_is_never_a_resolution(repo, registry) -> None:
     registry.answers[("app", "1")] = [("error",)]
     r = repo.run()
     assert r.returncode == 1
@@ -544,7 +544,7 @@ def test_a_server_error_is_never_a_resolution(repo, registry):
     assert APP not in resolved(r)
 
 
-def test_a_wholesale_non_answer_fails(repo, registry):
+def test_a_wholesale_non_answer_fails(repo, registry) -> None:
     """The floor: nothing verified is a broken check, never a warning."""
     for key in list(registry.answers):
         registry.answers[key] = [("limited",)]
@@ -554,7 +554,7 @@ def test_a_wholesale_non_answer_fails(repo, registry):
     assert summary(r) == (0, 2, 0, 2)
 
 
-def test_a_200_without_a_digest_is_not_a_resolution(repo, registry):
+def test_a_200_without_a_digest_is_not_a_resolution(repo, registry) -> None:
     """What came back must have the shape of an answer; an exit status is not one."""
     registry.answers[("app", "1")] = [("nodigest",)]
     r = repo.run()
@@ -562,14 +562,14 @@ def test_a_200_without_a_digest_is_not_a_resolution(repo, registry):
     assert verdict(r, "UNANSWERED", APP), r.stderr
 
 
-def test_a_registry_that_is_down_fails(repo, registry):
+def test_a_registry_that_is_down_fails(repo, registry) -> None:
     registry.close()
     r = repo.run({"HAF_FYP_REQUEST_TIMEOUT": "2", "HAF_FYP_RESOLVE_TRIES": "1"})
     assert r.returncode == 1
     assert resolved(r) == {}
 
 
-def test_a_registry_that_hangs_is_cut_off_by_the_request_timeout(repo, registry):
+def test_a_registry_that_hangs_is_cut_off_by_the_request_timeout(repo, registry) -> None:
     """A registry that accepts and never answers must not hold the sweep past its budget --
     the deadline is only checked between attempts, so each request needs its own bound."""
     registry.answers[("app", "1")] = [("hang",)]
@@ -579,7 +579,7 @@ def test_a_registry_that_hangs_is_cut_off_by_the_request_timeout(repo, registry)
     assert r.seconds < Registry.HANG - 5, f"took {r.seconds:.1f}s: a hung request was waited out"
 
 
-def test_a_token_service_that_hangs_is_cut_off_too(repo, registry):
+def test_a_token_service_that_hangs_is_cut_off_too(repo, registry) -> None:
     registry.token_mode["app"] = "hang"
     r = repo.run({"HAF_FYP_REQUEST_TIMEOUT": "1", "HAF_FYP_RESOLVE_TRIES": "2"})
     assert r.returncode == 1
@@ -591,7 +591,7 @@ def test_a_token_service_that_hangs_is_cut_off_too(repo, registry):
 # Refusals and 404s: a verdict only when the registry really gave one
 # --------------------------------------------------------------------------------------
 
-def test_a_repository_the_token_service_refuses_is_unreadable_not_unanswered(repo, registry):
+def test_a_repository_the_token_service_refuses_is_unreadable_not_unanswered(repo, registry) -> None:
     """gitlab.syncad.com refuses a missing project at the TOKEN step (403 DENIED). That once
     ended as UNANSWERED -- with advice not to touch a pin that really is dead."""
     registry.token_mode["app"] = "deny"
@@ -600,7 +600,7 @@ def test_a_repository_the_token_service_refuses_is_unreadable_not_unanswered(rep
     assert verdict(r, "UNREADABLE", APP), r.stderr
 
 
-def test_a_token_service_that_fails_is_unanswered_not_a_verdict(repo, registry):
+def test_a_token_service_that_fails_is_unanswered_not_a_verdict(repo, registry) -> None:
     """A 500 from the token service says nothing about the pin."""
     registry.token_mode["app"] = "fail"
     r = repo.run()
@@ -609,7 +609,7 @@ def test_a_token_service_that_fails_is_unanswered_not_a_verdict(repo, registry):
     assert not verdict(r, "UNREADABLE", APP), r.stderr
 
 
-def test_a_token_service_that_answers_without_a_token_is_unanswered(repo, registry):
+def test_a_token_service_that_answers_without_a_token_is_unanswered(repo, registry) -> None:
     """A 200 with no token in it is not a refusal: nothing was said about the pin."""
     registry.token_mode["app"] = "empty"
     r = repo.run()
@@ -618,7 +618,7 @@ def test_a_token_service_that_answers_without_a_token_is_unanswered(repo, regist
     assert not verdict(r, "UNREADABLE", APP), r.stderr
 
 
-def test_a_refusal_on_the_last_try_alone_is_not_refused_on_every_try(repo, registry):
+def test_a_refusal_on_the_last_try_alone_is_not_refused_on_every_try(repo, registry) -> None:
     """Two outages, then one 401: that is not "refused on every try" (found by review)."""
     registry.answers[("app", "1")] = [("error",), ("error",), ("private",)]
     r = repo.run()
@@ -627,7 +627,7 @@ def test_a_refusal_on_the_last_try_alone_is_not_refused_on_every_try(repo, regis
     assert not verdict(r, "UNREADABLE", APP), r.stderr
 
 
-def test_a_403_the_registry_did_not_send_is_not_a_refusal(repo, registry):
+def test_a_403_the_registry_did_not_send_is_not_a_refusal(repo, registry) -> None:
     """The same rule as for 404: a WAF's or a proxy's 403 is not the registry speaking."""
     registry.answers[("app", "1")] = [("bare403",)]
     r = repo.run()
@@ -635,7 +635,7 @@ def test_a_403_the_registry_did_not_send_is_not_a_refusal(repo, registry):
     assert verdict(r, "UNANSWERED", APP), r.stderr
 
 
-def test_a_token_service_refusal_needs_the_registry_s_error_body(repo, registry):
+def test_a_token_service_refusal_needs_the_registry_s_error_body(repo, registry) -> None:
     """gitlab.syncad.com refuses with {"errors":[{"code":"DENIED"}]}; an HTML 403 is not
     that."""
     registry.token_mode["app"] = "waf"
@@ -645,7 +645,7 @@ def test_a_token_service_refusal_needs_the_registry_s_error_body(repo, registry)
     assert not verdict(r, "UNREADABLE", APP), r.stderr
 
 
-def test_a_rate_limited_token_service_says_so(repo, registry):
+def test_a_rate_limited_token_service_says_so(repo, registry) -> None:
     """The token service's own status and Retry-After reach the log -- if it is auth.docker.io
     that trips, "HTTP 000" would settle nothing."""
     registry.token_mode["app"] = "limited"
@@ -655,7 +655,7 @@ def test_a_rate_limited_token_service_says_so(repo, registry):
     assert "429" in r.stderr and "3600" in r.stderr, r.stderr
 
 
-def test_a_refusal_that_passes_is_not_a_verdict(repo, registry):
+def test_a_refusal_that_passes_is_not_a_verdict(repo, registry) -> None:
     """One bad answer from an auth service must not accuse a healthy pin."""
     registry.token_mode["app"] = ("deny", 1)
     r = repo.run()
@@ -663,25 +663,25 @@ def test_a_refusal_that_passes_is_not_a_verdict(repo, registry):
     assert resolved(r)[APP] == DIGEST
 
 
-def test_a_manifest_refusal_that_passes_is_not_a_verdict(repo, registry):
+def test_a_manifest_refusal_that_passes_is_not_a_verdict(repo, registry) -> None:
     registry.answers[("app", "1")] = [("private",), ("ok", DIGEST)]
     assert repo.run().returncode == 0
 
 
-def test_a_refusal_is_asked_every_try_before_it_counts(repo, registry):
+def test_a_refusal_is_asked_every_try_before_it_counts(repo, registry) -> None:
     registry.answers[("app", "1")] = [("private",)]
     repo.run()
     assert registry.served[("app", "1")] == 3
 
 
-def test_a_401_with_no_challenge_on_every_try_is_unreadable(repo, registry):
+def test_a_401_with_no_challenge_on_every_try_is_unreadable(repo, registry) -> None:
     registry.answers[("app", "1")] = [("norealm",)]
     r = repo.run()
     assert r.returncode == 1
     assert verdict(r, "UNREADABLE", APP), r.stderr
 
 
-def test_a_404_the_registry_did_not_send_is_not_a_missing_pin(repo, registry):
+def test_a_404_the_registry_did_not_send_is_not_a_missing_pin(repo, registry) -> None:
     """A proxy's or a misrouted ingress's 404 would otherwise report every pin on that host
     as gone. Real registries mark their own with Docker-Distribution-Api-Version."""
     registry.answers[("app", "1")] = [("bare404",)]
@@ -691,7 +691,7 @@ def test_a_404_the_registry_did_not_send_is_not_a_missing_pin(repo, registry):
     assert not verdict(r, "MISSING", APP), r.stderr
 
 
-def test_an_unanswered_line_carries_the_rate_limit_headers(repo, registry):
+def test_an_unanswered_line_carries_the_rate_limit_headers(repo, registry) -> None:
     """Whether a HEAD is refused once the runner's IP is over its limit is not documented; a
     run that meets it should say so in the job log."""
     registry.answers[("app", "1")] = [("limited",)]
@@ -703,7 +703,7 @@ def test_an_unanswered_line_carries_the_rate_limit_headers(repo, registry):
 # The protocol as the real registries speak it
 # --------------------------------------------------------------------------------------
 
-def test_the_token_comes_from_the_realm_the_challenge_names(repo, registry, hub):
+def test_the_token_comes_from_the_realm_the_challenge_names(repo, registry, hub) -> None:
     """Each registry's token service lives on ANOTHER host (gitlab.syncad.com/jwt/auth,
     auth.docker.io/token); a realm guessed from the registry's own host reaches neither."""
     repo.compose("docker-compose.yml", {"app": {"image": APP},
@@ -717,14 +717,14 @@ def test_the_token_comes_from_the_realm_the_challenge_names(repo, registry, hub)
             "scope": "repository:library/postgres:pull"} in hub.token_requests
 
 
-def test_each_repository_gets_its_own_token(repo, registry):
+def test_each_repository_gets_its_own_token(repo, registry) -> None:
     """Tokens are scoped to one repository; reusing one for the next is a 401 there."""
     r = repo.run()
     assert r.returncode == 0, r.stderr
     assert ("app", "1", True) in registry.heads and ("base", "1", True) in registry.heads
 
 
-def test_lower_case_headers_as_docker_hub_sends_them(repo, hub):
+def test_lower_case_headers_as_docker_hub_sends_them(repo, hub) -> None:
     """Hub sends `www-authenticate` and `docker-content-digest`; GitLab `Www-Authenticate`
     and `Docker-Content-Digest`. Both fakes are exercised by the pins below."""
     repo.compose("docker-compose.yml", {"db": {"image": "postgres:14-alpine"}})
@@ -738,7 +738,7 @@ def test_lower_case_headers_as_docker_hub_sends_them(repo, hub):
 
 @pytest.mark.parametrize("media", [OCI_INDEX, OCI_MANIFEST, DOCKER_LIST,
                                    "application/vnd.docker.distribution.manifest.v2+json"])
-def test_every_manifest_kind_is_accepted(repo, registry, media):
+def test_every_manifest_kind_is_accepted(repo, registry, media) -> None:
     """A registry answers 404 for a manifest whose type is not in Accept -- syncad's
     psql:14-3 is an OCI manifest -- which would read as a dead pin."""
     registry.answers[("app", "1")] = [("ok", DIGEST, media)]
@@ -746,7 +746,7 @@ def test_every_manifest_kind_is_accepted(repo, registry, media):
     assert r.returncode == 0, r.stderr
 
 
-def test_a_missing_docker_hub_repository_is_unreadable(repo, hub):
+def test_a_missing_docker_hub_repository_is_unreadable(repo, hub) -> None:
     """Hub issues a token for a repository that does not exist, then 401s the manifest."""
     repo.compose("docker-compose.yml", {"x": {"image": "nosuchuser/nothing:1"}})
     hub.answers[("nosuchuser/nothing", "1")] = [("private",)]
@@ -765,7 +765,7 @@ def test_a_missing_docker_hub_repository_is_unreadable(repo, hub):
     ("postgres@" + "sha256:" + "c" * 64, "library/postgres", "sha256:" + "c" * 64),
     ("postgres:14@" + "sha256:" + "c" * 64, "library/postgres", "sha256:" + "c" * 64),
 ])
-def test_docker_hub_references_are_resolved_where_docker_would(repo, hub, ref, repo_path, tag):
+def test_docker_hub_references_are_resolved_where_docker_would(repo, hub, ref, repo_path, tag) -> None:
     repo.compose("docker-compose.yml", {"db": {"image": ref}})
     hub.answers[(repo_path, tag)] = [("ok", DIGEST)]
     r = repo.run()
@@ -773,7 +773,7 @@ def test_docker_hub_references_are_resolved_where_docker_would(repo, hub, ref, r
     assert (repo_path, tag, True) in hub.heads, hub.heads
 
 
-def test_a_registry_named_by_its_dot_alone_is_a_registry(repo, registry, hub):
+def test_a_registry_named_by_its_dot_alone_is_a_registry(repo, registry, hub) -> None:
     """No port and ONE dot: `registry.test/app` is a registry host because of the dot --
     sent to Docker Hub instead, every syncad pin would be looked up in the wrong place."""
     r = repo.run()
@@ -782,18 +782,18 @@ def test_a_registry_named_by_its_dot_alone_is_a_registry(repo, registry, hub):
     assert hub.heads == []
 
 
-def test_a_single_component_path_on_another_registry_gets_no_library(repo, registry):
+def test_a_single_component_path_on_another_registry_gets_no_library(repo, registry) -> None:
     assert ("app", "1") in (repo.run() and registry.asked())
 
 
-def test_a_nested_path_is_kept(repo, registry):
+def test_a_nested_path_is_kept(repo, registry) -> None:
     repo.compose("docker-compose.yml",
                   {"x": {"image": f"{registry.host}/hive/common-ci-configuration/psql:14-3"}})
     registry.answers[("hive/common-ci-configuration/psql", "14-3")] = [("ok", DIGEST, OCI_MANIFEST)]
     assert repo.run().returncode == 0
 
 
-def test_a_reference_pinned_twice_is_asked_once(repo, registry):
+def test_a_reference_pinned_twice_is_asked_once(repo, registry) -> None:
     repo.compose("docker-compose.yml", {"a": {"image": APP}, "b": {"image": APP}})
     r = repo.run()
     assert summary(r)[1] == 2, r.stderr
@@ -804,7 +804,7 @@ def test_a_reference_pinned_twice_is_asked_once(repo, registry):
 # What gets checked
 # --------------------------------------------------------------------------------------
 
-def test_the_shell_environment_cannot_change_which_pin_is_checked(repo, registry):
+def test_the_shell_environment_cannot_change_which_pin_is_checked(repo, registry) -> None:
     """Compose prefers the shell to --env-file. A CI variable, an operator's export, or the
     documented HAF_FYP_REWRITER_IMAGE override must not substitute another image for the
     one the repository ships."""
@@ -821,7 +821,7 @@ def test_the_shell_environment_cannot_change_which_pin_is_checked(repo, registry
     assert ("app", "hijacked") not in asked and ("evil", "1") not in asked, asked
 
 
-def test_compose_sees_no_environment_beyond_path_and_home(repo, registry):
+def test_compose_sees_no_environment_beyond_path_and_home(repo, registry) -> None:
     """REPLACED, not filtered: nothing the script was handed reaches compose. (LC_CTYPE is
     Python's own -- PEP 538 coerces a C locale inside the stub -- not the script's.)"""
     repo.run({"SOMETHING_ELSE": "x", "HAF_VERSION": "y", "COMPOSE_PROJECT_NAME": "z"})
@@ -832,7 +832,7 @@ def test_compose_sees_no_environment_beyond_path_and_home(repo, registry):
         assert env <= {"PATH", "HOME", "PWD", "SHLVL", "_", "LC_CTYPE"}, env
 
 
-def test_a_service_behind_a_profile_is_checked(repo, registry):
+def test_a_service_behind_a_profile_is_checked(repo, registry) -> None:
     repo.compose("docker-compose.yml", {
         "app": {"image": APP},
         "tool": {"image": f"{registry.host}/tool:1", "profiles": ["maintenance"]},
@@ -846,7 +846,7 @@ def test_a_service_behind_a_profile_is_checked(repo, registry):
     assert verdict(r, "MISSING", f"{registry.host}/other:1"), r.stderr
 
 
-def test_a_profile_listing_that_fails_is_not_skipped(repo, registry):
+def test_a_profile_listing_that_fails_is_not_skipped(repo, registry) -> None:
     """Swallowed, it would drop every profiled service in silence."""
     repo.stub_config(fail_profiles=True)
     r = repo.run()
@@ -854,7 +854,7 @@ def test_a_profile_listing_that_fails_is_not_skipped(repo, registry):
     assert registry.heads == []
 
 
-def test_every_compose_file_must_contribute(repo, registry):
+def test_every_compose_file_must_contribute(repo, registry) -> None:
     """With two files, one yielding nothing once passed while the other's images were
     checked -- and the HAF pin never contacted."""
     repo.compose("docker-compose-ci.yml", {"built": {"build": "."}})
@@ -863,14 +863,14 @@ def test_every_compose_file_must_contribute(repo, registry):
     assert registry.heads == [], "images were checked although one file yielded none"
 
 
-def test_a_compose_file_that_will_not_parse_fails(repo, registry):
+def test_a_compose_file_that_will_not_parse_fails(repo, registry) -> None:
     repo.stub_config(fail=True)
     r = repo.run()
     assert r.returncode == 1
     assert registry.heads == []
 
 
-def test_all_three_pinning_compose_files_are_read_by_default(repo, registry):
+def test_all_three_pinning_compose_files_are_read_by_default(repo, registry) -> None:
     """All of them, not the last: keeping only the last file's images dropped
     docker-compose.yml -- and with it the HAF pin, #56's own case -- with the job green
     (found by review). The model install lane's file (#47) is the third: it pulls a server
@@ -885,7 +885,7 @@ def test_all_three_pinning_compose_files_are_read_by_default(repo, registry):
     assert {APP, f"{registry.host}/db:1", f"{registry.host}/db:17"} <= set(resolved(r)), r.stdout
 
 
-def test_the_haf_install_lane_is_not_read_by_default(repo, registry):
+def test_the_haf_install_lane_is_not_read_by_default(repo, registry) -> None:
     """Its HAF is HAF develop's newest image, looked up per pipeline (#126): no tag in the
     repository to resolve, and the variable naming it is unset here. Reading the file would
     fail every sweep on `config`; what else it pulls, the model lane's file pulls too."""
@@ -900,7 +900,7 @@ def test_the_haf_install_lane_is_not_read_by_default(repo, registry):
     assert ("haf", "gone") not in registry.asked(), registry.asked()
 
 
-def test_a_default_compose_file_that_is_missing_is_an_error(repo, registry):
+def test_a_default_compose_file_that_is_missing_is_an_error(repo, registry) -> None:
     """Not skipped: a lane's file that was renamed or deleted would otherwise take its
     images out of the check without a word."""
     repo.compose("docker-compose-ci.yml", {"db": {"image": f"{registry.host}/db:1"}})
@@ -911,7 +911,7 @@ def test_a_default_compose_file_that_is_missing_is_an_error(repo, registry):
 
 
 @pytest.mark.parametrize("var", ["HAF_FYP_COMPOSE_FILES", "HAF_FYP_DOCKERFILES"])
-def test_a_blank_override_is_unset_not_an_empty_list(repo, registry, var):
+def test_a_blank_override_is_unset_not_an_empty_list(repo, registry, var) -> None:
     """A CI/CD variable left as a space once emptied the list -- and the loop over it checked
     nothing, exit 0."""
     repo.compose("docker-compose-ci.yml", {"db": {"image": f"{registry.host}/db:1"}})
@@ -925,7 +925,7 @@ def test_a_blank_override_is_unset_not_an_empty_list(repo, registry, var):
     assert wanted in registry.asked(), registry.asked()
 
 
-def test_compose_that_does_not_run_is_said_before_anything_is_asked(repo, registry):
+def test_compose_that_does_not_run_is_said_before_anything_is_asked(repo, registry) -> None:
     repo.stub_config(no_compose=True)
     r = repo.run()
     assert r.returncode == 1
@@ -937,14 +937,14 @@ def test_compose_that_does_not_run_is_said_before_anything_is_asked(repo, regist
 # Dockerfiles
 # --------------------------------------------------------------------------------------
 
-def test_a_dockerfile_base_is_checked(repo, registry):
+def test_a_dockerfile_base_is_checked(repo, registry) -> None:
     registry.answers[("base", "1")] = [("missing",)]
     r = repo.run()
     assert r.returncode == 1
     assert verdict(r, "MISSING", BASE), r.stderr
 
 
-def test_an_empty_dockerfile_override_does_not_skip_them(repo, registry):
+def test_an_empty_dockerfile_override_does_not_skip_them(repo, registry) -> None:
     """!77's `${VAR+x}` made an EMPTY override mean "no Dockerfiles", and exit 0."""
     registry.answers[("base", "1")] = [("missing",)]
     r = repo.run({"HAF_FYP_DOCKERFILES": ""})
@@ -952,19 +952,19 @@ def test_an_empty_dockerfile_override_does_not_skip_them(repo, registry):
     assert verdict(r, "MISSING", BASE), r.stderr
 
 
-def test_no_dockerfile_at_all_fails(repo, registry):
+def test_no_dockerfile_at_all_fails(repo, registry) -> None:
     (repo.root / "Dockerfile.app").unlink()
     r = repo.run()
     assert r.returncode == 1
     assert registry.heads == []
 
 
-def test_a_dockerfile_with_no_from_fails(repo, registry):
+def test_a_dockerfile_with_no_from_fails(repo, registry) -> None:
     repo.dockerfile("Dockerfile.app", "RUN true\n")
     assert repo.run().returncode == 1
 
 
-def test_from_is_parsed_the_way_docker_reads_it(repo, registry):
+def test_from_is_parsed_the_way_docker_reads_it(repo, registry) -> None:
     """Flags are skipped (any number), an earlier stage is not an image whatever its case --
     `AS` or `as` -- and neither scratch nor an interpolated reference (braced or not) is a
     failure."""
@@ -984,7 +984,7 @@ def test_from_is_parsed_the_way_docker_reads_it(repo, registry):
     assert registry.asked() == {("app", "1"), ("base", "1"), ("second", "1")}, registry.asked()
 
 
-def test_a_dockerfile_of_only_scratch_is_legitimate(repo, registry):
+def test_a_dockerfile_of_only_scratch_is_legitimate(repo, registry) -> None:
     repo.dockerfile("Dockerfile.app", "FROM scratch\nCOPY x /x\n")
     assert repo.run().returncode == 0
 
@@ -993,7 +993,7 @@ def test_a_dockerfile_of_only_scratch_is_legitimate(repo, registry):
 # Budget
 # --------------------------------------------------------------------------------------
 
-def test_the_deadline_leaves_the_rest_unanswered_and_fails(repo, registry):
+def test_the_deadline_leaves_the_rest_unanswered_and_fails(repo, registry) -> None:
     """Past the sweep's budget nothing more is asked, and what was not asked is not a pass.
     `date` is stubbed to move 100s per call: the first image is asked, the second is not."""
     counter = repo.bin.parent / "clock"
@@ -1010,7 +1010,7 @@ def test_the_deadline_leaves_the_rest_unanswered_and_fails(repo, registry):
     assert summary(r) == (1, 2, 0, 1)
 
 
-def test_the_deadline_is_checked_between_retries_too(repo, registry):
+def test_the_deadline_is_checked_between_retries_too(repo, registry) -> None:
     """Checked only before a reference's first try, one retrying reference could run up to
     three more bounded attempts past the budget -- and past the job's timeout."""
     counter = repo.bin.parent / "clock"
@@ -1030,7 +1030,7 @@ def test_the_deadline_is_checked_between_retries_too(repo, registry):
 @pytest.mark.parametrize("var", ["HAF_FYP_RESOLVE_TRIES", "HAF_FYP_REQUEST_TIMEOUT",
                                  "HAF_FYP_RESOLVE_DEADLINE"])
 @pytest.mark.parametrize("value", ["x y", "0", "ten", "-1"])
-def test_a_bad_number_stops_before_anything_is_asked(repo, registry, var, value):
+def test_a_bad_number_stops_before_anything_is_asked(repo, registry, var, value) -> None:
     r = repo.run({var: value})
     assert r.returncode == 1
     assert registry.heads == []
@@ -1040,7 +1040,7 @@ def test_a_bad_number_stops_before_anything_is_asked(repo, registry, var, value)
 # Review round 2
 # --------------------------------------------------------------------------------------
 
-def test_every_dockerfile_is_read(repo, registry):
+def test_every_dockerfile_is_read(repo, registry) -> None:
     """All of them, not the first: the three shipped Dockerfiles pin three different bases,
     two of them on syncad's registry."""
     for name in ("b", "c", "d"):
@@ -1051,7 +1051,7 @@ def test_every_dockerfile_is_read(repo, registry):
     assert {("base", "1"), ("b", "1"), ("c", "1"), ("d", "1")} <= registry.asked(), registry.asked()
 
 
-def test_a_missing_docker_hub_tag_is_missing(repo, hub):
+def test_a_missing_docker_hub_tag_is_missing(repo, hub) -> None:
     """Hub marks its own 404 with a LOWER-CASE docker-distribution-api-version; read with the
     wrong case, a dead Hub tag reads as UNANSWERED -- "do not change the pin"."""
     repo.compose("docker-compose.yml", {"db": {"image": "postgres:14-nope"}})
@@ -1061,7 +1061,7 @@ def test_a_missing_docker_hub_tag_is_missing(repo, hub):
     assert verdict(r, "MISSING", "postgres:14-nope"), r.stderr
 
 
-def test_a_registry_named_by_host_and_port_is_a_registry(repo, registry, hub):
+def test_a_registry_named_by_host_and_port_is_a_registry(repo, registry, hub) -> None:
     repo.compose("docker-compose.yml", {"x": {"image": "myregistry:5000/app:1"}})
     r = repo.run()
     assert r.returncode == 0, r.stderr
@@ -1069,28 +1069,28 @@ def test_a_registry_named_by_host_and_port_is_a_registry(repo, registry, hub):
     assert hub.heads == []
 
 
-def test_a_digest_that_is_not_sha256_is_not_a_resolution(repo, registry):
+def test_a_digest_that_is_not_sha256_is_not_a_resolution(repo, registry) -> None:
     registry.answers[("app", "1")] = [("ok", "md5:0123")]
     r = repo.run()
     assert r.returncode == 1
     assert verdict(r, "UNANSWERED", APP), r.stderr
 
 
-def test_a_token_service_401_with_the_registry_s_error_is_a_refusal(repo, registry):
+def test_a_token_service_401_with_the_registry_s_error_is_a_refusal(repo, registry) -> None:
     registry.token_mode["app"] = "unauthorized"
     r = repo.run()
     assert r.returncode == 1
     assert verdict(r, "UNREADABLE", APP), r.stderr
 
 
-def test_a_registry_403_on_every_try_is_a_refusal(repo, registry):
+def test_a_registry_403_on_every_try_is_a_refusal(repo, registry) -> None:
     registry.answers[("app", "1")] = [("forbidden",)]
     r = repo.run()
     assert r.returncode == 1
     assert verdict(r, "UNREADABLE", APP), r.stderr
 
 
-def test_the_default_scheme_is_https(repo, registry):
+def test_the_default_scheme_is_https(repo, registry) -> None:
     """Every other test forces http to reach the fakes. Unforced, the script must speak TLS:
     the fake then sees no plain-text request at all."""
     env = {"HAF_FYP_REQUEST_TIMEOUT": "2", "HAF_FYP_RESOLVE_TRIES": "1"}
@@ -1106,7 +1106,7 @@ def test_the_default_scheme_is_https(repo, registry):
 ZZ = "registry.test/zz:1"
 
 
-def _app_then(repo, registry, *answers):
+def _app_then(repo, registry, *answers) -> None:
     """app resolves first; zz -- sorting AFTER it -- gets `answers`. Per-reference state
     (the refusal flag, the try count, FROM_REGISTRY) that leaked from one reference into
     the next would only show on a reference that is not the first."""
@@ -1115,13 +1115,13 @@ def _app_then(repo, registry, *answers):
         registry.answers[("zz", "1")] = list(answers)
 
 
-def test_a_refusal_after_a_resolved_pin_is_still_unreadable(repo, registry):
+def test_a_refusal_after_a_resolved_pin_is_still_unreadable(repo, registry) -> None:
     _app_then(repo, registry, ("private",))
     r = repo.run()
     assert verdict(r, "UNREADABLE", ZZ), r.stderr
 
 
-def test_a_token_refusal_after_a_resolved_pin_is_still_unreadable(repo, registry):
+def test_a_token_refusal_after_a_resolved_pin_is_still_unreadable(repo, registry) -> None:
     """Measured against the real registries with the refusal flag set once per sweep: the
     syncad pins sort after the Hub ones, and a dead syncad project read UNANSWERED."""
     _app_then(repo, registry)
@@ -1130,13 +1130,13 @@ def test_a_token_refusal_after_a_resolved_pin_is_still_unreadable(repo, registry
     assert verdict(r, "UNREADABLE", ZZ), r.stderr
 
 
-def test_a_bare_404_after_a_resolved_pin_is_not_missing(repo, registry):
+def test_a_bare_404_after_a_resolved_pin_is_not_missing(repo, registry) -> None:
     _app_then(repo, registry, ("bare404",))
     r = repo.run()
     assert verdict(r, "UNANSWERED", ZZ), r.stderr
 
 
-def test_every_reference_gets_every_try(repo, registry):
+def test_every_reference_gets_every_try(repo, registry) -> None:
     """One reference needing retries must not spend the next one's."""
     _app_then(repo, registry, ("limited",))
     registry.answers[("app", "1")] = [("limited",), ("limited",), ("ok", DIGEST)]
@@ -1144,7 +1144,7 @@ def test_every_reference_gets_every_try(repo, registry):
     assert registry.served[("zz", "1")] == 3, registry.served
 
 
-def test_an_image_that_can_also_be_built_is_checked(repo, registry):
+def test_an_image_that_can_also_be_built_is_checked(repo, registry) -> None:
     """The rewriter has `image:` AND `build:` -- compose pulls it and builds only if the pull
     fails, so its pin is exactly the kind that rots unnoticed."""
     repo.compose("docker-compose.yml", {"app": {"image": APP},
@@ -1154,20 +1154,20 @@ def test_an_image_that_can_also_be_built_is_checked(repo, registry):
     assert verdict(r, "MISSING", f"{registry.host}/rw:1"), r.stderr
 
 
-def test_a_token_refusal_with_another_registry_error_is_not_a_refusal(repo, registry):
+def test_a_token_refusal_with_another_registry_error_is_not_a_refusal(repo, registry) -> None:
     registry.token_mode["app"] = "othererror"
     r = repo.run()
     assert verdict(r, "UNANSWERED", APP), r.stderr
 
 
-def test_localhost_is_a_registry(repo, registry, hub):
+def test_localhost_is_a_registry(repo, registry, hub) -> None:
     repo.compose("docker-compose.yml", {"x": {"image": "localhost/app:1"}})
     r = repo.run()
     assert r.returncode == 0, r.stderr
     assert hub.heads == []
 
 
-def test_every_request_is_bounded_by_the_request_timeout(repo, registry):
+def test_every_request_is_bounded_by_the_request_timeout(repo, registry) -> None:
     """Asserted on curl's own argv, not on the clock: a bound loose enough not to flake on a
     busy runner is too loose to notice a doubled -m."""
     registry.answers[("app", "1")] = [("limited",), ("ok", DIGEST)]
