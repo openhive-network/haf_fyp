@@ -58,7 +58,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CI = ROOT / ".gitlab-ci.yml"
 SCRIPT = ROOT / "scripts" / "openapi_rewrite.sh"
 
-PINNED_REF = "96889a650b3f45244cecc4bb3f250af439a71900"
+PINNED_REF = "1d952fd19118762d0e66f91953e194ff08e69bb0"
 
 
 def _drift_block() -> str:

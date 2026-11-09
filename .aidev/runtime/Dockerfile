@@ -76,10 +76,10 @@ RUN /python_venv/bin/pip freeze | grep -iE '^(pytest|pytest-xdist|pytest-timeout
         sqlfluff==3.3.0 \
     && /usr/bin/python3.14 -m venv /opt/openapi \
     && /opt/openapi/bin/pip install --no-cache-dir -q deepmerge jsonpointer pyyaml openapi-spec-validator==0.9.0 \
-    && curl -fsSL https://gitlab.syncad.com/hive/common-ci-configuration/-/raw/96889a650b3f45244cecc4bb3f250af439a71900/haf-app-tools/python/process_openapi.py \
+    && curl -fsSL https://gitlab.syncad.com/hive/common-ci-configuration/-/raw/1d952fd19118762d0e66f91953e194ff08e69bb0/haf-app-tools/python/process_openapi.py \
         -o /opt/openapi/process_openapi.py \
-    && echo "292e8825e36117357983f8d669ba5d9805a33127ace28869feaa29731ecb6f0a  /opt/openapi/process_openapi.py" | sha256sum -c - \
-    && echo 96889a650b3f45244cecc4bb3f250af439a71900 > /opt/openapi/COMMON_CI_REF
+    && echo "8d0db49d368e21b663a905ac363eb22d54547b72200e483ae30246374233b3aa  /opt/openapi/process_openapi.py" | sha256sum -c - \
+    && echo 1d952fd19118762d0e66f91953e194ff08e69bb0 > /opt/openapi/COMMON_CI_REF
 
 ENV HOME=/tmp PYTHONDONTWRITEBYTECODE=1 VIRTUAL_ENV=/opt/python-tests PATH="/opt/python-tests/bin:${PATH}"
 ENTRYPOINT []
