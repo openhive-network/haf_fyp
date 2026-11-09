@@ -1,5 +1,5 @@
 -- What the install lanes add to the database before the first install (#47): a second
--- application, and the lane's own notes. Loaded by both lanes -- over the model
+-- application, a stand-in for hivemind, and the lane's own notes. Loaded by both lanes -- over the model
 -- (tests/haf_stub.sql + tests/ci_install_haf_model.sql) in
 -- docker/docker-compose-ci-install.yml, and over a real HAF in
 -- docker/docker-compose-ci-install-haf.yml -- so it uses HAF's API and nothing the
@@ -38,6 +38,35 @@ SELECT hive.app_context_set_non_forking('ci_bystander');
 SELECT hive.app_context_detach('ci_bystander');
 SELECT hive.app_set_current_block_num('ci_bystander', 4242);
 SELECT hive.app_register('ci_bystander', ARRAY['ci_bystander']::hive.contexts_group, 'ci_bystander_app.process_blocks');
+RESET ROLE;
+
+-- ---------------------------------------------------------------------------------
+-- A hivemind stand-in
+-- ---------------------------------------------------------------------------------
+-- db/register_app.sql makes haf_fyp depend on the application that owns the context
+-- hivemind_app, so one is registered here, through the same API: the context
+-- hivemind_app, under the registry name hivemind (hivemind#445). Without it the install
+-- only warns that the dependency gate is missing, and HAF's app_add_dependency is never
+-- called. The context lives in a schema of its own, NOT hivemind_app: the installer
+-- reads that schema to decide what to grant and which locks the processor takes, and
+-- an empty one would send it down hivemind's branches with nothing behind them.
+-- Registered with the three-argument app_register, which binds on every HAF the lanes
+-- run.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'ci_hivemind_owner') THEN
+        CREATE ROLE ci_hivemind_owner NOLOGIN IN ROLE hive_applications_owner_group;
+    END IF;
+END
+$$;
+CREATE SCHEMA IF NOT EXISTS ci_hivemind_standin AUTHORIZATION ci_hivemind_owner;
+SET ROLE ci_hivemind_owner;
+SELECT hive.app_create_context(
+    'hivemind_app'::hafd.context_name, 'ci_hivemind_standin',
+    ARRAY[hafd.live_stage()]::hafd.application_stages, FALSE
+);
+CREATE PROCEDURE ci_hivemind_standin.process_blocks(IN _range hive.blocks_range) LANGUAGE sql AS 'SELECT 1';
+SELECT hive.app_register('hivemind', ARRAY['hivemind_app']::hive.contexts_group, 'ci_hivemind_standin.process_blocks');
 RESET ROLE;
 
 -- ---------------------------------------------------------------------------------
@@ -96,9 +125,11 @@ $$;
 --
 -- Left out are the tables and sequences HAF itself writes when an application's
 -- context is created, registered, moved or removed -- which is what an install and an
--- uninstall legitimately do. What the contexts and applications tables hold FOR THE
--- OTHER APPLICATION is compared whole by bystander_now() below, and for haf_fyp by
--- data_now(). HAF's log of context events may only grow: context_log_now() below.
+-- uninstall legitimately do -- and HAF's table of dependencies between applications,
+-- where the install declares haf_fyp's on hivemind. What the contexts and applications
+-- tables hold FOR THE OTHER APPLICATION is compared whole by bystander_now() below, for
+-- the hivemind stand-in by hivemind_standin_now(), and for haf_fyp by data_now();
+-- haf_fyp's dependencies are pinned in tests/ci_install_verify.sql. HAF's log of context events may only grow: context_log_now() below.
 -- So the sequences behind HAF's contexts tables are compared by nobody. Likewise HAF's
 -- records of the indexes it drops and restores for haf_fyp's tables
 -- (hafd.indexes_constraints rows on haf_fyp_app.*, which the install registers): they
@@ -123,7 +154,7 @@ BEGIN
           AND NOT ci_install_lane.of_pgvector('pg_class', c.oid)
           -- HAF's record of contexts (the table, who is attached, its log, their
           -- sequences) and of registered applications...
-          AND NOT (n.nspname = 'hafd' AND (c.relname LIKE 'contexts%' OR c.relname = 'applications'))
+          AND NOT (n.nspname = 'hafd' AND (c.relname LIKE 'contexts%' OR c.relname IN ('applications', 'application_dependencies')))
           -- ...and, over the model, the model's own record of what was asked of it.
           AND NOT (n.nspname = 'hive' AND c.relname LIKE 'ci\_%')
         ORDER BY 1
@@ -508,6 +539,20 @@ RETURNS TEXT [] LANGUAGE sql STABLE AS $$
     ];
 $$;
 
+-- The hivemind stand-in as HAF holds it: its registry row, its context row and what IT
+-- depends on. Not what depends on it: that is haf_fyp's dependency, which the install
+-- adds and the uninstall takes away.
+CREATE OR REPLACE FUNCTION ci_install_lane.hivemind_standin_now()
+RETURNS TEXT [] LANGUAGE sql STABLE AS $$
+    SELECT ARRAY[
+        'registry ' || coalesce((SELECT to_jsonb(a)::text FROM hafd.applications AS a WHERE a.name = 'hivemind'), 'GONE'),
+        'context ' || coalesce((SELECT to_jsonb(c)::text FROM hafd.contexts AS c WHERE c.name = 'hivemind_app'), 'GONE'),
+        'depends on ' || coalesce((SELECT string_agg(d.depends_on, ',' ORDER BY d.depends_on)
+                                   FROM hafd.application_dependencies AS d
+                                   WHERE d.application = 'hivemind'), 'nothing')
+    ];
+$$;
+
 -- HAF's log of context events, a line per row. An install and an uninstall add to it;
 -- neither may take from it. Asked for by name at run time, because the model keeps no
 -- such log: there this is an empty list, and the check on it says nothing.
@@ -528,5 +573,6 @@ $$;
 INSERT INTO ci_install_lane.note (name, item) VALUES
 ('HAF''s context log at setup', ci_install_lane.context_log_now()),
 ('the other application at setup', ci_install_lane.bystander_now()),
+('the hivemind stand-in at setup', ci_install_lane.hivemind_standin_now()),
 ('outside at setup', ci_install_lane.outside_now(FALSE)),
 ('outside at setup, with privileges', ci_install_lane.outside_now(TRUE));

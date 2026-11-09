@@ -815,13 +815,16 @@ BEGIN
 
     -- The stages the context was created with: 10000 blocks a batch until 101 blocks
     -- from the head, then live. A batch of 1 there is a first sync that takes months.
-    -- haf_fyp depends on hivemind and on nothing else (db/register_app.sql), and
-    -- hivemind is not on this database: so on nothing. HAF holds an application back
-    -- to what it depends on.
-    IF EXISTS (SELECT 1 FROM hafd.application_dependencies AS d WHERE 'haf_fyp' IN (d.application, d.depends_on)) THEN
-        RAISE EXCEPTION 'haf_fyp has dependencies registered: %',
-            (SELECT string_agg(d.application || ' -> ' || d.depends_on, ', ')
-             FROM hafd.application_dependencies AS d WHERE 'haf_fyp' IN (d.application, d.depends_on));
+    -- haf_fyp depends on hivemind and on nothing else (db/register_app.sql), found by
+    -- its context: here the stand-in tests/ci_install_setup.sql registers. HAF holds an
+    -- application back to what it depends on, so a missing dependency is a processor
+    -- that runs ahead of hivemind, and a second one is a processor that stops with it.
+    IF (SELECT string_agg(d.application || ' -> ' || d.depends_on, ', ' ORDER BY d.application, d.depends_on)
+        FROM hafd.application_dependencies AS d WHERE 'haf_fyp' IN (d.application, d.depends_on))
+       IS DISTINCT FROM 'haf_fyp -> hivemind' THEN
+        RAISE EXCEPTION 'haf_fyp''s dependencies are %, expected haf_fyp -> hivemind',
+            coalesce((SELECT string_agg(d.application || ' -> ' || d.depends_on, ', ' ORDER BY d.application, d.depends_on)
+                      FROM hafd.application_dependencies AS d WHERE 'haf_fyp' IN (d.application, d.depends_on)), 'none');
     END IF;
 
     IF _c.stages IS DISTINCT FROM '{"(MASSIVE_PROCESSING,101,10000,00:00:20)","(live,0,1,00:00:03)"}' THEN
@@ -1126,7 +1129,7 @@ END
 $$;
 
 -- ---------------------------------------------------------------------------------
--- 8. The other application on this HAF is exactly as tests/ci_install_setup.sql left it
+-- 8. The other applications on this HAF are exactly as tests/ci_install_setup.sql left them
 -- ---------------------------------------------------------------------------------
 DO $$
 BEGIN
@@ -1145,9 +1148,15 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'the install changed another application''s registration';
     END IF;
-    IF (SELECT count(*) FROM hafd.contexts) <> 2 OR (SELECT count(*) FROM hafd.applications) <> 2 THEN
-        RAISE EXCEPTION 'expected two contexts and two applications, found % and %',
+    IF (SELECT count(*) FROM hafd.contexts) <> 3 OR (SELECT count(*) FROM hafd.applications) <> 3 THEN
+        RAISE EXCEPTION 'expected three contexts and three applications, found % and %',
             (SELECT count(*) FROM hafd.contexts), (SELECT count(*) FROM hafd.applications);
+    END IF;
+    IF ci_install_lane.hivemind_standin_now() IS DISTINCT FROM
+       (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'the hivemind stand-in at setup') THEN
+        RAISE EXCEPTION E'the install changed how HAF holds the hivemind stand-in:\n  was: %\n  is:  %',
+            (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'the hivemind stand-in at setup'),
+            ci_install_lane.hivemind_standin_now();
     END IF;
     IF ci_install_lane.bystander_now() IS DISTINCT FROM
        (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'the other application at setup') THEN
@@ -1488,8 +1497,8 @@ BEGIN
         RETURN;
     END IF;
 
-    -- The processor holds the lock of haf_fyp and of nothing else. This database has
-    -- no hivemind: a lock on `hivemind` here is #79, where hivemind's installer found
+    -- The processor holds the lock of haf_fyp and of nothing else. hivemind is only
+    -- registered here, not installed: a lock on `hivemind` here is #79, where hivemind's installer found
     -- its lock held by haf_fyp's processor and skipped itself on a fresh node.
     IF _held IS DISTINCT FROM 'haf_fyp-ci-lock-holder holds ShareLock on haf_fyp' THEN
         RAISE EXCEPTION 'while the block processor runs, the application locks held are: % (expected its one shared lock on haf_fyp)', _held;
