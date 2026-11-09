@@ -123,13 +123,14 @@ docker daemon, so `ci_job.py --compose-lane` puts `.aidev/compose_lane.py` first
 | `fastapi-db` | `fastapi-tests` | `postgres:14-alpine` (the job's `services:`) |
 | `postgres`, `haf-fyp-postgrest`, `haf-fyp-postgrest-rewriter` | `postgrest-tests` | `pgvector/pgvector:pg14`, `postgrest/postgrest:v12.2.3`, and the rewriter built from the candidate's `Dockerfile.rewriter` |
 | `install-db` | `install-test` | `pgvector/pgvector:pg18` |
-| `haf-init`, `haf` | `install-test-haf` | `hive/haf:${HAF_INSTALL_LANE_VERSION}` from `docker/.env` (1.28.8), initialised with `--exit-before-sync`, served with `--skip-hived` |
+| `haf-init`, `haf` | `install-test-haf` | `hive/haf:1.28.8`, the stack's own pin, initialised with `--exit-before-sync`, served with `--skip-hived`. In CI the lane runs HAF `develop`'s newest image, looked up per pipeline by `find_haf_image`, which a digest-pinned stack cannot follow; `run-checks.sh` hands the stack's image to the job as `HAF_UPSTREAM_IMAGE`, that job's output |
 
 Where it can, a service `extends` the lane's own definition; every image is pinned by
-digest. When a lane's image moves (a tag in a `docker/` compose file, `docker/.env`'s
-`HAF_INSTALL_LANE_VERSION`, the `fastapi-tests` service), re-pin the stack service to the
+digest. When a lane's image moves (a tag in a `docker/` compose file or `docker/.env`, the
+`fastapi-tests` service), re-pin the stack service to the
 new tag's digest (`docker buildx imagetools inspect <image:tag>`); `stack-pins` fails until
-it matches.
+it matches. The stack's HAF is the exception: CI names no tag for it, so `stack-pins` holds it
+only to HAF's repository (`docker/.env`'s `HAF_REGISTRY`), and moving it is a choice made here.
 
 To run the checks by hand:
 

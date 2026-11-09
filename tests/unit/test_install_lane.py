@@ -27,6 +27,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests.unit import common_ci_include
+
 ROOT = Path(__file__).resolve().parents[2]
 CI = ROOT / ".gitlab-ci.yml"
 HASH = "${HAF_FYP_GIT_HASH:-ci-install}"
@@ -49,6 +51,7 @@ class Flavour:
     database: dict       # the services that provide the database, in order
     setup_files: tuple   # what db-setup loads, in order
     top_level: frozenset  # the compose file's top-level keys
+    image_from: str | None = None  # the CI job whose dotenv names the database image
 
     @property
     def path(self) -> Path:
@@ -138,12 +141,15 @@ class Flavour:
 
     def ci_job(self) -> dict:
         f = self.compose
+        found = {"dependencies": [self.image_from]} if self.image_from else {}
         return {
             "stage": "test",
             "image": "docker:24",
             "services": ["docker:24-dind"],
             "variables": {"DOCKER_TLS_CERTDIR": "/certs", "HAF_FYP_GIT_HASH": "$CI_COMMIT_SHORT_SHA"},
+            **found,
             "script": [
+                *([IMAGE_LOG] if self.image_from else []),
                 f"timeout 900 {f} up --detach --build",
                 f"timeout 600 {f} wait {LAST}",
                 f'{f} logs verify | grep -Ec "first install. [0-9]{{3,}} items recorded"',
@@ -197,10 +203,11 @@ MODEL = Flavour(
     top_level=frozenset({"name", "x-app", "x-sql", "services"}),
 )
 
-# Over HAF itself: the release docker/.env pins for this lane, run once with hived to
-# initialise the database and then without it. No model file is loaded -- that is the
-# point.
-HAF_IMAGE = "${HAF_REGISTRY}/haf:${HAF_INSTALL_LANE_VERSION}"
+# Over HAF itself: HAF develop's newest image, which find_haf_image looks up in every
+# pipeline (#126), run once with hived to initialise the database and then without it. No
+# model file is loaded -- that is the point.
+HAF_IMAGE = "${HAF_UPSTREAM_IMAGE:?the HAF image to run, which the find_haf_image CI job looks up}"
+IMAGE_LOG = 'echo "HAF image: ${HAF_UPSTREAM_IMAGE}"'
 REAL = Flavour(
     name="haf", file="docker-compose-ci-install-haf.yml", project="haf_fyp_ci_install_haf", job="install-test-haf",
     host="haf", user="haf_admin",
@@ -226,6 +233,7 @@ REAL = Flavour(
     },
     setup_files=("ci_install_setup.sql",),
     top_level=frozenset({"name", "x-app", "x-sql", "volumes", "services"}),
+    image_from="find_haf_image",
 )
 
 LANES = pytest.mark.parametrize("flavour", [MODEL, REAL], ids=lambda f: f.name)
@@ -377,35 +385,49 @@ def test_the_two_jobs_agree(ci) -> None:
         j = _neutral(flavour, ci[flavour.job])
         own = {f"docker compose -f docker/LANE.yml logs {name} || true" for name in flavour.database}
         j["after_script"] = [line for line in j["after_script"] if line not in own]
+        if flavour.image_from:
+            assert j.pop("dependencies") == [flavour.image_from]
+            j["script"].remove(IMAGE_LOG)
         return j
     assert job(MODEL) == job(REAL)
 
 
-def test_the_haf_the_real_lane_runs_is_the_one_the_repository_pins(ci) -> None:
-    """`${HAF_REGISTRY}/haf:${HAF_INSTALL_LANE_VERSION}` is a pin only while nothing
-    else can set those two. A CI-level `variables:` would: the shell's environment beats
-    docker/.env in compose, silently, and the lane would be testing some other HAF. So
-    would a `workflow:` or an `include:` that brings variables with it."""
-    assert not {"variables", "workflow", "include"} & set(ci), set(ci)
-    for flavour in (MODEL, REAL):
-        assert not [k for k in ci[flavour.job]["variables"]
-                    if k.startswith(("HAF_REGISTRY", "HAF_VERSION", "HAF_INSTALL_LANE", "COMPOSE_"))]
-    assert HAF_IMAGE == "${HAF_REGISTRY}/haf:${HAF_INSTALL_LANE_VERSION}"
+def test_the_haf_the_real_lane_runs_is_the_one_find_haf_image_found(ci) -> None:
+    """HAF develop's newest image, which find_haf_image looks up in every pipeline and
+    hands the lane in its dotenv as HAF_UPSTREAM_IMAGE (#126). Required, so a lane without
+    it stops at `up` rather than running some other HAF. And only that job may set it:
+    docker/.env would, whenever the shell has no value -- compose falls back to it in
+    silence, and the lane would test a pinned HAF -- and so would a CI `variables:`,
+    pipeline-wide or the job's own, which stands in whenever the dotenv does not arrive, a
+    `workflow:`, or the include."""
     for name in ("haf-init", "haf"):
         assert _load(REAL)["services"][name]["image"] == HAF_IMAGE, name
+    assert ci["find_haf_image"] == {"extends": ".find_haf_image", "variables": {"UPSTREAM_BRANCH": "develop"},
+                                    "rules": STANDARD_RULES}
+    assert ci[REAL.job]["dependencies"] == ["find_haf_image"]
+    assert not {"variables", "workflow"} & set(ci), set(ci)
+    assert ci["include"] == common_ci_include.INCLUDE
+    for flavour in (MODEL, REAL):
+        assert not [k for k in ci[flavour.job]["variables"]
+                    if k.startswith(("HAF_REGISTRY", "HAF_VERSION", "HAF_UPSTREAM", "COMPOSE_"))]
     text = (ROOT / "docker" / ".env").read_text(encoding="utf-8")
-    for key in ("HAF_REGISTRY", "HAF_INSTALL_LANE_VERSION"):
-        # Exactly one assignment, in the one spelling every reader of this file agrees
-        # on. Compose takes the LAST of two and accepts `export KEY=` and `KEY = `; a
-        # parser that does not would report the first, or none.
-        loose = re.findall(rf"^[ \t]*(?:export[ \t]+)?{key}[ \t]*[=:].*$", text, re.M)
-        assert len(loose) == 1 and loose[0].startswith(f"{key}=") and not loose[0].endswith((" ", "\t")), loose
-    env = dict(line.split("=", 1) for line in text.splitlines()
-               if "=" in line and not line.lstrip().startswith("#"))
-    assert env["HAF_REGISTRY"] == "registry.gitlab.syncad.com/hive", env["HAF_REGISTRY"]
-    # A RELEASE, exactly: not `latest`, which moves; not a release candidate, which is
-    # not what nodes run; not a commit tag, which the registry sweeps.
-    assert re.fullmatch(r"\d+\.\d+\.\d+", env["HAF_INSTALL_LANE_VERSION"]), env["HAF_INSTALL_LANE_VERSION"]
+    assert not re.search(r"^[ \t]*(?:export[ \t]+)?HAF_UPSTREAM_IMAGE[ \t]*[=:]", text, re.M)
+
+
+def test_the_include_sets_nothing_a_compose_file_reads(ci) -> None:
+    """The include's variables are in every job's environment, and compose takes the
+    shell's value over docker/.env's. One that a compose file interpolates would replace
+    what the repository says for every lane, without a line here showing it. Except what
+    this file hands compose on purpose: PYTHON_TEST_TOOLS_IMAGE, for docker-compose-ci.yml's
+    tavern, set in .python-test-tools-image, whose job variables win over the include's."""
+    assert ci["include"] == common_ci_include.INCLUDE
+    read = set()
+    for path in (ROOT / "docker").glob("docker-compose*.yml"):
+        read |= set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)", path.read_text(encoding="utf-8")))
+    assert "HAF_UPSTREAM_IMAGE" in read
+    handed = set(ci[".python-test-tools-image"]["variables"])
+    assert ".python-test-tools-image" in ci["postgrest-tests"]["extends"]
+    assert not (read & common_ci_include.VARIABLES) - handed, (read & common_ci_include.VARIABLES) - handed
 
 
 @LANES
@@ -426,6 +448,9 @@ def test_the_job_is_defined_once_and_nothing_global_runs_inside_it(ci, flavour) 
     # may only pick the runner (`tags`), which changes where the job runs, not what it runs.
     assert not {"before_script", "after_script", "image", "services"} & set(ci), set(ci)
     assert set(ci.get("default") or {}) <= {"tags"}, ci["default"]
+    # ...nor through the include, whose `default:` merges with this file's.
+    assert ci["include"] == common_ci_include.INCLUDE
+    assert not {"before_script", "after_script", "hooks", "image", "services"} & set(common_ci_include.DEFAULT)
 
 
 def test_the_standard_rules_are_what_this_file_says_they_are(ci) -> None:
@@ -434,7 +459,9 @@ def test_the_standard_rules_are_what_this_file_says_they_are(ci) -> None:
 
 @LANES
 def test_both_blocking_commands_are_bounded(flavour) -> None:
-    for line in flavour.ci_job()["script"][:2]:
+    blocking = [line for line in flavour.ci_job()["script"] if line.startswith("timeout ")]
+    assert len(blocking) == 2, blocking
+    for line in blocking:
         seconds = int(re.match(r"timeout (\d+) ", line).group(1))
         assert 60 <= seconds <= 1800, line
 

@@ -50,7 +50,26 @@ BEGIN
         RETURN;
     END IF;
 
-    IF to_regprocedure('hive.app_register(text, hive.contexts_group, text, text)') IS NULL THEN
+    -- The four parameters this file has always resolved against, then anything at all,
+    -- so long as everything past the three arguments passed below has a default. Not the
+    -- whole signature: haf#454 appended a fifth parameter (_health_function), the exact
+    -- 4-argument probe stopped matching, and every HAF built since skipped registration.
+    -- Still not a probe by name alone: an overload that takes a different shape must land
+    -- on the tolerant path, not on a call.
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_proc AS p
+        INNER JOIN pg_namespace AS n ON p.pronamespace = n.oid
+        WHERE
+            n.nspname = 'hive'
+            AND p.proname = 'app_register'
+            AND p.pronargs >= 4
+            AND p.pronargs - p.pronargdefaults <= 3
+            AND p.proargtypes[0] = 'text'::REGTYPE
+            AND p.proargtypes[1] = to_regtype('hive.contexts_group')
+            AND p.proargtypes[2] = 'text'::REGTYPE
+            AND p.proargtypes[3] = 'text'::REGTYPE
+    ) THEN
         RAISE WARNING 'HAF application registry not available (hive.app_register); haf_fyp runs unregistered on the legacy loop';
         RETURN;
     END IF;

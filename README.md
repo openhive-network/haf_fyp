@@ -1860,10 +1860,12 @@ Two CI jobs run the installer and the uninstaller for real
 | job | compose file | the database |
 |---|---|---|
 | `install-test` | `docker/docker-compose-ci-install.yml` | PostgreSQL 18 with a **model** of HAF (`tests/haf_stub.sql`, `tests/ci_install_haf_model.sql`). Fast, pulls nothing large |
-| `install-test-haf` | `docker/docker-compose-ci-install-haf.yml` | **HAF itself**: the latest HAF release, pinned in `docker/.env` as `HAF_INSTALL_LANE_VERSION` (separately from the standalone stack's `HAF_VERSION`, which cannot move without a replay). Initialised once by hived (`--exit-before-sync`) and then served without it (`--skip-hived`). No replay, no blocks |
+| `install-test-haf` | `docker/docker-compose-ci-install-haf.yml` | **HAF itself**: HAF `develop`'s newest image, which the `find_haf_image` job (common-ci-configuration's `.find_haf_image`) looks up in every pipeline and hands over as `HAF_UPSTREAM_IMAGE`; the job logs which ([#126](https://gitlab.syncad.com/hive/haf_fyp/-/issues/126)). Not pinned anywhere, and independent of the standalone stack's `HAF_VERSION`, which cannot move without a replay. Initialised once by hived (`--exit-before-sync`) and then served without it (`--skip-hived`). No replay, no blocks |
 
 The second is the one that says the installer works on HAF, and the one that goes red
-if HAF moves away from the model. To run either by hand (the model lane shown):
+if HAF moves away from the model. To run either by hand (the model lane shown; the HAF
+lane needs `HAF_UPSTREAM_IMAGE` exported first, e.g.
+`registry.gitlab.syncad.com/hive/haf:<short commit>` for a commit of HAF `develop`):
 
 ```bash
 docker compose -f docker/docker-compose-ci-install.yml up --detach --build

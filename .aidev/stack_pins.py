@@ -8,7 +8,8 @@ Run in the runtime image. It fails, naming each mismatch, when
 * a stack service's image (.aidev/test-stack.compose.yml) is not digest-pinned, or its
   repository:tag is not the one the CI lane it stands in for names — .gitlab-ci.yml's
   fastapi-tests service, or a docker/ compose file's service, interpolated with
-  docker/.env as compose does;
+  docker/.env as compose does (install-test-haf's HAF is looked up per pipeline, so for
+  `haf-init` and `haf` only the repository is CI's, and the two must be one image);
 * a stack service written out rather than extended no longer has the lane's
   command, environment and healthcheck;
 * a tool baked into the runtime image is not the version CI's job uses: PostgREST
@@ -73,10 +74,16 @@ def main() -> int:
     stack = load(".aidev/test-stack.compose.yml")["services"]
     ci = load(".gitlab-ci.yml")
     env_file = dotenv(REPO / "docker" / ".env")
+    # install-test-haf's HAF is HAF develop's newest image, which its find_haf_image job
+    # looks up per pipeline: CI pins no tag for the stack's to follow. The stack keeps its
+    # own digest-pinned HAF (.aidev/README.md), stands it in for that job's output here, and
+    # is held to the repository HAF images come from (docker/.env's HAF_REGISTRY).
+    haf_repository = f"{env_file.get('HAF_REGISTRY')}/haf"
+    found_haf = {**env_file, "HAF_UPSTREAM_IMAGE": str(stack.get("haf", {}).get("image", "")).split("@")[0]}
     lanes = {
         "docker/docker-compose-ci.yml": load("docker/docker-compose-ci.yml", env_file)["services"],
         "docker/docker-compose-ci-install.yml": load("docker/docker-compose-ci-install.yml", env_file)["services"],
-        "docker/docker-compose-ci-install-haf.yml": load("docker/docker-compose-ci-install-haf.yml", env_file)["services"],
+        "docker/docker-compose-ci-install-haf.yml": load("docker/docker-compose-ci-install-haf.yml", found_haf)["services"],
     }
     fastapi_service = ci["fastapi-tests"]["services"][0]
     fastapi_service = fastapi_service["name"] if isinstance(fastapi_service, dict) else fastapi_service
@@ -99,8 +106,13 @@ def main() -> int:
         if not m:
             problems.append(f"stack service {name}: image {svc.get('image')!r} is not pinned as repo:tag@sha256:<digest>")
             continue
-        want = lane_service if lane is None else lanes[lane][lane_service]["image"]
-        check(f"stack {name} image (CI: {lane or '.gitlab-ci.yml fastapi-tests'} {lane_service})", m.group("ref"), want)
+        if lane == "docker/docker-compose-ci-install-haf.yml":
+            check(f"stack {name} image repository (CI: find_haf_image's HAF develop image)",
+                  m.group("ref").rsplit(":", 1)[0], haf_repository)
+            check(f"stack {name} image (the stack's haf)", m.group("ref"), lanes[lane][lane_service]["image"])
+        else:
+            want = lane_service if lane is None else lanes[lane][lane_service]["image"]
+            check(f"stack {name} image (CI: {lane or '.gitlab-ci.yml fastapi-tests'} {lane_service})", m.group("ref"), want)
         for field in fields:
             check(f"stack {name} {field}", svc.get(field), lanes[lane][lane_service].get(field))
     for name in stack:
