@@ -1,0 +1,22 @@
+---
+test_name: rewriter - HEAD answers the GET's status with no body
+
+includes:
+  - !include ../common.yaml
+
+# The rewriter turns a HEAD into a POST to reach the function, and an answer to a POST
+# carries a body. The stages share one keep-alive connection (one session per test), so a
+# body left on the HEAD's answer would be read as the start of the next answer and break
+# the GET that follows: that GET is the framing check, not a repeat.
+
+stages:
+  - name: HEAD answers 200
+    request: {url: "{rewriter_url}/v1/fyp/profile/not.blocktrades", method: HEAD}
+    response: {status_code: 200}
+
+  - name: the next GET on the connection is framed correctly
+    request: {url: "{rewriter_url}/v1/fyp/profile/not.blocktrades", method: GET}
+    response:
+      status_code: 200
+      json:
+        - {has_feed: false, has_vector: false, posts_sampled: 0, top_communities: null, updated_at: null}

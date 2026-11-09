@@ -1,0 +1,32 @@
+---
+test_name: rewriter - operator-prefixed account names reach get_personalized_feed
+
+includes:
+  - !include ../common.yaml
+
+stages:
+  - name: not.blocktrades reaches get_personalized_feed
+    request:
+      url: "{rewriter_url}/v1/fyp/feed/not.blocktrades"
+      method: GET
+      params: {page-size: "1"}
+    response:
+      status_code: 200
+      verify_response_with:
+        function: tavern.helpers:validate_content
+        extra_kwargs:
+          comparisons:
+            - {jmespath: "type(@)", operator: "eq", expected: "array"}
+
+  - name: eq.blocktrades reaches get_personalized_feed
+    request:
+      url: "{rewriter_url}/v1/fyp/feed/eq.blocktrades"
+      method: GET
+      params: {page-size: "1"}
+    response:
+      status_code: 200
+      verify_response_with:
+        function: tavern.helpers:validate_content
+        extra_kwargs:
+          comparisons:
+            - {jmespath: "type(@)", operator: "eq", expected: "array"}
