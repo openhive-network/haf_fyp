@@ -26,6 +26,7 @@ import re
 
 import pytest
 
+from . import common_ci_include
 from .test_publish_tag_lane import (
     Unmodelled,
     _ci,
@@ -409,12 +410,15 @@ def test_a_workflow_that_excludes_schedules_is_not_invisible():
     )
 
 
-def test_an_include_would_hide_rules_from_this_model():
-    """Same class: an `include:` can bring in rules, defaults or a workflow nothing here reads."""
-    assert "include" not in _ci(), (
-        "an include: was added; this suite reasons only about what is in this file, so it "
-        "can no longer tell whether the scheduled lane runs"
+def test_the_include_hides_no_rules_from_this_model():
+    """Same class: an `include:` can bring in rules, defaults or a workflow nothing here
+    reads. The one there is, is pinned and stated in common_ci_include: hidden templates, no
+    workflow, and a `default:` whose interruptible and timeout this job sets for itself."""
+    assert _ci()["include"] == common_ci_include.INCLUDE, (
+        "the include changed; this suite reasons only about what it can read, so restate "
+        "what the new one brings in tests/unit/common_ci_include.py first"
     )
+    assert {"interruptible", "timeout"} <= set(_ci()[JOB]), "the included default would decide"
 
 
 def test_the_job_uses_only_keys_this_suite_models():

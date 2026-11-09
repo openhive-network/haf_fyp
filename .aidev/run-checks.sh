@@ -84,6 +84,14 @@ step() {
 
 job() { python3 .aidev/ci_job.py "$@" --out "$out"; }
 
+# The stack's HAF, standing in for find_haf_image's HAF_UPSTREAM_IMAGE, which in CI is HAF
+# develop's newest image: the lane's haf services are the stack's own, so the value is
+# what the lane's compose file is interpolated with and what the job logs.
+stack_haf_image() {
+    python3 -c 'import sys, yaml; print(yaml.safe_load(open(sys.argv[1]))["services"]["haf"]["image"].split("@")[0])' \
+        .aidev/test-stack.compose.yml
+}
+
 # --- the replay over clones of the shared HAF -----------------------------------------
 #
 # The two syncs run at the same time, on two clones: one after another they would not
@@ -385,7 +393,7 @@ for s in "$@"; do
             step postgrest job postgrest-tests --compose-lane --path /python_venv/bin \
                 --env "PYTEST_ADDOPTS=--junitxml=$PWD/$out/postgrest-tavern.xml" ;;
         install) step install job install-test --compose-lane ;;
-        install-haf) step install-haf job install-test-haf --compose-lane ;;
+        install-haf) step install-haf job install-test-haf --compose-lane --env "HAF_UPSTREAM_IMAGE=$(stack_haf_image)" ;;
         replay-install) step replay-install replay_install ;;
         replay-sync) step replay-sync needs "$replay_installed" replay-install replay_sync ;;
         replay-parity) step replay-parity needs "$replay_synced" replay-sync replay_parity ;;

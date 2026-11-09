@@ -142,9 +142,15 @@ def main() -> int:
         return 2
     # What this runner does not model it refuses, rather than running something else: a
     # file-wide `include:`, or a `default:` that sets more than the runner `tags`, would
-    # change every job (the project's own tests/unit/test_install_lane.py forbids both
-    # today), and so would a job keyword outside the set below.
-    unmodelled = {"include"} & set(ci)
+    # change every job, and so would a job keyword outside the set below. The exception is
+    # common-ci-configuration's templates (for find_haf_image, which runs only in GitLab):
+    # pinned, and stated in tests/unit/common_ci_include.py, they bring hidden templates,
+    # tool-image and pip-proxy variables the jobs run here do not read (their installs are
+    # skipped), and a default of interruptible / timeout / artifacts, none of which changes
+    # what a job's script does.
+    common_ci = all(isinstance(i, dict) and i.get("project") == "hive/common-ci-configuration"
+                    for i in ci.get("include") or [])
+    unmodelled = set() if common_ci else {"include"} & set(ci)
     unmodelled |= {f"default: {k}" for k in set(ci.get("default") or {}) - {"tags"}}
     job = resolve(ci, a.job)
     unmodelled |= set(job) - {

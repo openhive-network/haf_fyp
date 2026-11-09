@@ -11,10 +11,12 @@
 #                      Dockerfile.rewriter as CI builds it
 #   install-db         install-test: docker/docker-compose-ci-install.yml's `postgres`,
 #                      the model of HAF
-#   haf-init, haf      install-test-haf: docker/docker-compose-ci-install-haf.yml's HAF
-#                      at docker/.env's HAF_INSTALL_LANE_VERSION, initialised once
-#                      (--exit-before-sync) and served with --skip-hived; nothing is
-#                      replayed
+#   haf-init, haf      install-test-haf: docker/docker-compose-ci-install-haf.yml's HAF.
+#                      CI runs HAF develop's newest image, looked up per pipeline by
+#                      find_haf_image; this stack keeps a digest-pinned HAF of its own
+#                      (run-checks.sh hands it to the lane as HAF_UPSTREAM_IMAGE).
+#                      Initialised once (--exit-before-sync) and served with
+#                      --skip-hived; nothing is replayed
 #
 # Where it can, a service extends the lane's own definition (environment, command,
 # healthcheck), so a change there reaches this stack, and only the image is pinned
@@ -69,9 +71,9 @@ services:
     extends: {file: docker/docker-compose-ci-install.yml, service: postgres}
     image: pgvector/pgvector:pg18@sha256:2358fcba361ed2233a5ed81b5fe4ca779ccb304120ce531a3bf51c0ed7e2bc11
 
-  # Written out, not extended: the lane's image is `${HAF_REGISTRY}/haf:${...}` from
-  # docker/.env, which compose would interpolate (empty) from here. `stack-pins` checks
-  # command, environment and healthcheck are still the lane's.
+  # Written out, not extended: the lane's image is `${HAF_UPSTREAM_IMAGE:?...}`, which is
+  # unset here. `stack-pins` checks the repository is HAF's and command, environment and
+  # healthcheck are still the lane's.
   haf-init:
     image: registry.gitlab.syncad.com/hive/haf:1.28.8@sha256:666b4917b965e478ab34f714b17673e4450d8b770ab47adee6a3a17b186968ee
     command: ["--exit-before-sync", "--shared-file-size=1G"]

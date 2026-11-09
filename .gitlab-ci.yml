@@ -10,6 +10,25 @@ stages:
 default:
   tags: [public-runner-docker]
 
+# common-ci-configuration's HAF image lookup (.find_haf_image), for find_haf_image below:
+# install-test-haf runs against the HAF image it finds, as the other HAF apps' lanes do.
+# haf_app_testing needs haf_data_preparation beside it.
+#
+# At a COMMIT, not `develop`. The two files and what they include bring pipeline-wide
+# `variables:` (tool image tags, pip's package cache proxy, change-detection patterns) and a
+# `default:` (interruptible, a 1-hour timeout, artifacts kept a day) into every job here.
+# tests/unit/common_ci_include.py states what this commit brings, and the lane tests check
+# none of it reaches what a job reads or how the release and registry lanes run; at
+# `develop` that statement would go stale without a commit here. Moving the ref means
+# re-reading those templates and that file. What .find_haf_image FINDS is not frozen by
+# this: it looks HAF develop up in every pipeline.
+include:
+  - project: hive/common-ci-configuration
+    ref: e005ea4f2b4fd94f428232b568fe7c7ee24d00e4
+    file:
+      - /templates/haf_app_testing.gitlab-ci.yml
+      - /templates/haf_data_preparation.gitlab-ci.yml
+
 .python-cache:
   variables:
     PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
@@ -156,11 +175,14 @@ compose-validate:
     HAF_VERSION: "latest"
     POSTGREST_VERSION: "latest"
     FYP_ADMIN_API_KEY: "dummy"
+    # find_haf_image's output, which install-test-haf runs. In a pipeline that job's dotenv
+    # reaches this one too and wins over this; the placeholder is for a run without it.
+    HAF_UPSTREAM_IMAGE: "registry.example.com/haf:latest"
   script:
     - docker compose -f docker/docker-compose.yml config --quiet
     # Needs none of the placeholders above: it builds its one image from this checkout.
     - docker compose -f docker/docker-compose-ci-install.yml config --quiet
-    # Takes HAF_REGISTRY from above and HAF_INSTALL_LANE_VERSION from docker/.env.
+    # Takes HAF_UPSTREAM_IMAGE from above.
     - docker compose -f docker/docker-compose-ci-install-haf.yml config --quiet
   rules: *standard_rules
 
@@ -406,9 +428,9 @@ haf-shim-drift-develop:
 # pytest job at plugin loading, through a tavern that does not support it (#105).
 #
 # The two variables are common-ci-configuration's own (templates/base.gitlab-ci.yml), with
-# its values. They are set here rather than included: an `include:` of that file brings its
-# pipeline-wide `variables:` and `default:` with it, which tests/unit/test_install_lane.py
-# forbids and .aidev/ci_job.py does not model. `develop` is the moving tag
+# its values. That file also arrives, pipeline-wide, through the `include:` at the top; they
+# are set here as well so that these jobs' image is stated in this file and does not move
+# with that include's ref (job variables win over included ones). `develop` is the moving tag
 # common-ci-configuration republishes, so these jobs follow a tool bump there on their next
 # pipeline. Override PYTHON_TEST_TOOLS_TAG only for a deliberate exception.
 .python-test-tools-image:
@@ -626,11 +648,27 @@ install-test:
   rules: *standard_rules
 
 
+# The HAF install-test-haf runs against (#126): the image of HAF develop's newest commit
+# that has one, looked up in every pipeline, as haf_block_explorer, hivemind, HAfAH,
+# balance_tracker and the other HAF apps do. HAF develop is where the application registry
+# and context API haf_fyp's installer depends on change first; a release pin let those
+# changes reach nodes before this lane saw them. The job's dotenv hands
+# HAF_UPSTREAM_IMAGE (registry.gitlab.syncad.com/hive/haf:<short commit>) to the lane.
+# Stage .pre, from the template: it fails, and with it the pipeline, when none of the
+# last 25 develop commits has an image (UPSTREAM_REQUIRE_HIT), rather than leaving the
+# lane without a HAF.
+find_haf_image:
+  extends: .find_haf_image
+  variables:
+    UPSTREAM_BRANCH: "develop"
+  rules: *standard_rules
+
 # The same lane against HAF itself (#47): docker/docker-compose-ci-install-haf.yml runs
-# the steps above, with the same files, over the HAF release docker/.env pins for it
-# (HAF_INSTALL_LANE_VERSION, what nodes run) instead of over a model of it. No replay: hived runs once to initialise the database and stops
-# before it syncs. This is the job that says the installer works on HAF, and the one
-# that goes red when HAF moves away from what install-test's model says it is.
+# the steps above, with the same files, over the HAF image find_haf_image found (HAF
+# develop) instead of over a model of it. No replay: hived runs once to initialise the
+# database and stops before it syncs. This is the job that says the installer works on
+# HAF, and the one that goes red when HAF moves away from what install-test's model says
+# it is.
 #
 # It pulls the HAF image (about 1.3 GB), which install-test does not; that is the cost
 # of asking HAF instead of a model, and the reason there are two jobs and not one.
@@ -644,7 +682,12 @@ install-test-haf:
     # Recorded by the installer in haf_fyp_app.app_version, and expected there by the
     # verify steps: the image's baked value, read back from the database.
     HAF_FYP_GIT_HASH: $CI_COMMIT_SHORT_SHA
+  # Its dotenv (HAF_UPSTREAM_IMAGE), and no other job's artifacts. Not `needs:`, which
+  # would start the lane before the lint stage has passed.
+  dependencies: [find_haf_image]
   script:
+    # Which HAF this run asked: the lane's verdict is about that image.
+    - 'echo "HAF image: ${HAF_UPSTREAM_IMAGE}"'
     # `timeout` on both: a step that never exits (an installer waiting on a database, a
     # lock that is never released) would otherwise hold the job to GitLab's own limit
     # and report "job timeout" with no log from the step that hung.

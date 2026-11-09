@@ -44,6 +44,7 @@ from pathlib import Path
 
 import pytest
 
+from . import common_ci_include
 from .shell_harness import clean_env, write_exec
 
 try:
@@ -408,8 +409,11 @@ def _build_images(ci: dict | None = None) -> set[str]:
 def test_the_file_uses_only_what_this_suite_can_reason_about():
     """Fail closed: anything that could change whether the lane runs must be modelled."""
     ci = _ci()
-    assert "include" not in ci, (
-        "an include: can bring in rules, variables or defaults this suite cannot see"
+    # The one include there is, is pinned and stated in common_ci_include: hidden templates,
+    # pipeline-wide variables, and a `default:` checked with this file's below.
+    assert ci.get("include") == common_ci_include.INCLUDE, (
+        "the include changed, and it can bring in rules, variables or defaults this suite "
+        "cannot see: restate what it brings in tests/unit/common_ci_include.py first"
     )
     job = _job(ci)
     # `needs: []` only makes the job start at once, and in a tag pipeline it is alone.
@@ -424,6 +428,11 @@ def test_the_file_uses_only_what_this_suite_can_reason_about():
         assert key not in default, (
             "default: %s applies to publish_tag, which sets no %s of its own" % (key, key)
         )
+    # The included default's timeout is GitLab's own for a job that sets none, so the
+    # release keeps the ceiling it had; anything beyond that is new and unmodelled.
+    included = common_ci_include.DEFAULT
+    assert "after_script" not in included and included.get("timeout") == "1 hour", included
+    assert job.get("interruptible") is False, "the included default would make the release cancellable"
     conditions = [r.get("if", "") for r in _job(ci)["rules"]]
     conditions += [r.get("if", "") for r in (ci.get("workflow") or {}).get("rules") or []]
     referenced = {v for c in conditions if isinstance(c, str) for v in re.findall(r"\$(\w+)", c)}
@@ -431,7 +440,7 @@ def test_the_file_uses_only_what_this_suite_can_reason_about():
     # commit under the release name with the job green, and CI_REGISTRY_IMAGE a different
     # image. `repo` is the script's own loop variable.
     referenced |= set(re.findall(r"\$\{?(\w+)", _program(ci))) - {"repo"}
-    shadowed = referenced & _variables_defined_by_the_file(ci)
+    shadowed = referenced & (_variables_defined_by_the_file(ci) | common_ci_include.VARIABLES)
     assert not shadowed, (
         "the release lane reads %s, which this file also defines, so its value is not what "
         "a pipeline would otherwise give it" % sorted(shadowed)

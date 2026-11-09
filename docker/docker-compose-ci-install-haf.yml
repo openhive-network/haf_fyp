@@ -11,9 +11,9 @@
 # different here is the database.
 #
 # THE DATABASE IS HAF. hive_fork_manager, HAF's roles, its row-level security, its
-# application API, registry and locks are the image's own, at the release docker/.env
-# pins for this lane (HAF_INSTALL_LANE_VERSION: the latest HAF release, which is what
-# nodes run). Nothing from tests/haf_stub.sql or tests/ci_install_haf_model.sql is loaded,
+# application API, registry and locks are the image's own: HAF_UPSTREAM_IMAGE, which in
+# CI is the image of HAF develop that the find_haf_image job looked up for the pipeline
+# (#126). Nothing from tests/haf_stub.sql or tests/ci_install_haf_model.sql is loaded,
 # so this lane is also what says whether that model is still a model of HAF: both
 # lanes are held to one set of checks, and HAF moving away from the model turns this
 # one red while the other stays green.
@@ -33,10 +33,12 @@
 # admits the compose network. (haf_api_node writes one such rule per service and role;
 # this project holds nothing but the lane, so it writes one for everybody.)
 #
-# PostgreSQL is whatever the pinned HAF image is built with: 18 for 1.28.8, the same
-# major the model lane's server is.
+# PostgreSQL is whatever the HAF image is built with: 18 since 1.28, the same major the
+# model lane's server is.
 #
-# Run by the `install-test-haf` job in .gitlab-ci.yml. By hand:
+# Run by the `install-test-haf` job in .gitlab-ci.yml. By hand, naming a HAF image (HAF
+# develop's are tagged with their short commit):
+#   export HAF_UPSTREAM_IMAGE=registry.gitlab.syncad.com/hive/haf:<short commit>
 #   docker compose -f docker/docker-compose-ci-install-haf.yml up --detach --build
 #   docker compose -f docker/docker-compose-ci-install-haf.yml wait verify-gone
 #   docker compose -f docker/docker-compose-ci-install-haf.yml down -v
@@ -73,9 +75,9 @@ volumes:
   haf_datadir:
 
 services:
-  # The tag comes from docker/.env (compose loads that file for this one too, because
-  # it sits in the same directory), so it is pinned in a tracked file, and
-  # scripts/check_pinned_images.sh resolves it against the registry with the rest.
+  # The image is not pinned here or in docker/.env: it is whatever HAF develop has
+  # published when the pipeline runs, so scripts/check_pinned_images.sh does not read this
+  # file. Required: without it compose stops here, rather than running some other HAF.
   #
   # Once, with hived: a HAF database that hived has never attached to lacks what hived
   # writes when it first starts (the sentinel event hive.context_detach points a
@@ -83,7 +85,7 @@ services:
   # --exit-before-sync makes hived open the database, initialise it and stop before it
   # connects to a peer; the container then exits, leaving the datadir in the volume.
   haf-init:
-    image: ${HAF_REGISTRY}/haf:${HAF_INSTALL_LANE_VERSION}
+    image: "${HAF_UPSTREAM_IMAGE:?the HAF image to run, which the find_haf_image CI job looks up}"
     command: ["--exit-before-sync", "--shared-file-size=1G"]
     environment:
       # HAF's own switch for CI: its entrypoint installs docker/ci_postgresql.conf,
@@ -100,7 +102,7 @@ services:
   # idles instead of starting hived (see the healthcheck below for why that order
   # matters).
   haf:
-    image: ${HAF_REGISTRY}/haf:${HAF_INSTALL_LANE_VERSION}
+    image: "${HAF_UPSTREAM_IMAGE:?the HAF image to run, which the find_haf_image CI job looks up}"
     command: ["--skip-hived"]
     environment:
       HAF_CI_MODE: "1"

@@ -45,8 +45,9 @@ issues:
 # the long-running servers of CI's fastapi-tests, postgrest-tests, install-test and
 # install-test-haf jobs, one set per lane — PostgreSQL 14 for the FastAPI tests,
 # pgvector 14 + PostgREST + the rewriter built from the candidate's
-# Dockerfile.rewriter, pgvector 18 as the model of HAF, and HAF itself (docker/.env's
-# HAF_INSTALL_LANE_VERSION, initialised with --exit-before-sync, nothing replayed).
+# Dockerfile.rewriter, pgvector 18 as the model of HAF, and HAF itself (the stack's own
+# digest-pinned HAF 1.28.8, where CI runs HAF develop's newest image; initialised with
+# --exit-before-sync, nothing replayed).
 # The lanes' one-shot steps run in the runtime image, which joins the stack's
 # network. Slots that only lint and unit-test say `stack: false`. See
 # .aidev/README.md.
