@@ -28,6 +28,18 @@ BEGIN
 END
 $$;
 
+-- The replay is over (#129): the model lane ran its first install on a HAF in massive
+-- sync (tests/ci_install_haf_model.sql). From here on HAF is ready, as on a node whose
+-- hived has caught up, so section 7 can call sync_status() and the later installs run
+-- step 13's call for real. A no-op on HAF itself, which has no such row.
+DO $$
+BEGIN
+    IF to_regclass('hive.ci_instance_state') IS NOT NULL THEN
+        UPDATE hive.ci_instance_state SET is_ready = TRUE;
+    END IF;
+END
+$$;
+
 -- ---------------------------------------------------------------------------------
 -- 1. Roles
 -- ---------------------------------------------------------------------------------
