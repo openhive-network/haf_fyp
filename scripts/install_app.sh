@@ -481,32 +481,17 @@ if grep -q 'Self-healing FAILED' <<<"${_grants_output}"; then
     exit 1
 fi
 
-# 13. Post-install assertion for GET /sync-status (#16). SET ROLE drops superuser,
-#     so this runs the endpoint's exact query as the exact role, exercising the
-#     real EXECUTE grant, the SECURITY DEFINER hop, the definer's real group
-#     membership and HAF's real RLS policy. In CI this runs against HAF itself in
-#     the install-test-haf lane (#47), and against a model of HAF (tests/haf_stub.sql
-#     plus tests/ci_install_haf_model.sql, which carries the policies) in install-test;
-#     the fastapi-tests lane's haf_fyp_user is a superuser for whom every ACL and
-#     policy is bypassed. It stays here because a node is not CI.
-#     A zero-row result (not an error) is the signature of a missing or
-#     non-inheriting membership on the definer, so assert on the count.
-psql_cmd -v ON_ERROR_STOP=on -c "
-    SET ROLE haf_fyp_user;
-    DO \$\$
-    BEGIN
-        IF NOT EXISTS (SELECT 1 FROM haf_fyp_app.sync_status()) THEN
-            RAISE EXCEPTION
-                'haf_fyp_app.sync_status() returned no row: GET /sync-status would '
-                'report a missing context. Either the HAF context is absent, or '
-                'haf_fyp_owner (the function definer) does not INHERIT '
-                'hive_applications_group, so RLS on hafd.contexts hides every row '
-                '(see db/builtin_roles.sql).';
-        END IF;
-    END
-    \$\$;
-    RESET ROLE;
-"
+# 13. Post-install assertion for GET /sync-status (#16), as the endpoint role. SET ROLE
+#     drops superuser, so it exercises the real EXECUTE grant, the SECURITY DEFINER hop,
+#     the definer's real group membership and HAF's real RLS policy. In CI this runs
+#     against HAF itself in the install-test-haf lane (#47), and against a model of HAF
+#     (tests/haf_stub.sql plus tests/ci_install_haf_model.sql, which carries the
+#     policies) in install-test; the fastapi-tests lane's haf_fyp_user is a superuser for
+#     whom every ACL and policy is bypassed. It stays here because a node is not CI.
+#     On a HAF still in massive sync (haf_api_node installs apps while hived replays) the
+#     call is deferred with a WARNING and the grant chain is checked from the catalogs
+#     instead (#129); see db/install_assert_sync_status.sql.
+psql_cmd -c "SET ROLE haf_fyp_user;" -f "${SCRIPT_DIR}/../db/install_assert_sync_status.sql"
 
 # 14. Post-install assertion that the two clocks agree. The context pointer and
 #     app_status.last_processed_block are one clock (see db/haf_fyp_app.sql), and

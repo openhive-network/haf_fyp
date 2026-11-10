@@ -237,3 +237,13 @@ DROP POLICY IF EXISTS sp_applications_delete_hive_context ON hafd.contexts;
 CREATE POLICY sp_applications_delete_hive_context ON hafd.contexts
 FOR DELETE TO hive_applications_group
 USING (hive.can_impersonate(current_user, owner));
+
+-- ---------------------------------------------------------------------------------
+-- A HAF still in massive sync (#129)
+-- ---------------------------------------------------------------------------------
+-- haf_api_node installs every application while hived replays, so the first install
+-- here runs on a HAF that is not ready: every step after it has to cope, and step 13
+-- defers its call to haf_fyp_app.sync_status() instead of failing. tests/haf_stub.sql's
+-- hive.is_instance_ready() reads this row; tests/ci_install_verify.sql marks the replay
+-- finished once that install is through, so the later installs run on a ready HAF.
+UPDATE hive.ci_instance_state SET is_ready = FALSE;
