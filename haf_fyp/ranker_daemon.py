@@ -1400,7 +1400,6 @@ def run_cycle(conn, reads: Callable[..., set[str]] | None = None) -> set[str]:
         algorithm_weights=weights,
     )
     write_global_feed_cache(conn, global_scored, algo_version)
-    log.info("global feed written (%d posts)", min(len(global_scored), 200))
 
     users = _fetch_personalised_users(conn, MAX_USERS_PER_CYCLE)
     # #10: drop un-opted-in accounts before ranking them — ranking would upsert
