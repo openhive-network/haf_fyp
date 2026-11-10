@@ -22,6 +22,9 @@ BEGIN
         SELECT 'registry row ' || a.name FROM hafd.applications AS a
         WHERE a.name = 'haf_fyp' OR 'haf_fyp' = ANY(a.contexts)
         UNION ALL
+        SELECT 'dependency ' || d.application || ' -> ' || d.depends_on FROM hafd.application_dependencies AS d
+        WHERE 'haf_fyp' IN (d.application, d.depends_on)
+        UNION ALL
         -- Anything left in ANOTHER schema with haf_fyp in its name.
         SELECT 'function ' || p.oid::regprocedure::text FROM pg_proc AS p
         WHERE p.proname LIKE '%haf\_fyp%'
@@ -153,11 +156,11 @@ BEGIN
     END IF;
     IF (SELECT count(*) FROM pg_roles
         WHERE rolname IN ('haf_admin', 'hive_applications_group', 'hive_applications_owner_group',
-                          'ci_bystander_owner')) <> 4 THEN
+                          'ci_bystander_owner', 'ci_hivemind_owner')) <> 5 THEN
         RAISE EXCEPTION 'the uninstall dropped a role that is not haf_fyp''s';
     END IF;
     IF to_regnamespace('hafd') IS NULL OR to_regnamespace('hive') IS NULL
-       OR to_regnamespace('ci_bystander_app') IS NULL THEN
+       OR to_regnamespace('ci_bystander_app') IS NULL OR to_regnamespace('ci_hivemind_standin') IS NULL THEN
         RAISE EXCEPTION 'the uninstall dropped a schema that is not haf_fyp''s';
     END IF;
     -- HAF's application group still holds what every other application needs. A
@@ -172,7 +175,8 @@ $$;
 
 -- HAF holds the other application exactly as it did before haf_fyp was installed:
 -- its registry row (`paused` included), its context row (stages included) and its
--- dependencies.
+-- dependencies. Likewise the hivemind stand-in: the uninstall takes haf_fyp's
+-- dependency on it away, and must leave it registered.
 DO $$
 BEGIN
     -- HAF's log of context events only grows: every line it held before the first
@@ -188,6 +192,12 @@ BEGIN
         RAISE EXCEPTION E'the uninstall changed how HAF holds another application:\n  was: %\n  is:  %',
             (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'the other application at setup'),
             ci_install_lane.bystander_now();
+    END IF;
+    IF ci_install_lane.hivemind_standin_now() IS DISTINCT FROM
+       (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'the hivemind stand-in at setup') THEN
+        RAISE EXCEPTION E'the uninstall changed how HAF holds the hivemind stand-in:\n  was: %\n  is:  %',
+            (SELECT n.item FROM ci_install_lane.note AS n WHERE n.name = 'the hivemind stand-in at setup'),
+            ci_install_lane.hivemind_standin_now();
     END IF;
 END
 $$;
@@ -226,8 +236,8 @@ RESET ROLE;
 
 DO $$
 BEGIN
-    IF (SELECT count(*) FROM hafd.contexts) <> 1 OR (SELECT count(*) FROM hafd.applications) <> 1 THEN
-        RAISE EXCEPTION 'expected one context and one application to remain, found % and %',
+    IF (SELECT count(*) FROM hafd.contexts) <> 2 OR (SELECT count(*) FROM hafd.applications) <> 2 THEN
+        RAISE EXCEPTION 'expected two contexts and two applications to remain, the other application''s and the hivemind stand-in''s, found % and %',
             (SELECT count(*) FROM hafd.contexts), (SELECT count(*) FROM hafd.applications);
     END IF;
     IF (SELECT current_block_num FROM hafd.contexts WHERE name = 'ci_bystander') <> 4243 THEN

@@ -628,6 +628,9 @@ install-test:
     - docker compose -f docker/docker-compose-ci-install.yml logs verify-gone | grep -c "haf_fyp is gone and nothing else was touched"
     - docker compose -f docker/docker-compose-ci-install.yml logs install-locked | grep -c "Skipping haf_fyp install"
     - docker compose -f docker/docker-compose-ci-install.yml logs install-again | grep -c "Acquired install lock for haf_fyp"
+    # The installs found the hivemind stand-in tests/ci_install_setup.sql registers and
+    # declared haf_fyp's dependency on it (the verify steps check HAF's record of it).
+    - test "$(docker compose -f docker/docker-compose-ci-install.yml logs install install-again | grep -c 'without the hivemind dependency gate')" = 0
   after_script:
     - docker compose -f docker/docker-compose-ci-install.yml ps -a || true
     - docker compose -f docker/docker-compose-ci-install.yml logs postgres || true
@@ -710,6 +713,9 @@ install-test-haf:
     - docker compose -f docker/docker-compose-ci-install-haf.yml logs verify-gone | grep -c "haf_fyp is gone and nothing else was touched"
     - docker compose -f docker/docker-compose-ci-install-haf.yml logs install-locked | grep -c "Skipping haf_fyp install"
     - docker compose -f docker/docker-compose-ci-install-haf.yml logs install-again | grep -c "Acquired install lock for haf_fyp"
+    # The installs found the hivemind stand-in tests/ci_install_setup.sql registers and
+    # declared haf_fyp's dependency on it (the verify steps check HAF's record of it).
+    - test "$(docker compose -f docker/docker-compose-ci-install-haf.yml logs install install-again | grep -c 'without the hivemind dependency gate')" = 0
   after_script:
     - docker compose -f docker/docker-compose-ci-install-haf.yml ps -a || true
     - docker compose -f docker/docker-compose-ci-install-haf.yml logs haf-init || true
