@@ -181,9 +181,10 @@ _HIVESENSE_KEY = ".".join(_HIVESENSE_RELATION)
 #     whose cached rows all fail to render gets [] while this reads servable.
 #   * a post can be in the window and still be dropped: get_bridge_post returns NULL
 #     for a post deleted in hivemind and the endpoint filters it out.
-#   * global_feed_cache is the recency-weighted top 200, so it can stay servable
+#   * global_feed_cache is the recency-weighted global pool, so it can stay servable
 #     while per-user feeds are empty -- see #43, which stays open for that.
-# Bounded by write_global_feed_cache's 200-row cap: 200 PK probes at most.
+# Bounded by write_global_feed_cache's cap (GLOBAL_FEED_MAX_POSTS): 2,500 PK probes at
+# most, and EXISTS stops at the first servable row.
 _SERVABILITY_SQL = """
     SELECT EXISTS (SELECT 1 FROM haf_fyp_app.global_feed_cache) AS cached,
            EXISTS (
@@ -287,7 +288,7 @@ def build_ranking_sources_report(
         pre-rendered JSON, so a privilege-derived "every feed returns []" was simply
         wrong there.
       * it read false when the node was not serving -- the global cache is the
-        recency-weighted top 200, so it can stay green while per-user feeds are empty.
+        recency-weighted global pool, so it can stay green while per-user feeds are empty.
 
     So the payload now reports two INDEPENDENT observations and lets the operator
     (and `degraded`) combine them, instead of collapsing them into one boolean that

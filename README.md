@@ -232,7 +232,7 @@ was wrong in *both* directions, so it is gone rather than left to mislead:
   from pre-rendered JSON, so revoking `SELECT` on `hive_posts` on a warm node left
   every request succeeding;
 * it read `false` on nodes that were **not** — `global_feed_cache` is the
-  recency-weighted top 200, so it can stay green while per-user feeds are empty.
+  recency-weighted global pool, so it can stay green while per-user feeds are empty.
 
 So the section reports two independent observations and lets `degraded` combine
 them, instead of collapsing them into one boolean that is wrong at both ends:
@@ -308,7 +308,7 @@ built per feed entry, so an empty response carries no `fyp` object at all and
 read `fyp.source`; that state is not observable.)
 
 There is also no staleness check here: a ranker that stopped days ago leaves its last
-good 200 rows in place, and they keep resolving, so `global_feed` reads servable.
+good rows in place, and they keep resolving, so `global_feed` reads servable.
 **`/sync-status` does not answer this** — it reports the HAF context advanced by the
 `haf-fyp-sync` service, which keeps running when `haf-fyp-ranker` dies. The signals
 that do move with the ranker are elsewhere in this `/metrics` payload:
@@ -499,7 +499,7 @@ below).
 | GET | `/v1/fyp/algorithms` | `/rpc/list_algorithm_versions` | All registered algorithm versions |
 | GET | `/v1/fyp/feed/{username}?page-size=20` | `/rpc/get_personalized_feed` | Ranked feed for a user; pages of one read session are stable (see [Read sessions](#read-sessions-stable-pages)). With `language=es` (or `es,pt`), only posts in those languages; see [Languages](#languages) |
 | GET | `/v1/fyp/warmup/{username}` | `/rpc/warm_up_feed` | Ask for a fresh feed before the user opens it; 204, no body (see [Read sessions](#read-sessions-stable-pages)) |
-| GET | `/v1/fyp/global?page-size=20` | `/rpc/get_global_feed` | Global feed. With `observer=<account>`, posts by authors that account muted or blacklisted (directly or through a list it follows) are left out before paging (#114); the feed holds at most 200 posts, so it ends sooner for a reader who hides many. `language` as on the user feed. Unauthenticated |
+| GET | `/v1/fyp/global?page-size=20` | `/rpc/get_global_feed` | Global feed. With `observer=<account>`, posts by authors that account muted or blacklisted (directly or through a list it follows) are left out before paging (#114); the feed holds the top 200 plus the last 48 hours of posts (at most 2,500; #130), so it ends sooner for a reader who hides many. `language` as on the user feed. Unauthenticated |
 | GET | `/v1/fyp/profile/{username}` | `/rpc/get_user_profile` | User vector status and top communities |
 | GET | `/v1/fyp/explain/{username}/{post_id}` | `/rpc/get_score_explanation` | Per-signal score breakdown |
 | GET | `/v1/fyp/feed-metrics` | `/rpc/get_feed_metrics` | Feed performance analytics per algorithm version (#13) — product metrics, not service health |
@@ -764,7 +764,8 @@ English). A post with none (a caption under a photo, a bare video link: 2%)
 is in no language's feed. Edits do not change a post's languages.
 
 The parameter filters the feed as ranked, before the page is cut: pages are full until it
-runs out, and a reader's feed holds their top 200 posts (the global one, 200), so a
+runs out, and a reader's feed holds their top 200 posts (the global one, its top 200 plus
+the last 48 hours, at most 2,500), so a
 language that is a small share of it gives a short feed, or an empty one: a code no post
 has returns an empty feed, not an error, so a client should offer the unfiltered feed when
 the first page is empty. A blank `language` filters nothing.
