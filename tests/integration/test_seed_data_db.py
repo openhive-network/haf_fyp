@@ -167,10 +167,16 @@ def test_upgrade_with_none_active_changes_nothing(cur: cursor) -> None:
     assert _active(cur) == []
 
 
+def _rows(cur: cursor) -> list[tuple]:
+    cur.execute(f"SELECT version, is_active, weights::text, deployed_at FROM {_SCHEMA}.algorithm_versions ORDER BY version")
+    return cur.fetchall()
+
+
 def test_rerun_changes_nothing(cur: cursor) -> None:
     cur.execute(_seed())
+    first = _rows(cur)
     cur.execute(_seed())
-    assert _versions(cur) == ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.4.1"]
+    assert _rows(cur) == first
     assert _active(cur) == ["1.4.1"]
 
 
@@ -261,12 +267,14 @@ def test_choosing_1_4_1_survives_the_next_install(cur: cursor) -> None:
 
 
 def _seed_before_1_4_1() -> str:
-    """The seed of the releases that registered 1.4.0 but not yet 1.4.1."""
+    """The seed of the develop builds that registered 1.4.0 but not yet 1.4.1 (no tagged
+    release shipped either). 1.28.8, with 1.3.0 and no 1.4.x, is the path
+    test_1_4_0_takes_this_nodes_1_3_0_weights runs."""
     seed = _seed()
     return seed[: seed.index("-- 1.4.1 (#117)")]
 
 
-def test_upgrade_from_the_1_4_0_release_on_1_3_0_moves_to_1_4_1(cur: cursor) -> None:
+def test_upgrade_from_a_1_4_0_build_on_1_3_0_moves_to_1_4_1(cur: cursor) -> None:
     cur.execute(_seed_before_1_4_1())
     assert _active(cur) == ["1.3.0"]
     cur.execute(_seed())
@@ -274,8 +282,8 @@ def test_upgrade_from_the_1_4_0_release_on_1_3_0_moves_to_1_4_1(cur: cursor) -> 
 
 
 def test_node_that_registered_1_4_1_inactive_keeps_1_3_0(cur: cursor) -> None:
-    # A node on the release that seeded 1.4.1 inactive, still running 1.3.0: 1.4.1 is not
-    # new to it, so it is not taken over (the same as an operator going back to 1.3.0).
+    # A node on a develop build that seeded 1.4.1 inactive, still running 1.3.0: 1.4.1 is
+    # not new to it, so it is not taken over (the same as an operator going back to 1.3.0).
     cur.execute(_seed())
     _choose(cur, "1.3.0")
     cur.execute(_seed())

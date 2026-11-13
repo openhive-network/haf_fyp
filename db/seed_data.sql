@@ -1,5 +1,6 @@
 -- Seed data: algorithm versions.
--- Safe to re-run (ON CONFLICT DO NOTHING; 1.3.0, 1.4.0 and 1.4.1 only when missing).
+-- Safe to re-run: every version is added only when missing (ON CONFLICT DO NOTHING, or a
+-- NOT EXISTS check for the versions that can take over).
 -- A fresh install ends with 1.4.1 active (1.3.0 takes over from 1.1.0, then 1.4.1 from 1.3.0).
 
 INSERT INTO haf_fyp_app.algorithm_versions (version, description, weights, deployed_at, is_active)
@@ -91,7 +92,7 @@ $$;
 -- 1.4.0 (#117): 1.3.0 plus reader-to-author affinity, which raises relevance for the
 -- authors a reader has lately voted on, reblogged or replied to (haf_fyp/affinity.py,
 -- scoring.compute_scores). Registered INACTIVE: activate it with
--- POST /v1/fyp/admin/algorithm to compare it with 1.3.0 on feed_metrics_daily, once the
+-- POST /v1/fyp/admin/algorithm to run it instead of the active version, once the
 -- ranker runs this release. Its weights are this node's 1.3.0 weights when it is
 -- registered, so the tuning made until then carries over (not later changes to 1.3.0).
 INSERT INTO haf_fyp_app.algorithm_versions (version, description, weights, deployed_at, is_active)
@@ -120,9 +121,10 @@ ON CONFLICT (version) DO NOTHING;
 -- weights when it is registered, with the share set to 0.60.
 -- 1.4.1 is the default: it takes over from 1.3.0 the way 1.3.0 takes over from 1.1.0,
 -- only on the install that registers it and only where 1.3.0 is the one active version
--- (so a fresh install, and a node still on the shipped default, end on 1.4.1). A node
--- that registered 1.4.1 inactive with an earlier release keeps its active version: the
--- seed cannot tell an operator's choice of 1.3.0 from the old default. Measured against
+-- (so a fresh install, and a node upgraded from 1.28.8 or older still on the shipped
+-- default, end on 1.4.1). No tagged release shipped 1.4.0 or 1.4.1; a node on a develop
+-- build that registered 1.4.1 inactive keeps its active version: the seed cannot tell an
+-- operator's choice of 1.3.0 from the old default. Measured against
 -- 1.3.0 on testapi in #117: no measurable difference in opens or upvotes.
 DO $$
 DECLARE
@@ -146,7 +148,9 @@ BEGIN
         FROM haf_fyp_app.algorithm_versions AS v
         WHERE v.version = '1.4.0';
 
-        IF _take_over THEN
+        -- FOUND: 1.4.1 was inserted (it needs the 1.4.0 row), so 1.3.0 is never switched
+        -- off without a version switched on.
+        IF _take_over AND FOUND THEN
             UPDATE haf_fyp_app.algorithm_versions SET is_active = FALSE WHERE version = '1.3.0';
         END IF;
     END IF;

@@ -715,11 +715,11 @@ difference in opens or upvotes, on too little traffic to show a small one.
 
 1.4.1 is the default: an install that registers it activates it only where 1.3.0 was
 the one active version, the way 1.3.0 takes over from 1.1.0. So a new install, and a
-node upgraded from a release before 1.4.1 that still runs the shipped default, end on
-1.4.1; a version the operator chose stays active. A node that already registered 1.4.1
-inactive (the releases that shipped it as an option) keeps the version it runs: the
-seed cannot tell an operator's choice of 1.3.0 from the old default. Switch it with
-`POST /v1/fyp/admin/algorithm`.
+node upgraded from 1.28.8 or older that runs the shipped default (1.1.0 or 1.3.0), end
+on 1.4.1; a node running any other version keeps it. No tagged release shipped 1.4.0 or
+1.4.1: a node on a develop build that registered 1.4.1 inactive keeps the version it
+runs, because the seed cannot tell an operator's choice of 1.3.0 from the old default.
+Switch it with `POST /v1/fyp/admin/algorithm`.
 
 | Signal | Range | Source |
 |--------|-------|--------|
@@ -729,7 +729,7 @@ seed cannot tell an operator's choice of 1.3.0 from the old default. Switch it w
 | `credibility` | [0, 1] | 0.6 × normalised reputation + 0.4 × log-normalised VESTS |
 | `community_boost` | ×1.20 | Applied post-sum for subscribed or declared community posts |
 | `community_boost_engaged` | ×1.10 | Applied post-sum for the reader's most-engaged communities, when not subscribed |
-| `boost_rescale` | true | 1.3.0: every score is divided by 1 + the larger boost, so a boosted one is not clipped at 1 |
+| `boost_rescale` | true | 1.3.0 and later: every score is divided by 1 + the larger boost, so a boosted one is not clipped at 1 |
 | `author_affinity` | 0.30 / 0.60 | 1.4.0 / 1.4.1: share of relevance's headroom given to the reader's affinity for the post's author |
 
 All weights are stored in `haf_fyp_app.algorithm_versions` and activated via `POST /v1/fyp/admin/algorithm`. The active version and its weights are returned by `/rpc/get_algorithm`. Every feed response includes per-signal component scores for full transparency; use `/rpc/get_score_explanation` for a detailed breakdown of any individual post.
