@@ -644,7 +644,7 @@ or `IMMUTABLE`.
 
 ## Ranking Algorithm
 
-**Version 1.3.0** (active on a new install) — four-signal weighted sum with a tiered community boost:
+**Version 1.3.0** — four-signal weighted sum with a tiered community boost:
 
 ```
 final_score = 0.40 × relevance
@@ -703,14 +703,23 @@ comparison is of one period against another. The table is never read back by the
 ranker; it keeps each reader's set from its last ranking under a version that sets
 `author_affinity` (1.4.0, 1.4.1).
 
-**Version 1.4.1** (registered inactive, #117) — 1.4.0 with the affinity share doubled:
+**Version 1.4.1** (active on a new install, #117) — 1.4.0 with the affinity share doubled:
 `author_affinity` 0.60 instead of 0.30, everything else as the node's 1.4.0. Relevance
 at the top of a feed is already about 0.7, so 0.30 of the headroom moves little. In a
 dry run over the 136 cached readers with affinity data on testapi, 1.4.0 kept the same
 20 posts as 1.3.0 in 79 top-20s, and 0.60 in 54; the posts swapped into top-20s about
-doubled (101 to 214). Like 1.4.0 it is activated with `POST /v1/fyp/admin/algorithm`
-and stores affinity in the same table. It needs a ranker that runs 1.4.0's code or
-later: an older one ranks exactly as 1.3.0 and labels its feeds 1.4.1.
+doubled (101 to 214). It stores affinity in the same table as 1.4.0, and needs a ranker
+that runs 1.4.0's code or later: an older one ranks exactly as 1.3.0 and labels its
+feeds 1.4.1. Measured against 1.3.0 on testapi (#117), it showed no measurable
+difference in opens or upvotes, on too little traffic to show a small one.
+
+1.4.1 is the default: an install that registers it activates it only where 1.3.0 was
+the one active version, the way 1.3.0 takes over from 1.1.0. So a new install, and a
+node upgraded from a release before 1.4.1 that still runs the shipped default, end on
+1.4.1; a version the operator chose stays active. A node that already registered 1.4.1
+inactive (the releases that shipped it as an option) keeps the version it runs: the
+seed cannot tell an operator's choice of 1.3.0 from the old default. Switch it with
+`POST /v1/fyp/admin/algorithm`.
 
 | Signal | Range | Source |
 |--------|-------|--------|
