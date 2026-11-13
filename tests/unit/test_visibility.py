@@ -302,7 +302,8 @@ def test_rank_user_leaves_out_hand_voted_posts_even_with_no_list(monkeypatch):
     seen = {}
     monkeypatch.setattr(rd.visibility, "muted_authors", lambda *_a: set())
     monkeypatch.setattr(rd.visibility, "blacklisted_authors", lambda *_a: set())
-    monkeypatch.setattr(rd.visibility, "hand_voted_post_ids", lambda _c, _u, _ids: {2})
+    # Only alice's votes: the ranker must ask about the account it is ranking.
+    monkeypatch.setattr(rd.visibility, "hand_voted_post_ids", lambda _c, u, _ids: {2} if u == "alice" else set())
     monkeypatch.setattr(rd, "fetch_user_communities", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_user_interests", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_top_communities", lambda _c, _u: [])

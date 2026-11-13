@@ -241,7 +241,12 @@ def test_only_posts_the_reader_upvoted_by_hand_are_reported(conn) -> None:
     votes on that post. Every post is created at 12:00 (the table's default)."""
     with conn.cursor() as cur:
         cur.execute("INSERT INTO hivemind_app.hive_posts (id, author_id) VALUES "
-                    + ", ".join(f"({i}, 10)" for i in range(701, 712)) + ", (712, 1)")
+                    + ", ".join(f"({i}, 10)" for i in range(701, 712)) + ", (712, 1), (713, 10)")
+        # 713: three votes on the post, each in its own block: no trail, by hand. A rule
+        # counting the post's votes in all blocks would keep it.
+        _vote(cur, 713, 1, 40, 9013)
+        _vote(cur, 713, 2, 41, 9014)
+        _vote(cur, 713, 3, 42, 9015)
         _vote(cur, 701, 1, 30, 9001)                  # by hand
         _vote(cur, 702, 1, 15, 9002)                  # by hand, at the line itself
         _vote(cur, 703, 1, 14, 9003)                  # one minute short: an auto-vote
@@ -262,8 +267,8 @@ def test_only_posts_the_reader_upvoted_by_hand_are_reported(conn) -> None:
         _vote(cur, 711, 1, 60, 9011, percent=0)
         # 712 is the reader's own post, voted by hand: never reported.
         _vote(cur, 712, 1, 60, 9012)
-    every = list(range(701, 713))
-    assert visibility.hand_voted_post_ids(conn, "reader", every) == {701, 702, 706, 707}
+    every = list(range(701, 714))
+    assert visibility.hand_voted_post_ids(conn, "reader", every) == {701, 702, 706, 707, 713}
     # Only the candidates asked about; the stranger's votes are not the reader's.
     assert visibility.hand_voted_post_ids(conn, "reader", [701, 703, 799]) == {701}
     assert visibility.hand_voted_post_ids(conn, "stranger", every) == set()
@@ -271,8 +276,8 @@ def test_only_posts_the_reader_upvoted_by_hand_are_reported(conn) -> None:
 
 
 def test_a_block_full_of_votes_on_the_post_is_a_trails(conn) -> None:
-    """The same-block count stops at the threshold (LIMIT): a block with 42 votes on the
-    post still counts as 3 or more, so the reader's vote in it is a trail's."""
+    """A block with 42 votes on the post is a trail's: the count, cut short at the
+    threshold for speed, still reads as 3 or more."""
     with conn.cursor() as cur:
         cur.execute("INSERT INTO hivemind_app.hive_posts (id, author_id) VALUES (720, 10)")
         cur.execute("INSERT INTO hivemind_app.hive_accounts SELECT g, 'trail' || g FROM generate_series(100, 140) g")

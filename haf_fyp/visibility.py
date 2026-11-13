@@ -46,8 +46,8 @@ suggested.
 Posts the reader already voted on are left out only when the vote looks cast by hand
 (#131): an upvote is no sign the post was read when a curation trail or an auto-vote
 service cast it. The reader's own posts are never left out by these lists, even one that
-names the reader (ranker_daemon._rank_user; the same on the serve side, #114). Heavily downvoted posts (#112) and authors excluded by setting
-(#111) are left out by the candidate query itself, in ranker_daemon: both are haf_fyp's
+names the reader (ranker_daemon._rank_user; the same on the serve side, #114). Heavily
+downvoted posts (#112) and authors excluded by setting (#111) are left out by the candidate query itself, in ranker_daemon: both are haf_fyp's
 own data, so those two apply whether or not hivemind can be read.
 
 When hivemind is not there to read (no schema or table, no grant) the ranker writes feeds
