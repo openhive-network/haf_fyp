@@ -250,6 +250,7 @@ def _rank(monkeypatch, weights, vector=None, vecs=None):
     seen = {}
     monkeypatch.setattr(rd.visibility, "muted_authors", lambda _c, _u, _ids: set())
     monkeypatch.setattr(rd.visibility, "blacklisted_authors", lambda _c, _u, _ids: set())
+    monkeypatch.setattr(rd.visibility, "hand_voted_post_ids", lambda _c, _u, _ids: set())
     monkeypatch.setattr(rd, "fetch_user_communities", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_user_interests", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_top_communities", lambda _c, _u: [])

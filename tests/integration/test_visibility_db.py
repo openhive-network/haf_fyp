@@ -38,7 +38,13 @@ CREATE TABLE hivemind_app.follow_blacklisted (follower INT NOT NULL, following I
                                               PRIMARY KEY (follower, following));
 CREATE TABLE hivemind_app.hive_posts (id INT PRIMARY KEY, is_muted BOOLEAN NOT NULL DEFAULT FALSE,
                                       author_id INT NOT NULL, community_id INT,
-                                      counter_deleted INT NOT NULL DEFAULT 0);
+                                      counter_deleted INT NOT NULL DEFAULT 0,
+                                      created_at TIMESTAMP NOT NULL DEFAULT '2026-11-01 12:00');
+-- hivemind's key is (voter_id, author_id, permlink_id) and its id a serial; the read goes
+-- by (post_id, voter_id) and (post_id, block_num), which hivemind indexes.
+CREATE TABLE hivemind_app.hive_votes (post_id INT NOT NULL, voter_id INT NOT NULL, vote_percent INT NOT NULL,
+                                      last_update TIMESTAMP NOT NULL, block_num INT NOT NULL,
+                                      PRIMARY KEY (voter_id, post_id));
 CREATE TABLE hivemind_app.hive_communities (id INT PRIMARY KEY, is_nsfw BOOLEAN NOT NULL DEFAULT FALSE);
 CREATE TABLE hivemind_app.hive_tag_data (id INT PRIMARY KEY, tag VARCHAR(64) NOT NULL UNIQUE);
 CREATE TABLE hivemind_app.hive_post_tags (post_id INT NOT NULL, tag_id INT NOT NULL, PRIMARY KEY (post_id, tag_id));
@@ -222,6 +228,66 @@ def test_only_posts_tagged_nsfw_or_in_an_nsfw_community_are_reported(conn) -> No
         cur.execute("INSERT INTO hivemind_app.hive_post_tags VALUES (521, 1), (522, 1), (522, 117), (523, 3)")
     assert visibility.nsfw_post_ids(conn, [521, 522, 523, 524, 526, 527]) == {522, 524}
     assert visibility.nsfw_post_ids(conn, [521, 523]) == set()
+
+
+def _vote(cur, post_id, voter_id, minutes, block, percent=10000):
+    cur.execute("INSERT INTO hivemind_app.hive_votes VALUES "
+                "(%s, %s, %s, TIMESTAMP '2026-11-01 12:00' + %s * INTERVAL '1 minute', %s)",
+                (post_id, voter_id, percent, minutes, block))
+
+
+def test_only_posts_the_reader_upvoted_by_hand_are_reported(conn) -> None:
+    """#131: an upvote 15 minutes or more after the post, in a block holding fewer than 3
+    votes on that post. Every post is created at 12:00 (the table's default)."""
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO hivemind_app.hive_posts (id, author_id) VALUES "
+                    + ", ".join(f"({i}, 10)" for i in range(701, 712)) + ", (712, 1)")
+        _vote(cur, 701, 1, 30, 9001)                  # by hand
+        _vote(cur, 702, 1, 15, 9002)                  # by hand, at the line itself
+        _vote(cur, 703, 1, 14, 9003)                  # one minute short: an auto-vote
+        _vote(cur, 704, 1, 0, 9004)                   # as the post appeared
+        # 705: two other votes in the reader's block on the same post, a trail's.
+        _vote(cur, 705, 1, 40, 9005)
+        _vote(cur, 705, 2, 40, 9005)
+        _vote(cur, 705, 3, 40, 9005)
+        # 706: one other vote in the block, fewer than 3 in all: by hand.
+        _vote(cur, 706, 1, 40, 9006)
+        _vote(cur, 706, 2, 40, 9006)
+        # 707: many votes in the reader's block, but on OTHER posts: by hand.
+        _vote(cur, 707, 1, 50, 9007)
+        _vote(cur, 708, 2, 50, 9007)
+        _vote(cur, 709, 3, 50, 9007)
+        # 710 downvoted, 711 vote taken back (0%): no upvote at all.
+        _vote(cur, 710, 1, 60, 9010, percent=-10000)
+        _vote(cur, 711, 1, 60, 9011, percent=0)
+        # 712 is the reader's own post, voted by hand: never reported.
+        _vote(cur, 712, 1, 60, 9012)
+    every = list(range(701, 713))
+    assert visibility.hand_voted_post_ids(conn, "reader", every) == {701, 702, 706, 707}
+    # Only the candidates asked about; the stranger's votes are not the reader's.
+    assert visibility.hand_voted_post_ids(conn, "reader", [701, 703, 799]) == {701}
+    assert visibility.hand_voted_post_ids(conn, "stranger", every) == set()
+    assert visibility.hand_voted_post_ids(conn, "nobody", every) == set()
+
+
+def test_a_block_full_of_votes_on_the_post_is_a_trails(conn) -> None:
+    """The same-block count stops at the threshold (LIMIT): a block with 42 votes on the
+    post still counts as 3 or more, so the reader's vote in it is a trail's."""
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO hivemind_app.hive_posts (id, author_id) VALUES (720, 10)")
+        cur.execute("INSERT INTO hivemind_app.hive_accounts SELECT g, 'trail' || g FROM generate_series(100, 140) g")
+        _vote(cur, 720, 1, 90, 9020)
+        cur.execute("INSERT INTO hivemind_app.hive_votes SELECT 720, g, 10000, "
+                    "TIMESTAMP '2026-11-01 13:30', 9020 FROM generate_series(100, 140) g")
+    assert visibility.hand_voted_post_ids(conn, "reader", [720]) == set()
+
+
+def test_without_the_votes_table_nothing_is_left_out_and_said_so(conn, caplog) -> None:
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE hivemind_app.hive_votes")
+    with caplog.at_level(logging.WARNING, logger="haf_fyp.visibility"):
+        assert visibility.hand_voted_post_ids(conn, "reader", [701]) == set()
+    assert "accounts' votes could not be read" in caplog.text
 
 
 def _candidates(conn, monkeypatch, excluded):

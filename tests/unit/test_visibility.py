@@ -115,18 +115,38 @@ def test_blacklisted_authors_are_asked_for_the_reader_and_the_candidates_authors
     assert "muted" not in query
 
 
-@pytest.mark.parametrize("read", [visibility.muted_authors, visibility.blacklisted_authors])
-def test_ids_taken_from_a_frame_are_sent_as_ints_psycopg2_can_adapt(read):
+def test_hand_votes_are_asked_for_the_reader_and_the_candidates():
+    conn, cur = _conn(rows=[(2,)])
+    assert visibility.hand_voted_post_ids(conn, "alice", [1, 2, 3]) == {2}
+    query, params = cur.execute.call_args.args
+    assert params == {"username": "alice", "post_ids": [1, 2, 3],
+                      "after": visibility.HAND_VOTE_AFTER, "trail": visibility.TRAIL_BLOCK_VOTES}
+    # Upvotes only, never on the reader's own post, late enough and outside a trail's block.
+    assert "v.vote_percent > 0" in query
+    assert "hp.author_id <> v.voter_id" in query
+    assert "v.last_update >= hp.created_at + %(after)s::interval" in query
+    assert "same.post_id = v.post_id AND same.block_num = v.block_num" in query
+    assert "< %(trail)s" in query
+    assert visibility.HAND_VOTE_AFTER == "15 minutes" and visibility.TRAIL_BLOCK_VOTES == 3
+
+
+@pytest.mark.parametrize("read, column, key", [
+    (visibility.muted_authors, "author_id", "author_ids"),
+    (visibility.blacklisted_authors, "author_id", "author_ids"),
+    (visibility.hand_voted_post_ids, "post_id", "post_ids"),
+])
+def test_ids_taken_from_a_frame_are_sent_as_ints_psycopg2_can_adapt(read, column, key):
     import psycopg2.extensions
 
     conn, cur = _conn()
-    read(conn, "alice", _frame()["author_id"].unique())
-    ids = cur.execute.call_args.args[1]["author_ids"]
-    assert ids == [11, 12, 13] and all(type(i) is int for i in ids)
+    read(conn, "alice", _frame()[column].unique())
+    ids = cur.execute.call_args.args[1][key]
+    assert ids == _frame()[column].unique().tolist() and all(type(i) is int for i in ids)
     psycopg2.extensions.adapt(ids).getquoted()  # numpy integers raise here
 
 
-@pytest.mark.parametrize("read", [visibility.muted_authors, visibility.blacklisted_authors])
+@pytest.mark.parametrize("read", [visibility.muted_authors, visibility.blacklisted_authors,
+                                  visibility.hand_voted_post_ids])
 def test_no_candidate_authors_no_query(read):
     conn, cur = _conn()
     assert read(conn, "alice", []) == set()
@@ -146,6 +166,7 @@ class _PgError(Exception):
     lambda conn: visibility.community_muted_post_ids(conn, [1]),
     lambda conn: visibility.muted_authors(conn, "alice", [1]),
     lambda conn: visibility.blacklisted_authors(conn, "alice", [1]),
+    lambda conn: visibility.hand_voted_post_ids(conn, "alice", [1]),
 ])
 def test_no_hivemind_to_read_filters_nothing_and_rolls_back(read, pgcode, caplog):
     conn, _cur = _conn(error=_PgError(pgcode, 'relation "hivemind_app.muted" does not exist'))
@@ -171,6 +192,8 @@ def test_any_other_failure_is_raised_not_written_unfiltered(error):
         visibility.community_muted_post_ids(conn, [1])
     with pytest.raises(type(error)):
         visibility.blacklisted_authors(conn, "alice", [1])
+    with pytest.raises(type(error)):
+        visibility.hand_voted_post_ids(conn, "alice", [1])
 
 
 def test_the_warning_is_given_once_per_process_not_once_per_account(caplog):
@@ -248,8 +271,14 @@ def test_rank_user_scores_only_what_the_reader_can_be_shown(monkeypatch):
         # A list alice follows names alice herself: her own posts stay.
         return {"carol", "alice"} if u == "alice" else set()
 
+    def _voted(_c, u, post_ids):
+        asked.append(post_ids)
+        # #131: alice upvoted post 3 by hand (carol's, also blacklisted) and post 4 (bob's).
+        return {3, 4} if u == "alice" else set()
+
     monkeypatch.setattr(rd.visibility, "muted_authors", _muted)
     monkeypatch.setattr(rd.visibility, "blacklisted_authors", _blacklisted)
+    monkeypatch.setattr(rd.visibility, "hand_voted_post_ids", _voted)
     monkeypatch.setattr(rd, "fetch_user_communities", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_user_interests", lambda _c, _u: set())
     monkeypatch.setattr(rd, "fetch_top_communities", lambda _c, _u: [])
@@ -260,11 +289,34 @@ def test_rank_user_scores_only_what_the_reader_can_be_shown(monkeypatch):
 
     rd._rank_user(MagicMock(), "alice", _frame(), {}, {}, "1.2.0", {})
     assert seen["candidates"]["author"].tolist() == ["alice"]
-    # #118: both lists are asked about the candidates' distinct authors, once each.
-    assert asked == [[11, 12, 13], [11, 12, 13]]
+    # #118: both lists are asked about the candidates' distinct authors, once each; #131:
+    # the votes about every candidate.
+    assert asked == [[11, 12, 13], [11, 12, 13], [1, 2, 3, 4]]
 
     rd._rank_user(MagicMock(), "dave", _frame(), {}, {}, "1.2.0", {})
     assert seen["candidates"]["post_id"].tolist() == [1, 2, 3, 4]
+
+
+def test_rank_user_leaves_out_hand_voted_posts_even_with_no_list(monkeypatch):
+    """#131 on its own: no mutes, no blacklist, one post upvoted by hand."""
+    seen = {}
+    monkeypatch.setattr(rd.visibility, "muted_authors", lambda *_a: set())
+    monkeypatch.setattr(rd.visibility, "blacklisted_authors", lambda *_a: set())
+    monkeypatch.setattr(rd.visibility, "hand_voted_post_ids", lambda _c, _u, _ids: {2})
+    monkeypatch.setattr(rd, "fetch_user_communities", lambda _c, _u: set())
+    monkeypatch.setattr(rd, "fetch_user_interests", lambda _c, _u: set())
+    monkeypatch.setattr(rd, "fetch_top_communities", lambda _c, _u: [])
+    monkeypatch.setattr(rd, "build_user_profile_vector", lambda _c, _u, _v: (None, 0))
+    monkeypatch.setattr(rd, "read_user_vector", lambda _c, _u: (None, None))
+    def _scores(**kw):
+        seen["candidates"] = kw["candidates"]
+        return pd.DataFrame()
+
+    monkeypatch.setattr(rd, "compute_scores", _scores)
+    monkeypatch.setattr(rd, "write_feed_cache", lambda *a, **k: None)
+    rd._rank_user(MagicMock(), "alice", _frame(), {}, {}, "1.2.0", {})
+    # Only post 2 goes: bob's other post (4) stays, so it is the post, not its author.
+    assert seen["candidates"]["post_id"].tolist() == [1, 3, 4]
 
 
 def test_the_cycle_candidates_leave_out_community_muted_nsfw_and_greyed_posts(monkeypatch):

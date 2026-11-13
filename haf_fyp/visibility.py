@@ -2,7 +2,8 @@
 What a reader must not be shown (#89): posts their community has muted, posts by authors
 their community has muted, and posts by authors the reader has muted. Since #112, posts
 by authors hivemind greys for a low reputation; since #113, posts by authors the reader
-has blacklisted; since #115, posts marked NSFW.
+has blacklisted; since #115, posts marked NSFW; since #131, posts the reader has already
+upvoted by hand.
 
 Applied when the ranker WRITES a feed, not when it is served. Dropping posts from a served
 page would make it shorter than its page-size, and front ends read a short page as the end
@@ -31,6 +32,8 @@ Read from hivemind (the same sources its bridge API uses for an observer):
     hive_communities.is_nsfw     -- the post is in a community its owner marked NSFW
                                     (hive_posts.is_nsfw is not read: set on none of the last 2M
                                     posts on testapi)
+    hive_votes                   -- the reader's upvote on the post, and how many votes on
+                                    the same post its block holds (see HAND_VOTED_SQL)
 Account columns are hive_accounts ids. haf_fyp_owner, which the ranker connects as, can
 read them once scripts/grant_cross_schema.sh has run since hivemind was installed: the same
 grant the feed endpoints depend on.
@@ -40,9 +43,10 @@ blacklisted authors with a badge; a recommendation leaves them out. A reader who
 blacklisted an author, or follows a list that names them, has said they do not want them
 suggested.
 
-NOT done here: posts the reader already voted on. The reader's own posts are never left
-out by these lists, even one that names the reader (ranker_daemon._rank_user; the same on
-the serve side, #114). Heavily downvoted posts (#112) and authors excluded by setting
+Posts the reader already voted on are left out only when the vote looks cast by hand
+(#131): an upvote is no sign the post was read when a curation trail or an auto-vote
+service cast it. The reader's own posts are never left out by these lists, even one that
+names the reader (ranker_daemon._rank_user; the same on the serve side, #114). Heavily downvoted posts (#112) and authors excluded by setting
 (#111) are left out by the candidate query itself, in ranker_daemon: both are haf_fyp's
 own data, so those two apply whether or not hivemind can be read.
 
@@ -134,6 +138,38 @@ BLACKLISTED_AUTHORS_SQL = """
       AND b.following IN (SELECT unnest(%(author_ids)s::int[]))
 """
 
+# Which of the candidates the reader has upvoted by hand (#131). Nothing on chain says who
+# or what cast a vote, so two signals stand in for it:
+#   * the vote came HAND_VOTE_AFTER or more after the post: auto-vote services vote as the
+#     post appears (on testapi, 2026-11, palomap3 cast 67% of its votes within 5 minutes,
+#     median 0), readers voting by hand take hours (medians 3-9 h);
+#   * its block holds fewer than TRAIL_BLOCK_VOTES votes on the post: a curation trail's
+#     followers vote in the leader's block (itharagaian 95% of its votes, drax 73%; readers
+#     voting by hand near 0%).
+# Both are heuristics: a fan who votes within minutes keeps the post (today's behaviour),
+# a bot that waits and votes alone loses it. The vote as it stands is read: last_update
+# and block_num move when a vote is changed (0.2% of recent votes on testapi), and a change
+# is the reader's own act. The reader's own posts stay. One probe of
+# hive_votes_post_id_voter_id_idx per candidate, and the same-block count stops at the
+# threshold: 15 ms for 5,000 candidates and the heaviest voter on testapi (2026-11-14,
+# 543 upvotes among them), 3 ms for an account with none.
+HAND_VOTE_AFTER = "15 minutes"
+TRAIL_BLOCK_VOTES = 3
+HAND_VOTED_SQL = """
+    SELECT v.post_id
+    FROM hivemind_app.hive_votes AS v
+    JOIN hivemind_app.hive_posts AS hp ON hp.id = v.post_id
+    WHERE v.voter_id = (SELECT reader.id FROM hivemind_app.hive_accounts AS reader
+                        WHERE reader.name = %(username)s)
+      AND v.post_id IN (SELECT unnest(%(post_ids)s::int[]))
+      AND v.vote_percent > 0
+      AND hp.author_id <> v.voter_id
+      AND v.last_update >= hp.created_at + %(after)s::interval
+      AND (SELECT count(*) FROM (SELECT 1 FROM hivemind_app.hive_votes AS same
+                                 WHERE same.post_id = v.post_id AND same.block_num = v.block_num
+                                 LIMIT %(trail)s) AS s) < %(trail)s
+"""
+
 # SQLSTATEs that mean "there is no hivemind to read here", not "this read went wrong":
 # invalid_schema_name, undefined_table, undefined_column, insufficient_privilege.
 _NOT_THERE = frozenset({"3F000", "42P01", "42703", "42501"})
@@ -217,6 +253,16 @@ def blacklisted_authors(conn, username: str, author_ids: list[int]) -> set[str]:
     if not ids:
         return set()
     return _read(conn, "accounts' blacklists", BLACKLISTED_AUTHORS_SQL, {"username": username, "author_ids": ids})
+
+
+def hand_voted_post_ids(conn, username: str, post_ids: list[int]) -> set[int]:
+    """Post ids among `post_ids` that `username` has upvoted by hand (see HAND_VOTED_SQL);
+    never one of its own posts."""
+    ids = _ints(post_ids)
+    if not ids:
+        return set()
+    return _read(conn, "accounts' votes", HAND_VOTED_SQL, {
+        "username": username, "post_ids": ids, "after": HAND_VOTE_AFTER, "trail": TRAIL_BLOCK_VOTES})
 
 
 def without(candidates: pd.DataFrame, post_ids: set | None = None, authors: set | None = None) -> pd.DataFrame:
