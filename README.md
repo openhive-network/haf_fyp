@@ -644,7 +644,7 @@ or `IMMUTABLE`.
 
 ## Ranking Algorithm
 
-**Version 1.3.0** (active on a new install) — four-signal weighted sum with a tiered community boost:
+**Version 1.3.0** — four-signal weighted sum with a tiered community boost:
 
 ```
 final_score = 0.40 × relevance
@@ -703,14 +703,23 @@ comparison is of one period against another. The table is never read back by the
 ranker; it keeps each reader's set from its last ranking under a version that sets
 `author_affinity` (1.4.0, 1.4.1).
 
-**Version 1.4.1** (registered inactive, #117) — 1.4.0 with the affinity share doubled:
+**Version 1.4.1** (active on a new install, #117) — 1.4.0 with the affinity share doubled:
 `author_affinity` 0.60 instead of 0.30, everything else as the node's 1.4.0. Relevance
 at the top of a feed is already about 0.7, so 0.30 of the headroom moves little. In a
 dry run over the 136 cached readers with affinity data on testapi, 1.4.0 kept the same
 20 posts as 1.3.0 in 79 top-20s, and 0.60 in 54; the posts swapped into top-20s about
-doubled (101 to 214). Like 1.4.0 it is activated with `POST /v1/fyp/admin/algorithm`
-and stores affinity in the same table. It needs a ranker that runs 1.4.0's code or
-later: an older one ranks exactly as 1.3.0 and labels its feeds 1.4.1.
+doubled (101 to 214). It stores affinity in the same table as 1.4.0, and needs a ranker
+that runs 1.4.0's code or later: an older one ranks exactly as 1.3.0 and labels its
+feeds 1.4.1. Measured against 1.3.0 on testapi (#117), it showed no measurable
+difference in opens or upvotes, on too little traffic to show a small one.
+
+1.4.1 is the default: an install that registers it activates it only where 1.3.0 was
+the one active version, the way 1.3.0 takes over from 1.1.0. So a new install, and a
+node upgraded from 1.28.8 or older that runs the shipped default (1.1.0 or 1.3.0), end
+on 1.4.1; a node running any other version keeps it. No tagged release shipped 1.4.0 or
+1.4.1: a node on a develop build that registered 1.4.1 inactive keeps the version it
+runs, because the seed cannot tell an operator's choice of 1.3.0 from the old default.
+Switch it with `POST /v1/fyp/admin/algorithm`.
 
 | Signal | Range | Source |
 |--------|-------|--------|
@@ -720,7 +729,7 @@ later: an older one ranks exactly as 1.3.0 and labels its feeds 1.4.1.
 | `credibility` | [0, 1] | 0.6 × normalised reputation + 0.4 × log-normalised VESTS |
 | `community_boost` | ×1.20 | Applied post-sum for subscribed or declared community posts |
 | `community_boost_engaged` | ×1.10 | Applied post-sum for the reader's most-engaged communities, when not subscribed |
-| `boost_rescale` | true | 1.3.0: every score is divided by 1 + the larger boost, so a boosted one is not clipped at 1 |
+| `boost_rescale` | true | 1.3.0 and later: every score is divided by 1 + the larger boost, so a boosted one is not clipped at 1 |
 | `author_affinity` | 0.30 / 0.60 | 1.4.0 / 1.4.1: share of relevance's headroom given to the reader's affinity for the post's author |
 
 All weights are stored in `haf_fyp_app.algorithm_versions` and activated via `POST /v1/fyp/admin/algorithm`. The active version and its weights are returned by `/rpc/get_algorithm`. Every feed response includes per-signal component scores for full transparency; use `/rpc/get_score_explanation` for a detailed breakdown of any individual post.
