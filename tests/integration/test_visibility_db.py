@@ -269,9 +269,11 @@ def test_only_posts_the_reader_upvoted_by_hand_are_reported(conn) -> None:
         _vote(cur, 712, 1, 60, 9012)
     every = list(range(701, 714))
     assert visibility.hand_voted_post_ids(conn, "reader", every) == {701, 702, 706, 707, 713}
-    # Only the candidates asked about; the stranger's votes are not the reader's.
+    # Only the candidates asked about.
     assert visibility.hand_voted_post_ids(conn, "reader", [701, 703, 799]) == {701}
-    assert visibility.hand_voted_post_ids(conn, "stranger", every) == set()
+    # Per voter: the stranger (3) voted alone in its block on 709 (+50 min) and 713
+    # (+42 min), and in the trail block on 705; none of the reader's posts comes back.
+    assert visibility.hand_voted_post_ids(conn, "stranger", every) == {709, 713}
     assert visibility.hand_voted_post_ids(conn, "nobody", every) == set()
 
 
