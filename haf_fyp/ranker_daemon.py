@@ -1249,7 +1249,10 @@ def _rank_user(
     hidden = (visibility.muted_authors(conn, username, author_ids)
               | visibility.blacklisted_authors(conn, username, author_ids))
     hidden.discard(username)
-    candidates = visibility.without(candidates, authors=hidden)
+    # #131: nor a post it has already upvoted by hand (one a trail or a bot voted for it
+    # stays: likely never read).
+    voted = visibility.hand_voted_post_ids(conn, username, candidates["post_id"].tolist())
+    candidates = visibility.without(candidates, post_ids=voted, authors=hidden)
     # Explicit communities (on-chain subscriptions + declared interests) get the
     # full boost; engaged communities (top by interaction) get the smaller tier.
     subscribed = fetch_user_communities(conn, username) | fetch_user_interests(conn, username)
