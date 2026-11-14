@@ -739,9 +739,12 @@ authors the community muted (all feeds, the global one included); and, for each 
 posts by authors it muted or blacklisted, directly or through a mute list or blacklist it
 follows. hivemind's own ranked lists return such posts greyed or badged; a recommendation
 leaves them out. From an account's own feed only (#131): posts it has already upvoted by
-hand, meaning an upvote cast 15 minutes or more after the post, in a block holding fewer
-than 3 votes on that post. A vote cast sooner (an auto-vote service, or a reader quick
-off the mark) or in a curation trail's block keeps the post. Also left out of
+hand, meaning an upvote cast 15 minutes or more after the post, with fewer than 3 votes
+of any kind on that post (the account's own included) from 3 blocks before its block to 3
+blocks after. A vote cast sooner (an auto-vote service, or a reader quick off the mark)
+or among a curation trail's votes keeps the post, and so does a hand vote that leads a
+trail. A trail of a leader and one follower, or a bot that waits and votes alone, looks
+like a hand vote. Also left out of
 every feed: posts tagged `nsfw` or in a community marked NSFW (there is no opt-in yet),
 posts by authors hivemind greys for a low reputation, posts downvoted to
 `DOWNVOTED_AT_NET_RSHARES` net rshares or below, and posts by the accounts in

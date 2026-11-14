@@ -120,14 +120,18 @@ def test_hand_votes_are_asked_for_the_reader_and_the_candidates():
     assert visibility.hand_voted_post_ids(conn, "alice", [1, 2, 3]) == {2}
     query, params = cur.execute.call_args.args
     assert params == {"username": "alice", "post_ids": [1, 2, 3],
-                      "after": visibility.HAND_VOTE_AFTER, "trail": visibility.TRAIL_BLOCK_VOTES}
-    # Upvotes only, never on the reader's own post, late enough and outside a trail's block.
+                      "after": visibility.HAND_VOTE_AFTER, "blocks": visibility.TRAIL_BLOCKS,
+                      "trail": visibility.TRAIL_BLOCK_VOTES}
+    # Upvotes only, never on the reader's own post, late enough and outside a trail's blocks.
     assert "v.vote_percent > 0" in query
     assert "hp.author_id <> v.voter_id" in query
     assert "v.last_update >= hp.created_at + %(after)s::interval" in query
-    assert "same.post_id = v.post_id AND same.block_num = v.block_num" in query
+    assert "same.post_id = v.post_id" in query
+    assert "same.block_num BETWEEN v.block_num - %(blocks)s" in query
+    assert "AND v.block_num + %(blocks)s" in query
     assert "< %(trail)s" in query
-    assert visibility.HAND_VOTE_AFTER == "15 minutes" and visibility.TRAIL_BLOCK_VOTES == 3
+    assert visibility.HAND_VOTE_AFTER == "15 minutes"
+    assert visibility.TRAIL_BLOCKS == 3 and visibility.TRAIL_BLOCK_VOTES == 3
 
 
 @pytest.mark.parametrize("read, column, key", [

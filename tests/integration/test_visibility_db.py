@@ -237,16 +237,17 @@ def _vote(cur, post_id, voter_id, minutes, block, percent=10000):
 
 
 def test_only_posts_the_reader_upvoted_by_hand_are_reported(conn) -> None:
-    """#131: an upvote 15 minutes or more after the post, in a block holding fewer than 3
-    votes on that post. Every post is created at 12:00 (the table's default)."""
+    """#131: an upvote 15 minutes or more after the post, with fewer than 3 votes on that
+    post (its own included) from 3 blocks before its block to 3 after. Every post is
+    created at 12:00 (the table's default)."""
     with conn.cursor() as cur:
         cur.execute("INSERT INTO hivemind_app.hive_posts (id, author_id) VALUES "
-                    + ", ".join(f"({i}, 10)" for i in range(701, 712)) + ", (712, 1), (713, 10)")
-        # 713: three votes on the post, each in its own block: no trail, by hand. A rule
+                    + ", ".join(f"({i}, 10)" for i in range(701, 712)) + ", (712, 1), (713, 10), (714, 10), (715, 10), (716, 10), (717, 10), (718, 10)")
+        # 713: three votes on the post, 100 blocks apart: no trail, by hand. A rule
         # counting the post's votes in all blocks would keep it.
         _vote(cur, 713, 1, 40, 9013)
-        _vote(cur, 713, 2, 41, 9014)
-        _vote(cur, 713, 3, 42, 9015)
+        _vote(cur, 713, 2, 41, 9113)
+        _vote(cur, 713, 3, 42, 9213)
         _vote(cur, 701, 1, 30, 9001)                  # by hand
         _vote(cur, 702, 1, 15, 9002)                  # by hand, at the line itself
         _vote(cur, 703, 1, 14, 9003)                  # one minute short: an auto-vote
@@ -267,12 +268,34 @@ def test_only_posts_the_reader_upvoted_by_hand_are_reported(conn) -> None:
         _vote(cur, 711, 1, 60, 9011, percent=0)
         # 712 is the reader's own post, voted by hand: never reported.
         _vote(cur, 712, 1, 60, 9012)
-    every = list(range(701, 714))
-    assert visibility.hand_voted_post_ids(conn, "reader", every) == {701, 702, 706, 707, 713}
+        # 714: the trail's other votes spill into the next blocks (1 and 3 after): a trail's.
+        # The others voted within 5 minutes, so they are no hand votes of their own.
+        _vote(cur, 714, 1, 40, 9030)
+        _vote(cur, 714, 2, 5, 9031)
+        _vote(cur, 714, 3, 5, 9033)
+        # 715: the others 4 blocks before and 4 after, outside the window: by hand.
+        _vote(cur, 715, 1, 40, 9040)
+        _vote(cur, 715, 2, 5, 9036)
+        _vote(cur, 715, 3, 5, 9044)
+        # 716: the others exactly 3 blocks before and 3 after, inside the window: a trail's.
+        _vote(cur, 716, 1, 40, 9050)
+        _vote(cur, 716, 2, 5, 9047)
+        _vote(cur, 716, 3, 5, 9053)
+        # 717 and 718: one vote inside the window and one just outside, on one side only:
+        # by hand. A window one block too wide on that side would count 3.
+        _vote(cur, 717, 1, 40, 9060)
+        _vote(cur, 717, 2, 5, 9059)
+        _vote(cur, 717, 3, 5, 9056)
+        _vote(cur, 718, 1, 40, 9070)
+        _vote(cur, 718, 2, 5, 9071)
+        _vote(cur, 718, 3, 5, 9074)
+    every = list(range(701, 719))
+    assert visibility.hand_voted_post_ids(conn, "reader", every) == {701, 702, 706, 707, 713, 715, 717, 718}
     # Only the candidates asked about.
     assert visibility.hand_voted_post_ids(conn, "reader", [701, 703, 799]) == {701}
-    # Per voter: the stranger (3) voted alone in its block on 709 (+50 min) and 713
-    # (+42 min), and in the trail block on 705; none of the reader's posts comes back.
+    # Per voter: the stranger (3) voted alone near its block on 709 (+50 min) and 713
+    # (+42 min), in the trail block on 705, and within 5 minutes on 714-718; none of the
+    # reader's posts comes back.
     assert visibility.hand_voted_post_ids(conn, "stranger", every) == {709, 713}
     assert visibility.hand_voted_post_ids(conn, "nobody", every) == set()
 

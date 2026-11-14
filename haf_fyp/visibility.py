@@ -33,7 +33,8 @@ Read from hivemind (the same sources its bridge API uses for an observer):
                                     (hive_posts.is_nsfw is not read: set on none of the last 2M
                                     posts on testapi)
     hive_votes                   -- the reader's upvote on the post, and how many votes on
-                                    the same post its block holds (see HAND_VOTED_SQL)
+                                    the same post the blocks around it hold (see
+                                    HAND_VOTED_SQL)
 Account columns are hive_accounts ids. haf_fyp_owner, which the ranker connects as, can
 read them once scripts/grant_cross_schema.sh has run since hivemind was installed: the same
 grant the feed endpoints depend on.
@@ -143,17 +144,25 @@ BLACKLISTED_AUTHORS_SQL = """
 #   * the vote came HAND_VOTE_AFTER or more after the post: auto-vote services vote as the
 #     post appears (on testapi, 2026-11, palomap3 cast 67% of its votes within 5 minutes,
 #     median 0), readers voting by hand take hours (medians 3-9 h);
-#   * its block holds fewer than TRAIL_BLOCK_VOTES votes on the post: a curation trail's
-#     followers vote in the leader's block (itharagaian 95% of its votes, drax 73%; readers
-#     voting by hand near 0%).
-# Both are heuristics: a fan who votes within minutes keeps the post (today's behaviour),
-# a bot that waits and votes alone loses it. The vote as it stands is read: last_update
-# and block_num move when a vote is changed (0.2% of recent votes on testapi), and a change
-# is the reader's own act. The reader's own posts stay. One probe of
-# hive_votes_post_id_voter_id_idx per candidate, and the same-block count stops at the
-# threshold: 15 ms for 5,000 candidates and the heaviest voter on testapi (2026-11-14,
-# 543 upvotes among them), 3 ms for an account with none.
+#   * the blocks from TRAIL_BLOCKS before its block to TRAIL_BLOCKS after hold fewer than
+#     TRAIL_BLOCK_VOTES votes of any kind on the post, the reader's own included: a curation
+#     trail's followers vote in the leader's block (itharagaian 95% of its votes, drax 73%;
+#     readers voting by hand near 0%) or spill into the next few (on testapi, 23 of 295
+#     votes that passed a same-block-only test had 3+ votes on the post within 3 blocks).
+#     The window looks back as well, as a follower's vote can land after the leader's and
+#     after other followers'.
+# Both are heuristics. A fan who votes within minutes keeps the post (today's behaviour),
+# and so does a reader who votes among a burst on a busy post, or who leads a trail by hand
+# (the followers land next to the vote). A small trail (leader and one follower) or a bot
+# that waits and votes alone loses it. The vote as it stands is read: last_update and
+# block_num move when a vote is changed (0.2% of recent votes on testapi), and a change is
+# the reader's own act. The reader's own posts stay. One probe of
+# hive_votes_post_id_voter_id_idx per candidate, and the count around its block is an
+# index-only range scan that stops at the threshold: 17 ms warm (93 ms cold) for 5,000
+# candidates and the heaviest voter on testapi (2026-11-14, with the window), 3 ms for an
+# account with none.
 HAND_VOTE_AFTER = "15 minutes"
+TRAIL_BLOCKS = 3
 TRAIL_BLOCK_VOTES = 3
 HAND_VOTED_SQL = """
     SELECT v.post_id
@@ -166,7 +175,9 @@ HAND_VOTED_SQL = """
       AND hp.author_id <> v.voter_id
       AND v.last_update >= hp.created_at + %(after)s::interval
       AND (SELECT count(*) FROM (SELECT 1 FROM hivemind_app.hive_votes AS same
-                                 WHERE same.post_id = v.post_id AND same.block_num = v.block_num
+                                 WHERE same.post_id = v.post_id
+                                   AND same.block_num BETWEEN v.block_num - %(blocks)s
+                                                          AND v.block_num + %(blocks)s
                                  LIMIT %(trail)s) AS s) < %(trail)s
 """
 
@@ -262,7 +273,8 @@ def hand_voted_post_ids(conn, username: str, post_ids: list[int]) -> set[int]:
     if not ids:
         return set()
     return _read(conn, "accounts' votes", HAND_VOTED_SQL, {
-        "username": username, "post_ids": ids, "after": HAND_VOTE_AFTER, "trail": TRAIL_BLOCK_VOTES})
+        "username": username, "post_ids": ids, "after": HAND_VOTE_AFTER,
+        "blocks": TRAIL_BLOCKS, "trail": TRAIL_BLOCK_VOTES})
 
 
 def without(candidates: pd.DataFrame, post_ids: set | None = None, authors: set | None = None) -> pd.DataFrame:
