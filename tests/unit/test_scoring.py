@@ -664,6 +664,7 @@ class TestWriteGlobalFeedCacheStampsAlgorithmVersion:
                 },
             ]
         )
+        df["created_at"] = datetime.now(tz=timezone.utc).replace(tzinfo=None)
         monkeypatch.setattr(scoring, "render_bridge_for_posts", lambda *a, **k: None)
         scoring.write_global_feed_cache(_CapturingConn(sink), df, algo_version)
         return captured
@@ -779,6 +780,7 @@ class TestFeedWritersRenderThePostsTheyPlace:
         })
         df["community_boost_applied"] = False
         df["boost_source"] = None
+        df["created_at"] = datetime.now(tz=timezone.utc).replace(tzinfo=None)
         return df
 
     @staticmethod
@@ -787,7 +789,7 @@ class TestFeedWritersRenderThePostsTheyPlace:
         monkeypatch.setattr(psycopg2.extras, "execute_values", lambda *a, **k: None)
         monkeypatch.setattr(
             scoring, "render_bridge_for_posts",
-            lambda conn, ids: calls.append((ids, sink.get("committed", False))),
+            lambda conn, ids, *fresh: calls.append((ids, sink.get("committed", False))),
         )
         return calls
 
@@ -798,12 +800,92 @@ class TestFeedWritersRenderThePostsTheyPlace:
         scoring.write_feed_cache(_CapturingConn(sink), "alice", self._scored(250), "1.2.0")
         assert calls == [(list(range(1000, 1200)), True)]
 
-    def test_the_global_writer_renders_its_top_200_after_committing(
+    def test_the_global_writer_renders_its_pool_after_committing(
             self, monkeypatch: MonkeyPatch) -> None:
+        # #130: all 250 are recent, so all are in the pool: the top 200 first, then
+        # the deeper 50 in a second call (on the slower refresh, see TestGlobalFeedPool).
         sink: dict[str, Any] = {}
         calls = self._capture(monkeypatch, sink)
         scoring.write_global_feed_cache(_CapturingConn(sink), self._scored(250), "1.2.0")
-        assert calls == [(list(range(1000, 1200)), True)]
+        assert calls == [(list(range(1000, 1200)), True), (list(range(1200, 1250)), True)]
+
+
+class TestGlobalFeedPool:
+    """#130: the global pool is the top 200 by score plus every other post of the last
+    48 hours, in score order, capped; it was the top 200 alone (~8 hours), which left
+    language and observer filters a couple of posts."""
+
+    @staticmethod
+    def _scored(ages_hours: list[float]) -> pd.DataFrame:
+        """One post per age, already in score order (as compute_scores returns them)."""
+        now = datetime.now(tz=timezone.utc).replace(tzinfo=None)
+        n = len(ages_hours)
+        return pd.DataFrame({
+            "post_id": list(range(1, n + 1)),
+            "final_score": [1 - i / (n + 1) for i in range(n)],
+            "score_engagement": [0.5] * n, "score_recency": [0.5] * n,
+            "score_credibility": [0.5] * n,
+            "created_at": [now - timedelta(hours=h) for h in ages_hours],
+        })
+
+    @staticmethod
+    def _write(monkeypatch: MonkeyPatch, df: pd.DataFrame) -> tuple[list[Any], list[Any]]:
+        rows: list[Any] = []
+        renders: list[Any] = []
+        monkeypatch.setattr(
+            psycopg2.extras, "execute_values", lambda cur, sql, r: rows.extend(r)
+        )
+        monkeypatch.setattr(
+            scoring, "render_bridge_for_posts",
+            lambda conn, ids, fresh_minutes=5, limit=None: renders.append(
+                (ids, fresh_minutes, limit)),
+        )
+        scoring.write_global_feed_cache(_CapturingConn({}), df, "1.4.1")
+        return rows, renders
+
+    def test_the_top_200_stay_whatever_their_age(self, monkeypatch: MonkeyPatch) -> None:
+        # A quiet chain: nothing recent. The pool is never smaller than it used to be.
+        rows, _ = self._write(monkeypatch, self._scored([100.0] * 250))
+        assert [r[0] for r in rows] == list(range(1, 201))
+
+    def test_recent_posts_below_the_top_200_join_in_score_order(
+            self, monkeypatch: MonkeyPatch) -> None:
+        # 200 old, then alternating 50h (out) and 10h (in) posts.
+        ages = [100.0] * 200 + [50.0, 10.0] * 50
+        rows, _ = self._write(monkeypatch, self._scored(ages))
+        ids = [r[0] for r in rows]
+        assert ids == list(range(1, 201)) + list(range(202, 301, 2))
+        assert [r[5] for r in rows] == list(range(1, 251)), "rank is the pool position"
+
+    def test_the_pool_is_capped(self, monkeypatch: MonkeyPatch) -> None:
+        monkeypatch.setattr(scoring, "GLOBAL_FEED_MAX_POSTS", 230)
+        rows, _ = self._write(monkeypatch, self._scored([1.0] * 300))
+        assert [r[0] for r in rows] == list(range(1, 231))
+
+    def test_the_deeper_posts_refresh_less_often(self, monkeypatch: MonkeyPatch) -> None:
+        _, renders = self._write(monkeypatch, self._scored([1.0] * 210))
+        assert renders == [
+            (list(range(1, 201)), 5, None),
+            (list(range(201, 211)), scoring.DEEP_RENDER_MINUTES,
+             scoring.DEEP_RENDER_MAX_PER_CYCLE),
+        ]
+
+    def test_the_age_filter_comes_before_the_cap(self, monkeypatch: MonkeyPatch) -> None:
+        # 200 top, then 100 old (out), then 40 recent: the cap keeps the first 30 recent,
+        # not the first 30 rows below the top.
+        monkeypatch.setattr(scoring, "GLOBAL_FEED_MAX_POSTS", 230)
+        rows, _ = self._write(monkeypatch, self._scored([100.0] * 300 + [1.0] * 40))
+        assert [r[0] for r in rows] == list(range(1, 201)) + list(range(301, 331))
+
+    def test_the_window_is_48_hours(self, monkeypatch: MonkeyPatch) -> None:
+        rows, _ = self._write(monkeypatch, self._scored([100.0] * 200 + [49.0, 47.0]))
+        assert [r[0] for r in rows] == list(range(1, 201)) + [202]
+
+    def test_the_top_is_positional_whatever_the_index(self, monkeypatch: MonkeyPatch) -> None:
+        df = self._scored([100.0] * 201)
+        df.index = range(1000, 1201)
+        rows, _ = self._write(monkeypatch, df)
+        assert [r[0] for r in rows] == list(range(1, 201))
 
 
 class _RenderConn:
@@ -848,8 +930,17 @@ class TestRenderBridgeForPostsIsBestEffort:
         conn = _RenderConn()
         scoring.render_bridge_for_posts(conn, [3, 1, 2])
         assert len(conn.executed) == 1
-        assert conn.executed[0][1] == ([3, 1, 2],)
+        assert conn.executed[0][1] == ([3, 1, 2], 5, None)
         assert conn.committed == 1 and conn.rolled_back == 0
+
+    def test_the_freshness_window_is_a_parameter(self) -> None:
+        # #130: the global pool's deeper posts skip a render for longer than 5 minutes.
+        conn = _RenderConn()
+        scoring.render_bridge_for_posts(conn, [1], 30, 500)
+        assert conn.executed[0][1] == ([1], 30, 500)
+        sql = " ".join(conn.executed[0][0].split())
+        assert "make_interval(mins => %s)" in sql
+        assert "ORDER BY c.computed_at NULLS FIRST LIMIT %s" in sql
 
     def test_a_hivemind_error_is_rolled_back_and_logged(self, caplog: pytest.LogCaptureFixture) -> None:
         conn = _RenderConn(psycopg2.errors.lookup("42501")("permission denied for table hive_posts"))

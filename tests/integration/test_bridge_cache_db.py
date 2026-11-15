@@ -16,6 +16,7 @@ import json
 import logging
 import os
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
@@ -326,6 +327,7 @@ def test_a_hivemind_failure_is_logged_and_the_global_writer_completes(
     scored = pd.DataFrame({
         "post_id": [5, 6], "final_score": [0.9, 0.8], "score_engagement": [0.5, 0.5],
         "score_recency": [0.4, 0.4], "score_credibility": [0.3, 0.3],
+        "created_at": [datetime.now(tz=timezone.utc).replace(tzinfo=None)] * 2,
     })
     with caplog.at_level(logging.WARNING, logger="haf_fyp.scoring"):
         scoring.write_global_feed_cache(_RehomedSession(db), scored, "1.2.0")
@@ -340,6 +342,7 @@ def test_the_global_writer_renders_the_posts_it_places(db: Connection) -> None:
     scored = pd.DataFrame({
         "post_id": [5, 6], "final_score": [0.9, 0.8], "score_engagement": [0.5, 0.5],
         "score_recency": [0.4, 0.4], "score_credibility": [0.3, 0.3],
+        "created_at": [datetime.now(tz=timezone.utc).replace(tzinfo=None)] * 2,
     })
     scoring.write_global_feed_cache(_RehomedSession(db), scored, "1.2.0")
     assert _cached_bodies(db) == {5: "body of post 5", 6: "body of post 6"}

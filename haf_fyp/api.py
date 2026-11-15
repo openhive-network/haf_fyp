@@ -1558,7 +1558,7 @@ def metrics(response: Response):
     style preference: #36 shipped a `feeds_empty` boolean and #43 tried to make it
     authoritative, and it was wrong in BOTH directions -- true on a node that was
     serving (pre-rendered posts answered without touching hivemind), and false on a
-    node that was not (the global cache is the recency-weighted top 200, so it can
+    node that was not (the global cache is the recency-weighted global pool, so it can
     stay green while per-user feeds are empty). Two separate observations are
     reported instead, and neither is a proxy for the others:
 

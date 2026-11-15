@@ -232,7 +232,7 @@ was wrong in *both* directions, so it is gone rather than left to mislead:
   from pre-rendered JSON, so revoking `SELECT` on `hive_posts` on a warm node left
   every request succeeding;
 * it read `false` on nodes that were **not** — `global_feed_cache` is the
-  recency-weighted top 200, so it can stay green while per-user feeds are empty.
+  recency-weighted global pool, so it can stay green while per-user feeds are empty.
 
 So the section reports two independent observations and lets `degraded` combine
 them, instead of collapsing them into one boolean that is wrong at both ends:
@@ -308,7 +308,7 @@ built per feed entry, so an empty response carries no `fyp` object at all and
 read `fyp.source`; that state is not observable.)
 
 There is also no staleness check here: a ranker that stopped days ago leaves its last
-good 200 rows in place, and they keep resolving, so `global_feed` reads servable.
+good rows in place, and they keep resolving, so `global_feed` reads servable.
 **`/sync-status` does not answer this** — it reports the HAF context advanced by the
 `haf-fyp-sync` service, which keeps running when `haf-fyp-ranker` dies. The signals
 that do move with the ranker are elsewhere in this `/metrics` payload:
@@ -499,7 +499,7 @@ below).
 | GET | `/v1/fyp/algorithms` | `/rpc/list_algorithm_versions` | All registered algorithm versions |
 | GET | `/v1/fyp/feed/{username}?page-size=20` | `/rpc/get_personalized_feed` | Ranked feed for a user; pages of one read session are stable (see [Read sessions](#read-sessions-stable-pages)). With `language=es` (or `es,pt`), only posts in those languages; see [Languages](#languages) |
 | GET | `/v1/fyp/warmup/{username}` | `/rpc/warm_up_feed` | Ask for a fresh feed before the user opens it; 204, no body (see [Read sessions](#read-sessions-stable-pages)) |
-| GET | `/v1/fyp/global?page-size=20` | `/rpc/get_global_feed` | Global feed. With `observer=<account>`, posts by authors that account muted or blacklisted (directly or through a list it follows) are left out before paging (#114); the feed holds at most 200 posts, so it ends sooner for a reader who hides many. `language` as on the user feed. Unauthenticated |
+| GET | `/v1/fyp/global?page-size=20` | `/rpc/get_global_feed` | Global feed. With `observer=<account>`, posts by authors that account muted or blacklisted (directly or through a list it follows) are left out before paging (#114); the feed holds the top 200 plus the last 48 hours of posts (at most 2,500; #130), so it ends sooner for a reader who hides many. `language` as on the user feed. Unauthenticated |
 | GET | `/v1/fyp/profile/{username}` | `/rpc/get_user_profile` | User vector status and top communities |
 | GET | `/v1/fyp/explain/{username}/{post_id}` | `/rpc/get_score_explanation` | Per-signal score breakdown |
 | GET | `/v1/fyp/feed-metrics` | `/rpc/get_feed_metrics` | Feed performance analytics per algorithm version (#13) — product metrics, not service health |
@@ -644,7 +644,7 @@ or `IMMUTABLE`.
 
 ## Ranking Algorithm
 
-**Version 1.3.0** (active on a new install) — four-signal weighted sum with a tiered community boost:
+**Version 1.3.0** — four-signal weighted sum with a tiered community boost:
 
 ```
 final_score = 0.40 × relevance
@@ -703,14 +703,23 @@ comparison is of one period against another. The table is never read back by the
 ranker; it keeps each reader's set from its last ranking under a version that sets
 `author_affinity` (1.4.0, 1.4.1).
 
-**Version 1.4.1** (registered inactive, #117) — 1.4.0 with the affinity share doubled:
+**Version 1.4.1** (active on a new install, #117) — 1.4.0 with the affinity share doubled:
 `author_affinity` 0.60 instead of 0.30, everything else as the node's 1.4.0. Relevance
 at the top of a feed is already about 0.7, so 0.30 of the headroom moves little. In a
 dry run over the 136 cached readers with affinity data on testapi, 1.4.0 kept the same
 20 posts as 1.3.0 in 79 top-20s, and 0.60 in 54; the posts swapped into top-20s about
-doubled (101 to 214). Like 1.4.0 it is activated with `POST /v1/fyp/admin/algorithm`
-and stores affinity in the same table. It needs a ranker that runs 1.4.0's code or
-later: an older one ranks exactly as 1.3.0 and labels its feeds 1.4.1.
+doubled (101 to 214). It stores affinity in the same table as 1.4.0, and needs a ranker
+that runs 1.4.0's code or later: an older one ranks exactly as 1.3.0 and labels its
+feeds 1.4.1. Measured against 1.3.0 on testapi (#117), it showed no measurable
+difference in opens or upvotes, on too little traffic to show a small one.
+
+1.4.1 is the default: an install that registers it activates it only where 1.3.0 was
+the one active version, the way 1.3.0 takes over from 1.1.0. So a new install, and a
+node upgraded from 1.28.8 or older that runs the shipped default (1.1.0 or 1.3.0), end
+on 1.4.1; a node running any other version keeps it. No tagged release shipped 1.4.0 or
+1.4.1: a node on a develop build that registered 1.4.1 inactive keeps the version it
+runs, because the seed cannot tell an operator's choice of 1.3.0 from the old default.
+Switch it with `POST /v1/fyp/admin/algorithm`.
 
 | Signal | Range | Source |
 |--------|-------|--------|
@@ -720,16 +729,22 @@ later: an older one ranks exactly as 1.3.0 and labels its feeds 1.4.1.
 | `credibility` | [0, 1] | 0.6 × normalised reputation + 0.4 × log-normalised VESTS |
 | `community_boost` | ×1.20 | Applied post-sum for subscribed or declared community posts |
 | `community_boost_engaged` | ×1.10 | Applied post-sum for the reader's most-engaged communities, when not subscribed |
-| `boost_rescale` | true | 1.3.0: every score is divided by 1 + the larger boost, so a boosted one is not clipped at 1 |
+| `boost_rescale` | true | 1.3.0 and later: every score is divided by 1 + the larger boost, so a boosted one is not clipped at 1 |
 | `author_affinity` | 0.30 / 0.60 | 1.4.0 / 1.4.1: share of relevance's headroom given to the reader's affinity for the post's author |
 
 All weights are stored in `haf_fyp_app.algorithm_versions` and activated via `POST /v1/fyp/admin/algorithm`. The active version and its weights are returned by `/rpc/get_algorithm`. Every feed response includes per-signal component scores for full transparency; use `/rpc/get_score_explanation` for a detailed breakdown of any individual post.
 
-**Left out before scoring (#89, #111, #112, #113, #115).** Posts their community muted, and posts by
+**Left out before scoring (#89, #111, #112, #113, #115, #131).** Posts their community muted, and posts by
 authors the community muted (all feeds, the global one included); and, for each account,
 posts by authors it muted or blacklisted, directly or through a mute list or blacklist it
 follows. hivemind's own ranked lists return such posts greyed or badged; a recommendation
-leaves them out. Also left out of
+leaves them out. From an account's own feed only (#131): posts it has already upvoted by
+hand, meaning an upvote cast 15 minutes or more after the post, with fewer than 3 votes
+of any kind on that post (the account's own included) from 3 blocks before its block to 3
+blocks after. A vote cast sooner (an auto-vote service, or a reader quick off the mark)
+or among a curation trail's votes keeps the post, and so does a hand vote that leads a
+trail. A trail of a leader and one follower, or a bot that waits and votes alone, looks
+like a hand vote. Also left out of
 every feed: posts tagged `nsfw` or in a community marked NSFW (there is no opt-in yet),
 posts by authors hivemind greys for a low reputation, posts downvoted to
 `DOWNVOTED_AT_NET_RSHARES` net rshares or below, and posts by the accounts in
@@ -741,9 +756,9 @@ Not filtered: the account's own posts, and other NSFW-like tags (`adult`, `18+`,
 `nsfw18`): front ends hide only `nsfw`.
 The filters take effect when a feed is next written (see "How fresh a feed is"): a post
 downvoted or muted after that stays in the feed until then. An account still on the
-cold-start global feed gets every filter, and its own mutes and blacklists are left out
-when it is served (#114). The mutes, blacklists, NSFW marks and grey authors are read from
-hivemind; on a node where one cannot be read the ranker writes feeds
+cold-start global feed gets every filter but the upvoted-by-hand one, and its own mutes
+and blacklists are left out when it is served (#114). The mutes, blacklists, votes, NSFW
+marks and grey authors are read from hivemind; on a node where one cannot be read the ranker writes feeds
 without that filter and logs a warning until it can. The downvote and `EXCLUDED_AUTHORS`
 filters are haf_fyp's own and always apply.
 
@@ -764,7 +779,8 @@ English). A post with none (a caption under a photo, a bare video link: 2%)
 is in no language's feed. Edits do not change a post's languages.
 
 The parameter filters the feed as ranked, before the page is cut: pages are full until it
-runs out, and a reader's feed holds their top 200 posts (the global one, 200), so a
+runs out, and a reader's feed holds their top 200 posts (the global one, its top 200 plus
+the last 48 hours, at most 2,500), so a
 language that is a small share of it gives a short feed, or an empty one: a code no post
 has returns an empty feed, not an error, so a client should offer the unfiltered feed when
 the first page is empty. A blank `language` filters nothing.

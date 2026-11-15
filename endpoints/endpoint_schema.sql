@@ -738,7 +738,7 @@ DECLARE
               ],
               "default": null
             },
-            "description": "Only posts written in this language: a code, or several comma-separated (es or es,pt; case and spaces ignored, and a region cut off, so es-ES and pt_BR are es and pt). Codes are ISO 639-1 where the language has one, else ISO 639-3 (yue, ary); see README \"Languages\" for close languages to send together (no,nn; id,ms). The posts are left out before the page is cut, so pages are full until the feed runs out. It filters the feed as ranked, which holds the reader's top 200 posts (the global fallback, 200 too), so a language that is a small share of it gives a short feed. A post's languages are detected from its title and body when the ranker first reads it; a post written in two languages counts for both, and one too short to tell (a caption under a photo) counts for none; a language a post declares in its metadata is not read, and an edit does not change it. A code no post has returns an empty feed, not an error, so an empty first page means \"nothing in this language here\": offer the unfiltered feed. Blank means no filter. Nodes older than this parameter answer 404 when it is sent."
+            "description": "Only posts written in this language: a code, or several comma-separated (es or es,pt; case and spaces ignored, and a region cut off, so es-ES and pt_BR are es and pt). Codes are ISO 639-1 where the language has one, else ISO 639-3 (yue, ary); see README \"Languages\" for close languages to send together (no,nn; id,ms). The posts are left out before the page is cut, so pages are full until the feed runs out. It filters the feed as ranked, which holds the reader's top 200 posts (the global fallback, its top 200 plus the last 48 hours, at most 2,500), so a language that is a small share of it gives a short feed. A post's languages are detected from its title and body when the ranker first reads it; a post written in two languages counts for both, and one too short to tell (a caption under a photo) counts for none; a language a post declares in its metadata is not read, and an edit does not change it. A code no post has returns an empty feed, not an error, so an empty first page means \"nothing in this language here\": offer the unfiltered feed. Blank means no filter. Nodes older than this parameter answer 404 when it is sent."
           }
         ],
         "responses": {
@@ -858,7 +858,7 @@ DECLARE
               ],
               "default": null
             },
-            "description": "Hive account the feed is shown to (optional; a leading @ is ignored). Posts by authors it has muted or blacklisted, directly or through a list it follows, are left out before the page is cut, so pages are full until the feed runs out; it holds at most 200 posts, so a reader who hides many authors reaches the end sooner. Cached posts carry no observer context; a post not yet in the render cache is rendered for this account. An unknown account is served as if none was given. Not authenticated: it filters for whoever is named. Nodes older than this parameter answer 404 when it is sent."
+            "description": "Hive account the feed is shown to (optional; a leading @ is ignored). Posts by authors it has muted or blacklisted, directly or through a list it follows, are left out before the page is cut, so pages are full until the feed runs out; it holds the top 200 plus the last 48 hours of posts (at most 2,500), so a reader who hides many authors reaches the end sooner. Cached posts carry no observer context; a post not yet in the render cache is rendered for this account. An unknown account is served as if none was given. Not authenticated: it filters for whoever is named. Nodes older than this parameter answer 404 when it is sent."
           },
           {
             "in": "query",
@@ -871,7 +871,7 @@ DECLARE
               ],
               "default": null
             },
-            "description": "Only posts written in this language: a code, or several comma-separated (es or es,pt; case and spaces ignored, and a region cut off, so es-ES and pt_BR are es and pt). Codes are ISO 639-1 where the language has one, else ISO 639-3 (yue, ary); see README \"Languages\" for close languages to send together (no,nn; id,ms). The posts are left out before the page is cut, so pages are full until the feed runs out. It filters the feed as ranked, which holds 200 posts, so a language that is a small share of it gives a short feed. A post's languages are detected from its title and body when the ranker first reads it; a post written in two languages counts for both, and one too short to tell (a caption under a photo) counts for none; a language a post declares in its metadata is not read, and an edit does not change it. A code no post has returns an empty feed, not an error, so an empty first page means \"nothing in this language here\": offer the unfiltered feed. Blank means no filter. Nodes older than this parameter answer 404 when it is sent."
+            "description": "Only posts written in this language: a code, or several comma-separated (es or es,pt; case and spaces ignored, and a region cut off, so es-ES and pt_BR are es and pt). Codes are ISO 639-1 where the language has one, else ISO 639-3 (yue, ary); see README \"Languages\" for close languages to send together (no,nn; id,ms). The posts are left out before the page is cut, so pages are full until the feed runs out. It filters the feed as ranked, which holds the top 200 plus the last 48 hours of posts (at most 2,500), so a language that is a small share of it gives a short feed. A post's languages are detected from its title and body when the ranker first reads it; a post written in two languages counts for both, and one too short to tell (a caption under a photo) counts for none; a language a post declares in its metadata is not read, and an edit does not change it. A code no post has returns an empty feed, not an error, so an empty first page means \"nothing in this language here\": offer the unfiltered feed. Blank means no filter. Nodes older than this parameter answer 404 when it is sent."
           }
         ],
         "responses": {
@@ -1635,11 +1635,18 @@ GRANT EXECUTE ON FUNCTION haf_fyp_app.get_bridge_post(int, int, int) TO haf_fyp_
 -- read them). haf_fyp.visibility leaves the same authors out of a personal feed when the
 -- ranker writes it (#89, #113).
 --
--- Applied to the whole cache (at most 200 posts) before the page is cut, so the hidden
--- posts are skipped, not blanked: pages are full until the cache runs out, which for a
--- reader who hides many authors is sooner. The reader's own posts are never hidden.
--- Primary-key probes per post (all four tables are keyed (follower, following)): the
--- size of a list does not matter, the number of lists the observer follows does.
+-- Applied to the whole cache (the top 200 plus 48h of posts, at most 2,500; #130) before the page
+-- is cut, so the hidden posts are skipped, not blanked: pages are full until the cache
+-- runs out, which for a reader who hides many authors is sooner. The reader's own posts
+-- are never hidden.
+-- One semi-join of the cache's authors against the observer's hidden authors, not four
+-- correlated probes per post: on testapi (2026-11-10, a 2,470-post pool) the probes
+-- took 470-540 ms for a reader who mutes 38k accounts, this takes 22 ms, and 58 ms for
+-- one who follows large mute lists (the old body took 62 ms for that reader over the old
+-- 200-post cache). The cost is now the total size of the observer's hidden sets (its own
+-- lists plus the lists it follows), not the depth of the cache. A generic plan, as plpgsql
+-- caches after five calls, keeps the same shape (the cache drives, the hidden set is
+-- hashed): 23-95 ms for the same two readers.
 -- Observer 0 or below is anonymous: nothing hidden, and hivemind not read.
 -- When those tables cannot be read (not there, or no grant), nothing is hidden and the
 -- feed is served, as the ranker writes feeds without a filter it cannot read.
@@ -1658,16 +1665,20 @@ BEGIN
         FROM haf_fyp_app.global_feed_cache AS gfc
         JOIN hivemind_app.hive_posts AS hp ON hp.id = gfc.post_id
         WHERE hp.author_id <> _observer_id
-          AND (EXISTS (SELECT 1 FROM hivemind_app.muted AS m
-                      WHERE m.follower = _observer_id AND m.following = hp.author_id)
-           OR EXISTS (SELECT 1 FROM hivemind_app.follow_muted AS fm
-                      JOIN hivemind_app.muted AS m ON m.follower = fm.following
-                      WHERE fm.follower = _observer_id AND m.following = hp.author_id)
-           OR EXISTS (SELECT 1 FROM hivemind_app.blacklisted AS b
-                      WHERE b.follower = _observer_id AND b.following = hp.author_id)
-           OR EXISTS (SELECT 1 FROM hivemind_app.follow_blacklisted AS fb
-                      JOIN hivemind_app.blacklisted AS b ON b.follower = fb.following
-                      WHERE fb.follower = _observer_id AND b.following = hp.author_id))
+          AND hp.author_id IN (
+              SELECT m.following FROM hivemind_app.muted AS m
+              WHERE m.follower = _observer_id
+              UNION ALL
+              SELECT m.following FROM hivemind_app.follow_muted AS fm
+              JOIN hivemind_app.muted AS m ON m.follower = fm.following
+              WHERE fm.follower = _observer_id
+              UNION ALL
+              SELECT b.following FROM hivemind_app.blacklisted AS b
+              WHERE b.follower = _observer_id
+              UNION ALL
+              SELECT b.following FROM hivemind_app.follow_blacklisted AS fb
+              JOIN hivemind_app.blacklisted AS b ON b.follower = fb.following
+              WHERE fb.follower = _observer_id)
     ), '{}'::int[]);
 EXCEPTION
     -- The same SQLSTATEs as haf_fyp.visibility._NOT_THERE.
@@ -1767,7 +1778,7 @@ GRANT EXECUTE ON FUNCTION haf_fyp_app.hivemind_post_identity(int) TO haf_fyp_use
           ISO 639-3 (yue, ary); see README "Languages" for close languages to send
           together (no,nn; id,ms). The posts are left out before the page is cut, so
           pages are full until the feed runs out.
-          It filters the feed as ranked, which holds the reader's top 200 posts (the global fallback, 200 too), so a language that is a
+          It filters the feed as ranked, which holds the reader's top 200 posts (the global fallback, its top 200 plus the last 48 hours, at most 2,500), so a language that is a
           small share of it gives a short feed. A post's languages are detected from
           its title and body when the ranker first reads it; a post written in two
           languages counts for both, and one too short to tell (a caption under a
@@ -2177,7 +2188,7 @@ $$;
           Hive account the feed is shown to (optional; a leading @ is ignored).
           Posts by authors it has muted or blacklisted, directly or through a list
           it follows, are left out before the page is cut, so pages are full until
-          the feed runs out; it holds at most 200 posts, so a reader who hides many
+          the feed runs out; it holds the top 200 plus the last 48 hours of posts (at most 2,500), so a reader who hides many
           authors reaches the end sooner. Cached posts carry no observer context; a
           post not yet in the render cache is rendered for this account. An unknown
           account is served as if none was given. Not authenticated: it filters for
@@ -2195,7 +2206,7 @@ $$;
           ISO 639-3 (yue, ary); see README "Languages" for close languages to send
           together (no,nn; id,ms). The posts are left out before the page is cut, so
           pages are full until the feed runs out.
-          It filters the feed as ranked, which holds 200 posts, so a language that is a
+          It filters the feed as ranked, which holds the top 200 plus the last 48 hours of posts (at most 2,500), so a language that is a
           small share of it gives a short feed. A post's languages are detected from
           its title and body when the ranker first reads it; a post written in two
           languages counts for both, and one too short to tell (a caption under a
@@ -2317,7 +2328,7 @@ BEGIN
                         'algorithm_version', gfc.algorithm_version
                     ) AS fyp
                 -- The community filter reads post_candidates (global_feed_cache is
-                -- capped at the top ~200 posts, so this is a tiny PK-probed scan).
+                -- capped at 2,500 posts (#130), so this is a small PK-probed scan).
                 FROM haf_fyp_app.global_feed_cache gfc
                 LEFT JOIN haf_fyp_app.post_bridge_cache pbc ON pbc.post_id = gfc.post_id
                 WHERE gfc.post_id <> ALL (_hidden)

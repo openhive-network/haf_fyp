@@ -18,7 +18,7 @@ and credibility (btracker VESTS + reptracker reputation).
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
 import numpy as np
@@ -472,16 +472,20 @@ def compute_scores(
     return ranked
 
 
-def render_bridge_for_posts(conn: Any, post_ids: list[int]) -> None:
+def render_bridge_for_posts(
+    conn: Any, post_ids: list[int], fresh_minutes: int = 5, limit: int | None = None
+) -> None:
     """Render and cache the observer-agnostic bridge JSON for the given posts.
 
     post_ids are hivemind hive_posts ids, as the feed caches hold them. The result
     lands in haf_fyp_app.post_bridge_cache, which the feed endpoints read before
     rendering a post live. One set-based upsert that skips posts already cached and
-    paid out (frozen) or rendered in the last 5 minutes, so a post shared by many
-    feeds is rendered at most once per cycle; the skip is decided before the
+    paid out (frozen) or rendered in the last fresh_minutes (5 by default), so a post
+    shared by many feeds is rendered at most once per cycle; the skip is decided before the
     get_bridge_post LATERAL, so a skipped post costs nothing. Posts no longer in
     post_candidates are skipped too (the cache row would outlive the window).
+    With a limit, at most that many are rendered: those never rendered first, then the
+    oldest renders, so a long list is refreshed over several calls (#130).
 
     Best-effort: a hivemind error is logged and rolled back, never raised, so it
     cannot break a ranking cycle. A lost connection (OperationalError) propagates
@@ -500,13 +504,13 @@ def render_bridge_for_posts(conn: Any, post_ids: list[int]) -> None:
                 FROM (
                     SELECT pc.post_id
                     FROM haf_fyp_app.post_candidates pc
+                    LEFT JOIN haf_fyp_app.post_bridge_cache c ON c.post_id = pc.post_id
                     WHERE pc.post_id = ANY(%s::int[])
-                      AND NOT EXISTS (
-                          SELECT 1 FROM haf_fyp_app.post_bridge_cache c
-                          WHERE c.post_id = pc.post_id
-                            AND (c.is_paidout
-                                 OR c.computed_at > now() - INTERVAL '5 minutes')
-                      )
+                      AND (c.post_id IS NULL
+                           OR NOT (c.is_paidout
+                                   OR c.computed_at > now() - make_interval(mins => %s)))
+                    ORDER BY c.computed_at NULLS FIRST
+                    LIMIT %s
                 ) s
                 CROSS JOIN LATERAL
                     haf_fyp_app.get_bridge_post(s.post_id, 0, 0) AS b(bridge)
@@ -516,7 +520,7 @@ def render_bridge_for_posts(conn: Any, post_ids: list[int]) -> None:
                         is_paidout = EXCLUDED.is_paidout,
                         computed_at = now()
                 """,
-                (post_ids,),
+                (post_ids, fresh_minutes, limit),
             )
         conn.commit()
     except psycopg2.OperationalError:
@@ -667,14 +671,45 @@ def write_feed_cache(
     render_bridge_for_posts(conn, [int(x) for x in top["post_id"].tolist()])
 
 
+# The global feed's pool (#130): the ranked posts of the last GLOBAL_FEED_HOURS, at
+# most GLOBAL_FEED_MAX_POSTS, and never fewer than the top GLOBAL_FEED_TOP whatever
+# their age. It was the top 200 alone, which the recency score keeps to the last ~8
+# hours, and get_global_feed filters language and observer inside the pool: on
+# testapi (2026-11-10) language=pt or de returned about 2 posts. 48h held 2,470 posts
+# there, so on a busy day the cap cuts the lowest-ranked of the recent posts.
+GLOBAL_FEED_TOP = 200
+GLOBAL_FEED_HOURS = 48
+GLOBAL_FEED_MAX_POSTS = 2500
+# The top GLOBAL_FEED_TOP are the unfiltered first pages, re-rendered on the usual
+# 5-minute rule; the deeper posts are mostly read through a filter and refresh every
+# DEEP_RENDER_MINUTES, at most DEEP_RENDER_MAX_PER_CYCLE a cycle (never rendered
+# first, then the oldest). Re-rendering all 2,500 every 5-minute cycle costs ~11 s
+# (~4.4 ms a post) and rewrites ~20 MB of post_bridge_cache each time; without the
+# limit the deeper posts, rendered together once, would also go stale together and
+# cost ~10 s every sixth cycle. ~2,300 deeper posts every 30 minutes is ~380 a cycle,
+# so 500 keeps up, and a pool rendered from scratch catches up in ~5 cycles.
+DEEP_RENDER_MINUTES = 30
+DEEP_RENDER_MAX_PER_CYCLE = 500
+
+
 def write_global_feed_cache(conn, scored_df: pd.DataFrame, algo_version: str) -> None:
-    """Replace global_feed_cache with the top 200 posts by base score.
+    """Replace global_feed_cache with the global feed's pool.
+
+    The pool is GLOBAL_FEED_TOP posts by base score plus every other scored post
+    created in the last GLOBAL_FEED_HOURS, in ranked order, at most
+    GLOBAL_FEED_MAX_POSTS (#130).
 
     algo_version is stamped on every row (#23). It used to be accepted here and
     then dropped, which left every global-sourced impression unattributable --
     both /v1/fyp/global and the cold-start fallback inside get_personalized_feed.
     """
-    top = scored_df.head(200)
+    # created_at is naive UTC, as compute_recency reads it.
+    cutoff = datetime.now(tz=timezone.utc).replace(tzinfo=None) - timedelta(
+        hours=GLOBAL_FEED_HOURS
+    )
+    recent = pd.to_datetime(scored_df["created_at"]) >= cutoff
+    in_top = pd.Series(range(len(scored_df)), index=scored_df.index) < GLOBAL_FEED_TOP
+    top = scored_df[in_top | recent].head(GLOBAL_FEED_MAX_POSTS)
     now = datetime.utcnow()
     # Rows as Any: the stubs type each itertuples() field as a union of every pandas
     # scalar type, NA and None, since the columns' dtypes are this frame's, not the
@@ -705,5 +740,10 @@ def write_global_feed_cache(conn, scored_df: pd.DataFrame, algo_version: str) ->
             rows,
         )
     conn.commit()
+    log.info("global feed written (%d posts)", len(rows))
     # Observer-agnostic, which is exactly what the unauthenticated global feed serves.
-    render_bridge_for_posts(conn, [int(x) for x in top["post_id"].tolist()])
+    post_ids = [int(x) for x in top["post_id"].tolist()]
+    render_bridge_for_posts(conn, post_ids[:GLOBAL_FEED_TOP])
+    render_bridge_for_posts(
+        conn, post_ids[GLOBAL_FEED_TOP:], DEEP_RENDER_MINUTES, DEEP_RENDER_MAX_PER_CYCLE
+    )

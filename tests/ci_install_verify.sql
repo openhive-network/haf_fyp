@@ -895,7 +895,7 @@ BEGIN
     -- telemetry rollup starts from the beginning.
     IF current_setting('ci.phase') = 'first' THEN
         IF (SELECT md5(string_agg(v.version || ' ' || v.is_active || ' ' || v.weights::text, E'\n' ORDER BY v.version COLLATE "C"))
-            FROM haf_fyp_app.algorithm_versions AS v) IS DISTINCT FROM 'd8e1aae3f43fb30bc884167d5bb74e67' THEN
+            FROM haf_fyp_app.algorithm_versions AS v) IS DISTINCT FROM 'fce2eb74936156c04deba6c420bcf4a8' THEN
             RAISE EXCEPTION E'the seeded algorithm versions are not the ones tests/ci_install_verify.sql pins (db/seed_data.sql changed?). They read, as md5 %:\n%',
                 (SELECT md5(string_agg(v.version || ' ' || v.is_active || ' ' || v.weights::text, E'\n' ORDER BY v.version COLLATE "C"))
                  FROM haf_fyp_app.algorithm_versions AS v),
@@ -910,10 +910,10 @@ BEGIN
     SELECT string_agg(v.version, ',' ORDER BY v.version) INTO _active
     FROM haf_fyp_app.algorithm_versions AS v WHERE v.is_active;
     IF current_setting('ci.phase') = 'first' THEN
-        -- db/seed_data.sql ships 1.3.0 active (it takes over from 1.1.0, #116) and 1.2.0
-        -- registered but not yet live.
-        IF _active IS DISTINCT FROM '1.3.0' THEN
-            RAISE EXCEPTION 'a fresh install activated %, not 1.3.0 as db/seed_data.sql ships', _active;
+        -- db/seed_data.sql ships 1.4.1 active (1.3.0 takes over from 1.1.0, #116, then
+        -- 1.4.1 from 1.3.0, #117) and the others registered but not live.
+        IF _active IS DISTINCT FROM '1.4.1' THEN
+            RAISE EXCEPTION 'a fresh install activated %, not 1.4.1 as db/seed_data.sql ships', _active;
         END IF;
     ELSIF _active IS DISTINCT FROM (SELECT min(v.version) FROM haf_fyp_app.algorithm_versions AS v) THEN
         RAISE EXCEPTION 'in phase % the active version is %, not the one the operator chose', current_setting('ci.phase'), _active;
