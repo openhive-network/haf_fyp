@@ -172,8 +172,9 @@ def _drop_churn(stop_at: float) -> None:
     The churner meets the same race from its side (a DROP behind the GRANT's walk can fail
     with "tuple concurrently updated", or deadlock), and an error ends the DO block. It is
     restarted until stop_at, so one such hit does not leave the rest of the round without
-    churn (#122); any other error is raised. IF [NOT] EXISTS keeps a restart from failing
-    on a table whose DROP committed but whose CREATE did not."""
+    churn (#122). Any other error ends the churner and fails the round (_under_churn
+    re-raises it). IF [NOT] EXISTS keeps a restart from failing on a table whose DROP
+    committed but whose CREATE did not."""
     c = _connect(TEST_DB)
     c.autocommit = True
     try:
@@ -189,7 +190,9 @@ def _drop_churn(stop_at: float) -> None:
                         "EXIT WHEN clock_timestamp() > t; END LOOP; END $$"
                         % (left, CHURN_TABLES))
                 except psycopg2.Error as exc:
-                    if exc.pgcode not in ("XX000", "40P01"):
+                    if not (exc.pgcode == "40P01" or (
+                            exc.pgcode == "XX000"
+                            and any(m in str(exc) for m in (CONFLICT, DELETED, LOOKUP)))):
                         raise
     finally:
         c.close()
@@ -198,9 +201,19 @@ def _drop_churn(stop_at: float) -> None:
 def _under_churn(
         conn: connection, statements: list[str], churn: Callable[[float], None] = _churn,
 ) -> psycopg2.Error | None:
-    """Run statements while churn runs; return the error raised, or None."""
+    """Run statements while churn runs; return the error raised, or None. An error that
+    ends the churner itself is raised here: in its thread it would only be a warning, and
+    the round would have run without churn."""
     stop_at = time.monotonic() + CHURN_SECONDS
-    t = threading.Thread(target=churn, args=(stop_at,))
+    churn_failed: list[BaseException] = []
+
+    def _run_churn() -> None:
+        try:
+            churn(stop_at)
+        except BaseException as exc:  # noqa: BLE001 -- re-raised in the test's thread
+            churn_failed.append(exc)
+
+    t = threading.Thread(target=_run_churn)
     t.start()
     time.sleep(0.3)  # let the churner reach its loop
     error: psycopg2.Error | None = None
@@ -212,6 +225,8 @@ def _under_churn(
         error = exc
     finally:
         t.join()
+    if churn_failed:
+        raise churn_failed[0]
     return error
 
 
@@ -305,10 +320,11 @@ def test_shipped_file_survives_a_concurrent_table_dropper(conn: connection) -> N
         err = _under_churn(conn, statements, churn=_drop_churn)
         assert err is None, f"round {round_no}: {err.pgcode} {err}"
         notices = "".join(conn.notices)
-        retries += len(re.findall(
-            rf"hivemind_app: ({DELETED}|{LOOKUP} \d+) \(attempt \d of 5\), retrying", notices))
+        # Any retried conflict counts: against a dropper the GRANT can also meet "tuple
+        # concurrently updated" or a deadlock, and all of them are the race.
+        retries += len(re.findall(r"hivemind_app: [^\n]* \(attempt \d of 5\), retrying", notices))
         assert notices.count("hivemind_app: granted SELECT + EXECUTE") == 1, notices
-    _report(f"shipped file (drop): {rounds}/{rounds} runs passed, {retries} retried attempts")
+    _report(f"shipped file (drop): {rounds} runs passed, {retries} retried attempts")
     assert retries >= 1, f"the drop race was not met in {rounds} rounds"
 
 
