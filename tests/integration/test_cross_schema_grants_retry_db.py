@@ -54,6 +54,9 @@ CHURN_TABLES = 400
 # a writer that never stops is not what the issue saw and no bounded retry survives it.
 CHURN_SECONDS = 2.0
 ROUNDS = 5
+# The drop race can miss all ROUNDS on a fast host (#122); the dropper test then runs more
+# rounds, up to this many, until one meets it.
+MAX_ROUNDS = 20
 
 # Every schema a retry loop grants on, in file order. hafd's loop is the unguarded one and
 # prints no success NOTICE (it never did).
@@ -164,19 +167,33 @@ def _churn(stop_at) -> None:
 def _drop_churn(stop_at: float) -> None:
     """DROP and re-CREATE random hivemind_app tables until stop_at, as an app's block
     processing would. Looped server-side, committing each statement: fast enough that a
-    GRANT walking the schema meets a table dropped under it."""
+    GRANT walking the schema meets a table dropped under it.
+
+    The churner meets the same race from its side (a DROP behind the GRANT's walk can fail
+    with "tuple concurrently updated", or deadlock), and an error ends the DO block. It is
+    restarted until stop_at, so one such hit does not leave the rest of the round without
+    churn (#122). Any other error ends the churner and fails the round (_under_churn
+    re-raises it). IF [NOT] EXISTS keeps a restart from failing on a table whose DROP
+    committed but whose CREATE did not."""
     c = _connect(TEST_DB)
     c.autocommit = True
     try:
         with c.cursor() as cur:
-            cur.execute(
-                "DO $$ DECLARE t timestamptz := clock_timestamp() + %s * interval '1 s'; i int; "
-                "BEGIN LOOP "
-                "i := 1 + floor(random() * %s)::int; "
-                "EXECUTE format('DROP TABLE hivemind_app.t%%s', i); COMMIT; "
-                "EXECUTE format('CREATE TABLE hivemind_app.t%%s (id int)', i); COMMIT; "
-                "EXIT WHEN clock_timestamp() > t; END LOOP; END $$"
-                % (max(stop_at - time.monotonic(), 0), CHURN_TABLES))
+            while (left := stop_at - time.monotonic()) > 0:
+                try:
+                    cur.execute(
+                        "DO $$ DECLARE t timestamptz := clock_timestamp() + %s * interval '1 s'; i int; "
+                        "BEGIN LOOP "
+                        "i := 1 + floor(random() * %s)::int; "
+                        "EXECUTE format('DROP TABLE IF EXISTS hivemind_app.t%%s', i); COMMIT; "
+                        "EXECUTE format('CREATE TABLE IF NOT EXISTS hivemind_app.t%%s (id int)', i); COMMIT; "
+                        "EXIT WHEN clock_timestamp() > t; END LOOP; END $$"
+                        % (left, CHURN_TABLES))
+                except psycopg2.Error as exc:
+                    if not (exc.pgcode == "40P01" or (
+                            exc.pgcode == "XX000"
+                            and any(m in str(exc) for m in (CONFLICT, DELETED, LOOKUP)))):
+                        raise
     finally:
         c.close()
 
@@ -184,9 +201,19 @@ def _drop_churn(stop_at: float) -> None:
 def _under_churn(
         conn: connection, statements: list[str], churn: Callable[[float], None] = _churn,
 ) -> psycopg2.Error | None:
-    """Run statements while churn runs; return the error raised, or None."""
+    """Run statements while churn runs; return the error raised, or None. An error that
+    ends the churner itself is raised here: in its thread it would only be a warning, and
+    the round would have run without churn."""
     stop_at = time.monotonic() + CHURN_SECONDS
-    t = threading.Thread(target=churn, args=(stop_at,))
+    churn_failed: list[BaseException] = []
+
+    def _run_churn() -> None:
+        try:
+            churn(stop_at)
+        except BaseException as exc:  # noqa: BLE001 -- re-raised in the test's thread
+            churn_failed.append(exc)
+
+    t = threading.Thread(target=_run_churn)
     t.start()
     time.sleep(0.3)  # let the churner reach its loop
     error: psycopg2.Error | None = None
@@ -198,6 +225,8 @@ def _under_churn(
         error = exc
     finally:
         t.join()
+    if churn_failed:
+        raise churn_failed[0]
     return error
 
 
@@ -281,17 +310,22 @@ def test_negative_control_bare_grant_hits_a_dropped_table(conn: connection) -> N
 def test_shipped_file_survives_a_concurrent_table_dropper(conn: connection) -> None:
     _many_tables(conn)
     statements = _statements(open(GRANTS_SQL, encoding="utf-8").read())
-    retries = 0
-    for round_no in range(ROUNDS):
+    retries = rounds = 0
+    # Every round must pass; at least ROUNDS run, and more (up to MAX_ROUNDS) until one has
+    # met the drop race, so the assertion below still proves it was met and retried (#122).
+    while rounds < ROUNDS or (retries == 0 and rounds < MAX_ROUNDS):
+        round_no = rounds
+        rounds += 1
         del conn.notices[:]
         err = _under_churn(conn, statements, churn=_drop_churn)
         assert err is None, f"round {round_no}: {err.pgcode} {err}"
         notices = "".join(conn.notices)
-        retries += len(re.findall(
-            rf"hivemind_app: ({DELETED}|{LOOKUP} \d+) \(attempt \d of 5\), retrying", notices))
+        # Any retried conflict counts: against a dropper the GRANT can also meet "tuple
+        # concurrently updated" or a deadlock, and all of them are the race.
+        retries += len(re.findall(r"hivemind_app: [^\n]* \(attempt \d of 5\), retrying", notices))
         assert notices.count("hivemind_app: granted SELECT + EXECUTE") == 1, notices
-    _report(f"shipped file (drop): {ROUNDS}/{ROUNDS} runs passed, {retries} retried attempts")
-    assert retries >= 1
+    _report(f"shipped file (drop): {rounds} runs passed, {retries} retried attempts")
+    assert retries >= 1, f"the drop race was not met in {rounds} rounds"
 
 
 # ---------------------------------------------------------------------------
