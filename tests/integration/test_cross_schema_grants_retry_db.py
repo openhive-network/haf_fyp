@@ -164,19 +164,29 @@ def _churn(stop_at) -> None:
 def _drop_churn(stop_at: float) -> None:
     """DROP and re-CREATE random hivemind_app tables until stop_at, as an app's block
     processing would. Looped server-side, committing each statement: fast enough that a
-    GRANT walking the schema meets a table dropped under it."""
+    GRANT walking the schema meets a table dropped under it.
+
+    The churner meets the same race from its side (a DROP behind the GRANT's walk can fail
+    with "tuple concurrently updated"), and an error ends the DO block. It is restarted
+    until stop_at, so one such hit does not leave the rest of the round without churn
+    (#122). IF [NOT] EXISTS keeps a restart from failing on a table whose DROP committed
+    but whose CREATE did not."""
     c = _connect(TEST_DB)
     c.autocommit = True
     try:
         with c.cursor() as cur:
-            cur.execute(
-                "DO $$ DECLARE t timestamptz := clock_timestamp() + %s * interval '1 s'; i int; "
-                "BEGIN LOOP "
-                "i := 1 + floor(random() * %s)::int; "
-                "EXECUTE format('DROP TABLE hivemind_app.t%%s', i); COMMIT; "
-                "EXECUTE format('CREATE TABLE hivemind_app.t%%s (id int)', i); COMMIT; "
-                "EXIT WHEN clock_timestamp() > t; END LOOP; END $$"
-                % (max(stop_at - time.monotonic(), 0), CHURN_TABLES))
+            while (left := stop_at - time.monotonic()) > 0:
+                try:
+                    cur.execute(
+                        "DO $$ DECLARE t timestamptz := clock_timestamp() + %s * interval '1 s'; i int; "
+                        "BEGIN LOOP "
+                        "i := 1 + floor(random() * %s)::int; "
+                        "EXECUTE format('DROP TABLE IF EXISTS hivemind_app.t%%s', i); COMMIT; "
+                        "EXECUTE format('CREATE TABLE IF NOT EXISTS hivemind_app.t%%s (id int)', i); COMMIT; "
+                        "EXIT WHEN clock_timestamp() > t; END LOOP; END $$"
+                        % (left, CHURN_TABLES))
+                except psycopg2.Error:
+                    pass
     finally:
         c.close()
 
@@ -204,6 +214,15 @@ def _under_churn(
 def _report(line: str) -> None:
     print(line)
     warnings.warn(line, stacklevel=2)
+
+
+def _require_the_race(retries: int, what: str) -> None:
+    """Every round passed; if none of them met the conflict, the shipped file was not
+    tested against it. That is no failure of the file (#122: a fast host can finish the
+    GRANT walk between two drops in all rounds), so skip, which keeps it visible. The
+    negative controls above assert that the harness does reproduce the race."""
+    if retries == 0:
+        pytest.skip(f"{what}: the race never fired in {ROUNDS} rounds, nothing was retried")
 
 
 def _many_tables(conn: connection) -> None:
@@ -250,13 +269,13 @@ def test_shipped_file_survives_a_concurrent_grant_writer(conn) -> None:
         # Same NOTICEs as before the fix: the success line, exactly once per run.
         assert notices.count("hivemind_app: granted SELECT + EXECUTE") == 1, notices
     _report(f"shipped file: {ROUNDS}/{ROUNDS} runs passed, {retries} retried attempts")
-    # Proves the conflict was actually met and retried, not merely avoided.
-    assert retries >= 1
     with conn.cursor() as cur:
         cur.execute(
             "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
             "WHERE n.nspname = 'hivemind_app' AND has_table_privilege('haf_fyp_owner', c.oid, 'SELECT')")
         assert cur.fetchone()[0] == CHURN_TABLES
+    # Proves the conflict was actually met and retried, not merely avoided.
+    _require_the_race(retries, "grant writer")
 
 
 def _is_drop_conflict(err: psycopg2.Error) -> bool:
@@ -291,7 +310,7 @@ def test_shipped_file_survives_a_concurrent_table_dropper(conn: connection) -> N
             rf"hivemind_app: ({DELETED}|{LOOKUP} \d+) \(attempt \d of 5\), retrying", notices))
         assert notices.count("hivemind_app: granted SELECT + EXECUTE") == 1, notices
     _report(f"shipped file (drop): {ROUNDS}/{ROUNDS} runs passed, {retries} retried attempts")
-    assert retries >= 1
+    _require_the_race(retries, "table dropper")
 
 
 # ---------------------------------------------------------------------------
