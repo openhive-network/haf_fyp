@@ -68,4 +68,9 @@ if grep -q 'Self-healing incomplete' <<<"${grant_output}"; then
     log "WARNING: some targets could not be self-healed — see the line above."
 fi
 
+if grep -q 'grants skipped' <<<"${grant_output}"; then
+    log "WARNING: some schemas were skipped while another app's install was changing them"
+    log "         (named above). Re-run this script once the other installs finish."
+fi
+
 log "Done. Check NOTICE output above — re-run after installing any missing apps."
