@@ -4,6 +4,12 @@
 # Run as haf_admin AFTER HiveSense, btracker, and reptracker are installed.
 # Safe to re-run — missing schemas are skipped with a NOTICE, not an error.
 # Re-run once for each app that was installed after haf_fyp.
+#
+# --retry-for=SECONDS  While a schema's grants are skipped because another app's install
+#                      is still changing it, re-run the grants every
+#                      HAF_FYP_GRANT_RETRY_INTERVAL_SECONDS (default 30) until nothing is
+#                      skipped or SECONDS have passed. Default 0: one pass. install_app.sh
+#                      passes it when its own pass skipped a schema (#134).
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,6 +33,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 source "${SCRIPT_DIR}/common.sh"
 
+RETRY_FOR=0
+for arg in "$@"; do
+    case "$arg" in
+        --retry-for=*) require_flag_value "$arg"; RETRY_FOR="${arg#*=}" ;;
+        *) log "ERROR: '${arg}' is not a valid option (only --retry-for=SECONDS)"; exit 2 ;;
+    esac
+done
+RETRY_INTERVAL="${HAF_FYP_GRANT_RETRY_INTERVAL_SECONDS:-30}"
+for _value in "${RETRY_FOR}" "${RETRY_INTERVAL}"; do
+    case "${_value}" in
+        '' | *[!0-9]*)
+            log "ERROR: '${_value}' is not a number of seconds (--retry-for= / HAF_FYP_GRANT_RETRY_INTERVAL_SECONDS)."
+            exit 2
+            ;;
+    esac
+done
+
 wait_for_postgres
 
 # A deliberate override is still allowed, but say what it buys. Membership in the
@@ -46,16 +69,33 @@ log "Granting cross-schema read access to haf_fyp_user..."
 # what psql wrote -- so a real SQL error (ON_ERROR_STOP=on) would leave the operator
 # with a bare exit code and no diagnostics at all, in the one script whose whole
 # purpose is to stop silent failures. Capture, restore -e, print, then decide.
-set +e
-grant_output="$(run_sql_file "${SCRIPT_DIR}/../db/cross_schema_grants.sql" 2>&1)"
-grant_status=$?
-set -e
-echo "${grant_output}"
+#
+# A pass that skipped a schema is repeated while --retry-for allows (#134): the file is
+# idempotent, and between passes nothing is held, so the other app's install is never
+# kept waiting on this one. Every pass is checked for a real failure, which still ends
+# the script at once.
+_retry_until=$((SECONDS + RETRY_FOR))
+while :; do
+    set +e
+    grant_output="$(run_sql_file "${SCRIPT_DIR}/../db/cross_schema_grants.sql" 2>&1)"
+    grant_status=$?
+    set -e
+    echo "${grant_output}"
 
-if [ "${grant_status}" -ne 0 ]; then
-    log "ERROR: cross_schema_grants.sql failed (psql exit ${grant_status}) — see output above."
-    exit "${grant_status}"
-fi
+    if [ "${grant_status}" -ne 0 ]; then
+        log "ERROR: cross_schema_grants.sql failed (psql exit ${grant_status}) — see output above."
+        exit "${grant_status}"
+    fi
+
+    if ! grep -q 'grants skipped' <<<"${grant_output}" \
+       || [ "${SECONDS}" -ge "${_retry_until}" ] \
+       || [ $((SECONDS + RETRY_INTERVAL)) -gt "${_retry_until}" ]; then
+        break
+    fi
+    log "Some schemas were skipped while another app's install was changing them;"
+    log "retrying in ${RETRY_INTERVAL}s (until $((_retry_until - SECONDS))s from now)."
+    sleep "${RETRY_INTERVAL}"
+done
 
 if grep -q 'Self-healing FAILED' <<<"${grant_output}"; then
     log "ERROR: self-healing set nothing while targets are installed."
@@ -71,6 +111,8 @@ fi
 if grep -q 'grants skipped' <<<"${grant_output}"; then
     log "WARNING: some schemas were skipped while another app's install was changing them"
     log "         (named above). Re-run this script once the other installs finish."
+elif [ "${RETRY_FOR}" -gt 0 ]; then
+    log "No cross-schema grants are skipped any more."
 fi
 
 log "Done. Check NOTICE output above — re-run after installing any missing apps."

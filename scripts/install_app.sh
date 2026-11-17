@@ -482,12 +482,14 @@ if grep -q 'Self-healing FAILED' <<<"${_grants_output}"; then
 fi
 
 # A foreign app's install that kept re-creating its objects through every retry leaves
-# that schema's grants unapplied (a WARNING per schema above); the install still
-# succeeds, and only that schema's readers wait for the re-run.
+# that schema's grants unapplied (a WARNING per schema above). The install goes on, and
+# step 17 re-applies them once everything else is installed.
+_grants_skipped=""
 if grep -q 'grants skipped' <<<"${_grants_output}"; then
-    log "WARNING: some cross-schema grants were skipped while another app's install was"
-    log "         changing that schema (named above). Run scripts/grant_cross_schema.sh"
-    log "         once the other installs finish."
+    _grants_skipped=1
+    log "NOTE: some cross-schema grants were skipped while another app's install was"
+    log "      changing that schema (named above). They are retried at the end of this"
+    log "      install."
 fi
 
 # 13. Post-install assertion for GET /sync-status (#16), as the endpoint role. SET ROLE
@@ -668,6 +670,22 @@ BEGIN
     END IF;
 END
 \$\$;"
+
+# 17. Re-apply the cross-schema grants step 12 skipped (#134). This is the one place they
+#     are healed without an operator: block processing connects as haf_fyp_owner, which
+#     cannot grant on another app's objects (see db/cross_schema_grants.sql). Last, so the
+#     other app's install has had the whole of this one to finish, and bounded by
+#     HAF_FYP_GRANT_RETRY_SECONDS (default 900): past it the install still succeeds, with
+#     grant_cross_schema.sh's WARNING naming what is left for a manual re-run. A real SQL
+#     error, or self-healing that set nothing, fails the install as it does in step 12.
+#     The connection settings are passed on explicitly: this script does not export them.
+if [ -n "${_grants_skipped}" ]; then
+    log "Re-applying the skipped cross-schema grants..."
+    POSTGRES_HOST="${POSTGRES_HOST}" POSTGRES_PORT="${POSTGRES_PORT}" \
+        POSTGRES_DB="${POSTGRES_DB}" POSTGRES_USER="${POSTGRES_USER}" \
+        "${BASH}" "${SCRIPT_DIR}/grant_cross_schema.sh" \
+        --retry-for="${HAF_FYP_GRANT_RETRY_SECONDS:-900}"
+fi
 
 log "Installation complete."
 log "If any cross-schema NOTICEs appeared above, install the missing apps"

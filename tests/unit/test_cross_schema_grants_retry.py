@@ -5,7 +5,9 @@ tests/integration/test_cross_schema_grants_retry_db.py (fastapi-tests job). This
 the structure in the job that has no database, so a block added later without the retry,
 or a handler widened to catch more than the two conflict errors, fails here too. A
 schema-guarded block skips its grants with a WARNING when the conflict outlasts every
-attempt (#132); the unguarded hafd block still re-raises.
+attempt (#132); the unguarded hafd block still re-raises. Each schema-guarded block grants
+USAGE ON SCHEMA in a retry loop of its own, ahead of the object grants, so a skipped object
+grant no longer withholds schema USAGE (#134).
 """
 
 import os
@@ -88,21 +90,22 @@ def test_every_grant_in_a_block_is_inside_a_retry_loop() -> None:
             loops += 1
             assert f"{pad}    _attempt := _attempt + 1;\n{pad}    BEGIN\n" in body
             assert re.search(r"^\s*GRANT ", body, re.M)
-            notice = re.search(r"RAISE NOTICE '(\w+): % \(attempt", body)
+            notice = re.search(r"RAISE NOTICE '(\w+(?: USAGE)?): % \(attempt", body)
             assert notice, body
             schema = notice.group(1)
             handler = HAFD_HANDLER if schema == "hafd" else HANDLER
             assert f"{pad}        EXIT;\n{pad}    " + handler.format(pad=pad, schema=schema) in body, body
             assert f"PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));\n{pad}    END;\n" in body
         assert inside
-    assert loops == 8
+    # 7 schema guards x (USAGE + objects), plus hafd.
+    assert loops == 15
 
 
 def test_handler_catches_only_the_two_conflict_errors() -> None:
     sql = _sql()
     handlers = re.findall(r"EXCEPTION WHEN ([^\n]*) THEN", sql)
-    # 8 retry loops + the self-heal pass's insufficient_privilege fallback; nothing wider.
-    assert handlers.count("internal_error OR deadlock_detected") == 8
+    # 15 retry loops + the self-heal pass's insufficient_privilege fallback; nothing wider.
+    assert handlers.count("internal_error OR deadlock_detected") == 15
     assert "OTHERS" not in " ".join(handlers)
     assert sorted(set(handlers)) == ["insufficient_privilege", "internal_error OR deadlock_detected"]
 
@@ -133,3 +136,25 @@ def test_a_skipped_guarded_block_prints_no_success_notice() -> None:
             assert re.search(rf"(?m)^{pad[:-4]}IF NOT _skipped THEN\n{pad}RAISE NOTICE '\w+: granted ", b), b
     (hafd,) = [b for b in _grant_blocks() if "ON SCHEMA hafd TO" in b]
     assert "_skipped" not in hafd
+
+
+def test_schema_usage_is_granted_in_a_loop_of_its_own_before_the_object_grants() -> None:
+    """A skipped ON ALL TABLES / ON ALL FUNCTIONS attempt rolls back only its own loop's
+    grants, so USAGE must never share one (#134). The counter restarts for the object loop,
+    which runs whether or not USAGE was skipped."""
+    guards = 0
+    for b in _guarded_blocks():
+        loops = re.findall(r"(?ms)^(        )LOOP\n(.*?)^\1END LOOP;\n(        _attempt := 0;\n)?", b)
+        for i in range(0, len(loops), 2):
+            (_, usage, reset), (_, objects, _) = loops[i], loops[i + 1]
+            grants = re.findall(r"^\s*GRANT ([^;]*);", usage, re.M)
+            assert len(grants) == 1 and grants[0].startswith("USAGE ON SCHEMA "), usage
+            schema = grants[0].split()[3]
+            assert grants[0] == f"USAGE ON SCHEMA {schema} TO haf_fyp_user, haf_fyp_owner"
+            assert f"'{schema} USAGE: % (attempt % of %) — grants skipped;" in usage
+            assert reset, f"{schema}: the object loop does not restart the attempt counter"
+            assert re.search(r"^\s*GRANT ", objects, re.M), objects
+            assert "GRANT USAGE" not in objects, objects
+            assert f"'{schema}: % (attempt % of %) — grants skipped;" in objects
+            guards += 1
+    assert guards == 7
