@@ -2,6 +2,7 @@
 """Run one of the project's CI compose lanes inside the AIDEV runtime container.
 
     compose_lane.py compose -f FILE [-f FILE] (up|wait|logs|ps|down|config) [ARGS]
+    compose_lane.py wait ID...
 
 The CI jobs postgrest-tests, install-test and install-test-haf drive a compose file
 under docker/ with `docker compose up / wait / logs / down` in a DinD service. The
@@ -24,6 +25,8 @@ PATH as `docker`, and the job's own script runs unchanged against it:
   as `up --detach` does when a dependency fails; services still running stay running
   for `logs` / `down`. `wait S` prints and exits with S's exit code, `logs S` prints
   its output prefixed as compose does, `down` stops whatever is still running.
+  `ps -q S` prints an id for S once it has run, and `docker wait ID` (outside compose)
+  prints that service's exit code, as the real commands do for a container.
 
 State lives under $COMPOSE_LANE_STATE (set by ci_job.py). Any other docker command is
 passed to the real docker CLI ($COMPOSE_LANE_REAL_DOCKER).
@@ -46,6 +49,10 @@ import yaml
 REPO = Path(__file__).resolve().parent.parent
 LANES = REPO / ".aidev" / "compose-lanes.yaml"
 POLL = 0.25
+# What `ps -q` prints in place of a container id: `ID_PREFIX<project>/<service>`.
+ID_PREFIX = "compose-lane:"
+# The states of a service that had a container; "failed" never started one.
+HAD_CONTAINER = ("running", "healthy", "unhealthy", "exited")
 
 
 def interpolate(value: str, env: dict[str, str]) -> str:
@@ -397,8 +404,14 @@ class Lane:
                 print(f"{name}-1  | {line}")
         return 0
 
-    def ps(self) -> int:
-        for name, s in self.load().items():
+    def ps(self, names: list[str], quiet: bool) -> int:
+        st = self.load()
+        if quiet:
+            for name in names or list(st):
+                if st.get(name, {}).get("state") in HAD_CONTAINER:
+                    print(f"{ID_PREFIX}{self.name}/{name}")
+            return 0
+        for name, s in st.items():
             print(f"{name:28} {s.get('state', '?'):10} {s.get('rc', '')}")
         return 0
 
@@ -413,7 +426,24 @@ class Lane:
         return 0
 
 
+def wait_ids(ids: list[str]) -> int:
+    """`docker wait` on ids `ps -q` printed: each one's exit code. `up` has run the
+    graph to the end, so a service that has not exited never will."""
+    base = Path(os.environ.get("COMPOSE_LANE_STATE", "/tmp/compose-lane"))
+    for cid in ids:
+        project, _, name = cid.removeprefix(ID_PREFIX).partition("/")
+        p = base / project / "state.json"
+        s = (json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}).get(name, {})
+        if s.get("state") != "exited":
+            print(f"compose_lane: {cid} has not exited ({s.get('state', 'no such container')})", file=sys.stderr)
+            return 1
+        print(s["rc"])
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    if len(argv) > 1 and argv[0] == "wait" and all(a.startswith(ID_PREFIX) for a in argv[1:]):
+        return wait_ids(argv[1:])
     if not argv or argv[0] != "compose":
         real = os.environ.get("COMPOSE_LANE_REAL_DOCKER", "/usr/local/bin/docker")
         os.execv(real, [real, *argv])
@@ -432,7 +462,7 @@ def main(argv: list[str]) -> int:
     if cmd == "logs":
         return lane.logs(args)
     if cmd == "ps":
-        return lane.ps()
+        return lane.ps(args, quiet=bool({"-q", "--quiet"} & set(rest[1:])))
     if cmd == "down":
         return lane.down()
     raise SystemExit(f"compose_lane: `compose {cmd}` is not supported here")
