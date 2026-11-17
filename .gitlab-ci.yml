@@ -614,7 +614,11 @@ install-test:
     # exit 0, so this is the whole lane. On a red lane `up` above has usually failed
     # already (compose stops at the first step that exits non-zero and names it); the
     # step's own log is in after_script below.
-    - timeout 600 docker compose -f docker/docker-compose-ci-install.yml wait verify-gone
+    # Not `compose wait`: it sees only a running container, and `up --detach` can return
+    # before verify-gone is created or after it has exited ("no containers for project",
+    # #137). So poll until the container exists, then read its exit code, which `docker
+    # wait` gives for a running and an exited container alike.
+    - timeout 600 sh -c 'until c=$(docker compose -f docker/docker-compose-ci-install.yml ps -a -q verify-gone) && [ -n "$c" ]; do sleep 2; done; rc=$(docker wait "$c") && exit "$rc"'
     # Exit 0 is not enough: a verify file that was emptied, or that quits at its first
     # line, exits 0 too. Each prints its sentence only once the comparison it reports
     # has been made (the uninstall check at its very end; the install check with one
@@ -699,7 +703,11 @@ install-test-haf:
     # exit 0, so this is the whole lane. On a red lane `up` above has usually failed
     # already (compose stops at the first step that exits non-zero and names it); the
     # step's own log is in after_script below.
-    - timeout 600 docker compose -f docker/docker-compose-ci-install-haf.yml wait verify-gone
+    # Not `compose wait`: it sees only a running container, and `up --detach` can return
+    # before verify-gone is created or after it has exited ("no containers for project",
+    # #137). So poll until the container exists, then read its exit code, which `docker
+    # wait` gives for a running and an exited container alike.
+    - timeout 600 sh -c 'until c=$(docker compose -f docker/docker-compose-ci-install-haf.yml ps -a -q verify-gone) && [ -n "$c" ]; do sleep 2; done; rc=$(docker wait "$c") && exit "$rc"'
     # Exit 0 is not enough: a verify file that was emptied, or that quits at its first
     # line, exits 0 too. Each prints its sentence only once the comparison it reports
     # has been made (the uninstall check at its very end; the install check with one

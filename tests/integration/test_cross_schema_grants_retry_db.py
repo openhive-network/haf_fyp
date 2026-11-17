@@ -183,17 +183,18 @@ def _churn(stop_at) -> None:
         c.close()
 
 
-def _drop_churn(stop_at: float) -> None:
-    """DROP and re-CREATE random hivemind_app tables until stop_at, as an app's block
-    processing would. Looped server-side, committing each statement: fast enough that a
-    GRANT walking the schema meets a table dropped under it.
+def _drop_create_churn(stop_at: float, drop: str, create: str, conflicts: tuple[str, ...]) -> None:
+    """DROP and re-CREATE random hivemind_app objects until stop_at. `drop` and `create`
+    are format() templates taking the object's number. Looped server-side, committing each
+    statement: fast enough that a GRANT walking the schema meets an object dropped under it.
 
     The churner meets the same race from its side (a DROP behind the GRANT's walk can fail
     with "tuple concurrently updated", or deadlock), and an error ends the DO block. It is
     restarted until stop_at, so one such hit does not leave the rest of the round without
-    churn (#122). Any other error ends the churner and fails the round (_under_churn
-    re-raises it). IF [NOT] EXISTS keeps a restart from failing on a table whose DROP
-    committed but whose CREATE did not."""
+    churn (#122). An XX000 error carrying one of `conflicts`, or a 40P01, is that race; any
+    other error ends the churner and fails the round (_under_churn re-raises it). Both
+    templates must be idempotent (IF EXISTS, IF NOT EXISTS, OR REPLACE), so a restart does
+    not fail on an object whose DROP committed but whose CREATE did not."""
     c = _connect(TEST_DB)
     c.autocommit = True
     try:
@@ -201,20 +202,25 @@ def _drop_churn(stop_at: float) -> None:
             while (left := stop_at - time.monotonic()) > 0:
                 try:
                     cur.execute(
-                        "DO $$ DECLARE t timestamptz := clock_timestamp() + %s * interval '1 s'; i int; "
+                        f"DO $$ DECLARE t timestamptz := clock_timestamp() + {left} * interval '1 s'; i int; "
                         "BEGIN LOOP "
-                        "i := 1 + floor(random() * %s)::int; "
-                        "EXECUTE format('DROP TABLE IF EXISTS hivemind_app.t%%s', i); COMMIT; "
-                        "EXECUTE format('CREATE TABLE IF NOT EXISTS hivemind_app.t%%s (id int)', i); COMMIT; "
-                        "EXIT WHEN clock_timestamp() > t; END LOOP; END $$"
-                        % (left, CHURN_TABLES))
+                        f"i := 1 + floor(random() * {CHURN_TABLES})::int; "
+                        f"EXECUTE format('{drop}', i); COMMIT; "
+                        f"EXECUTE format('{create}', i); COMMIT; "
+                        "EXIT WHEN clock_timestamp() > t; END LOOP; END $$")
                 except psycopg2.Error as exc:
                     if not (exc.pgcode == "40P01" or (
-                            exc.pgcode == "XX000"
-                            and any(m in str(exc) for m in (CONFLICT, DELETED, LOOKUP)))):
+                            exc.pgcode == "XX000" and any(m in str(exc) for m in conflicts))):
                         raise
     finally:
         c.close()
+
+
+def _drop_churn(stop_at: float) -> None:
+    """DROP and re-CREATE random hivemind_app tables, as an app's block processing would."""
+    _drop_create_churn(
+        stop_at, "DROP TABLE IF EXISTS hivemind_app.t%s", "CREATE TABLE IF NOT EXISTS hivemind_app.t%s (id int)",
+        (CONFLICT, DELETED, LOOKUP))
 
 
 def _under_churn(
@@ -357,23 +363,13 @@ def _many_functions(conn: connection) -> None:
 
 
 def _function_churn(stop_at: float) -> None:
-    """DROP and re-CREATE random hivemind_app functions until stop_at, as hivemind's
-    installer does while it reinstalls its functions (#132)."""
-    c = _connect(TEST_DB)
-    c.autocommit = True
-    try:
-        with c.cursor() as cur:
-            cur.execute(
-                "DO $$ DECLARE t timestamptz := clock_timestamp() + %s * interval '1 s'; i int; "
-                "BEGIN LOOP "
-                "i := 1 + floor(random() * %s)::int; "
-                "EXECUTE format('DROP FUNCTION hivemind_app.f%%s()', i); COMMIT; "
-                "EXECUTE format('CREATE FUNCTION hivemind_app.f%%s() RETURNS int LANGUAGE sql AS $f$SELECT 1$f$', i); "
-                "COMMIT; "
-                "EXIT WHEN clock_timestamp() > t; END LOOP; END $$"
-                % (max(stop_at - time.monotonic(), 0), CHURN_TABLES))
-    finally:
-        c.close()
+    """DROP and re-CREATE random hivemind_app functions, as hivemind's installer does while
+    it reinstalls its functions (#132). Its DROP colliding with the GRANT under test ends
+    in "tuple concurrently updated" as often as the GRANT does (#137)."""
+    _drop_create_churn(
+        stop_at, "DROP FUNCTION IF EXISTS hivemind_app.f%s()",
+        "CREATE OR REPLACE FUNCTION hivemind_app.f%s() RETURNS int LANGUAGE sql AS $f$SELECT 1$f$",
+        (CONFLICT, DELETED, FUNC_LOOKUP))
 
 
 def _is_function_conflict(err: psycopg2.Error) -> bool:
@@ -399,16 +395,19 @@ def test_negative_control_bare_grant_hits_a_dropped_function(conn: connection) -
 def test_shipped_file_survives_a_concurrent_function_dropper(conn: connection) -> None:
     _many_functions(conn)
     statements = _statements(open(GRANTS_SQL, encoding="utf-8").read())
-    retries = 0
-    for round_no in range(ROUNDS):
+    retries = rounds = 0
+    # As for the table dropper: more rounds, up to MAX_ROUNDS, until one has met the race.
+    while rounds < ROUNDS or (retries == 0 and rounds < MAX_ROUNDS):
+        round_no = rounds
+        rounds += 1
         del conn.notices[:]
         err = _under_churn(conn, statements, churn=_function_churn)
         assert err is None, f"round {round_no}: {err.pgcode} {err}"
         notices = "".join(conn.notices)
         retries += len(re.findall(r"hivemind_app: [^\n]* \(attempt \d of 5\), retrying", notices))
         assert notices.count("hivemind_app: granted SELECT + EXECUTE") == 1, notices
-    _report(f"shipped file (function): {ROUNDS}/{ROUNDS} runs passed, {retries} retried attempts")
-    assert retries >= 1
+    _report(f"shipped file (function): {rounds} runs passed, {retries} retried attempts")
+    assert retries >= 1, f"the function drop race was not met in {rounds} rounds"
 
 
 def test_shipped_file_outlasted_by_a_function_dropper_still_succeeds(conn: connection) -> None:
