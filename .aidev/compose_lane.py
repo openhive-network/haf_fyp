@@ -112,7 +112,7 @@ def env_dict(environment) -> dict[str, str]:
 
 
 class Lane:
-    def __init__(self, compose_file: str):
+    def __init__(self, compose_file: str) -> None:
         self.file = (Path.cwd() / compose_file).resolve()
         self.rel = os.path.relpath(self.file, REPO)
         lanes = yaml.safe_load(LANES.read_text(encoding="utf-8"))
