@@ -39,26 +39,38 @@
 -- -- the same race raises XX000 "tuple concurrently deleted" when the drop is still in
 -- flight as GRANT reaches the row, or XX000 "cache lookup failed for relation N" when
 -- the drop committed between GRANT listing the schema's tables and looking that one up
--- (#119; under a create/drop loop the second is the more frequent). When the two
--- sessions reach the rows in a different order, the race ends in 40P01 "deadlock
--- detected" (seen on PostgreSQL 17, which HAF 1.28.8 runs). psql runs this file with
--- ON_ERROR_STOP, so one such collision used to fail the whole install (exit 3) although
--- a retry seconds later succeeds. Each schema-guarded block below, and the hafd grants
--- after them, therefore run their grants in a retry loop: up to 5 attempts, each in its
--- own subtransaction (the BEGIN ... EXCEPTION block, whose rollback releases the row and
--- tuple locks the attempt took), sleeping 0.5 s, 1 s, 2 s, 4 s between them. ONLY those
--- conflicts are retried: the handler catches internal_error (XX000) and
--- deadlock_detected (40P01), re-raises an XX000 unless SQLERRM is exactly 'tuple
--- concurrently updated' or 'tuple concurrently deleted', or starts with 'cache lookup
--- failed for relation ', and re-raises any of them after the last attempt, so every
--- other failure still reaches ON_ERROR_STOP at once. The grants are idempotent, so
--- repeating them after a rolled-back attempt is safe. The success NOTICE stays after
--- the loop, so a retried block still prints it exactly once.
+-- (#119; under a create/drop loop the second is the more frequent). GRANT EXECUTE ON
+-- ALL FUNCTIONS IN SCHEMA s has the same race with a function dropped under it -- an
+-- app's installer re-creating its functions -- and raises XX000 "cache lookup failed
+-- for function N" (#132). When the two sessions reach the rows in a different order,
+-- the race ends in 40P01 "deadlock detected" (seen on PostgreSQL 17, which HAF 1.28.8
+-- runs). psql runs this file with ON_ERROR_STOP, so one such collision used to fail the
+-- whole install (exit 3) although a retry seconds later succeeds. Each schema-guarded
+-- block below, and the hafd grants after them, therefore run their grants in a retry
+-- loop: up to 5 attempts, each in its own subtransaction (the BEGIN ... EXCEPTION
+-- block, whose rollback releases the row and tuple locks the attempt took), sleeping
+-- 0.5 s, 1 s, 2 s, 4 s between them. ONLY those conflicts are retried: the handler
+-- catches internal_error (XX000) and deadlock_detected (40P01), and re-raises an XX000
+-- unless SQLERRM is exactly 'tuple concurrently updated' or 'tuple concurrently
+-- deleted', or starts with 'cache lookup failed for relation ' or 'cache lookup failed
+-- for function ', so every other failure still reaches ON_ERROR_STOP at once. The
+-- grants are idempotent, so repeating them after a rolled-back attempt is safe. The
+-- success NOTICE stays after the loop, so a retried block still prints it exactly once.
+--
+-- A conflict that outlasts all 5 attempts (7.5 s) is a foreign app's install still
+-- running -- hivemind's re-creates its functions for far longer than that. Every
+-- schema-guarded grant is optional (a missing schema is skipped too), so such a block
+-- does not fail the install (#132): it RAISEs a WARNING naming the schema with "grants
+-- skipped" and scripts/grant_cross_schema.sh, applies none of that block's grants (the
+-- attempt rolled back as a whole), prints no success NOTICE, and the file goes on.
+-- install_app.sh and grant_cross_schema.sh repeat that as a closing WARNING. The
+-- unguarded hafd grants are not optional and still re-raise after the last attempt.
 
 DO $$
 DECLARE
     _attempt      int := 0;
     _max_attempts CONSTANT int := 5;
+    _skipped      boolean := false;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata
@@ -71,18 +83,26 @@ BEGIN
                 GRANT SELECT ON ALL TABLES IN SCHEMA hivesense_app TO haf_fyp_user, haf_fyp_owner;
                 EXIT;
             EXCEPTION WHEN internal_error OR deadlock_detected THEN
-                IF (SQLSTATE = 'XX000'
-                    AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
-                    AND SQLERRM NOT LIKE 'cache lookup failed for relation %')
-                   OR _attempt >= _max_attempts THEN
+                IF SQLSTATE = 'XX000'
+                   AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
+                   AND SQLERRM NOT LIKE 'cache lookup failed for relation %'
+                   AND SQLERRM NOT LIKE 'cache lookup failed for function %' THEN
                     RAISE;
+                END IF;
+                IF _attempt >= _max_attempts THEN
+                    RAISE WARNING 'hivesense_app: % (attempt % of %) — grants skipped; re-run scripts/grant_cross_schema.sh once the other installs finish',
+                        SQLERRM, _attempt, _max_attempts;
+                    _skipped := true;
+                    EXIT;
                 END IF;
                 RAISE NOTICE 'hivesense_app: % (attempt % of %), retrying in % s',
                     SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
                 PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
             END;
         END LOOP;
-        RAISE NOTICE 'hivesense_app: granted SELECT to haf_fyp_user, haf_fyp_owner';
+        IF NOT _skipped THEN
+            RAISE NOTICE 'hivesense_app: granted SELECT to haf_fyp_user, haf_fyp_owner';
+        END IF;
     ELSE
         RAISE NOTICE 'hivesense_app not found — install HiveSense then re-run grant_cross_schema.sh';
     END IF;
@@ -104,6 +124,7 @@ DO $$
 DECLARE
     _attempt      int := 0;
     _max_attempts CONSTANT int := 5;
+    _skipped      boolean := false;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata
@@ -123,18 +144,26 @@ BEGIN
                 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_app TO haf_fyp_owner;
                 EXIT;
             EXCEPTION WHEN internal_error OR deadlock_detected THEN
-                IF (SQLSTATE = 'XX000'
-                    AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
-                    AND SQLERRM NOT LIKE 'cache lookup failed for relation %')
-                   OR _attempt >= _max_attempts THEN
+                IF SQLSTATE = 'XX000'
+                   AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
+                   AND SQLERRM NOT LIKE 'cache lookup failed for relation %'
+                   AND SQLERRM NOT LIKE 'cache lookup failed for function %' THEN
                     RAISE;
+                END IF;
+                IF _attempt >= _max_attempts THEN
+                    RAISE WARNING 'hivemind_app: % (attempt % of %) — grants skipped; re-run scripts/grant_cross_schema.sh once the other installs finish',
+                        SQLERRM, _attempt, _max_attempts;
+                    _skipped := true;
+                    EXIT;
                 END IF;
                 RAISE NOTICE 'hivemind_app: % (attempt % of %), retrying in % s',
                     SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
                 PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
             END;
         END LOOP;
-        RAISE NOTICE 'hivemind_app: granted SELECT + EXECUTE to haf_fyp_user, SELECT to haf_fyp_owner';
+        IF NOT _skipped THEN
+            RAISE NOTICE 'hivemind_app: granted SELECT + EXECUTE to haf_fyp_user, SELECT to haf_fyp_owner';
+        END IF;
     ELSE
         RAISE NOTICE 'hivemind_app not found — install Hivemind then re-run grant_cross_schema.sh';
     END IF;
@@ -161,6 +190,7 @@ DO $$
 DECLARE
     _attempt      int := 0;
     _max_attempts CONSTANT int := 5;
+    _skipped      boolean := false;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata
@@ -174,18 +204,26 @@ BEGIN
                 GRANT SELECT ON ALL TABLES IN SCHEMA hivemind_postgrest_utilities TO haf_fyp_user, haf_fyp_owner;
                 EXIT;
             EXCEPTION WHEN internal_error OR deadlock_detected THEN
-                IF (SQLSTATE = 'XX000'
-                    AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
-                    AND SQLERRM NOT LIKE 'cache lookup failed for relation %')
-                   OR _attempt >= _max_attempts THEN
+                IF SQLSTATE = 'XX000'
+                   AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
+                   AND SQLERRM NOT LIKE 'cache lookup failed for relation %'
+                   AND SQLERRM NOT LIKE 'cache lookup failed for function %' THEN
                     RAISE;
+                END IF;
+                IF _attempt >= _max_attempts THEN
+                    RAISE WARNING 'hivemind_postgrest_utilities: % (attempt % of %) — grants skipped; re-run scripts/grant_cross_schema.sh once the other installs finish',
+                        SQLERRM, _attempt, _max_attempts;
+                    _skipped := true;
+                    EXIT;
                 END IF;
                 RAISE NOTICE 'hivemind_postgrest_utilities: % (attempt % of %), retrying in % s',
                     SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
                 PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
             END;
         END LOOP;
-        RAISE NOTICE 'hivemind_postgrest_utilities: granted EXECUTE + SELECT to haf_fyp_user, haf_fyp_owner';
+        IF NOT _skipped THEN
+            RAISE NOTICE 'hivemind_postgrest_utilities: granted EXECUTE + SELECT to haf_fyp_user, haf_fyp_owner';
+        END IF;
     ELSE
         RAISE NOTICE 'hivemind_postgrest_utilities not found — install Hivemind then re-run grant_cross_schema.sh';
     END IF;
@@ -196,6 +234,7 @@ DO $$
 DECLARE
     _attempt      int := 0;
     _max_attempts CONSTANT int := 5;
+    _skipped      boolean := false;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata
@@ -208,18 +247,26 @@ BEGIN
                 GRANT SELECT ON ALL TABLES IN SCHEMA reptracker_app TO haf_fyp_user, haf_fyp_owner;
                 EXIT;
             EXCEPTION WHEN internal_error OR deadlock_detected THEN
-                IF (SQLSTATE = 'XX000'
-                    AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
-                    AND SQLERRM NOT LIKE 'cache lookup failed for relation %')
-                   OR _attempt >= _max_attempts THEN
+                IF SQLSTATE = 'XX000'
+                   AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
+                   AND SQLERRM NOT LIKE 'cache lookup failed for relation %'
+                   AND SQLERRM NOT LIKE 'cache lookup failed for function %' THEN
                     RAISE;
+                END IF;
+                IF _attempt >= _max_attempts THEN
+                    RAISE WARNING 'reptracker_app: % (attempt % of %) — grants skipped; re-run scripts/grant_cross_schema.sh once the other installs finish',
+                        SQLERRM, _attempt, _max_attempts;
+                    _skipped := true;
+                    EXIT;
                 END IF;
                 RAISE NOTICE 'reptracker_app: % (attempt % of %), retrying in % s',
                     SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
                 PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
             END;
         END LOOP;
-        RAISE NOTICE 'reptracker_app: granted SELECT to haf_fyp_user, haf_fyp_owner';
+        IF NOT _skipped THEN
+            RAISE NOTICE 'reptracker_app: granted SELECT to haf_fyp_user, haf_fyp_owner';
+        END IF;
     ELSE
         RAISE NOTICE 'reptracker_app not found — install reputation_tracker then re-run grant_cross_schema.sh';
     END IF;
@@ -230,6 +277,7 @@ DO $$
 DECLARE
     _attempt      int := 0;
     _max_attempts CONSTANT int := 5;
+    _skipped      boolean := false;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata
@@ -242,18 +290,26 @@ BEGIN
                 GRANT SELECT ON ALL TABLES IN SCHEMA btracker_app TO haf_fyp_user, haf_fyp_owner;
                 EXIT;
             EXCEPTION WHEN internal_error OR deadlock_detected THEN
-                IF (SQLSTATE = 'XX000'
-                    AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
-                    AND SQLERRM NOT LIKE 'cache lookup failed for relation %')
-                   OR _attempt >= _max_attempts THEN
+                IF SQLSTATE = 'XX000'
+                   AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
+                   AND SQLERRM NOT LIKE 'cache lookup failed for relation %'
+                   AND SQLERRM NOT LIKE 'cache lookup failed for function %' THEN
                     RAISE;
+                END IF;
+                IF _attempt >= _max_attempts THEN
+                    RAISE WARNING 'btracker_app: % (attempt % of %) — grants skipped; re-run scripts/grant_cross_schema.sh once the other installs finish',
+                        SQLERRM, _attempt, _max_attempts;
+                    _skipped := true;
+                    EXIT;
                 END IF;
                 RAISE NOTICE 'btracker_app: % (attempt % of %), retrying in % s',
                     SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
                 PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
             END;
         END LOOP;
-        RAISE NOTICE 'btracker_app: granted SELECT to haf_fyp_user, haf_fyp_owner';
+        IF NOT _skipped THEN
+            RAISE NOTICE 'btracker_app: granted SELECT to haf_fyp_user, haf_fyp_owner';
+        END IF;
     ELSE
         RAISE NOTICE 'btracker_app not found — install balance_tracker then re-run grant_cross_schema.sh';
     END IF;
@@ -269,6 +325,7 @@ DECLARE
     _found int := 0;
     _attempt      int := 0;
     _max_attempts CONSTANT int := 5;
+    _skipped      boolean := false;
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata WHERE schema_name = 'btracker_backend'
@@ -280,20 +337,29 @@ BEGIN
                 GRANT SELECT ON ALL TABLES IN SCHEMA btracker_backend TO haf_fyp_user, haf_fyp_owner;
                 EXIT;
             EXCEPTION WHEN internal_error OR deadlock_detected THEN
-                IF (SQLSTATE = 'XX000'
-                    AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
-                    AND SQLERRM NOT LIKE 'cache lookup failed for relation %')
-                   OR _attempt >= _max_attempts THEN
+                IF SQLSTATE = 'XX000'
+                   AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
+                   AND SQLERRM NOT LIKE 'cache lookup failed for relation %'
+                   AND SQLERRM NOT LIKE 'cache lookup failed for function %' THEN
                     RAISE;
+                END IF;
+                IF _attempt >= _max_attempts THEN
+                    RAISE WARNING 'btracker_backend: % (attempt % of %) — grants skipped; re-run scripts/grant_cross_schema.sh once the other installs finish',
+                        SQLERRM, _attempt, _max_attempts;
+                    _skipped := true;
+                    EXIT;
                 END IF;
                 RAISE NOTICE 'btracker_backend: % (attempt % of %), retrying in % s',
                     SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
                 PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
             END;
         END LOOP;
-        RAISE NOTICE 'btracker_backend: granted SELECT to haf_fyp_user, haf_fyp_owner';
+        IF NOT _skipped THEN
+            RAISE NOTICE 'btracker_backend: granted SELECT to haf_fyp_user, haf_fyp_owner';
+        END IF;
         _found := _found + 1;
     END IF;
+    _skipped := false;
     _attempt := 0;
     IF EXISTS (
         SELECT 1 FROM information_schema.schemata WHERE schema_name = 'hafbe_bal'
@@ -305,18 +371,26 @@ BEGIN
                 GRANT SELECT ON ALL TABLES IN SCHEMA hafbe_bal TO haf_fyp_user, haf_fyp_owner;
                 EXIT;
             EXCEPTION WHEN internal_error OR deadlock_detected THEN
-                IF (SQLSTATE = 'XX000'
-                    AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
-                    AND SQLERRM NOT LIKE 'cache lookup failed for relation %')
-                   OR _attempt >= _max_attempts THEN
+                IF SQLSTATE = 'XX000'
+                   AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
+                   AND SQLERRM NOT LIKE 'cache lookup failed for relation %'
+                   AND SQLERRM NOT LIKE 'cache lookup failed for function %' THEN
                     RAISE;
+                END IF;
+                IF _attempt >= _max_attempts THEN
+                    RAISE WARNING 'hafbe_bal: % (attempt % of %) — grants skipped; re-run scripts/grant_cross_schema.sh once the other installs finish',
+                        SQLERRM, _attempt, _max_attempts;
+                    _skipped := true;
+                    EXIT;
                 END IF;
                 RAISE NOTICE 'hafbe_bal: % (attempt % of %), retrying in % s',
                     SQLERRM, _attempt, _max_attempts, 0.5 * 2 ^ (_attempt - 1);
                 PERFORM pg_sleep(0.5 * 2 ^ (_attempt - 1));
             END;
         END LOOP;
-        RAISE NOTICE 'hafbe_bal: granted SELECT to haf_fyp_user, haf_fyp_owner';
+        IF NOT _skipped THEN
+            RAISE NOTICE 'hafbe_bal: granted SELECT to haf_fyp_user, haf_fyp_owner';
+        END IF;
         _found := _found + 1;
     END IF;
     -- Said out loud because this block alone had no ELSE: on a deployment where
@@ -355,7 +429,8 @@ BEGIN
         EXCEPTION WHEN internal_error OR deadlock_detected THEN
             IF (SQLSTATE = 'XX000'
                 AND SQLERRM NOT IN ('tuple concurrently updated', 'tuple concurrently deleted')
-                AND SQLERRM NOT LIKE 'cache lookup failed for relation %')
+                AND SQLERRM NOT LIKE 'cache lookup failed for relation %'
+                AND SQLERRM NOT LIKE 'cache lookup failed for function %')
                OR _attempt >= _max_attempts THEN
                 RAISE;
             END IF;

@@ -1,4 +1,4 @@
-"""db/cross_schema_grants.sql survives a concurrent catalog writer (#90, #119).
+"""db/cross_schema_grants.sql survives a concurrent catalog writer (#90, #119, #132).
 
 `GRANT ... ON ALL TABLES IN SCHEMA s` rewrites the pg_class row of every table in s. When
 another session updates one of those rows at the same moment, PostgreSQL raises XX000
@@ -7,19 +7,24 @@ another session updates one of those rows at the same moment, PostgreSQL raises 
 sessions reach the rows in a different order. When the other session DROPs one of those
 tables instead, the same race raises XX000 "tuple concurrently deleted" or, when the drop
 committed before GRANT looked the table up, XX000 "cache lookup failed for relation N"
-(#119). Every schema-guarded block now retries those conflicts -- and only those -- up to 5
-times with a 0.5 s, 1 s, 2 s, 4 s backoff.
+(#119). GRANT EXECUTE ON ALL FUNCTIONS meets the same race with a function dropped under it
+-- an app's installer re-creating its functions -- as XX000 "cache lookup failed for function
+N" (#132). Every grant block now retries those conflicts -- and only those -- up to 5 times
+with a 0.5 s, 1 s, 2 s, 4 s backoff. A conflict outlasting every attempt skips that
+schema-guarded block with a WARNING instead of failing the install (#132); the unguarded hafd
+block still re-raises it.
 
 Two halves:
 
-* The race itself. A background session loops GRANT/REVOKE -- or DROP/CREATE TABLE -- on a
-  schema of 400 tables while the shipped file runs. A bare GRANT under the same churn is the
+* The race itself. A background session loops GRANT/REVOKE -- or DROP/CREATE TABLE, or
+  DROP/CREATE FUNCTION -- on a schema of 400 tables or functions while the shipped file runs. A bare GRANT under the same churn is the
   negative control: it must fail (conflict or deadlock) at least once, or the harness is not
   reproducing the race and proves nothing. The shipped file must pass every round.
 * The handler. Each retry loop is cut out of the shipped file and its grants replaced by an
   injected error, so the matching is pinned exactly: XX000 + each conflict message is
-  retried with backoff and re-raised after the 5th attempt, and so is 40P01; a conflict
-  message under another SQLSTATE, and XX000 with another message, fail on the first attempt.
+  retried with backoff and, after the 5th attempt, skipped with a WARNING (hafd: re-raised),
+  and so is 40P01; a conflict message under another SQLSTATE, and XX000 with another
+  message, fail on the first attempt.
 
 Everything runs in a throwaway database created and dropped here (roles are cluster-wide;
 only the ones created here are dropped). Runs in the fastapi-tests job; skipped when no
@@ -44,9 +49,14 @@ CHURN_ROLE = "haf_fyp_test_churn_reader"
 CONFLICT = "tuple concurrently updated"
 DELETED = "tuple concurrently deleted"
 LOOKUP = "cache lookup failed for relation"
+FUNC_LOOKUP = "cache lookup failed for function"
+SKIPPED = "grants skipped; re-run scripts/grant_cross_schema.sh"
 DEADLOCK = "deadlock detected"
 # (SQLSTATE, message) pairs the handler must retry.
-RETRIED = [("XX000", CONFLICT), ("XX000", DELETED), ("XX000", f"{LOOKUP} 16384"), ("40P01", DEADLOCK)]
+RETRIED = [
+    ("XX000", CONFLICT), ("XX000", DELETED), ("XX000", f"{LOOKUP} 16384"),
+    ("XX000", f"{FUNC_LOOKUP} 132621442"), ("40P01", DEADLOCK),
+]
 MAX_ATTEMPTS = 5
 TOTAL_BACKOFF = 0.5 + 1 + 2 + 4
 CHURN_TABLES = 400
@@ -294,13 +304,101 @@ def test_shipped_file_survives_a_concurrent_table_dropper(conn: connection) -> N
     assert retries >= 1
 
 
+def _many_functions(conn: connection) -> None:
+    with conn.cursor() as cur:
+        cur.execute("CREATE SCHEMA hivemind_app")
+        cur.execute(
+            "DO $$ BEGIN FOR i IN 1..%s LOOP "
+            "EXECUTE format('CREATE FUNCTION hivemind_app.f%%s() RETURNS int LANGUAGE sql AS $f$SELECT 1$f$', i); "
+            "END LOOP; END $$" % CHURN_TABLES)
+
+
+def _function_churn(stop_at: float) -> None:
+    """DROP and re-CREATE random hivemind_app functions until stop_at, as hivemind's
+    installer does while it reinstalls its functions (#132)."""
+    c = _connect(TEST_DB)
+    c.autocommit = True
+    try:
+        with c.cursor() as cur:
+            cur.execute(
+                "DO $$ DECLARE t timestamptz := clock_timestamp() + %s * interval '1 s'; i int; "
+                "BEGIN LOOP "
+                "i := 1 + floor(random() * %s)::int; "
+                "EXECUTE format('DROP FUNCTION hivemind_app.f%%s()', i); COMMIT; "
+                "EXECUTE format('CREATE FUNCTION hivemind_app.f%%s() RETURNS int LANGUAGE sql AS $f$SELECT 1$f$', i); "
+                "COMMIT; "
+                "EXIT WHEN clock_timestamp() > t; END LOOP; END $$"
+                % (max(stop_at - time.monotonic(), 0), CHURN_TABLES))
+    finally:
+        c.close()
+
+
+def _is_function_conflict(err: psycopg2.Error) -> bool:
+    return err.pgcode == "40P01" or (err.pgcode == "XX000" and any(
+        m in str(err) for m in (FUNC_LOOKUP, DELETED, CONFLICT)))
+
+
+def test_negative_control_bare_grant_hits_a_dropped_function(conn: connection) -> None:
+    """Without a retry, a concurrent DROP FUNCTION breaks a bare GRANT -- the #132 failure."""
+    _many_functions(conn)
+    failures = []
+    for _ in range(ROUNDS):
+        err = _under_churn(
+            conn, ["GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA hivemind_app TO haf_fyp_user, haf_fyp_owner"],
+            churn=_function_churn)
+        if err is not None:
+            assert _is_function_conflict(err), err
+            failures.append(str(err).splitlines()[0])
+    _report(f"negative control (function): {len(failures)}/{ROUNDS} bare GRANTs failed: {failures}")
+    assert failures
+
+
+def test_shipped_file_survives_a_concurrent_function_dropper(conn: connection) -> None:
+    _many_functions(conn)
+    statements = _statements(open(GRANTS_SQL, encoding="utf-8").read())
+    retries = 0
+    for round_no in range(ROUNDS):
+        del conn.notices[:]
+        err = _under_churn(conn, statements, churn=_function_churn)
+        assert err is None, f"round {round_no}: {err.pgcode} {err}"
+        notices = "".join(conn.notices)
+        retries += len(re.findall(r"hivemind_app: [^\n]* \(attempt \d of 5\), retrying", notices))
+        assert notices.count("hivemind_app: granted SELECT + EXECUTE") == 1, notices
+    _report(f"shipped file (function): {ROUNDS}/{ROUNDS} runs passed, {retries} retried attempts")
+    assert retries >= 1
+
+
+def test_shipped_file_outlasted_by_a_function_dropper_still_succeeds(conn: connection) -> None:
+    """A foreign install that re-creates its functions for longer than every retry: the
+    file still succeeds, and either grants hivemind_app or names it for the re-run."""
+    _many_functions(conn)
+    statements = _statements(open(GRANTS_SQL, encoding="utf-8").read())
+    stop_at = time.monotonic() + TOTAL_BACKOFF + 3
+    t = threading.Thread(target=_function_churn, args=(stop_at,))
+    t.start()
+    time.sleep(0.3)
+    del conn.notices[:]
+    try:
+        with conn.cursor() as cur:
+            for stmt in statements:
+                cur.execute(stmt)
+    finally:
+        t.join()
+    notices = "".join(conn.notices)
+    granted = notices.count("hivemind_app: granted SELECT + EXECUTE")
+    skipped = len(re.findall(rf"WARNING:  hivemind_app: [^\n]* — {re.escape(SKIPPED)}", notices))
+    _report(f"shipped file (outlasted): granted={granted} skipped={skipped}")
+    assert granted + skipped == 1, notices
+
+
 # ---------------------------------------------------------------------------
 # The handler, loop by loop, with an injected error
 # ---------------------------------------------------------------------------
 
-def _block_for(sql, schema):
+def _block_for(sql: str, schema: str) -> str:
     """The DO block holding the retry loop for schema."""
-    for block in re.findall(r"(?ms)^DO \$\$\n.*?^\$\$;", sql):
+    blocks: list[str] = re.findall(r"(?ms)^DO \$\$\n.*?^\$\$;", sql)
+    for block in blocks:
         guards = f"schema_name = '{schema}'" in block or (
             schema == "hafd" and "ON SCHEMA hafd TO" in block)
         if guards and "LOOP\n" in block:
@@ -308,7 +406,7 @@ def _block_for(sql, schema):
     raise AssertionError(f"no retry loop guards {schema}")
 
 
-def _inject(block, schema, sequence, code, message, fail_times):
+def _inject(block: str, schema: str, sequence: str, code: str, message: str, fail_times: int) -> str:
     """Replace this schema's GRANT statements with: count an attempt (a sequence survives
     the subtransaction rollback), then raise (code, message) for the first fail_times
     attempts. Every other line of the shipped block stays as written."""
@@ -328,7 +426,9 @@ def _inject(block, schema, sequence, code, message, fail_times):
     return "\n".join(out)
 
 
-def _run_injected(conn, schema, code, message, fail_times):
+def _run_injected(
+        conn: connection, schema: str, code: str, message: str, fail_times: int,
+) -> tuple[psycopg2.Error | None, int, float, str]:
     sql = open(GRANTS_SQL, encoding="utf-8").read()
     with conn.cursor() as cur:
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")  # the fixture makes hafd
@@ -336,7 +436,7 @@ def _run_injected(conn, schema, code, message, fail_times):
     block = _inject(_block_for(sql, schema), schema, "attempts_a", code, message, fail_times)
     del conn.notices[:]
     start = time.monotonic()
-    error = None
+    error: psycopg2.Error | None = None
     try:
         with conn.cursor() as cur:
             cur.execute(block)
@@ -345,7 +445,9 @@ def _run_injected(conn, schema, code, message, fail_times):
     elapsed = time.monotonic() - start
     with conn.cursor() as cur:
         cur.execute("SELECT last_value FROM public.attempts_a")
-        attempts = cur.fetchone()[0]
+        row = cur.fetchone()
+    assert row is not None
+    attempts: int = row[0]
     return error, attempts, elapsed, "".join(conn.notices)
 
 
@@ -360,13 +462,30 @@ def test_conflict_is_retried_with_backoff_then_succeeds(conn, schema, code, mess
     assert notices.count(f"{schema}: granted ") == (0 if schema == "hafd" else 1), notices
 
 
-@pytest.mark.parametrize("schema", LOOP_SCHEMAS)
+@pytest.mark.parametrize("schema", [s for s in LOOP_SCHEMAS if s != "hafd"])
 @pytest.mark.parametrize("code,message", RETRIED)
-def test_conflict_is_reraised_after_the_last_attempt(conn, schema, code, message) -> None:
-    err, attempts, elapsed, _ = _run_injected(conn, schema, code, message, fail_times=99)
+def test_conflict_outlasting_every_attempt_skips_the_schema(
+        conn: connection, schema: str, code: str, message: str,
+) -> None:
+    """A foreign install still re-creating its objects after the last attempt does not fail
+    haf_fyp's install: the block names the schema and the re-run, and claims no grant."""
+    err, attempts, elapsed, notices = _run_injected(conn, schema, code, message, fail_times=99)
+    assert err is None, err
+    assert attempts == MAX_ATTEMPTS
+    assert elapsed >= TOTAL_BACKOFF - 0.05, f"backoff too short: {elapsed:.2f}s"
+    assert notices.count(
+        f"WARNING:  {schema}: {message} (attempt {MAX_ATTEMPTS} of {MAX_ATTEMPTS}) — {SKIPPED}") == 1, notices
+    assert f"{schema}: granted " not in notices
+
+
+@pytest.mark.parametrize("code,message", RETRIED)
+def test_hafd_conflict_is_reraised_after_the_last_attempt(conn: connection, code: str, message: str) -> None:
+    """hafd is HAF core and not optional, so it still fails the install."""
+    err, attempts, elapsed, notices = _run_injected(conn, "hafd", code, message, fail_times=99)
     assert err is not None and err.pgcode == code and message in str(err)
     assert attempts == MAX_ATTEMPTS
     assert elapsed >= TOTAL_BACKOFF - 0.05, f"backoff too short: {elapsed:.2f}s"
+    assert "grants skipped" not in notices
 
 
 @pytest.mark.parametrize("schema", LOOP_SCHEMAS)

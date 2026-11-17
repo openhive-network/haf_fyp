@@ -481,6 +481,15 @@ if grep -q 'Self-healing FAILED' <<<"${_grants_output}"; then
     exit 1
 fi
 
+# A foreign app's install that kept re-creating its objects through every retry leaves
+# that schema's grants unapplied (a WARNING per schema above); the install still
+# succeeds, and only that schema's readers wait for the re-run.
+if grep -q 'grants skipped' <<<"${_grants_output}"; then
+    log "WARNING: some cross-schema grants were skipped while another app's install was"
+    log "         changing that schema (named above). Run scripts/grant_cross_schema.sh"
+    log "         once the other installs finish."
+fi
+
 # 13. Post-install assertion for GET /sync-status (#16), as the endpoint role. SET ROLE
 #     drops superuser, so it exercises the real EXECUTE grant, the SECURITY DEFINER hop,
 #     the definer's real group membership and HAF's real RLS policy. In CI this runs
