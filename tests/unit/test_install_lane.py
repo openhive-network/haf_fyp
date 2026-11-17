@@ -151,7 +151,8 @@ class Flavour:
             "script": [
                 *([IMAGE_LOG] if self.image_from else []),
                 f"timeout 900 {f} up --detach --build",
-                f"timeout 600 {f} wait {LAST}",
+                f"timeout 600 sh -c 'until c=$({f} ps -a -q {LAST}) && [ -n \"$c\" ]; do sleep 2; done; "
+                f'rc=$(docker wait "$c") && exit "$rc"\'',
                 f'{f} logs verify | grep -Ec "first install. [0-9]{{3,}} items recorded"',
                 f'{f} logs verify-locked | grep -Ec "phase locked. all [0-9]{{3,}} items identical to the first install"',
                 f'{f} logs verify-again | grep -Ec "phase second. all [0-9]{{3,}} items identical to the first install"',

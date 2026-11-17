@@ -42,7 +42,7 @@
 # develop's are tagged with their short commit):
 #   export HAF_UPSTREAM_IMAGE=registry.gitlab.syncad.com/hive/haf:<short commit>
 #   docker compose -f docker/docker-compose-ci-install-haf.yml up --detach --build
-#   docker compose -f docker/docker-compose-ci-install-haf.yml wait verify-gone
+#   docker wait "$(docker compose -f docker/docker-compose-ci-install-haf.yml ps -a -q verify-gone)"
 #   docker compose -f docker/docker-compose-ci-install-haf.yml down -v
 #
 # Its own project name, so that `down -v` here removes this lane's datadir volume and

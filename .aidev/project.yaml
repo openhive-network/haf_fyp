@@ -105,8 +105,13 @@ verification:
   canary:
     adapter: command
     reports: ["test-results/canary/processor-timings.json"]
-    # as full, about 17 min; 1500 s is the canary cap, about 1.45x on that
-    timeout: 1500
+    # the same steps as full, kept whole: replay-sync and replay-parity prove the landed
+    # tip syncs on the deployed HAF, which replay-install alone does not. Measured
+    # 2026-11: full_test on steem-19 ran unit 271 s, fastapi 405 s, replay-sync 163 s;
+    # the canary on steem-9 spent unit 331 s and fastapi 862 s and was still in
+    # replay-sync at 1500 s, as was steem-5 (block 3.6M of 5M). About 25-30 min on a
+    # slow or busy host; 2700 s leaves about 1.5x on that. aidev sets no canary cap.
+    timeout: 2700
     args: [".aidev/run-checks.sh", "canary", "stack-pins", "aidev-scripts", "sql-lint", "shell-lint", "python-lint", "hadolint", "compose-validate", "openapi-drift", "unit", "fastapi", "postgrest", "install", "install-haf", "replay-install", "replay-sync", "replay-parity", "replay-report"]
     artifacts: ["test-results/canary/"]
   # python-tests with its pytest-cov run (coverage.xml beside the junit). `static`

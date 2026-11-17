@@ -1885,7 +1885,7 @@ lane needs `HAF_UPSTREAM_IMAGE` exported first, e.g.
 
 ```bash
 docker compose -f docker/docker-compose-ci-install.yml up --detach --build
-docker compose -f docker/docker-compose-ci-install.yml wait verify-gone   # 0 = the whole lane passed
+docker wait "$(docker compose -f docker/docker-compose-ci-install.yml ps -a -q verify-gone)"   # 0 = the whole lane passed
 docker compose -f docker/docker-compose-ci-install.yml logs verify verify-locked verify-again verify-gone
 docker compose -f docker/docker-compose-ci-install.yml down -v
 ```

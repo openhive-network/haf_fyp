@@ -45,7 +45,7 @@
 # in the chain and each step waits for the one before, so it cannot complete unless
 # every step did. tests/unit/test_install_lane.py pins this whole file. By hand:
 #   docker compose -f docker/docker-compose-ci-install.yml up --detach --build
-#   docker compose -f docker/docker-compose-ci-install.yml wait verify-gone
+#   docker wait "$(docker compose -f docker/docker-compose-ci-install.yml ps -a -q verify-gone)"
 #   docker compose -f docker/docker-compose-ci-install.yml down -v
 #
 # Pinned to its own project name, like docker-compose-ci.yml, so that neither `up` nor
