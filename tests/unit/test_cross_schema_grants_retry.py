@@ -147,13 +147,13 @@ def test_schema_usage_is_granted_in_a_loop_of_its_own_before_the_object_grants()
         loops = re.findall(r"(?ms)^(        )LOOP\n(.*?)^\1END LOOP;\n(        _attempt := 0;\n)?", b)
         for i in range(0, len(loops), 2):
             (_, usage, reset), (_, objects, _) = loops[i], loops[i + 1]
-            grants = re.findall(r"^\s*GRANT ([^;]*);", usage, re.M)
+            grants = re.findall(r"^\s*GRANT ([^;]*);", usage, re.MULTILINE)
             assert len(grants) == 1 and grants[0].startswith("USAGE ON SCHEMA "), usage
             schema = grants[0].split()[3]
             assert grants[0] == f"USAGE ON SCHEMA {schema} TO haf_fyp_user, haf_fyp_owner"
             assert f"'{schema} USAGE: % (attempt % of %) — grants skipped;" in usage
             assert reset, f"{schema}: the object loop does not restart the attempt counter"
-            assert re.search(r"^\s*GRANT ", objects, re.M), objects
+            assert re.search(r"^\s*GRANT ", objects, re.MULTILINE), objects
             assert "GRANT USAGE" not in objects, objects
             assert f"'{schema}: % (attempt % of %) — grants skipped;" in objects
             guards += 1
