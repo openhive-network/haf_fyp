@@ -202,9 +202,17 @@ def test_rendering_leaves_no_placeholder_behind(bash, tmp_path):
     conf = render(bash, tmp_path)
     left = re.findall(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", conf)
     assert not left, "unsubstituted placeholders in the rendered config: %s" % sorted(set(left))
-    assert "proxy_pass http://haf-fyp-postgrest:3000;" in conf, (
+    assert "set $postgrest_upstream http://haf-fyp-postgrest:3000;" in conf, (
         "the POSTGREST_HOST/PORT defaults no longer render -- this test would pass on a config "
         "nginx cannot proxy with"
+    )
+    assert "resolver 127.0.0.11 valid=10s;" in conf, (
+        "the RESOLVER default no longer renders: a variable proxy_pass with no resolver cannot "
+        "reach PostgREST by name"
+    )
+    assert "proxy_pass $postgrest_upstream;" in conf, (
+        "the entrypoint substituted the nginx variable $postgrest_upstream, or the template no "
+        "longer proxies through it"
     )
 
 

@@ -50,11 +50,20 @@ http {
         rpc_arguments = dofile(ngx.config.prefix() .. "conf/rpc_arguments.lua")
     }
 
+    # The upstream is resolved per request (below), not once at start, so a recreated
+    # PostgREST container with a new address is followed within `valid`. 127.0.0.11 is
+    # Docker's embedded DNS; ${RESOLVER} is replaced by the entrypoint.
+    resolver ${RESOLVER} valid=10s;
+
     server {
         listen 0.0.0.0:80 default_server;
         server_name _;
 
         location / {
+            # A variable makes proxy_pass resolve the name through `resolver` at request time.
+            # It must be set ahead of the include: a matching `rewrite ... break` stops every
+            # later rewrite-module directive, `set` included, and an empty upstream is a 500.
+            set $postgrest_upstream http://${POSTGREST_HOST}:${POSTGREST_PORT};
             include rewrite_rules.conf;
             # ${REWRITE_LOG} is replaced by the entrypoint (rewrite logging on/off).
             ${REWRITE_LOG}
@@ -73,7 +82,9 @@ http {
                 rpc_form.restore_head()
             }
 
-            proxy_pass http://${POSTGREST_HOST}:${POSTGREST_PORT};
+            # No URI part, so nginx sends the current URI and args: the ones the rewrite rules
+            # and rpc_form.forward left, exactly as the literal upstream did.
+            proxy_pass $postgrest_upstream;
 
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;

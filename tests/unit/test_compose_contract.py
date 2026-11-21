@@ -927,13 +927,24 @@ CONF_DIR = "nginx/conf"                       # under OPENRESTY in the image
 STAGE = "_openresty"
 RENDERED_CONF = f"./{STAGE}/{CONF_DIR}/nginx.conf"   # as the staged script sees it
 _PLACEHOLDER = re.compile(r"\$\{[A-Z_][A-Z0-9_]*\}")   # the entrypoint's, not nginx's ${var}
-# The entrypoint only substitutes three placeholders, so every render must equal the
+# The entrypoint only substitutes four placeholders, so every render must equal the
 # template line for line apart from them. Whether the template is valid nginx is left to
 # CI's rewriter lane, which starts the image on it; here the template must keep its one
 # upstream and its placeholders in place. Whitespace is spaces and tabs only.
-_PLACEHOLDERS = ("${POSTGREST_HOST}", "${POSTGREST_PORT}", "${REWRITE_LOG}")
-_PROXY_LINE = re.compile(r"[ \t]*proxy_pass[ \t]+http://\$\{POSTGREST_HOST\}:\$\{POSTGREST_PORT\}/?[ \t]*;[ \t]*")
-_UPSTREAM = re.compile(r"[ \t]*proxy_pass[ \t]+http://([A-Za-z0-9._-]+):([0-9]+)/?[ \t]*;[ \t]*")
+#
+# The upstream is the nginx variable $postgrest_upstream, so that nginx resolves the host per
+# request through `resolver` and follows a recreated PostgREST; a literal upstream is resolved
+# once at start. `proxy_pass $postgrest_upstream;` is not a placeholder: it must render as
+# written, which the line-for-line comparison checks.
+_PLACEHOLDERS = ("${POSTGREST_HOST}", "${POSTGREST_PORT}", "${REWRITE_LOG}", "${RESOLVER}")
+_PROXY_LINE = re.compile(r"[ \t]*proxy_pass[ \t]+\$postgrest_upstream[ \t]*;[ \t]*")
+_SET_LINE = re.compile(r"[ \t]*set[ \t]+\$postgrest_upstream[ \t]+"
+                       r"http://\$\{POSTGREST_HOST\}:\$\{POSTGREST_PORT\}[ \t]*;[ \t]*")
+_UPSTREAM = re.compile(r"[ \t]*set[ \t]+\$postgrest_upstream[ \t]+"
+                       r"http://([A-Za-z0-9._-]+):([0-9]+)[ \t]*;[ \t]*")
+_RESOLVER_LINE = re.compile(r"[ \t]*resolver[ \t]+\$\{RESOLVER\}[ \t]+valid=[0-9]+s[ \t]*;[ \t]*")
+_RESOLVED = re.compile(r"[ \t]*resolver[ \t]+([A-Za-z0-9.:\[\]_-]+)[ \t]+valid=([0-9]+)s[ \t]*;[ \t]*")
+_INCLUDE_RULES = re.compile(r"[ \t]*include[ \t]+rewrite_rules\.conf[ \t]*;[ \t]*")
 _LOG_LINE = re.compile(r"[ \t]*(#.*|rewrite_log[ \t]+(on|off)[ \t]*;)?[ \t]*")
 
 
@@ -945,46 +956,72 @@ def _is_comment(line: str) -> bool:
     return line.lstrip(" \t").startswith("#")
 
 
+def _one(found: list) -> int | None:
+    return found[0] if len(found) == 1 else None
+
+
 @functools.lru_cache(maxsize=None)
 def _template() -> tuple:
-    """(lines, index of the proxy_pass line, index of the ${REWRITE_LOG} line, problems).
-    An unreadable template has no lines: the entrypoint cannot render it either, and
+    """(lines, index of the `set $postgrest_upstream` line, index of the ${REWRITE_LOG} line,
+    index of the `resolver` line, problems). An unreadable template has no lines: the
+    entrypoint cannot render it either, and
     test_the_entrypoint_execs_openresty_in_the_foreground reports that."""
     try:
         lines = _lines(TEMPLATE.read_text(encoding="utf-8", errors="replace"))
     except OSError:
-        return [], None, None, []
+        return [], None, None, None, []
     code = [(i, line) for i, line in enumerate(lines) if not _is_comment(line)]
     passes = [i for i, line in code if "proxy_pass" in line]
+    sets = [i for i, line in code if "$postgrest_upstream" in line and i not in passes]
+    resolvers = [i for i, line in code if re.match(r"[ \t]*resolver\b", line)]
+    includes = [i for i, line in code if _INCLUDE_RULES.fullmatch(line)]
     logs = [i for i, line in code if "rewrite_log" in line.lower()]
     extra = sorted({p for _, line in code for p in _PLACEHOLDER.findall(line)}
                    - set(_PLACEHOLDERS))
     problems = []
     if len(passes) != 1 or not _PROXY_LINE.fullmatch(lines[passes[0]]):
-        problems.append(f"expected one line `proxy_pass http://${{POSTGREST_HOST}}:"
-                        f"${{POSTGREST_PORT}};`, found {[lines[i].strip() for i in passes]}. "
-                        f"The upstream tests read that one directive: another (a second "
-                        f"location, a `map`) needs them extended")
+        problems.append(f"expected one line `proxy_pass $postgrest_upstream;`, found "
+                        f"{[lines[i].strip() for i in passes]}. A literal upstream is resolved "
+                        f"once at start and keeps a recreated PostgREST's old address; another "
+                        f"directive (a second location, a `map`) needs the upstream tests extended")
+    if len(sets) != 1 or not _SET_LINE.fullmatch(lines[sets[0]]):
+        problems.append(f"expected one line `set $postgrest_upstream http://${{POSTGREST_HOST}}:"
+                        f"${{POSTGREST_PORT}};` and no other use of the variable, found "
+                        f"{[lines[i].strip() for i in sets]}")
+    elif len(includes) == 1 and sets[0] > includes[0]:
+        # A matching `rewrite ... break` stops the rewrite-module directives after it, `set`
+        # among them: every rewritten request would reach proxy_pass with an empty upstream.
+        problems.append("`set $postgrest_upstream` comes after `include rewrite_rules.conf`; "
+                        "a `rewrite ... break` would skip it")
+    if len(includes) != 1:
+        problems.append(f"expected one line `include rewrite_rules.conf;`, found "
+                        f"{[lines[i].strip() for i in includes]}")
+    if len(resolvers) != 1 or not _RESOLVER_LINE.fullmatch(lines[resolvers[0]]):
+        problems.append(f"expected one line `resolver ${{RESOLVER}} valid=<n>s;`, found "
+                        f"{[lines[i].strip() for i in resolvers]}: without it nginx cannot "
+                        f"resolve the variable upstream")
     if len(logs) != 1 or not re.fullmatch(r"[ \t]*\$\{REWRITE_LOG\}[ \t]*", lines[logs[0]]):
         problems.append(f"expected one line `${{REWRITE_LOG}}` and no other rewrite_log, "
                         f"found {[lines[i].strip() for i in logs]}")
     if extra:
         problems.append(f"placeholders the entrypoint does not substitute: {extra}")
-    stray = [line.strip() for i, line in code if i not in passes and (
+    stray = [line.strip() for i, line in code if i not in sets and (
         "${POSTGREST_HOST}" in line or "${POSTGREST_PORT}" in line)]
     if stray:
-        problems.append(f"the upstream placeholders belong on the proxy_pass line only, "
-                        f"found {stray}")
+        problems.append(f"the upstream placeholders belong on the `set $postgrest_upstream` "
+                        f"line only, found {stray}")
+    stray = [line.strip() for i, line in code if i not in resolvers and "${RESOLVER}" in line]
+    if stray:
+        problems.append(f"${{RESOLVER}} belongs on the resolver line only, found {stray}")
     if len(logs) == 1:
         # On the default branch ${REWRITE_LOG} renders a comment, which nginx skips: a
-        # statement left open above it would swallow the next line's proxy_pass as its
+        # statement left open above it would swallow the next line's directive as its
         # arguments there, while REWRITE_LOG=on -- the branch CI starts -- still works.
         ahead = [line.strip() for i, line in code if i < logs[0] and line.strip()]
         if ahead and not ahead[-1].endswith((";", "{", "}")):
             problems.append(f"{ahead[-1]!r}, the statement before the ${{REWRITE_LOG}} line, "
                             f"does not end in `;`, `{{` or `}}`")
-    return (lines, passes[0] if len(passes) == 1 else None,
-            logs[0] if len(logs) == 1 else None, problems)
+    return lines, _one(sets), _one(logs), _one(resolvers), problems
 
 
 @dataclass(frozen=True)
@@ -1009,7 +1046,7 @@ class Render:
     def problems(self) -> list:
         """How this render departs from the template apart from its placeholders. Empty when
         nothing was rendered or the template itself is wrong, which are reported elsewhere."""
-        template, proxy_at, log_at, template_problems = _template()
+        template, upstream_at, log_at, resolver_at, template_problems = _template()
         if self.conf is None or not template or template_problems:
             return []
         rendered = _lines(self.conf)
@@ -1018,25 +1055,37 @@ class Render:
                     f"the entrypoint may only substitute placeholders"]
         found = []
         for i, (want, got) in enumerate(zip(template, rendered)):
-            if i == proxy_at and not _UPSTREAM.fullmatch(got):
-                found.append(f"line {i + 1}: expected `proxy_pass http://<host>:<port>;`, "
+            if i == upstream_at and not _UPSTREAM.fullmatch(got):
+                found.append(f"line {i + 1}: expected `set $postgrest_upstream "
+                             f"http://<host>:<port>;`, rendered {got.strip()!r}")
+            elif i == resolver_at and not _RESOLVED.fullmatch(got):
+                found.append(f"line {i + 1}: expected `resolver <address> valid=<n>s;`, "
                              f"rendered {got.strip()!r}")
             elif i == log_at and not _LOG_LINE.fullmatch(got):
                 found.append(f"line {i + 1}: expected a comment or `rewrite_log on|off;` for "
                              f"${{REWRITE_LOG}}, rendered {got.strip()!r}")
-            elif i not in (proxy_at, log_at) and got != want and not (
+            elif i not in (upstream_at, log_at, resolver_at) and got != want and not (
                     _is_comment(want) and _is_comment(got)):   # a comment may name a placeholder
                 found.append(f"line {i + 1}: {want.strip()!r} rendered as {got.strip()!r}")
         return found
 
-    def upstream(self) -> tuple | None:
-        """The rendered `proxy_pass http://<host>:<port>;` -- or None when there is no usable
-        one, which test_the_entrypoint_execs_openresty_in_the_foreground or
-        test_the_rendered_config_is_valid reports."""
-        template, proxy_at, _, template_problems = _template()
+    def _rendered(self, at_index: int, pattern: re.Pattern) -> tuple | None:
+        template, *_, template_problems = _template()
         if self.conf is None or not template or template_problems or self.problems():
             return None
-        return _UPSTREAM.fullmatch(_lines(self.conf)[proxy_at]).groups()
+        return pattern.fullmatch(_lines(self.conf)[_template()[at_index]]).groups()
+
+    def upstream(self) -> tuple | None:
+        """The rendered `set $postgrest_upstream http://<host>:<port>;` as (host, port) -- or
+        None when there is no usable one, which
+        test_the_entrypoint_execs_openresty_in_the_foreground or
+        test_the_rendered_config_is_valid reports."""
+        return self._rendered(1, _UPSTREAM)
+
+    def resolver(self) -> tuple | None:
+        """The rendered `resolver <address> valid=<n>s;` as (address, n), or None as for
+        upstream()."""
+        return self._rendered(3, _RESOLVED)
 
 
 def _render(tmp_path_factory: TempPathFactory, **settings) -> Render:
@@ -1095,7 +1144,7 @@ def _run_entrypoint(sh, tmp_path_factory: TempPathFactory, settings) -> Render:
         handle.write("\necho 'openresty was not exec-ed' >&2\nexit 99\n")
 
     env = clean_env()
-    for name in ("POSTGREST_HOST", "POSTGREST_PORT", "REWRITE_LOG"):
+    for name in ("POSTGREST_HOST", "POSTGREST_PORT", "REWRITE_LOG", "RESOLVER"):
         env.pop(name, None)
     env.update(settings)
     # Output goes to pipes, so the run is over only when every process the entrypoint
@@ -1133,7 +1182,7 @@ def renders(tmp_path_factory: TempPathFactory) -> dict:
     return {
         "default": _render(tmp_path_factory),
         "override": _render(tmp_path_factory, POSTGREST_HOST="sentinel-upstream",
-                            POSTGREST_PORT="4242"),
+                            POSTGREST_PORT="4242", RESOLVER="10.9.8.7"),
         "rewrite_log": _render(tmp_path_factory, REWRITE_LOG="on"),
     }
 
@@ -1205,17 +1254,19 @@ def test_the_entrypoint_execs_openresty_in_the_foreground(renders) -> None:
 
 
 def test_the_rendered_config_is_valid(renders) -> None:
-    """The template must keep one upstream line, `proxy_pass http://${POSTGREST_HOST}:
-    ${POSTGREST_PORT};`, one `${REWRITE_LOG}` line and no other placeholder. Every render --
-    defaults, an explicit upstream, REWRITE_LOG=on -- must equal it line for line apart from
-    those: a `proxy_pass http://<host>:<port>;`, and a comment or `rewrite_log on|off;`.
+    """The template must keep one `resolver ${RESOLVER} valid=<n>s;`, one upstream line,
+    `set $postgrest_upstream http://${POSTGREST_HOST}:${POSTGREST_PORT};` ahead of the
+    rewrite rules, one `proxy_pass $postgrest_upstream;`, one `${REWRITE_LOG}` line and no
+    other placeholder. Every render -- defaults, an explicit upstream, REWRITE_LOG=on -- must
+    equal it line for line apart from those placeholders' lines, so the nginx variable in
+    proxy_pass survives the entrypoint unsubstituted.
 
     The default REWRITE_LOG branch is what every standard deployment runs, and no CI lane
     renders it: the CI rewriter sets REWRITE_LOG=on. Every proxy_pass counts, not only the
-    expected shape: nginx refuses to start when the literal host of any of them does not
-    resolve.
+    expected shape: a second, literal one would be resolved once at start and keep a
+    recreated PostgREST's old address.
     """
-    problems = [f"docker/haf_fyp_nginx.conf.template: {p}" for p in _template()[3]]
+    problems = [f"docker/haf_fyp_nginx.conf.template: {p}" for p in _template()[4]]
     for name, r in renders.items():
         if r.conf is None:
             if r.returncode == 0 and r.execed is not None:   # else the exec test's
@@ -1270,6 +1321,30 @@ def test_an_explicit_upstream_overrides_the_image_default(renders) -> None:
         f"POSTGREST_HOST=sentinel-upstream POSTGREST_PORT=4242 rendered "
         f"{upstream[0]}:{upstream[1]}: the entrypoint or template ignores an explicit "
         f"upstream{r.streams}"
+    )
+
+
+def test_the_resolver_defaults_to_dockers_dns_and_follows_resolver(renders) -> None:
+    """The upstream is resolved per request through the resolver, so a recreated PostgREST is
+    followed within its `valid` time. The default must be Docker's embedded DNS, which every
+    compose network has; RESOLVER overrides it for a network that has not. A `valid` beyond
+    15 s would outlast the window an operator is promised in docker/docker-compose.yml."""
+    default, override = renders["default"].resolver(), renders["override"].resolver()
+    if default is None or override is None:
+        pytest.skip("the entrypoint rendered no usable resolver -- see "
+                    "test_the_entrypoint_execs_openresty_in_the_foreground and "
+                    "test_the_rendered_config_is_valid")
+    assert default[0] == "127.0.0.11", (
+        f"with RESOLVER unset the rewriter resolves through {default[0]!r}, not Docker's "
+        f"embedded DNS 127.0.0.11"
+    )
+    assert override[0] == "10.9.8.7", (
+        f"RESOLVER=10.9.8.7 rendered resolver {override[0]!r}: the entrypoint ignores it"
+        f"{renders['override'].streams}"
+    )
+    assert int(default[1]) <= 15, (
+        f"the resolver caches the PostgREST address for {default[1]} s; a recreated "
+        f"PostgREST would be unreachable for that long"
     )
 
 

@@ -404,16 +404,13 @@ services:
       haf-fyp-setup:
         condition: service_completed_successfully
 
-  # OPERATIONAL NOTE: after substitution the template is a literal
-  # `proxy_pass http://haf-fyp-postgrest:3000` with no `resolver`, so nginx resolves that
-  # name ONCE at startup and caches the IP for the process lifetime. Recreating
-  # `haf-fyp-postgrest` (an image bump, --force-recreate) can give it a new IP -- Docker
-  # often hands the same address back, so this may keep working by accident -- and when
-  # it does change, this container fails every request -- a 502 once the connect to the stale address
-  # fails, or a timeout to a client that gives up sooner -- while still reporting HEALTHY,
-  # because the :81 probe is an
-  # unconditional 204 that never touches the upstream. Restart the rewriter after anything
-  # that recreates haf-fyp-postgrest.
+  # OPERATIONAL NOTE: the rewriter follows a recreated `haf-fyp-postgrest` (an image bump,
+  # `up -d --no-deps --force-recreate`) without a restart or reload. Its upstream is an
+  # nginx variable resolved per request through Docker's embedded DNS (`resolver
+  # 127.0.0.11 valid=10s`, overridable with RESOLVER), so a new address is picked up
+  # within about 10 s. Until then -- or while PostgREST is down -- requests 502 while the
+  # container still reports HEALTHY: the :81 probe is an unconditional 204 that never
+  # touches the upstream.
   #
   # The public read API. Without this service `docker compose up` served bare PostgREST,
   # so every /v1/fyp/... path this repo documents -- in the README tables, in the OpenAPI
