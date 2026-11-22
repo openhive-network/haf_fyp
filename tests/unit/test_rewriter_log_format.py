@@ -153,7 +153,7 @@ def assert_attributable(conf: str) -> None:
         )
 
 
-def render(bash, tmp_path, template_text: str | None = None, entrypoint: Path | None = None) -> str:
+def render(bash, tmp_path: Path, template_text: str | None = None, entrypoint: Path | None = None) -> str:
     """Run the REAL entrypoint over the template and return the config it writes.
 
     Only three things are patched: the input path, the output path, and the final exec of
@@ -182,7 +182,7 @@ def render(bash, tmp_path, template_text: str | None = None, entrypoint: Path | 
     return out.read_text(encoding="utf-8")
 
 
-def test_the_template_defines_the_format_and_wires_it_to_access_log():
+def test_the_template_defines_the_format_and_wires_it_to_access_log() -> None:
     text = TEMPLATE.read_text(encoding="utf-8")
     assert re.search(r"^\s*log_format\s+%s\b" % FORMAT, text, re.MULTILINE), (
         "no `log_format %s` in the template: the access log cannot name a caller" % FORMAT
@@ -193,22 +193,30 @@ def test_the_template_defines_the_format_and_wires_it_to_access_log():
     )
 
 
-def test_the_rendered_config_logs_the_calling_origin(bash, tmp_path):
+def test_the_rendered_config_logs_the_calling_origin(bash, tmp_path: Path) -> None:
     assert_attributable(render(bash, tmp_path))
 
 
-def test_rendering_leaves_no_placeholder_behind(bash, tmp_path):
+def test_rendering_leaves_no_placeholder_behind(bash, tmp_path: Path) -> None:
     """The same render must still substitute every ${...} the entrypoint owns."""
     conf = render(bash, tmp_path)
     left = re.findall(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", conf)
     assert not left, "unsubstituted placeholders in the rendered config: %s" % sorted(set(left))
-    assert "proxy_pass http://haf-fyp-postgrest:3000;" in conf, (
+    assert "set $postgrest_upstream http://haf-fyp-postgrest:3000;" in conf, (
         "the POSTGREST_HOST/PORT defaults no longer render -- this test would pass on a config "
         "nginx cannot proxy with"
     )
+    assert "resolver 127.0.0.11 valid=10s;" in conf, (
+        "the RESOLVER default no longer renders: a variable proxy_pass with no resolver cannot "
+        "reach PostgREST by name"
+    )
+    assert "proxy_pass $postgrest_upstream;" in conf, (
+        "the entrypoint substituted the nginx variable $postgrest_upstream, or the template no "
+        "longer proxies through it"
+    )
 
 
-def test_the_check_itself_fails_when_the_entrypoint_eats_nginx_variables(bash, tmp_path):
+def test_the_check_itself_fails_when_the_entrypoint_eats_nginx_variables(bash, tmp_path: Path) -> None:
     """Negative control for the regression this file's docstring is written about.
 
     `sed` on `${...}` leaves `$http_origin` alone; `envsubst` would replace every `$variable` with
@@ -226,7 +234,7 @@ def test_the_check_itself_fails_when_the_entrypoint_eats_nginx_variables(bash, t
         assert_attributable(render(bash, tmp_path, entrypoint=envsubst))
 
 
-def test_the_check_itself_fails_when_the_origin_is_dropped(bash, tmp_path):
+def test_the_check_itself_fails_when_the_origin_is_dropped(bash, tmp_path: Path) -> None:
     """Negative control: run the REAL check against a template with the origin field removed.
 
     An earlier version asserted that the stripped template lacked the field, which is a property

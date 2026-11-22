@@ -5,6 +5,8 @@
 #   REWRITE_LOG     - set to "on" to enable nginx rewrite logging (default: off)
 #   POSTGREST_HOST  - hostname of the PostgREST service to proxy to (default: haf-fyp-postgrest)
 #   POSTGREST_PORT  - port of the PostgREST service (default: 3000)
+#   RESOLVER        - DNS server nginx resolves POSTGREST_HOST through, per request
+#                     (default: 127.0.0.11, Docker's embedded DNS)
 
 if [ "$REWRITE_LOG" = "on" ]; then
     REWRITE_LOG="rewrite_log on;"
@@ -15,9 +17,8 @@ fi
 # Defaults to the service name a haf_api_node deployment uses. The old default,
 # "postgrest", resolves to nothing there, so an operator who swapped the
 # bind-mounted config for this image without also setting POSTGREST_HOST would get
-# no rewriter at all: the template's upstream is a literal with no `resolver`, so
-# nginx resolves it while parsing the config and openresty exits with
-# "[emerg] host not found in upstream".
+# no working rewriter: the name is resolved per request, so every request fails with
+# a 502 while the :81 health probe still answers.
 #
 # "Matching haf_stats" is NOT the reason for this name: haf_stats' entrypoint defaults
 # to its own docker/docker-compose.yml service name (haf-stats-api), which its node
@@ -28,10 +29,12 @@ fi
 # line, so that changing it cannot silently move that stack's upstream.
 POSTGREST_HOST="${POSTGREST_HOST:-haf-fyp-postgrest}"
 POSTGREST_PORT="${POSTGREST_PORT:-3000}"
+RESOLVER="${RESOLVER:-127.0.0.11}"
 
 sed -e "s|\${REWRITE_LOG}|$REWRITE_LOG|g" \
     -e "s|\${POSTGREST_HOST}|$POSTGREST_HOST|g" \
     -e "s|\${POSTGREST_PORT}|$POSTGREST_PORT|g" \
+    -e "s|\${RESOLVER}|$RESOLVER|g" \
     /usr/local/openresty/nginx/conf/nginx.conf.template \
     > /usr/local/openresty/nginx/conf/nginx.conf
 
